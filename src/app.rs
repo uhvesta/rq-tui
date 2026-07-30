@@ -408,6 +408,34 @@ impl AgentProgress {
         }
     }
 
+    pub(crate) fn record_disconnect(
+        &mut self,
+        summary: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        let now = Instant::now();
+        self.phase = AgentPhase::Disconnected;
+        self.summary = summary.into();
+        self.detail = detail.into();
+        self.active_outbound_id = None;
+        self.turn_started_at = None;
+        self.event_count = self.event_count.saturating_add(1);
+        self.timeline.push_back(AgentTimelineEntry {
+            at: now,
+            label: if self.detail.is_empty() || self.detail == self.summary {
+                self.summary.clone()
+            } else {
+                format!("{} — {}", self.summary, self.detail)
+            },
+        });
+        while self.timeline.len() > 24 {
+            self.timeline.pop_front();
+        }
+        // Deliberately retain `last_event_at`: this is the last healthy SDK
+        // progress timestamp, not the time the local bridge noticed that the
+        // stream had disconnected.
+    }
+
     pub(crate) fn elapsed(&self) -> Duration {
         self.turn_started_at
             .map(|started| self.now().saturating_duration_since(started))
@@ -665,6 +693,7 @@ pub(crate) struct AppState {
     preview_return: Option<PreviewReturnState>,
     pub(crate) context_draft: String,
     pub(crate) context_streaming: bool,
+    pub(crate) context_outbound_id: Option<String>,
     pub(crate) agent_connected: bool,
     pub(crate) agent_activity: String,
     pub(crate) agent_progress: AgentProgress,
@@ -770,6 +799,7 @@ impl AppState {
             preview_return: None,
             context_draft: String::new(),
             context_streaming: false,
+            context_outbound_id: None,
             agent_connected: false,
             agent_activity: "Connecting…".into(),
             agent_progress: AgentProgress::default(),
@@ -2792,6 +2822,7 @@ impl AppState {
             KeyCode::Char('r') => {
                 self.context_draft.clear();
                 self.context_streaming = true;
+                self.context_outbound_id = None;
                 vec![Effect::GenerateContext]
             }
             KeyCode::Char('a') if !self.context_draft.trim().is_empty() => {
@@ -3525,6 +3556,7 @@ impl AppState {
                 self.open_overlay(Screen::ContextEditor);
                 self.context_draft.clear();
                 self.context_streaming = true;
+                self.context_outbound_id = None;
                 vec![Effect::GenerateContext]
             }
             (Some("snapshot"), _) => vec![Effect::Snapshot],
@@ -4311,18 +4343,42 @@ impl AppState {
     fn yank_current(&mut self) -> Vec<Effect> {
         if self.focus == Focus::Chat {
             let text = self
-                .chat_selection
+                .chat_layout
                 .as_ref()
-                .zip(self.chat_layout.as_ref())
-                .map(|(selection, layout)| {
-                    selection.copy(
-                        layout,
-                        CopyPolicy {
-                            include_speaker_labels: true,
-                        },
-                    )
-                })
-                .unwrap_or_default();
+                .map_or_else(String::new, |layout| {
+                    let selection = self.chat_selection.clone().or_else(|| {
+                        let message_id = self
+                            .chat_navigation
+                            .as_ref()
+                            .map(|cursor| cursor.point.message_id.clone())
+                            .or_else(|| {
+                                self.chat
+                                    .get(self.chat_cursor)
+                                    .map(|entry| ChatMessageId::new(entry.id.clone()))
+                            })?;
+                        let mut rows = layout
+                            .rows
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, row)| row.message_id == message_id)
+                            .filter_map(|(row, _)| layout.row_bounds(row));
+                        let (start, mut end) = rows.next()?;
+                        for (_, row_end) in rows {
+                            end = row_end;
+                        }
+                        let mut selection = ChatSelection::character(start);
+                        selection.active = end;
+                        Some(selection)
+                    });
+                    selection.map_or_else(String::new, |selection| {
+                        selection.copy(
+                            layout,
+                            CopyPolicy {
+                                include_speaker_labels: true,
+                            },
+                        )
+                    })
+                });
             self.input_mode = InputMode::Normal;
             self.chat_selection = None;
             self.status = format!(

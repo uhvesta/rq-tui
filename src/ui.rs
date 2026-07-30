@@ -1446,11 +1446,12 @@ pub(crate) fn handle_effect(
             );
             state.context_draft.clear();
             state.context_streaming = true;
-            queue_outbound(
+            let outbound_id = queue_outbound(
                 state,
                 bridge,
                 Outbound::new(OutboundKind::ContextDraft, prompt),
             )?;
+            state.context_outbound_id = Some(outbound_id);
             state.status = "Generating structured context…".into();
         }
         Effect::AttachContext(draft) => {
@@ -1632,6 +1633,12 @@ pub(crate) fn handle_effect_failure(state: &mut AppState, effect: &Effect, error
             );
             state.status =
                 format!("Could not stop the Copilot response: {error:#} · retry with :stop");
+        }
+        Effect::GenerateContext => {
+            state.context_streaming = false;
+            state.context_outbound_id = None;
+            state.status =
+                format!("Context generation could not start: {error:#} · press r to retry");
         }
         Effect::CancelQueued(outbound_id) => {
             state.status = format!(
@@ -3105,8 +3112,10 @@ pub(crate) fn handle_agent_event(
                     None
                 }
                 OutboundKind::ContextDraft => {
-                    state.context_draft = first_delta.clone();
-                    state.context_streaming = true;
+                    if state.context_outbound_id.as_deref() == Some(outbound_id.as_str()) {
+                        state.context_draft = first_delta.clone();
+                        state.context_streaming = true;
+                    }
                     None
                 }
                 OutboundKind::Context { work_item_id } => {
@@ -3154,7 +3163,7 @@ pub(crate) fn handle_agent_event(
                 ),
                 Some(outbound_id.clone()),
             );
-            if state.context_streaming {
+            if state.context_outbound_id.as_deref() == Some(outbound_id.as_str()) {
                 state.context_draft.push_str(&delta);
             }
             if let Some(message) = state.chat.iter_mut().find(|message| {
@@ -3184,7 +3193,7 @@ pub(crate) fn handle_agent_event(
                 format!("Snapshot now contains {} bytes", text.len()),
                 Some(outbound_id.clone()),
             );
-            if state.context_streaming {
+            if state.context_outbound_id.as_deref() == Some(outbound_id.as_str()) {
                 state.context_draft = text.clone();
             }
             if let Some(message) = state.chat.iter_mut().find(|message| {
@@ -3217,9 +3226,11 @@ pub(crate) fn handle_agent_event(
             let completed_visible_turn = state.agent_progress.active_outbound_id.as_deref()
                 == Some(outbound_id.as_str())
                 || state.agent_progress.active_outbound_id.is_none();
-            let context_completed = state.context_streaming;
+            let context_completed =
+                state.context_outbound_id.as_deref() == Some(outbound_id.as_str());
             if context_completed {
                 state.context_streaming = false;
+                state.context_outbound_id = None;
                 state.status = if aborted {
                     "Context generation stopped; the partial draft is editable".into()
                 } else {
@@ -3298,8 +3309,10 @@ pub(crate) fn handle_agent_event(
             }
             state.pending_outbound_ids.remove(&outbound_id);
             state.side_outbound_ids.remove(&outbound_id);
-            if outbound == OutboundKind::ContextDraft {
+            let context_failed = state.context_outbound_id.as_deref() == Some(outbound_id.as_str());
+            if context_failed {
                 state.context_streaming = false;
+                state.context_outbound_id = None;
             }
             if let Some(chat) = state
                 .chat
@@ -3337,7 +3350,11 @@ pub(crate) fn handle_agent_event(
                 message.clone(),
                 Some(outbound_id.clone()),
             );
-            state.status = format!("Copilot turn failed: {message}");
+            state.status = if context_failed {
+                format!("Context generation failed: {message} · press r to retry or e to edit")
+            } else {
+                format!("Copilot turn failed: {message}")
+            };
         }
         AgentEvent::Activity { outbound_id, label } => {
             state.agent_activity = label.clone();
@@ -3616,12 +3633,9 @@ pub(crate) fn handle_agent_event(
             state.prune_recoveries.clear();
             state.agent_connected = false;
             state.agent_activity = "Disconnected".into();
-            state.agent_progress.record(
-                AgentPhase::Disconnected,
-                "Copilot SDK disconnected",
-                error.clone(),
-                None,
-            );
+            state
+                .agent_progress
+                .record_disconnect("Copilot SDK disconnected", error.clone());
             for message in state
                 .chat
                 .iter_mut()
@@ -3643,8 +3657,7 @@ pub(crate) fn handle_agent_event(
                 .then(|| state.agent_progress.detail.clone());
             state.agent_connected = false;
             state.agent_activity = "Disconnected".into();
-            state.agent_progress.record(
-                AgentPhase::Disconnected,
+            state.agent_progress.record_disconnect(
                 "Copilot worker stopped",
                 cleanup_warning
                     .as_ref()
@@ -3652,7 +3665,6 @@ pub(crate) fn handle_agent_event(
                         format!("No SDK event stream is active · SIDE cleanup warning: {warning}")
                     })
                     .unwrap_or_else(|| "No SDK event stream is active".into()),
-                None,
             );
             for message in state
                 .chat
@@ -4070,7 +4082,7 @@ fn truncate_terminal_line(text: &str, max_cells: usize) -> String {
 
 fn render_model_picker(frame: &mut ratatui::Frame, state: &AppState) {
     let compact = frame.area().width < 60;
-    let (step, title, subtitle, rows) = match state.model_picker_stage {
+    let (_, title, subtitle, rows) = match state.model_picker_stage {
         ModelPickerStage::Model => (
             1,
             "Choose a model",
@@ -4166,6 +4178,7 @@ fn render_model_picker(frame: &mut ratatui::Frame, state: &AppState) {
             )
         }
     };
+    let (step, total_steps) = model_picker_progress(state);
     let viewport = frame.area().height.saturating_sub(6).max(1) as usize;
     let start = state
         .model_picker_index
@@ -4198,7 +4211,9 @@ fn render_model_picker(frame: &mut ratatui::Frame, state: &AppState) {
     frame.render_widget(
         List::new(items).block(
             Block::default()
-                .title(format!(" Model picker · step {step}/3 · {title} "))
+                .title(format!(
+                    " Model picker · step {step}/{total_steps} · {title} "
+                ))
                 .borders(Borders::ALL),
         ),
         frame.area(),
@@ -4222,6 +4237,30 @@ fn render_model_picker(frame: &mut ratatui::Frame, state: &AppState) {
             1,
         ),
     );
+}
+
+fn model_picker_progress(state: &AppState) -> (usize, usize) {
+    let model = match state.model_picker_stage {
+        ModelPickerStage::Model => state.model_options.get(state.model_picker_index),
+        ModelPickerStage::Reasoning | ModelPickerStage::Context => state
+            .pending_model_selection
+            .as_ref()
+            .and_then(|selection| {
+                state
+                    .model_options
+                    .iter()
+                    .find(|model| model.id == selection.model_id)
+            }),
+    };
+    let has_reasoning = model.is_some_and(|model| !model.supported_reasoning_efforts.is_empty());
+    let has_context = model.is_some_and(|model| !model.context_tiers.is_empty());
+    let total = 1 + usize::from(has_reasoning) + usize::from(has_context);
+    let step = match state.model_picker_stage {
+        ModelPickerStage::Model => 1,
+        ModelPickerStage::Reasoning => 2,
+        ModelPickerStage::Context => 2 + usize::from(has_reasoning),
+    };
+    (step.min(total), total)
 }
 
 fn format_token_count(tokens: i64) -> String {
@@ -6314,9 +6353,18 @@ fn render_agent_progress(frame: &mut ratatui::Frame, state: &AppState, area: Rec
         Color::DarkGray
     };
     let compact = area.width < 60;
+    let compact_liveness = if progress.phase == AgentPhase::Disconnected || !state.agent_connected {
+        "OFFLINE".to_owned()
+    } else if quiet {
+        format!("QUIET {}", format_duration(age))
+    } else if active {
+        format!("LIVE {}", format_duration(progress.elapsed()))
+    } else {
+        "READY".to_owned()
+    };
     let headline = if compact && area.height <= 3 {
         format!(
-            " COPILOT {lane} {} · {}",
+            " COPILOT {lane} {state_marker} {} · {compact_liveness} · {}",
             progress.phase.label(),
             progress.summary
         )
@@ -8384,6 +8432,128 @@ mod tests {
         assert_eq!(context.work_item_id, "work");
         assert_eq!(context.title, "Demo");
         assert_eq!(context.alternatives, "Cache");
+    }
+
+    #[test]
+    fn generated_context_ignores_events_from_other_outbounds() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+        state.context_streaming = true;
+        state.context_outbound_id = Some("context-turn".into());
+
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::ResponseStarted {
+                outbound_id: "ordinary-turn".into(),
+                outbound: OutboundKind::Chat,
+                first_delta: "ordinary".into(),
+            },
+        )
+        .unwrap();
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::ResponseDelta {
+                outbound_id: "ordinary-turn".into(),
+                delta: " response".into(),
+            },
+        )
+        .unwrap();
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::ResponseComplete {
+                outbound_id: "ordinary-turn".into(),
+                aborted: false,
+            },
+        )
+        .unwrap();
+
+        assert!(state.context_streaming);
+        assert_eq!(state.context_outbound_id.as_deref(), Some("context-turn"));
+        assert!(state.context_draft.is_empty());
+
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::ResponseStarted {
+                outbound_id: "context-turn".into(),
+                outbound: OutboundKind::ContextDraft,
+                first_delta: "Title: Draft\n".into(),
+            },
+        )
+        .unwrap();
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::ResponseSnapshot {
+                outbound_id: "ordinary-turn".into(),
+                text: "unrelated snapshot".into(),
+            },
+        )
+        .unwrap();
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::ResponseDelta {
+                outbound_id: "context-turn".into(),
+                delta: "What: Correlated".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.context_draft, "Title: Draft\nWhat: Correlated");
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::ResponseComplete {
+                outbound_id: "context-turn".into(),
+                aborted: false,
+            },
+        )
+        .unwrap();
+        assert!(!state.context_streaming);
+        assert_eq!(state.context_outbound_id, None);
+        assert!(state.status.contains("Context draft ready"));
+    }
+
+    #[test]
+    fn stale_context_failure_cannot_cancel_a_new_generation() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+        state.context_streaming = true;
+        state.context_outbound_id = Some("new-context".into());
+
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::TurnFailed {
+                outbound_id: "old-context".into(),
+                outbound: OutboundKind::ContextDraft,
+                message: "old failure".into(),
+                response_started: false,
+            },
+        )
+        .unwrap();
+        assert!(state.context_streaming);
+        assert_eq!(state.context_outbound_id.as_deref(), Some("new-context"));
+
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::TurnFailed {
+                outbound_id: "new-context".into(),
+                outbound: OutboundKind::ContextDraft,
+                message: "network unavailable".into(),
+                response_started: false,
+            },
+        )
+        .unwrap();
+        assert!(!state.context_streaming);
+        assert_eq!(state.context_outbound_id, None);
+        assert!(state.status.contains("press r to retry"));
+        assert!(state.status.contains("e to edit"));
     }
 
     #[test]

@@ -4092,6 +4092,13 @@ async fn start_next(
     let Some(outbound) = queue.pop_front() else {
         return;
     };
+    events.activity(
+        Some(outbound.id.clone()),
+        AgentActivity::other(format!(
+            "Dispatching queued request to Copilot SDK · waiting up to {}s for acknowledgement",
+            SDK_CONTROL_TIMEOUT.as_secs()
+        )),
+    );
     // Make the SDK delivery contract explicit. The bridge retains its local
     // queue for UI recovery/state, and every dispatched turn is FIFO at the
     // SDK boundary as well.

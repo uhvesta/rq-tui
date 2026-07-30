@@ -811,6 +811,7 @@ pub fn render_ui_scenario(name: &str, width: u16, height: u16) -> Result<String>
         }
         "quiet" => {
             press(&mut harness, crossterm::event::KeyCode::Tab)?;
+            harness.state.agent_connected = true;
             press(&mut harness, crossterm::event::KeyCode::Char('i'))?;
             type_into(&mut harness, "Audit authentication handling")?;
             press(&mut harness, crossterm::event::KeyCode::Enter)?;
@@ -2519,6 +2520,23 @@ mod tests {
     }
 
     #[test]
+    fn chat_yy_yanks_the_whole_current_message_without_visual_mode() {
+        let mut chat = TuiHarness::from_unified_diff("chat-yy", workflow_diff(), 100, 24).unwrap();
+        chat.key(key(KeyCode::Tab)).unwrap();
+        chat.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut chat, "whole current message");
+        chat.key(key(KeyCode::Enter)).unwrap();
+        chat.render().unwrap();
+        chat.key(key(KeyCode::Char('g'))).unwrap();
+        chat.key(key(KeyCode::Char('g'))).unwrap();
+        chat.key(key(KeyCode::Char('y'))).unwrap();
+        chat.key(key(KeyCode::Char('y'))).unwrap();
+
+        assert_eq!(chat.last_yank(), Some("whole current message"));
+        assert!(chat.render().unwrap().contains("Yanked 21 bytes"));
+    }
+
+    #[test]
     fn chat_character_visual_at_latest_selects_the_final_source_character() {
         let mut chat =
             TuiHarness::from_unified_diff("latest-character", workflow_diff(), 100, 24).unwrap();
@@ -3185,6 +3203,56 @@ mod tests {
     }
 
     #[test]
+    fn model_picker_numbers_only_runtime_supported_stages() {
+        let mut context_only =
+            TuiHarness::from_unified_diff("context-only", workflow_diff(), 100, 24).unwrap();
+        context_only.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut context_only, "model");
+        context_only.key(key(KeyCode::Enter)).unwrap();
+        context_only
+            .inject_agent_event(AgentEvent::ModelsListed(vec![ModelOption {
+                id: "context-model".into(),
+                name: "Context Model".into(),
+                supported_reasoning_efforts: Vec::new(),
+                default_reasoning_effort: None,
+                max_context_tokens: Some(128_000),
+                context_tiers: vec![ContextTierOption {
+                    id: "long_context".into(),
+                    max_context_tokens: Some(256_000),
+                }],
+            }]))
+            .unwrap();
+        assert!(context_only.render().unwrap().contains("step 1/2"));
+        context_only.key(key(KeyCode::Enter)).unwrap();
+        assert!(context_only
+            .render()
+            .unwrap()
+            .contains("step 2/2 · Choose context tier"));
+
+        let mut reasoning_only =
+            TuiHarness::from_unified_diff("reasoning-only", workflow_diff(), 100, 24).unwrap();
+        reasoning_only.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut reasoning_only, "model");
+        reasoning_only.key(key(KeyCode::Enter)).unwrap();
+        reasoning_only
+            .inject_agent_event(AgentEvent::ModelsListed(vec![ModelOption {
+                id: "reasoning-model".into(),
+                name: "Reasoning Model".into(),
+                supported_reasoning_efforts: vec!["low".into(), "high".into()],
+                default_reasoning_effort: Some("low".into()),
+                max_context_tokens: Some(128_000),
+                context_tiers: Vec::new(),
+            }]))
+            .unwrap();
+        assert!(reasoning_only.render().unwrap().contains("step 1/2"));
+        reasoning_only.key(key(KeyCode::Enter)).unwrap();
+        assert!(reasoning_only
+            .render()
+            .unwrap()
+            .contains("step 2/2 · Choose reasoning effort"));
+    }
+
+    #[test]
     fn minimum_model_picker_keeps_confirmation_and_cancel_controls_visible() {
         let mut harness =
             TuiHarness::from_unified_diff("minimum-model", workflow_diff(), 40, 9).unwrap();
@@ -3417,6 +3485,11 @@ mod tests {
         let quiet = harness.render().unwrap();
         assert!(quiet.contains("no SDK events for"));
         assert!(quiet.contains(":agent-status"));
+        harness.state.agent_connected = true;
+        harness.resize(40, 9);
+        let compact_quiet = harness.render().unwrap();
+        assert!(compact_quiet.contains("QUIET"));
+        harness.resize(110, 26);
         for index in 0..12 {
             harness
                 .inject_activity(
@@ -3511,6 +3584,22 @@ mod tests {
             compact_failure.contains("Subagent edge auditor"),
             "compact failure summary was hidden:\n{compact_failure}"
         );
+    }
+
+    #[test]
+    fn disconnect_preserves_the_age_of_the_last_healthy_sdk_event() {
+        let mut harness =
+            TuiHarness::from_unified_diff("disconnect-age", workflow_diff(), 100, 20).unwrap();
+        harness.state.agent_connected = true;
+        harness.backdate_agent_progress(Duration::from_secs(20));
+        harness
+            .inject_agent_event(AgentEvent::Error("transport closed".into()))
+            .unwrap();
+
+        let frame = harness.render().unwrap();
+        assert!(frame.contains("OFFLINE"));
+        assert!(frame.contains("last SDK event 20s"));
+        assert!(!frame.contains("last SDK event 0ms"));
     }
 
     #[test]
