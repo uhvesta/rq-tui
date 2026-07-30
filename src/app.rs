@@ -39,6 +39,55 @@ pub(crate) use rq_tui_app::{Focus, InputMode, Screen};
 
 pub(crate) const INLINE_COMPOSER_ID: &str = "zzzzzzzz-inline-composer";
 
+/// Determine the selected source side without constructing a durable
+/// annotation anchor. Split rendering calls this on every frame, so it must
+/// not flatten the file, assemble snippets, or hash the containing hunk.
+fn review_selection_side(
+    file: &DiffFile,
+    selection_start: usize,
+    selection_end: usize,
+) -> Option<AnchorSide> {
+    let line_count = file.visible_line_count();
+    if line_count == 0 {
+        return None;
+    }
+    let start = selection_start.min(selection_end).min(line_count - 1);
+    let end = selection_start.max(selection_end).min(line_count - 1);
+    let mut offset = 0usize;
+    let mut saw_line = false;
+    let mut has_additions = false;
+    let mut has_deletions = false;
+    for hunk in &file.hunks {
+        let hunk_start = offset;
+        let hunk_end = offset.saturating_add(hunk.lines.len());
+        offset = hunk_end;
+        let overlap_start = start.saturating_sub(hunk_start).min(hunk.lines.len());
+        let overlap_end = end
+            .saturating_add(1)
+            .saturating_sub(hunk_start)
+            .min(hunk.lines.len());
+        for line in &hunk.lines[overlap_start..overlap_end] {
+            saw_line = true;
+            match line.kind {
+                LineKind::Addition => has_additions = true,
+                LineKind::Deletion => has_deletions = true,
+                LineKind::Context => {}
+                LineKind::Meta => return None,
+            }
+        }
+        if hunk_end > end {
+            break;
+        }
+    }
+    if !saw_line || (has_additions && has_deletions) {
+        None
+    } else if has_deletions {
+        Some(AnchorSide::Old)
+    } else {
+        Some(AnchorSide::New)
+    }
+}
+
 /// Cached immutable semantic data for Review.  Cursor/scroll belong to
 /// `AppState`, which keeps the stream safe to share across navigation and
 /// paints.
@@ -1764,11 +1813,7 @@ impl AppState {
     pub(crate) fn review_selection_side(&self) -> Option<AnchorSide> {
         let selection = self.diff_selection();
         self.current_file()
-            .and_then(|file| {
-                anchor_from_diff(file, selection.start_row, selection.end_row)
-                    .ok()
-                    .map(|anchor| anchor.side)
-            })
+            .and_then(|file| review_selection_side(file, selection.start_row, selection.end_row))
             .or_else(|| {
                 self.current_file()
                     .and_then(|file| file.visible_lines().nth(self.cursor))
@@ -5400,12 +5445,14 @@ pub(crate) mod tests_support {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::tests_support::state_for_ui;
     use super::{
-        AgentPhase, AppState, ComposeTarget, DiffLayout, Effect, Focus, InputMode, MarkdownPreview,
-        PruneChoice, Screen,
+        review_selection_side, AgentPhase, AppState, ComposeTarget, DiffLayout, Effect, Focus,
+        InputMode, MarkdownPreview, PruneChoice, Screen,
     };
     use crate::chat_selection::{
         BlockId, ChatBlock, ChatCell, ChatLayout, ChatMessage, ChatPoint, ChatRow, RowBreak,
@@ -5413,11 +5460,71 @@ mod tests {
     };
     use crate::context_editor::ContextField;
     use crate::diff::{DiffLine, LineKind};
-    use crate::domain::{AskMessage, DeliveryState};
+    use crate::domain::{AnchorSide, AskMessage, DeliveryState};
     use crate::review_stream::ReviewRow;
 
     fn state() -> AppState {
         state_for_ui()
+    }
+
+    #[test]
+    fn split_selection_side_does_not_construct_annotation_anchors() {
+        let mut app = state();
+        app.work_item.repos[0].diff.files[0].hunks[0].lines = vec![
+            DiffLine {
+                kind: LineKind::Deletion,
+                old_line: Some(1),
+                new_line: None,
+                content: "old".into(),
+            },
+            DiffLine {
+                kind: LineKind::Context,
+                old_line: Some(2),
+                new_line: Some(1),
+                content: "context".into(),
+            },
+            DiffLine {
+                kind: LineKind::Addition,
+                old_line: None,
+                new_line: Some(2),
+                content: "new".into(),
+            },
+            DiffLine {
+                kind: LineKind::Meta,
+                old_line: None,
+                new_line: None,
+                content: "fold".into(),
+            },
+        ];
+        let file = &app.work_item.repos[0].diff.files[0];
+
+        assert_eq!(review_selection_side(file, 0, 1), Some(AnchorSide::Old));
+        assert_eq!(review_selection_side(file, 1, 2), Some(AnchorSide::New));
+        assert_eq!(review_selection_side(file, 0, 2), None);
+        assert_eq!(review_selection_side(file, 3, 3), None);
+    }
+
+    #[test]
+    fn split_selection_side_stays_constant_time_for_a_large_hunk() {
+        let mut app = state();
+        app.work_item.repos[0].diff.files[0].hunks[0].lines = (0..100_000)
+            .map(|index| DiffLine {
+                kind: LineKind::Context,
+                old_line: Some(index + 1),
+                new_line: Some(index + 1),
+                content: format!("let large_hunk_{index} = {index};"),
+            })
+            .collect();
+        app.cursor = 99_999;
+        let started = Instant::now();
+        for _ in 0..32 {
+            assert_eq!(app.review_selection_side(), Some(AnchorSide::New));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "split selection-side lookup regressed to whole-hunk work: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

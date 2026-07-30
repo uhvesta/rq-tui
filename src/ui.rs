@@ -5684,38 +5684,32 @@ fn render_split(
                 content,
                 ..
             } => {
-                let source = DiffLine {
-                    kind: *kind,
-                    old_line: *old_line,
-                    new_line: *new_line,
-                    content: content.clone(),
-                };
-                let (old, new) = match kind {
-                    LineKind::Deletion => (Some(&source), None),
-                    LineKind::Addition => (None, Some(&source)),
-                    LineKind::Context => (Some(&source), Some(&source)),
-                    LineKind::Meta => (None, None),
-                };
+                let old_number = matches!(kind, LineKind::Deletion | LineKind::Context)
+                    .then_some(*old_line)
+                    .flatten();
+                let new_number = matches!(kind, LineKind::Addition | LineKind::Context)
+                    .then_some(*new_line)
+                    .flatten();
+                let (old, new) = split_source_lines(
+                    old_number,
+                    new_number,
+                    *kind,
+                    content,
+                    std::path::Path::new(file),
+                    *line,
+                    selection.filter(|_| selection_side == Some(AnchorSide::Old)),
+                    selection.filter(|_| selection_side == Some(AnchorSide::New)),
+                    highlighter,
+                    search,
+                );
                 let old = clip_styled_line_content(
-                    split_line(
-                        old,
-                        Some(std::path::Path::new(file)),
-                        old.and(selection.filter(|_| selection_side == Some(AnchorSide::Old))),
-                        highlighter,
-                        search,
-                    ),
+                    old,
                     1,
                     state.review_horizontal_scroll,
                     body_columns[0].width.saturating_sub(1) as usize,
                 );
                 let new = clip_styled_line_content(
-                    split_line(
-                        new,
-                        Some(std::path::Path::new(file)),
-                        new.and(selection.filter(|_| selection_side == Some(AnchorSide::New))),
-                        highlighter,
-                        search,
-                    ),
+                    new,
                     1,
                     state.review_horizontal_scroll,
                     body_columns[1].width as usize,
@@ -5723,7 +5717,6 @@ fn render_split(
                 if skip == 0 && take > 0 {
                     rendered_rows.push((index, old, new, None));
                 }
-                let _ = line;
             }
             _ => {
                 for line in review_row_lines_with_search(
@@ -7792,28 +7785,50 @@ fn unified_line(
     result
 }
 
-fn split_line(
-    line: Option<&DiffLine>,
-    path: Option<&std::path::Path>,
-    selection: Option<ReviewRowSelection>,
+#[allow(clippy::too_many_arguments)]
+fn split_source_lines(
+    old_number: Option<usize>,
+    new_number: Option<usize>,
+    kind: LineKind,
+    content: &str,
+    path: &std::path::Path,
+    highlight_line_number: usize,
+    old_selection: Option<ReviewRowSelection>,
+    new_selection: Option<ReviewRowSelection>,
     highlighter: &mut dyn Highlighter,
     search: Option<&str>,
+) -> (Line<'static>, Line<'static>) {
+    if old_number.is_none() && new_number.is_none() {
+        return (Line::from(""), Line::from(""));
+    }
+    let content_spans = highlight_spans_with_search(
+        highlighter
+            .highlight_line(path, highlight_line_number, content)
+            .unwrap_or_else(|_| plain_segments(content)),
+        content,
+        search,
+    );
+    (
+        split_source_half(old_number, kind, &content_spans, old_selection),
+        split_source_half(new_number, kind, &content_spans, new_selection),
+    )
+}
+
+fn split_source_half(
+    number: Option<usize>,
+    kind: LineKind,
+    content_spans: &[Span<'static>],
+    selection: Option<ReviewRowSelection>,
 ) -> Line<'static> {
-    let Some(line) = line else {
+    let Some(number) = number else {
         return Line::from("");
     };
     let selected = selection.is_some();
-    let number = line.new_line.or(line.old_line).unwrap_or(0);
     let mut spans = vec![Span::styled(
         format!("{}{:>4} ", if selected { "❯" } else { " " }, number),
-        gutter_style(line.kind),
+        gutter_style(kind),
     )];
-    spans.extend(highlight_spans_with_search(
-        path.and_then(|path| highlighter.highlight_line(path, number, &line.content).ok())
-            .unwrap_or_else(|| plain_segments(&line.content)),
-        &line.content,
-        search,
-    ));
+    spans.extend(content_spans.iter().cloned());
     let mut rendered = Line::from(spans);
     if matches!(selection, Some(ReviewRowSelection::Whole)) {
         rendered = rendered.style(Style::default().bg(Color::Rgb(40, 50, 65)));
@@ -7937,6 +7952,7 @@ fn plain_segments(text: &str) -> Vec<StyledSegment> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
@@ -7954,9 +7970,9 @@ mod tests {
         handle_agent_event, handle_agent_event_with_persistence, handle_effect,
         handle_effect_failure, load_model_preferences, load_ui_preferences, markdown_to_html,
         mouse_scroll_effects, open_browser_preview, render, review_row_lines,
-        run_clipboard_candidate, search_ranges, table_cells, truncate_terminal_text,
-        wait_for_ask_retry_signal, AskResponseUpdate, AskResponseWriter, AskResponseWriterSignal,
-        NavigationBurstLimiter, MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST,
+        run_clipboard_candidate, search_ranges, split_source_lines, table_cells,
+        truncate_terminal_text, wait_for_ask_retry_signal, AskResponseUpdate, AskResponseWriter,
+        AskResponseWriterSignal, NavigationBurstLimiter, MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST,
     };
     use crate::app::{
         tests_support::state_for_ui, AgentPhase, ChatEntry, ComposeTarget, DiffLayout, Effect,
@@ -8011,6 +8027,29 @@ mod tests {
             text: &str,
         ) -> Result<Vec<StyledSegment>> {
             self.calls += 1;
+            Ok(vec![StyledSegment {
+                text: text.to_owned(),
+                foreground: (210, 210, 210),
+                bold: false,
+                italic: false,
+            }])
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingHighlighter {
+        requested: Vec<(PathBuf, usize, String)>,
+    }
+
+    impl Highlighter for RecordingHighlighter {
+        fn highlight_line(
+            &mut self,
+            path: &Path,
+            line_number: usize,
+            text: &str,
+        ) -> Result<Vec<StyledSegment>> {
+            self.requested
+                .push((path.to_path_buf(), line_number, text.to_owned()));
             Ok(vec![StyledSegment {
                 text: text.to_owned(),
                 foreground: (210, 210, 210),
@@ -9257,6 +9296,29 @@ mod tests {
     }
 
     #[test]
+    fn split_context_highlights_once_and_uses_each_side_line_number() {
+        let mut highlighter = CountingHighlighter::default();
+        let (old, new) = split_source_lines(
+            Some(10),
+            Some(20),
+            LineKind::Context,
+            "let value = 1;",
+            Path::new("main.rs"),
+            7,
+            None,
+            None,
+            &mut highlighter,
+            None,
+        );
+        let old_gutter = old.spans[0].content.as_ref();
+        let new_gutter = new.spans[0].content.as_ref();
+
+        assert_eq!(highlighter.calls, 1);
+        assert!(old_gutter.contains("10"));
+        assert!(new_gutter.contains("20"));
+    }
+
+    #[test]
     fn large_review_highlights_only_the_visible_viewport() {
         let mut state = state_for_ui();
         state.work_item.repos[0].diff.files[0].hunks[0].lines = (0..12_000)
@@ -9283,6 +9345,43 @@ mod tests {
             );
             assert!(highlighter.calls > 0);
         }
+    }
+
+    #[test]
+    fn split_layout_reuses_unified_highlight_cache_keys() {
+        let mut state = state_for_ui();
+        state.work_item.repos[0].diff.files[0].hunks[0].lines = (0..100)
+            .map(|index| DiffLine {
+                kind: LineKind::Context,
+                old_line: Some(index + 10),
+                new_line: Some(index + 20),
+                content: format!("let cached_{index} = {index};"),
+            })
+            .collect();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut highlighter = RecordingHighlighter::default();
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        let unified_keys = highlighter
+            .requested
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let unified_request_count = highlighter.requested.len();
+        state.layout = DiffLayout::Split;
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+
+        let split_keys = &highlighter.requested[unified_request_count..];
+        assert!(!split_keys.is_empty());
+        assert!(
+            split_keys.iter().all(|key| unified_keys.contains(key)),
+            "switching to split mode requested syntax cache keys absent from the warm unified viewport"
+        );
     }
 
     #[test]
