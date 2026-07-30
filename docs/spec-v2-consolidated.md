@@ -48,6 +48,21 @@ mode gets the same treatment in reverse: it must feel like those same CLIs —
 a transcript you scroll and select text in like a real editor, not a
 message-index list.
 
+**Scope note — read this before touching diff-pane navigation.** The
+existing build's core diff-pane navigation is already right and is
+explicitly *not* being redesigned here: file-to-file movement (`h`/`l`),
+line-to-line movement (`j`/`k`, including moving straight through an
+expanded inline block and back out, §3.4), fold expand/collapse (`o`/`O`,
+§9), `gg`/`G`, and in-pane search (`/`, `n`/`N`, §9) all already feel
+correct and should be carried forward as-is, mechanically unchanged. Every
+requirement in this document is about what surrounds that navigation, not
+about replacing it: killing the annotation rail (§2.5, §3.4), Chat's feel
+and rendered-text selection (§7), focus visibility and window scope (§4.2,
+§4.3), composer growth (§7.5), inline Markdown preview (§3.11), and the
+crate/workspace split (§1.1). If an implementer finds themselves rewriting
+how the cursor moves through diff lines, that's a sign they've drifted
+outside this document's scope, not a sign the spec asked for it.
+
 **Stack:** Rust, [ratatui](https://ratatui.rs) (TUI framework), `syntect`
 (syntax highlighting, lazy per-viewport — see §9), `github-copilot-sdk` (Rust
 crate, JSON-RPC to the `copilot` CLI in server mode), `gh` CLI shelled out to
