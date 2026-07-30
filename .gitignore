@@ -4,6 +4,7 @@
 /bazel-*
 /bazel-rq-tui
 /.bazel-cache/
+/.tools/
 /target/
 *.tar.gz
 *.zip

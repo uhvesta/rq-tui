@@ -8,7 +8,7 @@ chat.
 
 ## Requirements
 
-- Bazel 9 through Bazelisk; `.bazelversion` pins `9.0.0`.
+- Bazel 9 through Bazelisk; `.bazelversion` pins `9.1.0`.
 - `git` for local review targets.
 - `gh` authenticated with GitHub for remote PR reviews.
 - `copilot` on `PATH`, or `COPILOT_CLI_PATH=/absolute/path/to/copilot`, for
@@ -18,6 +18,18 @@ The repository uses bzlmod through `MODULE.bazel` and its checked-in lockfile.
 Rust compilation, formatting, linting, tests, and release builds are driven
 through Bazel targets only. Target and Rust-module visibility is intentionally
 kept narrow.
+
+Bootstrap a pinned, checksum-verified Bazelisk on macOS or Linux (arm64 or
+x86_64) without installing anything globally:
+
+```sh
+./bootstrap-bazelisk.sh
+export PATH="$PWD/.tools/bin:$PATH"
+```
+
+The script installs Bazelisk under the git-ignored `.tools/bin/` directory.
+Bazelisk then reads `.bazelversion` and downloads the repository's pinned Bazel
+release. Running the script again is idempotent.
 
 ## CLI behavior
 
