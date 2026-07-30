@@ -1,9 +1,27 @@
-load("@rules_rust//rust:defs.bzl", "rust_binary")
-load("@crates//:defs.bzl", "crate_deps")
+filegroup(
+    name = "migrations",
+    srcs = glob(["migrations/*.sql"]),
+    visibility = ["//src:__pkg__"],
+)
 
-rust_binary(
+alias(
+    name = "rq_tui_lib",
+    actual = "//src:rq_tui_lib",
+    visibility = ["//visibility:private"],
+)
+
+alias(
     name = "rq-tui",
-    srcs = ["src/main.rs"],
-    edition = "2021",
-    deps = crate_deps(["crossterm", "ratatui"]),
+    actual = "//src:rq-tui",
+    visibility = ["//visibility:private"],
+)
+
+test_suite(
+    name = "rq_tui_tests",
+    tests = [
+        "//src:clippy_test",
+        "//src:rq_tui_tests",
+        "//src:rustfmt_test",
+    ],
+    visibility = ["//visibility:private"],
 )

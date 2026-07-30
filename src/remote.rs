@@ -1,0 +1,515 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::annotations::{follow_rename, reanchor};
+use crate::config::AppPaths;
+use crate::diff::parse_unified;
+use crate::domain::{
+    BaseBranchSource, DeliveryState, Repo, ReviewContext, Version, VersionKind, WorkItem,
+};
+use crate::storage::{now, Storage};
+use crate::work_item::{ResolvedWorkItem, ReviewRepo};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PrReference {
+    pub(crate) owner: String,
+    pub(crate) repo: String,
+    pub(crate) number: u64,
+}
+
+impl PrReference {
+    pub(crate) fn parse(input: &str) -> Result<Self> {
+        let value = input
+            .trim()
+            .trim_end_matches('/')
+            .strip_prefix("https://")
+            .or_else(|| input.trim().trim_end_matches('/').strip_prefix("http://"))
+            .unwrap_or(input.trim().trim_end_matches('/'))
+            .strip_prefix("github.com/")
+            .unwrap_or_else(|| {
+                input
+                    .trim()
+                    .trim_end_matches('/')
+                    .strip_prefix("https://github.com/")
+                    .unwrap_or(input.trim().trim_end_matches('/'))
+            });
+
+        if let Some((name, number)) = value.rsplit_once('#') {
+            let (owner, repo) = name
+                .trim_start_matches("github.com/")
+                .split_once('/')
+                .context("PR reference must include owner and repository")?;
+            return Ok(Self {
+                owner: owner.to_owned(),
+                repo: repo.to_owned(),
+                number: number.parse().context("invalid PR number")?,
+            });
+        }
+
+        let parts = value
+            .trim_start_matches("github.com/")
+            .split('/')
+            .collect::<Vec<_>>();
+        if let [owner, repo, "pull", number] = parts.as_slice() {
+            return Ok(Self {
+                owner: (*owner).to_owned(),
+                repo: (*repo).to_owned(),
+                number: number.parse().context("invalid PR number")?,
+            });
+        }
+        bail!("invalid PR reference: {input}")
+    }
+
+    pub(crate) fn canonical_url(&self) -> String {
+        format!(
+            "https://github.com/{}/{}/pull/{}",
+            self.owner, self.repo, self.number
+        )
+    }
+
+    pub(crate) fn gh_selector(&self) -> String {
+        format!("{}/{}#{}", self.owner, self.repo, self.number)
+    }
+
+    pub(crate) fn cache_key(&self) -> String {
+        format!("{}_{}_{}", self.owner, self.repo, self.number).replace(['/', '\\', ':'], "_")
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PrMetadata {
+    pub(crate) number: u64,
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) url: String,
+    pub(crate) state: String,
+    pub(crate) merged_at: Option<String>,
+    pub(crate) base_ref_name: String,
+    pub(crate) head_ref_oid: String,
+}
+
+pub(crate) trait ProcessRunner {
+    fn output(&self, command: &mut Command) -> Result<Output>;
+}
+
+#[derive(Default)]
+pub(crate) struct SystemProcessRunner;
+
+impl ProcessRunner for SystemProcessRunner {
+    fn output(&self, command: &mut Command) -> Result<Output> {
+        command.output().context("failed to execute process")
+    }
+}
+
+pub(crate) struct RemoteResolver<R = SystemProcessRunner> {
+    runner: R,
+}
+
+impl Default for RemoteResolver<SystemProcessRunner> {
+    fn default() -> Self {
+        Self {
+            runner: SystemProcessRunner,
+        }
+    }
+}
+
+impl<R: ProcessRunner> RemoteResolver<R> {
+    pub(crate) fn metadata(&self, reference: &PrReference) -> Result<PrMetadata> {
+        let output = self.runner.output(Command::new("gh").args([
+            "pr",
+            "view",
+            &reference.gh_selector(),
+            "--json",
+            "number,title,body,url,state,mergedAt,baseRefName,headRefOid",
+        ]))?;
+        ensure_success("gh pr view", &output)?;
+        serde_json::from_slice(&output.stdout).context("invalid PR metadata from gh")
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        references: &[PrReference],
+        paths: &AppPaths,
+        storage: &Storage,
+    ) -> Result<ResolvedWorkItem> {
+        if references.is_empty() {
+            bail!("at least one PR is required");
+        }
+        let metadata = references
+            .iter()
+            .map(|reference| self.metadata(reference).map(|meta| (reference, meta)))
+            .collect::<Result<Vec<_>>>()?;
+        let canonical_urls = references
+            .iter()
+            .map(PrReference::canonical_url)
+            .collect::<Vec<_>>();
+        let stable_item_id = stable_id("work", &canonical_urls.join("\n"));
+        let existing = storage.work_item_by_id(&stable_item_id)?;
+        let timestamp = now();
+        let item_id = existing
+            .as_ref()
+            .map(|item| item.id.clone())
+            .unwrap_or(stable_item_id);
+        let session_root = paths.roots.join(&item_id);
+        let item = WorkItem {
+            id: item_id.clone(),
+            name: if references.len() == 1 {
+                format!("{}#{}", references[0].repo, references[0].number)
+            } else {
+                format!("{} PRs", references.len())
+            },
+            workspace_root: session_root.clone(),
+            created_at: existing
+                .as_ref()
+                .map(|item| item.created_at.clone())
+                .unwrap_or_else(|| timestamp.clone()),
+            updated_at: timestamp.clone(),
+            last_opened_at: Some(timestamp),
+        };
+        storage.upsert_work_item(&item)?;
+        fs::create_dir_all(&session_root)?;
+
+        let metadata_for_context = metadata
+            .iter()
+            .map(|(_, metadata)| (*metadata).clone())
+            .collect::<Vec<_>>();
+        let mut repos = metadata
+            .into_iter()
+            .map(|(reference, metadata)| {
+                self.resolve_repo(reference, metadata, &item, paths, storage)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        repos.sort_by(|left, right| {
+            right
+                .record
+                .last_activity_at
+                .cmp(&left.record.last_activity_at)
+        });
+        for repo in &repos {
+            ensure_link(
+                &session_root.join(&repo.record.name),
+                repo.version.worktree_path.as_ref(),
+            )?;
+        }
+        write_remote_metadata(&session_root, &metadata_for_context)?;
+        if let [metadata] = metadata_for_context.as_slice() {
+            storage.upsert_context(&ReviewContext {
+                work_item_id: item.id.clone(),
+                title: metadata.title.clone(),
+                what: metadata.body.clone(),
+                why: String::new(),
+                how: String::new(),
+                considerations: String::new(),
+                alternatives: String::new(),
+                source: "remote_pr".into(),
+                attached_to_session: false,
+                delivery_state: DeliveryState::Draft,
+            })?;
+        }
+        Ok(ResolvedWorkItem {
+            item,
+            repos,
+            session_root,
+        })
+    }
+
+    fn resolve_repo(
+        &self,
+        reference: &PrReference,
+        metadata: PrMetadata,
+        item: &WorkItem,
+        paths: &AppPaths,
+        storage: &Storage,
+    ) -> Result<ReviewRepo> {
+        let cache = paths.prs.join(reference.cache_key());
+        let bare = cache.join("repo.git");
+        fs::create_dir_all(&cache)?;
+        self.ensure_bare_clone(reference, &bare)?;
+
+        let head_ref = format!("refs/rq-tui/pr/{}/head", reference.number);
+        let base_ref = format!("refs/rq-tui/pr/{}/base", reference.number);
+        let fetch_specs = [
+            format!("+refs/pull/{}/head:{head_ref}", reference.number),
+            format!("+refs/heads/{}:{base_ref}", metadata.base_ref_name),
+        ];
+        let output = self.runner.output(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&bare)
+                .args(["fetch", "--prune", "origin"])
+                .args(fetch_specs),
+        )?;
+        ensure_success("git fetch", &output)?;
+        let head_sha = self.git_dir_stdout(&bare, ["rev-parse", &head_ref])?;
+        let base_sha = self.git_dir_stdout(&bare, ["rev-parse", &base_ref])?;
+
+        let repo_id = stable_id(
+            "repo",
+            &format!("{}:{}", item.id, reference.canonical_url()),
+        );
+        let record = Repo {
+            id: repo_id.clone(),
+            work_item_id: item.id.clone(),
+            name: reference.repo.clone(),
+            path: bare.clone(),
+            remote_pr_url: Some(reference.canonical_url()),
+            pr_meta_json: Some(serde_json::to_string(&metadata)?),
+            base_branch: Some(metadata.base_ref_name.clone()),
+            base_branch_source: BaseBranchSource::Auto,
+            last_activity_at: Some(now()),
+        };
+        storage.upsert_repo(&record)?;
+
+        let existing = storage.latest_remote_version(&repo_id)?;
+        let created_new_version = !existing
+            .as_ref()
+            .is_some_and(|version| version.head_sha == head_sha);
+        let version = if !created_new_version {
+            existing.clone().expect("checked as present")
+        } else {
+            let version_num = existing
+                .as_ref()
+                .map(|version| version.version_num + 1)
+                .unwrap_or(1);
+            let id = format!("{repo_id}:v{version_num}");
+            let worktree = cache.join("worktrees").join(format!("v{version_num}"));
+            self.add_worktree(&bare, &worktree, &head_sha)?;
+            let version = Version {
+                id,
+                repo_id: repo_id.clone(),
+                version_num,
+                kind: VersionKind::Remote,
+                created_at: now(),
+                head_sha: head_sha.clone(),
+                worktree_path: Some(worktree),
+                last_opened_at: existing.is_none().then(now),
+            };
+            storage.upsert_version(&version)?;
+            version
+        };
+        if created_new_version {
+            if let Some(previous) = existing.as_ref() {
+                self.carry_forward_annotations(storage, &bare, previous, &version)?;
+            }
+        }
+        if !created_new_version || existing.is_none() {
+            storage.mark_version_opened(&version.id)?;
+        }
+        let worktree = version
+            .worktree_path
+            .as_ref()
+            .context("remote version has no worktree")?;
+        let merge_base = self.git_stdout(worktree, ["merge-base", &base_sha, &head_sha])?;
+        let raw = self.git_stdout(
+            worktree,
+            [
+                "diff",
+                "--find-renames",
+                "--no-ext-diff",
+                "--unified=6",
+                "--no-color",
+                &merge_base,
+                &head_sha,
+                "--",
+            ],
+        )?;
+        Ok(ReviewRepo {
+            record,
+            version,
+            diff: parse_unified(&raw)?,
+        })
+    }
+
+    fn carry_forward_annotations(
+        &self,
+        storage: &Storage,
+        bare: &Path,
+        previous: &Version,
+        current: &Version,
+    ) -> Result<()> {
+        let current_worktree = current
+            .worktree_path
+            .as_ref()
+            .context("new remote version has no worktree")?;
+        let renames = self.git_dir_stdout(
+            bare,
+            [
+                "diff",
+                "--name-status",
+                "--find-renames",
+                &previous.head_sha,
+                &current.head_sha,
+            ],
+        )?;
+        let rename_map = renames
+            .lines()
+            .filter_map(|line| {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                (fields.len() == 3 && fields[0].starts_with('R'))
+                    .then(|| (PathBuf::from(fields[1]), PathBuf::from(fields[2])))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        for (mut annotation, previous_placement) in storage.annotations_for_version(&previous.id)? {
+            let renamed_to = rename_map.get(&annotation.file_path);
+            if renamed_to.is_some() {
+                follow_rename(storage, &mut annotation, renamed_to.map(PathBuf::as_path))?;
+            }
+            let content = fs::read_to_string(current_worktree.join(&annotation.file_path))
+                .unwrap_or_default();
+            storage.upsert_placement(&reanchor(
+                &annotation,
+                &previous_placement,
+                &current.id,
+                &content,
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn ensure_bare_clone(&self, reference: &PrReference, bare: &Path) -> Result<()> {
+        let clone_url = format!(
+            "https://github.com/{}/{}.git",
+            reference.owner, reference.repo
+        );
+        if bare.exists() {
+            let output = self.runner.output(
+                Command::new("git")
+                    .arg("--git-dir")
+                    .arg(bare)
+                    .args(["remote", "set-url", "origin", &clone_url]),
+            )?;
+            return ensure_success("git remote set-url", &output);
+        }
+        if let Some(parent) = bare.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let output = self.runner.output(
+            Command::new("git")
+                .args(["clone", "--bare", &clone_url])
+                .arg(bare),
+        )?;
+        ensure_success("git clone --bare", &output)
+    }
+
+    fn add_worktree(&self, bare: &Path, worktree: &Path, head_sha: &str) -> Result<()> {
+        if worktree.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = worktree.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let output = self.runner.output(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(bare)
+                .args(["worktree", "add", "--detach"])
+                .arg(worktree)
+                .arg(head_sha),
+        )?;
+        ensure_success("git worktree add", &output)
+    }
+
+    fn git_dir_stdout<const N: usize>(&self, git_dir: &Path, args: [&str; N]) -> Result<String> {
+        let output = self
+            .runner
+            .output(Command::new("git").arg("--git-dir").arg(git_dir).args(args))?;
+        ensure_success("git", &output)?;
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    fn git_stdout<const N: usize>(&self, repo: &Path, args: [&str; N]) -> Result<String> {
+        let output = self
+            .runner
+            .output(Command::new("git").arg("-C").arg(repo).args(args))?;
+        ensure_success("git", &output)?;
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+}
+
+fn write_remote_metadata(root: &Path, metadata: &[PrMetadata]) -> Result<()> {
+    let directory = root.join(".rq-tui").join("metadata");
+    fs::create_dir_all(&directory)?;
+    for entry in metadata {
+        let name = entry.url.split('/').rev().nth(2).unwrap_or("pull-request");
+        fs::write(
+            directory.join(format!("{name}-{}.md", entry.number)),
+            format!(
+                "# {}\n\n{}\n\n- URL: {}\n- State: {}\n- Base: {}\n- Head: {}\n",
+                entry.title,
+                entry.body,
+                entry.url,
+                entry.state,
+                entry.base_ref_name,
+                entry.head_ref_oid,
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_success(operation: &str, output: &Output) -> Result<()> {
+    if output.status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "{operation} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+}
+
+fn stable_id(namespace: &str, value: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(namespace.as_bytes());
+    digest.update([0]);
+    digest.update(value.as_bytes());
+    let hex = format!("{:x}", digest.finalize());
+    format!("{namespace}-{}", &hex[..24])
+}
+
+fn ensure_link(link: &Path, target: Option<&PathBuf>) -> Result<()> {
+    let target = target.context("remote version has no worktree")?;
+    if link.symlink_metadata().is_ok() {
+        if std::fs::read_link(link).is_ok_and(|existing| existing == target.as_path()) {
+            return Ok(());
+        }
+        std::fs::remove_file(link)?;
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PrReference;
+
+    #[test]
+    fn parses_supported_pr_reference_forms() {
+        let expected = PrReference {
+            owner: "acme".into(),
+            repo: "api".into(),
+            number: 42,
+        };
+        for value in [
+            "acme/api#42",
+            "github.com/acme/api#42",
+            "https://github.com/acme/api/pull/42",
+        ] {
+            assert_eq!(PrReference::parse(value).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_incomplete_pr_references() {
+        assert!(PrReference::parse("api#42").is_err());
+        assert!(PrReference::parse("acme/api").is_err());
+    }
+}

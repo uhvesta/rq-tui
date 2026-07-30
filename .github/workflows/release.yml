@@ -17,11 +17,13 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-24.04
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
           - name: macos-x86_64
-            os: macos-13
+            os: macos-15-intel
           - name: macos-aarch64
-            os: macos-14
+            os: macos-15
 
     steps:
       - uses: actions/checkout@v4
@@ -31,20 +33,25 @@ jobs:
           path: |
             ~/.cache/bazel
             ~/.cache/bazelisk
-          key: bazel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/*.bzl', 'MODULE.bazel', 'Cargo.lock') }}
-          restore-keys: bazel-${{ runner.os }}-${{ runner.arch }}-
+          key: bazel-9-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.bazelversion', 'MODULE.bazel', 'MODULE.bazel.lock', 'Cargo.lock', '**/*.bzl') }}
+          restore-keys: bazel-9-${{ runner.os }}-${{ runner.arch }}-
+      - name: Test
+        run: bazel test //:rq_tui_tests
       - name: Build
-        run: bazel build //:rq-tui --announce_rc
+        run: bazel build //:rq-tui
       - name: Package binary
         shell: bash
         run: |
           mkdir -p dist
-          cp "bazel-bin/rq-tui" "dist/rq-tui-${{ matrix.name }}"
+          cp "bazel-bin/src/rq-tui" "dist/rq-tui-${{ matrix.name }}"
           tar -C dist -czf "rq-tui-${{ matrix.name }}.tar.gz" "rq-tui-${{ matrix.name }}"
+          shasum -a 256 "rq-tui-${{ matrix.name }}.tar.gz" > "rq-tui-${{ matrix.name }}.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: rq-tui-${{ matrix.name }}
-          path: rq-tui-${{ matrix.name }}.*
+          path: |
+            rq-tui-${{ matrix.name }}.tar.gz
+            rq-tui-${{ matrix.name }}.tar.gz.sha256
 
   publish:
     name: Publish GitHub release

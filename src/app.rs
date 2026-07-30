@@ -1,0 +1,2384 @@
+use std::cmp;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::annotations::anchor_from_diff;
+use crate::diff::{DiffFile, DiffSet, LineKind};
+use crate::domain::{AnchorSide, Annotation, AnnotationKind, AskMessage, Placement, Version};
+use crate::work_item::ResolvedWorkItem;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Screen {
+    #[default]
+    Review,
+    Chat,
+    Settings,
+    Versions,
+    ContextEditor,
+    Prune,
+    Recovery,
+    AgentStatus,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum InputMode {
+    #[default]
+    Normal,
+    Visual,
+    Command,
+    Search,
+    Compose,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Focus {
+    FilePicker,
+    #[default]
+    Diff,
+    AnnotationRail,
+    Chat,
+    InlineAsk,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DiffLayout {
+    #[default]
+    Split,
+    Unified,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Effect {
+    Quit {
+        force: bool,
+    },
+    Snapshot,
+    Sync,
+    ExpandContext {
+        all: bool,
+    },
+    Export {
+        format: Option<String>,
+    },
+    GenerateContext,
+    AttachContext(String),
+    CreateAnnotation {
+        kind: AnnotationKind,
+        text: String,
+        selection: DiffSelection,
+    },
+    FollowUpAsk {
+        annotation_id: String,
+        text: String,
+    },
+    EditAnnotation {
+        annotation_id: String,
+        text: String,
+    },
+    EditAskMessage {
+        annotation_id: String,
+        message_id: String,
+        text: String,
+    },
+    RepinAnnotation {
+        annotation_id: String,
+        selection: DiffSelection,
+    },
+    DeleteAnnotation(String),
+    UndoAnnotation,
+    OpenVersion {
+        repo_id: String,
+        version_id: String,
+    },
+    LoadPrune,
+    PruneWorkItems {
+        ids: Vec<String>,
+        export_first: bool,
+    },
+    SendChat(String),
+    StartSide(Option<String>),
+    ExitSide,
+    AbortAgent,
+    ResendPendingAsk(AskMessage),
+    DiscardPendingAsk(String),
+    ResendPendingComments,
+    DiscardPendingComments,
+    ResendPendingContext,
+    DiscardPendingContext,
+    Fork,
+    Compact(Option<String>),
+    SetModel(String),
+    SetBase {
+        branch: String,
+        repo: Option<String>,
+    },
+    SetExpandStep(usize),
+    Preview,
+    Yank(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiffSelection {
+    pub(crate) start_row: usize,
+    pub(crate) end_row: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ComposeTarget {
+    Annotation(AnnotationKind),
+    FollowUp(String),
+    EditAnnotation(String),
+    EditAskMessage {
+        annotation_id: String,
+        message_id: String,
+    },
+    Chat,
+    Context,
+    SettingModel,
+    SettingBase,
+    SettingExpandStep,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChatEntry {
+    pub(crate) role: String,
+    pub(crate) text: String,
+    pub(crate) streaming: bool,
+    pub(crate) annotation_id: Option<String>,
+    pub(crate) outbound_id: Option<String>,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum AgentPhase {
+    Connecting,
+    Queued,
+    Planning,
+    Tool,
+    Responding,
+    Stopping,
+    #[default]
+    Idle,
+    Failed,
+    Disconnected,
+}
+
+impl AgentPhase {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Connecting => "CONNECTING",
+            Self::Queued => "QUEUED",
+            Self::Planning => "THINKING",
+            Self::Tool => "TOOL",
+            Self::Responding => "RESPONDING",
+            Self::Stopping => "STOPPING",
+            Self::Idle => "IDLE",
+            Self::Failed => "FAILED",
+            Self::Disconnected => "OFFLINE",
+        }
+    }
+
+    pub(crate) fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Connecting
+                | Self::Queued
+                | Self::Planning
+                | Self::Tool
+                | Self::Responding
+                | Self::Stopping
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AgentTimelineEntry {
+    pub(crate) at: Instant,
+    pub(crate) label: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AgentProgress {
+    pub(crate) phase: AgentPhase,
+    pub(crate) summary: String,
+    pub(crate) detail: String,
+    pub(crate) active_outbound_id: Option<String>,
+    pub(crate) turn_started_at: Option<Instant>,
+    pub(crate) last_event_at: Instant,
+    pub(crate) event_count: usize,
+    pub(crate) queue_depth: usize,
+    pub(crate) timeline: VecDeque<AgentTimelineEntry>,
+}
+
+impl Default for AgentProgress {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self {
+            phase: AgentPhase::Connecting,
+            summary: "Starting Copilot SDK session".into(),
+            detail: "Waiting for the SDK session-ready event".into(),
+            active_outbound_id: None,
+            turn_started_at: Some(now),
+            last_event_at: now,
+            event_count: 0,
+            queue_depth: 0,
+            timeline: VecDeque::from([AgentTimelineEntry {
+                at: now,
+                label: "Starting Copilot SDK session".into(),
+            }]),
+        }
+    }
+}
+
+impl AgentProgress {
+    pub(crate) fn record(
+        &mut self,
+        phase: AgentPhase,
+        summary: impl Into<String>,
+        detail: impl Into<String>,
+        outbound_id: Option<String>,
+    ) {
+        let now = Instant::now();
+        if phase.is_active() && !self.phase.is_active() {
+            self.turn_started_at = Some(now);
+        }
+        if !phase.is_active() {
+            self.turn_started_at = None;
+        }
+        self.phase = phase;
+        self.summary = summary.into();
+        self.detail = detail.into();
+        self.active_outbound_id = outbound_id;
+        self.last_event_at = now;
+        self.event_count = self.event_count.saturating_add(1);
+        self.timeline.push_back(AgentTimelineEntry {
+            at: now,
+            label: self.summary.clone(),
+        });
+        while self.timeline.len() > 24 {
+            self.timeline.pop_front();
+        }
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.turn_started_at
+            .map(|started| started.elapsed())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn last_event_age(&self) -> Duration {
+        self.last_event_at.elapsed()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VersionChoice {
+    pub(crate) repo_name: String,
+    pub(crate) version: Version,
+    pub(crate) asks: usize,
+    pub(crate) comments: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PruneChoice {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) last_opened_at: String,
+    pub(crate) versions: usize,
+    pub(crate) annotations: usize,
+    pub(crate) selected: bool,
+}
+
+pub(crate) const COMMANDS: &[(&str, &str)] = &[
+    (
+        "agent-status",
+        "inspect Copilot liveness and recent SDK events",
+    ),
+    ("side [question]", "start an ephemeral side conversation"),
+    ("main", "leave the side conversation and return to main"),
+    ("stop", "cancel the active Copilot response"),
+    ("diff split", "show the side-by-side diff"),
+    ("diff unified", "show a single-column diff"),
+    ("diff expand", "expand all folded context"),
+    ("model <name>", "change the Copilot model"),
+    ("fork", "fork and activate a persistent session"),
+    (
+        "compact [instructions]",
+        "compact persistent session history",
+    ),
+    ("versions", "open exact review-version history"),
+    ("snapshot", "pin the current working-tree version"),
+    ("generate-context", "draft structured review context"),
+    ("export [markdown|json]", "export review annotations"),
+    ("prune", "remove old work items"),
+    ("settings", "open settings"),
+    ("sync", "refresh repositories and remote PRs"),
+    (
+        "base <branch> [--repo <name>]",
+        "change a repository base branch",
+    ),
+    ("q", "quit when no delivery is pending"),
+    ("q!", "force quit"),
+];
+
+pub(crate) fn command_matches(prefix: &str) -> Vec<(&'static str, &'static str)> {
+    let needle = prefix.split_whitespace().next().unwrap_or_default();
+    COMMANDS
+        .iter()
+        .copied()
+        .filter(|(command, _)| {
+            needle.is_empty()
+                || command
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|name| name.starts_with(needle))
+        })
+        .collect()
+}
+
+fn command_seed(command: &str) -> String {
+    command
+        .split_whitespace()
+        .take_while(|part| !part.starts_with('<') && !part.starts_with('['))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AppState {
+    pub(crate) work_item: ResolvedWorkItem,
+    pub(crate) screen: Screen,
+    pub(crate) previous_screen: Screen,
+    pub(crate) input_mode: InputMode,
+    pub(crate) focus: Focus,
+    pub(crate) layout: DiffLayout,
+    pub(crate) picker_open: bool,
+    pub(crate) repo_index: usize,
+    pub(crate) file_index: usize,
+    pub(crate) cursor: usize,
+    pub(crate) scroll: usize,
+    pub(crate) visual_anchor: Option<usize>,
+    pub(crate) chat_visual_anchor: Option<usize>,
+    pub(crate) command: String,
+    pub(crate) command_index: usize,
+    pub(crate) command_scroll: usize,
+    pub(crate) search: String,
+    pub(crate) compose: String,
+    pub(crate) compose_cursor: usize,
+    pub(crate) compose_scroll: usize,
+    pub(crate) compose_target: Option<ComposeTarget>,
+    pub(crate) input_return_mode: InputMode,
+    pub(crate) status: String,
+    pub(crate) annotations: Vec<(Annotation, Placement)>,
+    pub(crate) ask_threads: HashMap<String, Vec<AskMessage>>,
+    pub(crate) collapsed_annotations: HashSet<String>,
+    pub(crate) collapsed_repos: HashSet<String>,
+    pub(crate) expanded_context: HashMap<(String, String), usize>,
+    pub(crate) expand_step: usize,
+    pub(crate) chat: Vec<ChatEntry>,
+    pub(crate) main_chat: Option<Vec<ChatEntry>>,
+    pub(crate) pending_side_entries: Vec<ChatEntry>,
+    pub(crate) chat_cursor: usize,
+    pub(crate) chat_scroll: usize,
+    pub(crate) chat_total_rows: usize,
+    pub(crate) chat_viewport_rows: usize,
+    pub(crate) chat_autofollow: bool,
+    pub(crate) context_draft: String,
+    pub(crate) context_streaming: bool,
+    pub(crate) agent_connected: bool,
+    pub(crate) agent_activity: String,
+    pub(crate) agent_progress: AgentProgress,
+    pub(crate) side_starting: bool,
+    pub(crate) side_active: bool,
+    pub(crate) side_session_id: Option<String>,
+    pub(crate) last_usage: Option<String>,
+    pub(crate) pending_outbound_ids: HashSet<String>,
+    pub(crate) side_outbound_ids: HashSet<String>,
+    pub(crate) model: String,
+    pub(crate) pending_prefix: String,
+    pub(crate) pending_asks: Vec<AskMessage>,
+    pub(crate) pending_comment_ids: Vec<String>,
+    pub(crate) pending_context: bool,
+    pub(crate) recovery_index: usize,
+    pub(crate) annotation_index: usize,
+    pub(crate) deleted_annotation: Option<(Annotation, Vec<Placement>, Vec<AskMessage>)>,
+    pub(crate) versions: Vec<VersionChoice>,
+    pub(crate) version_index: usize,
+    pub(crate) prune_items: Vec<PruneChoice>,
+    pub(crate) prune_index: usize,
+    pub(crate) settings_index: usize,
+    pub(crate) should_quit: bool,
+    pub(crate) viewport_height: usize,
+}
+
+impl AppState {
+    pub(crate) fn new(work_item: ResolvedWorkItem) -> Self {
+        Self {
+            work_item,
+            screen: Screen::Review,
+            previous_screen: Screen::Review,
+            input_mode: InputMode::Normal,
+            focus: Focus::Diff,
+            layout: DiffLayout::Split,
+            picker_open: false,
+            repo_index: 0,
+            file_index: 0,
+            cursor: 0,
+            scroll: 0,
+            visual_anchor: None,
+            chat_visual_anchor: None,
+            command: String::new(),
+            command_index: 0,
+            command_scroll: 0,
+            search: String::new(),
+            compose: String::new(),
+            compose_cursor: 0,
+            compose_scroll: 0,
+            compose_target: None,
+            input_return_mode: InputMode::Normal,
+            status: String::new(),
+            annotations: Vec::new(),
+            ask_threads: HashMap::new(),
+            collapsed_annotations: HashSet::new(),
+            collapsed_repos: HashSet::new(),
+            expanded_context: HashMap::new(),
+            expand_step: 10,
+            chat: Vec::new(),
+            main_chat: None,
+            pending_side_entries: Vec::new(),
+            chat_cursor: 0,
+            chat_scroll: 0,
+            chat_total_rows: 0,
+            chat_viewport_rows: 0,
+            chat_autofollow: true,
+            context_draft: String::new(),
+            context_streaming: false,
+            agent_connected: false,
+            agent_activity: "Connecting…".into(),
+            agent_progress: AgentProgress::default(),
+            side_starting: false,
+            side_active: false,
+            side_session_id: None,
+            last_usage: None,
+            pending_outbound_ids: HashSet::new(),
+            side_outbound_ids: HashSet::new(),
+            model: "gpt-5".into(),
+            pending_prefix: String::new(),
+            pending_asks: Vec::new(),
+            pending_comment_ids: Vec::new(),
+            pending_context: false,
+            recovery_index: 0,
+            annotation_index: 0,
+            deleted_annotation: None,
+            versions: Vec::new(),
+            version_index: 0,
+            prune_items: Vec::new(),
+            prune_index: 0,
+            settings_index: 0,
+            should_quit: false,
+            viewport_height: 20,
+        }
+    }
+
+    pub(crate) fn current_diff(&self) -> Option<&DiffSet> {
+        self.work_item
+            .repos
+            .get(self.repo_index)
+            .map(|repo| &repo.diff)
+    }
+
+    pub(crate) fn current_file(&self) -> Option<&DiffFile> {
+        self.current_diff()
+            .and_then(|diff| diff.files.get(self.file_index))
+    }
+
+    pub(crate) fn current_line_count(&self) -> usize {
+        self.current_file()
+            .map(|file| file.visible_lines().count())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn selection(&self) -> (usize, usize) {
+        let anchor = self.visual_anchor.unwrap_or(self.cursor);
+        (cmp::min(anchor, self.cursor), cmp::max(anchor, self.cursor))
+    }
+
+    pub(crate) fn diff_selection(&self) -> DiffSelection {
+        let (start_row, end_row) = self.selection();
+        DiffSelection { start_row, end_row }
+    }
+
+    pub(crate) fn has_unsubmitted_work(&self) -> bool {
+        self.annotations
+            .iter()
+            .any(|(annotation, _)| match annotation.kind {
+                AnnotationKind::Comment => !annotation.submitted,
+                AnnotationKind::Ask => {
+                    annotation.delivery_state == crate::domain::DeliveryState::Pending
+                }
+            })
+            || self.pending_context
+            || !self.pending_comment_ids.is_empty()
+            || !self.pending_outbound_ids.is_empty()
+            || self.chat.iter().any(|message| message.streaming)
+    }
+
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        match self.input_mode {
+            InputMode::Command => return self.handle_command_key(key),
+            InputMode::Search => return self.handle_search_key(key),
+            InputMode::Compose => return self.handle_compose_key(key),
+            InputMode::Normal | InputMode::Visual => {}
+        }
+        self.handle_normal_key(key)
+    }
+
+    pub(crate) fn scroll_chat_or_diff(&mut self, delta: i32) {
+        let amount = delta.unsigned_abs() as usize;
+        if self.screen == Screen::Chat {
+            self.focus = Focus::Chat;
+        }
+        if delta < 0 {
+            self.move_up(amount);
+        } else {
+            self.move_down(amount);
+        }
+    }
+
+    fn handle_normal_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        if self.screen == Screen::Recovery {
+            return self.handle_recovery_key(key);
+        }
+        if self.screen == Screen::ContextEditor {
+            return self.handle_context_key(key);
+        }
+        if self.screen == Screen::Versions {
+            return self.handle_versions_key(key);
+        }
+        if self.screen == Screen::Prune {
+            return self.handle_prune_key(key);
+        }
+        if self.screen == Screen::Settings {
+            return self.handle_settings_key(key);
+        }
+        if self.screen == Screen::AgentStatus {
+            return match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.screen = self.previous_screen;
+                    Vec::new()
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.scroll = self.scroll.saturating_add(1);
+                    Vec::new()
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.scroll = self.scroll.saturating_sub(1);
+                    Vec::new()
+                }
+                KeyCode::Char('s') => vec![Effect::AbortAgent],
+                _ => Vec::new(),
+            };
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return self.handle_control_key(key.code);
+        }
+        if !self.pending_prefix.is_empty() {
+            if let KeyCode::Char(character) = key.code {
+                return self.handle_prefix_key(character);
+            }
+            self.pending_prefix.clear();
+        }
+        match key.code {
+            KeyCode::Char(':') => {
+                self.clear_visual_selection();
+                self.input_mode = InputMode::Command;
+                self.command.clear();
+                self.command_index = 0;
+                self.command_scroll = 0;
+                self.status = "COMMAND mode · type to filter, ↑/↓ choose, Tab complete".into();
+            }
+            KeyCode::Char('/') => {
+                self.input_return_mode = self.input_mode;
+                self.input_mode = InputMode::Search;
+                self.search.clear();
+            }
+            KeyCode::Tab if self.input_mode == InputMode::Normal => self.toggle_review_chat(),
+            KeyCode::Char('-') => {
+                self.picker_open = !self.picker_open;
+                self.focus = if self.picker_open {
+                    Focus::FilePicker
+                } else {
+                    Focus::Diff
+                };
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.move_down(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_up(1),
+            KeyCode::Char('h') if self.focus == Focus::Diff => self.previous_file(),
+            KeyCode::Char('l') if self.focus == Focus::Diff => self.next_file(),
+            KeyCode::Char('h') if self.focus == Focus::FilePicker => self.collapse_current_repo(),
+            KeyCode::Char('l') if self.focus == Focus::FilePicker => self.expand_current_repo(),
+            KeyCode::Char('G') => self.jump_bottom(),
+            KeyCode::Char('v')
+                if matches!(self.screen, Screen::Review | Screen::Chat)
+                    && matches!(self.focus, Focus::Diff | Focus::Chat | Focus::InlineAsk) =>
+            {
+                self.input_mode = InputMode::Visual;
+                if self.focus == Focus::Chat {
+                    self.chat_visual_anchor = Some(self.chat_cursor);
+                } else {
+                    self.visual_anchor = Some(self.cursor);
+                }
+            }
+            KeyCode::Esc if self.input_mode == InputMode::Visual => {
+                self.input_mode = InputMode::Normal;
+                self.visual_anchor = None;
+                self.chat_visual_anchor = None;
+            }
+            KeyCode::Esc if !self.search.is_empty() => {
+                self.search.clear();
+                self.status = "Search cleared".into();
+            }
+            KeyCode::Char('a') if self.screen == Screen::Review => {
+                self.start_composing(AnnotationKind::Ask);
+            }
+            KeyCode::Char('c') if self.screen == Screen::Review => {
+                self.start_composing(AnnotationKind::Comment);
+            }
+            KeyCode::Char('i')
+                if self.screen == Screen::Chat && self.input_mode == InputMode::Normal =>
+            {
+                self.input_return_mode = InputMode::Normal;
+                self.input_mode = InputMode::Compose;
+                self.compose_target = Some(ComposeTarget::Chat);
+                self.compose_cursor = self.compose.len();
+            }
+            KeyCode::Enter if self.focus == Focus::FilePicker => {
+                self.picker_open = false;
+                self.focus = Focus::Diff;
+                self.clear_visual_selection();
+            }
+            KeyCode::Enter if self.focus == Focus::AnnotationRail => {
+                self.focus = Focus::Diff;
+            }
+            KeyCode::Enter if self.screen == Screen::Review => {
+                if let Some((kind, annotation_id)) = self
+                    .annotation_under_cursor()
+                    .map(|(annotation, _)| (annotation.kind, annotation.id.clone()))
+                {
+                    if kind == AnnotationKind::Ask {
+                        self.collapsed_annotations.remove(&annotation_id);
+                        self.input_return_mode = InputMode::Normal;
+                        self.input_mode = InputMode::Compose;
+                        self.compose_target = Some(ComposeTarget::FollowUp(annotation_id));
+                        self.compose.clear();
+                        self.compose_cursor = 0;
+                        self.focus = Focus::InlineAsk;
+                    }
+                }
+            }
+            KeyCode::Char('e') if self.screen == Screen::Review => {
+                if let Some((kind, annotation_id, text, ambiguous)) = self
+                    .annotation_under_cursor()
+                    .map(|(annotation, placement)| {
+                        (
+                            annotation.kind,
+                            annotation.id.clone(),
+                            annotation.text.clone().unwrap_or_default(),
+                            placement.ambiguous,
+                        )
+                    })
+                {
+                    if ambiguous {
+                        let selection = self.diff_selection();
+                        self.input_mode = InputMode::Normal;
+                        self.visual_anchor = None;
+                        return vec![Effect::RepinAnnotation {
+                            annotation_id,
+                            selection,
+                        }];
+                    } else if kind == AnnotationKind::Comment {
+                        self.input_return_mode = InputMode::Normal;
+                        self.input_mode = InputMode::Compose;
+                        self.compose_target = Some(ComposeTarget::EditAnnotation(annotation_id));
+                        self.compose = text;
+                        self.compose_cursor = self.compose.len();
+                    } else {
+                        self.input_return_mode = InputMode::Normal;
+                        self.input_mode = InputMode::Compose;
+                        if let Some(message) =
+                            self.ask_threads.get(&annotation_id).and_then(|thread| {
+                                thread.iter().rev().find(|message| message.role == "user")
+                            })
+                        {
+                            self.compose_target = Some(ComposeTarget::EditAskMessage {
+                                annotation_id,
+                                message_id: message.id.clone(),
+                            });
+                            self.compose = message.text.clone();
+                            self.compose_cursor = self.compose.len();
+                        } else {
+                            self.compose_target = Some(ComposeTarget::FollowUp(annotation_id));
+                            self.compose.clear();
+                            self.compose_cursor = 0;
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('u') if self.screen == Screen::Review => {
+                return vec![Effect::UndoAnnotation];
+            }
+            KeyCode::Char('n') => self.jump_to_search(),
+            KeyCode::Char('N') => self.jump_to_search_reverse(),
+            KeyCode::Char('y') if self.input_mode == InputMode::Visual => {
+                return self.yank_current();
+            }
+            KeyCode::Char('*') if self.focus == Focus::Diff => {
+                if let Some(line) = self
+                    .current_file()
+                    .and_then(|file| file.visible_lines().nth(self.cursor))
+                {
+                    self.search = line
+                        .content
+                        .split(|character: char| !character.is_alphanumeric() && character != '_')
+                        .find(|word| !word.is_empty())
+                        .unwrap_or("")
+                        .to_owned();
+                    self.jump_to_search();
+                }
+            }
+            KeyCode::Char('o')
+                if self.screen == Screen::Review
+                    && self.focus == Focus::Diff
+                    && self.cursor_on_fold() =>
+            {
+                return vec![Effect::ExpandContext { all: false }];
+            }
+            KeyCode::Char('O')
+                if self.screen == Screen::Review
+                    && self.focus == Focus::Diff
+                    && self.cursor_on_fold() =>
+            {
+                return vec![Effect::ExpandContext { all: true }];
+            }
+            KeyCode::Char(character @ ('g' | ']' | '[' | 'y' | 'd' | 'z' | ',')) => {
+                return self.handle_prefix_key(character);
+            }
+            KeyCode::Char('q') => {
+                if !matches!(self.screen, Screen::Review | Screen::Chat) {
+                    self.screen = self.previous_screen;
+                } else {
+                    self.status = "Use :q to quit".into();
+                }
+            }
+            KeyCode::PageDown => self.move_down(self.viewport_height),
+            KeyCode::PageUp => self.move_up(self.viewport_height),
+            _ => {
+                self.pending_prefix.clear();
+            }
+        }
+        Vec::new()
+    }
+
+    fn handle_prune_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.prune_index = cmp::min(
+                    self.prune_items.len().saturating_sub(1),
+                    self.prune_index.saturating_add(1),
+                );
+                Vec::new()
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.prune_index = self.prune_index.saturating_sub(1);
+                Vec::new()
+            }
+            KeyCode::Char(' ') => {
+                if let Some(item) = self.prune_items.get_mut(self.prune_index) {
+                    item.selected = !item.selected;
+                }
+                Vec::new()
+            }
+            KeyCode::Char('d' | 'x') => {
+                let ids = self
+                    .prune_items
+                    .iter()
+                    .filter(|item| item.selected)
+                    .map(|item| item.id.clone())
+                    .collect::<Vec<_>>();
+                if ids.is_empty() {
+                    self.status = "Select at least one reviewed Work Item".into();
+                    Vec::new()
+                } else {
+                    vec![Effect::PruneWorkItems {
+                        ids,
+                        export_first: key.code == KeyCode::Char('x'),
+                    }]
+                }
+            }
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.screen = self.previous_screen;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn handle_settings_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        const SETTING_COUNT: usize = 7;
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.settings_index = cmp::min(
+                    SETTING_COUNT.saturating_sub(1),
+                    self.settings_index.saturating_add(1),
+                );
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.settings_index = self.settings_index.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                let target = match self.settings_index {
+                    0 => Some((ComposeTarget::SettingModel, self.model.clone())),
+                    2 => Some((
+                        ComposeTarget::SettingBase,
+                        self.work_item
+                            .repos
+                            .get(self.repo_index)
+                            .and_then(|repo| repo.record.base_branch.clone())
+                            .unwrap_or_default(),
+                    )),
+                    4 => Some((
+                        ComposeTarget::SettingExpandStep,
+                        self.expand_step.to_string(),
+                    )),
+                    _ => None,
+                };
+                if let Some((target, value)) = target {
+                    self.input_return_mode = InputMode::Normal;
+                    self.input_mode = InputMode::Compose;
+                    self.compose_target = Some(target);
+                    self.compose = value;
+                    self.compose_cursor = self.compose.len();
+                    self.status = "Edit value and press Ctrl-S or Ctrl-Enter to save".into();
+                } else {
+                    self.status = "This setting is informational".into();
+                }
+            }
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.screen = self.previous_screen;
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn handle_versions_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.version_index = cmp::min(
+                    self.versions.len().saturating_sub(1),
+                    self.version_index.saturating_add(1),
+                );
+                Vec::new()
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.version_index = self.version_index.saturating_sub(1);
+                Vec::new()
+            }
+            KeyCode::Enter => self
+                .versions
+                .get(self.version_index)
+                .map(|choice| Effect::OpenVersion {
+                    repo_id: choice.version.repo_id.clone(),
+                    version_id: choice.version.id.clone(),
+                })
+                .into_iter()
+                .collect(),
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.screen = self.previous_screen;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn handle_prefix_key(&mut self, character: char) -> Vec<Effect> {
+        let prefix = std::mem::take(&mut self.pending_prefix);
+        match (prefix.as_str(), character) {
+            ("g", 'g') => self.jump_top(),
+            ("g", 'c' | 'r') if self.input_mode == InputMode::Normal => self.toggle_review_chat(),
+            ("g", 'm') => return vec![Effect::Preview],
+            ("ctrl-w", 'h') => {
+                self.focus = Focus::FilePicker;
+                self.picker_open = true;
+                self.clear_visual_selection();
+            }
+            ("ctrl-w", 'l') => {
+                self.focus = if self.layout == DiffLayout::Split {
+                    Focus::AnnotationRail
+                } else {
+                    Focus::Diff
+                };
+                self.clear_visual_selection();
+            }
+            ("ctrl-w", 'j') => {
+                self.screen = Screen::Chat;
+                self.focus = Focus::Chat;
+                self.clear_visual_selection();
+            }
+            ("ctrl-w", 'k') => {
+                self.screen = Screen::Review;
+                self.focus = Focus::Diff;
+                self.clear_visual_selection();
+            }
+            ("]", 'a') => self.jump_annotation(true),
+            ("[", 'a') => self.jump_annotation(false),
+            ("y", 'y') => return self.yank_current(),
+            ("d", 'd') => {
+                if let Some((annotation, _)) = self.annotation_under_cursor() {
+                    return vec![Effect::DeleteAnnotation(annotation.id.clone())];
+                }
+            }
+            ("z", 'a') => {
+                if let Some(annotation_id) = self
+                    .annotation_under_cursor()
+                    .map(|(annotation, _)| annotation.id.clone())
+                {
+                    if !self.collapsed_annotations.remove(&annotation_id) {
+                        self.collapsed_annotations.insert(annotation_id);
+                    }
+                    self.status = "Toggled annotation fold".into();
+                }
+            }
+            (",", 'e') => {
+                self.picker_open = !self.picker_open;
+                self.focus = if self.picker_open {
+                    Focus::FilePicker
+                } else {
+                    Focus::Diff
+                };
+            }
+            ("", 'y') if self.input_mode == InputMode::Visual => return self.yank_current(),
+            ("", start @ ('g' | ']' | '[' | 'y' | 'd' | 'z' | ',')) => {
+                self.pending_prefix = start.to_string();
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn handle_context_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.screen = self.previous_screen;
+                Vec::new()
+            }
+            KeyCode::Char('r') => {
+                self.context_draft.clear();
+                self.context_streaming = true;
+                vec![Effect::GenerateContext]
+            }
+            KeyCode::Char('a') if !self.context_draft.trim().is_empty() => {
+                vec![Effect::AttachContext(self.context_draft.clone())]
+            }
+            KeyCode::Char('e') => {
+                self.input_return_mode = InputMode::Normal;
+                self.input_mode = InputMode::Compose;
+                self.compose_target = Some(ComposeTarget::Context);
+                self.compose = self.context_draft.clone();
+                self.compose_cursor = self.compose.len();
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn handle_recovery_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.recovery_index = cmp::min(
+                    self.recovery_count().saturating_sub(1),
+                    self.recovery_index.saturating_add(1),
+                );
+                Vec::new()
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.recovery_index = self.recovery_index.saturating_sub(1);
+                Vec::new()
+            }
+            KeyCode::Char('r') => self.recovery_effect(true).into_iter().collect(),
+            KeyCode::Char('d') => self.recovery_effect(false).into_iter().collect(),
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.screen = Screen::Review;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn recovery_effect(&self, resend: bool) -> Option<Effect> {
+        if let Some(message) = self.pending_asks.get(self.recovery_index) {
+            return Some(if resend {
+                Effect::ResendPendingAsk(message.clone())
+            } else {
+                Effect::DiscardPendingAsk(message.id.clone())
+            });
+        }
+        let mut index = self.recovery_index.saturating_sub(self.pending_asks.len());
+        if !self.pending_comment_ids.is_empty() {
+            if index == 0 {
+                return Some(if resend {
+                    Effect::ResendPendingComments
+                } else {
+                    Effect::DiscardPendingComments
+                });
+            }
+            index = index.saturating_sub(1);
+        }
+        (self.pending_context && index == 0).then_some(if resend {
+            Effect::ResendPendingContext
+        } else {
+            Effect::DiscardPendingContext
+        })
+    }
+
+    fn recovery_count(&self) -> usize {
+        self.pending_asks.len()
+            + usize::from(!self.pending_comment_ids.is_empty())
+            + usize::from(self.pending_context)
+    }
+
+    fn handle_control_key(&mut self, code: KeyCode) -> Vec<Effect> {
+        let half = (self.viewport_height / 2).max(1);
+        match code {
+            KeyCode::Char('c') => {
+                if self.screen == Screen::Chat && !self.compose.is_empty() {
+                    self.compose.clear();
+                    self.compose_cursor = 0;
+                    self.compose_scroll = 0;
+                    self.compose_target = None;
+                    self.status = "Draft cancelled".into();
+                    return Vec::new();
+                }
+                if self.side_starting {
+                    return vec![Effect::ExitSide];
+                }
+                if self.agent_progress.phase.is_active() {
+                    self.agent_progress.record(
+                        AgentPhase::Stopping,
+                        "Stopping the active Copilot response",
+                        "Cancellation was requested; waiting for the SDK idle event",
+                        self.agent_progress.active_outbound_id.clone(),
+                    );
+                    return vec![Effect::AbortAgent];
+                }
+                if self.side_active {
+                    return vec![Effect::ExitSide];
+                }
+                self.status =
+                    "Nothing is running · Esc cancels a draft, :agent-status inspects Copilot"
+                        .into();
+            }
+            KeyCode::Char('d') => self.move_down(half),
+            KeyCode::Char('u') => self.move_up(half),
+            KeyCode::Char('f') => self.move_down(self.viewport_height),
+            KeyCode::Char('b') => self.move_up(self.viewport_height),
+            KeyCode::Char('w') => self.pending_prefix = "ctrl-w".into(),
+            KeyCode::Char('h') if self.pending_prefix == "ctrl-w" => {
+                self.pending_prefix.clear();
+                self.focus = Focus::FilePicker;
+                self.picker_open = true;
+            }
+            KeyCode::Char('l') if self.pending_prefix == "ctrl-w" => {
+                self.pending_prefix.clear();
+                self.focus = if self.layout == DiffLayout::Split {
+                    Focus::AnnotationRail
+                } else {
+                    Focus::Diff
+                };
+            }
+            KeyCode::Char('j') if self.pending_prefix == "ctrl-w" => {
+                self.pending_prefix.clear();
+                self.screen = Screen::Chat;
+                self.focus = Focus::Chat;
+            }
+            KeyCode::Char('k') if self.pending_prefix == "ctrl-w" => {
+                self.pending_prefix.clear();
+                self.screen = Screen::Review;
+                self.focus = Focus::Diff;
+            }
+            KeyCode::Char('j' | 'm') => {
+                return self.handle_normal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+            _ => self.pending_prefix.clear(),
+        }
+        Vec::new()
+    }
+
+    fn handle_command_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        if terminal_enter(&key) {
+            let matches = command_matches(&self.command);
+            let selected = matches.get(self.command_index).map(|(command, _)| *command);
+            let typed = self.command.trim();
+            let command = if typed.is_empty() {
+                selected.map(command_seed).unwrap_or_default()
+            } else if !typed.contains(char::is_whitespace) {
+                selected
+                    .map(command_seed)
+                    .unwrap_or_else(|| typed.to_owned())
+            } else {
+                typed.to_owned()
+            };
+            if selected.is_some_and(|suggestion| suggestion.contains('<'))
+                && !typed.contains(char::is_whitespace)
+            {
+                self.command = format!("{command} ");
+                self.command_index = 0;
+                self.command_scroll = 0;
+                return Vec::new();
+            }
+            self.command.clear();
+            self.input_mode = InputMode::Normal;
+            return self.execute_command(command.trim());
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.command.clear();
+                Vec::new()
+            }
+            KeyCode::Backspace => {
+                self.command.pop();
+                self.command_index = 0;
+                self.command_scroll = 0;
+                Vec::new()
+            }
+            KeyCode::Up => {
+                let count = command_matches(&self.command).len();
+                if count > 0 {
+                    self.command_index = self.command_index.saturating_sub(1);
+                    self.command_scroll = self.command_scroll.min(self.command_index);
+                }
+                Vec::new()
+            }
+            KeyCode::Down => {
+                let count = command_matches(&self.command).len();
+                if count > 0 {
+                    self.command_index = cmp::min(
+                        count.saturating_sub(1),
+                        self.command_index.saturating_add(1),
+                    );
+                    if self.command_index >= self.command_scroll + 7 {
+                        self.command_scroll = self.command_index + 1 - 7;
+                    }
+                }
+                Vec::new()
+            }
+            KeyCode::PageUp => {
+                self.command_index = self.command_index.saturating_sub(7);
+                self.command_scroll = self.command_scroll.min(self.command_index);
+                Vec::new()
+            }
+            KeyCode::PageDown => {
+                let count = command_matches(&self.command).len();
+                self.command_index = cmp::min(
+                    count.saturating_sub(1),
+                    self.command_index.saturating_add(7),
+                );
+                self.command_scroll = self.command_index.saturating_sub(6);
+                Vec::new()
+            }
+            KeyCode::Tab => {
+                if let Some((suggestion, _)) =
+                    command_matches(&self.command).get(self.command_index)
+                {
+                    self.command = command_seed(suggestion);
+                    if suggestion.contains('<') {
+                        self.command.push(' ');
+                    }
+                    self.command_index = 0;
+                    self.command_scroll = 0;
+                }
+                Vec::new()
+            }
+            KeyCode::Char(character)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                self.command.push(character);
+                self.command_index = 0;
+                self.command_scroll = 0;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        if terminal_enter(&key) {
+            self.input_mode = self.input_return_mode;
+            self.jump_to_search();
+            return Vec::new();
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = self.input_return_mode;
+                self.search.clear();
+            }
+            KeyCode::Backspace => {
+                self.search.pop();
+            }
+            KeyCode::Char(character) => self.search.push(character),
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn handle_compose_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        if terminal_enter(&key)
+            || (key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            return self.submit_compose();
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') => {
+                    self.compose.clear();
+                    self.compose_cursor = 0;
+                    self.compose_scroll = 0;
+                    self.input_mode = self.input_return_mode;
+                    self.compose_target = None;
+                    self.status = "Draft cancelled".into();
+                    return Vec::new();
+                }
+                KeyCode::Char('a') => {
+                    self.compose_cursor = self.compose_line_start();
+                    return Vec::new();
+                }
+                KeyCode::Char('e') => {
+                    self.compose_cursor = self.compose_line_end();
+                    return Vec::new();
+                }
+                KeyCode::Char('u') => {
+                    let start = self.compose_line_start();
+                    self.compose.replace_range(start..self.compose_cursor, "");
+                    self.compose_cursor = start;
+                    return Vec::new();
+                }
+                KeyCode::Char('k') => {
+                    let end = self.compose_line_end();
+                    self.compose.replace_range(self.compose_cursor..end, "");
+                    return Vec::new();
+                }
+                _ => {}
+            }
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = self.input_return_mode;
+                if self.compose_target == Some(ComposeTarget::Chat) {
+                    self.status = if self.compose.is_empty() {
+                        "Chat composer left in NORMAL mode".into()
+                    } else {
+                        "Draft kept · press i to resume editing or Ctrl-C to discard".into()
+                    };
+                } else {
+                    self.compose.clear();
+                    self.compose_cursor = 0;
+                    self.compose_target = None;
+                }
+                Vec::new()
+            }
+            KeyCode::Backspace => {
+                if self.compose_cursor > 0 {
+                    let previous = self.previous_compose_boundary();
+                    self.compose
+                        .replace_range(previous..self.compose_cursor, "");
+                    self.compose_cursor = previous;
+                }
+                Vec::new()
+            }
+            KeyCode::Delete => {
+                let next = self.next_compose_boundary();
+                if next > self.compose_cursor {
+                    self.compose.replace_range(self.compose_cursor..next, "");
+                }
+                Vec::new()
+            }
+            KeyCode::Left => {
+                self.compose_cursor = self.previous_compose_boundary();
+                Vec::new()
+            }
+            KeyCode::Right => {
+                self.compose_cursor = self.next_compose_boundary();
+                Vec::new()
+            }
+            KeyCode::Home => {
+                self.compose_cursor = self.compose_line_start();
+                Vec::new()
+            }
+            KeyCode::End => {
+                self.compose_cursor = self.compose_line_end();
+                Vec::new()
+            }
+            KeyCode::Up => {
+                self.move_compose_vertical(-1);
+                Vec::new()
+            }
+            KeyCode::Down => {
+                self.move_compose_vertical(1);
+                Vec::new()
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.insert_compose("\n");
+                Vec::new()
+            }
+            KeyCode::Tab => {
+                self.insert_compose("    ");
+                Vec::new()
+            }
+            KeyCode::Char(character) => {
+                self.insert_compose(&character.to_string());
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn submit_compose(&mut self) -> Vec<Effect> {
+        if self.compose.trim().is_empty() {
+            self.status = "Enter text before submitting".into();
+            return Vec::new();
+        }
+        let text = std::mem::take(&mut self.compose);
+        self.compose_cursor = 0;
+        self.compose_scroll = 0;
+        let target = self
+            .compose_target
+            .take()
+            .expect("compose mode always has a target");
+        let selection = self.diff_selection();
+        self.input_mode = InputMode::Normal;
+        self.visual_anchor = None;
+        match target {
+            ComposeTarget::Annotation(kind) => {
+                vec![Effect::CreateAnnotation {
+                    kind,
+                    text,
+                    selection,
+                }]
+            }
+            ComposeTarget::FollowUp(annotation_id) => {
+                vec![Effect::FollowUpAsk {
+                    annotation_id,
+                    text,
+                }]
+            }
+            ComposeTarget::EditAnnotation(annotation_id) => {
+                vec![Effect::EditAnnotation {
+                    annotation_id,
+                    text,
+                }]
+            }
+            ComposeTarget::EditAskMessage {
+                annotation_id,
+                message_id,
+            } => vec![Effect::EditAskMessage {
+                annotation_id,
+                message_id,
+                text,
+            }],
+            ComposeTarget::Chat => {
+                let trimmed = text.trim();
+                if trimmed == "/side" {
+                    vec![Effect::StartSide(None)]
+                } else if let Some(question) = trimmed.strip_prefix("/side ") {
+                    vec![Effect::StartSide(Some(question.trim().to_owned()))]
+                } else if matches!(trimmed, "/main" | "/side-exit") {
+                    vec![Effect::ExitSide]
+                } else {
+                    vec![Effect::SendChat(text)]
+                }
+            }
+            ComposeTarget::Context => {
+                self.context_draft = text;
+                Vec::new()
+            }
+            ComposeTarget::SettingModel => vec![Effect::SetModel(text)],
+            ComposeTarget::SettingBase => vec![Effect::SetBase {
+                branch: text,
+                repo: None,
+            }],
+            ComposeTarget::SettingExpandStep => match text.parse::<usize>() {
+                Ok(step) if step > 0 => vec![Effect::SetExpandStep(step)],
+                _ => {
+                    self.status = "Expand step must be a positive integer".into();
+                    Vec::new()
+                }
+            },
+        }
+    }
+
+    fn execute_command(&mut self, command: &str) -> Vec<Effect> {
+        let mut parts = command.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some("q" | "quit"), _) => vec![Effect::Quit { force: false }],
+            (Some("q!" | "quit!"), _) => vec![Effect::Quit { force: true }],
+            (Some("diff"), Some("split")) => {
+                self.layout = DiffLayout::Split;
+                self.clear_visual_selection();
+                Vec::new()
+            }
+            (Some("diff"), Some("unified")) => {
+                self.layout = DiffLayout::Unified;
+                self.clear_visual_selection();
+                Vec::new()
+            }
+            (Some("diff"), Some("expand")) => {
+                vec![Effect::ExpandContext { all: true }]
+            }
+            (Some("settings"), _) => {
+                self.open_overlay(Screen::Settings);
+                Vec::new()
+            }
+            (Some("versions"), _) => {
+                self.open_overlay(Screen::Versions);
+                Vec::new()
+            }
+            (Some("prune"), _) => {
+                self.open_overlay(Screen::Prune);
+                vec![Effect::LoadPrune]
+            }
+            (Some("generate-context"), _) => {
+                self.open_overlay(Screen::ContextEditor);
+                self.context_draft.clear();
+                self.context_streaming = true;
+                vec![Effect::GenerateContext]
+            }
+            (Some("snapshot"), _) => vec![Effect::Snapshot],
+            (Some("sync"), _) => vec![Effect::Sync],
+            (Some("fork"), _) => vec![Effect::Fork],
+            (Some("compact"), _) => {
+                let rest = parts.collect::<Vec<_>>().join(" ");
+                vec![Effect::Compact((!rest.is_empty()).then_some(rest))]
+            }
+            (Some("stop" | "abort"), _) => vec![Effect::AbortAgent],
+            (Some("agent-status" | "progress"), _) => {
+                self.open_overlay(Screen::AgentStatus);
+                Vec::new()
+            }
+            (Some("side"), question) => {
+                let mut words = question.into_iter().collect::<Vec<_>>();
+                words.extend(parts);
+                let question = words.join(" ");
+                vec![Effect::StartSide(
+                    (!question.is_empty()).then_some(question),
+                )]
+            }
+            (Some("main" | "side-exit"), _) => vec![Effect::ExitSide],
+            (Some("model"), Some(model)) => vec![Effect::SetModel(model.to_owned())],
+            (Some("export"), format) => vec![Effect::Export {
+                format: format.map(str::to_owned),
+            }],
+            (Some("base"), Some(branch)) => {
+                let remaining = parts.collect::<Vec<_>>();
+                let repo = remaining
+                    .windows(2)
+                    .find(|window| window[0] == "--repo")
+                    .map(|window| window[1].to_owned());
+                vec![Effect::SetBase {
+                    branch: branch.to_owned(),
+                    repo,
+                }]
+            }
+            _ => {
+                self.status = format!("Unknown command: :{command}");
+                Vec::new()
+            }
+        }
+    }
+
+    fn start_composing(&mut self, kind: AnnotationKind) {
+        if !matches!(self.focus, Focus::Diff | Focus::InlineAsk) {
+            self.status = "Move focus to a code line before creating an annotation".into();
+            return;
+        }
+        if self.current_line_count() == 0 {
+            self.status = "Cannot annotate a binary or empty file".into();
+            return;
+        }
+        let Some(file) = self.current_file() else {
+            self.status = "Cannot annotate a binary or empty file".into();
+            return;
+        };
+        let selection = self.diff_selection();
+        if let Err(error) = anchor_from_diff(file, selection.start_row, selection.end_row) {
+            self.status = error.to_string();
+            return;
+        }
+        self.input_return_mode = self.input_mode;
+        self.input_mode = InputMode::Compose;
+        self.compose_target = Some(ComposeTarget::Annotation(kind));
+        self.compose.clear();
+        self.compose_cursor = 0;
+        self.compose_scroll = 0;
+    }
+
+    fn insert_compose(&mut self, text: &str) {
+        self.compose.insert_str(self.compose_cursor, text);
+        self.compose_cursor += text.len();
+    }
+
+    fn previous_compose_boundary(&self) -> usize {
+        self.compose[..self.compose_cursor]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+            .unwrap_or(0)
+    }
+
+    fn next_compose_boundary(&self) -> usize {
+        self.compose[self.compose_cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| self.compose_cursor + index)
+            .unwrap_or(self.compose.len())
+    }
+
+    fn compose_line_start(&self) -> usize {
+        self.compose[..self.compose_cursor]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0)
+    }
+
+    fn compose_line_end(&self) -> usize {
+        self.compose[self.compose_cursor..]
+            .find('\n')
+            .map(|index| self.compose_cursor + index)
+            .unwrap_or(self.compose.len())
+    }
+
+    fn move_compose_vertical(&mut self, direction: i8) {
+        let start = self.compose_line_start();
+        let column = self.compose[start..self.compose_cursor].chars().count();
+        if direction < 0 {
+            if start == 0 {
+                return;
+            }
+            let previous_end = start - 1;
+            let previous_start = self.compose[..previous_end]
+                .rfind('\n')
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            self.compose_cursor =
+                byte_at_char_column(&self.compose, previous_start, previous_end, column);
+        } else {
+            let end = self.compose_line_end();
+            if end == self.compose.len() {
+                return;
+            }
+            let next_start = end + 1;
+            let next_end = self.compose[next_start..]
+                .find('\n')
+                .map(|index| next_start + index)
+                .unwrap_or(self.compose.len());
+            self.compose_cursor = byte_at_char_column(&self.compose, next_start, next_end, column);
+        }
+    }
+
+    fn open_overlay(&mut self, screen: Screen) {
+        self.previous_screen = self.screen;
+        self.screen = screen;
+        self.scroll = 0;
+    }
+
+    fn toggle_review_chat(&mut self) {
+        self.screen = match self.screen {
+            Screen::Review => Screen::Chat,
+            Screen::Chat => Screen::Review,
+            other => other,
+        };
+        self.focus = if self.screen == Screen::Chat {
+            Focus::Chat
+        } else {
+            Focus::Diff
+        };
+        self.clear_visual_selection();
+    }
+
+    fn move_down(&mut self, amount: usize) {
+        match self.focus {
+            Focus::FilePicker => self.next_file_by(amount),
+            Focus::AnnotationRail => {
+                self.annotation_index = self.annotation_index.saturating_add(amount);
+                self.jump_to_rail_annotation();
+            }
+            Focus::Chat => {
+                self.chat_autofollow = false;
+                if self.input_mode == InputMode::Visual {
+                    self.chat_cursor = cmp::min(
+                        self.chat.len().saturating_sub(1),
+                        self.chat_cursor.saturating_add(amount),
+                    );
+                } else {
+                    let max_scroll = self.chat_total_rows.saturating_sub(self.chat_viewport_rows);
+                    self.chat_scroll =
+                        cmp::min(max_scroll, self.chat_scroll.saturating_add(amount));
+                }
+            }
+            _ => {
+                let last = self.current_line_count().saturating_sub(1);
+                self.cursor = cmp::min(last, self.cursor.saturating_add(amount));
+                self.ensure_cursor_visible();
+            }
+        }
+    }
+
+    fn move_up(&mut self, amount: usize) {
+        match self.focus {
+            Focus::FilePicker => {
+                for _ in 0..amount {
+                    self.previous_file();
+                }
+            }
+            Focus::AnnotationRail => {
+                self.annotation_index = self.annotation_index.saturating_sub(amount);
+                self.jump_to_rail_annotation();
+            }
+            Focus::Chat => {
+                self.chat_autofollow = false;
+                if self.input_mode == InputMode::Visual {
+                    self.chat_cursor = self.chat_cursor.saturating_sub(amount);
+                } else {
+                    self.chat_scroll = self.chat_scroll.saturating_sub(amount);
+                }
+            }
+            _ => {
+                self.cursor = self.cursor.saturating_sub(amount);
+                self.ensure_cursor_visible();
+            }
+        }
+    }
+
+    fn next_file_by(&mut self, amount: usize) {
+        for _ in 0..amount {
+            if self.current_repo_collapsed() {
+                if let Some(next_repo) = (self.repo_index + 1..self.work_item.repos.len())
+                    .find(|index| self.repo_is_visible(*index))
+                {
+                    self.repo_index = next_repo;
+                    self.file_index = 0;
+                }
+                continue;
+            }
+            let current_count = self
+                .current_diff()
+                .map(|diff| diff.files.len())
+                .unwrap_or(0);
+            if self.file_index + 1 < current_count {
+                self.file_index += 1;
+            } else if let Some(next_repo) = (self.repo_index + 1..self.work_item.repos.len())
+                .find(|index| self.repo_is_visible(*index))
+            {
+                self.repo_index = next_repo;
+                self.file_index = 0;
+            }
+        }
+        self.reset_file_position();
+    }
+
+    fn next_file(&mut self) {
+        self.next_file_by(1);
+    }
+
+    fn previous_file(&mut self) {
+        if !self.current_repo_collapsed() && self.file_index > 0 {
+            self.file_index -= 1;
+        } else if let Some(previous_repo) = (0..self.repo_index)
+            .rev()
+            .find(|index| self.repo_is_visible(*index))
+        {
+            self.repo_index = previous_repo;
+            self.file_index = self.work_item.repos[previous_repo]
+                .diff
+                .files
+                .len()
+                .saturating_sub(1);
+        }
+        self.reset_file_position();
+    }
+
+    fn reset_file_position(&mut self) {
+        self.cursor = 0;
+        self.scroll = 0;
+        self.clear_visual_selection();
+    }
+
+    fn clear_visual_selection(&mut self) {
+        self.visual_anchor = None;
+        self.chat_visual_anchor = None;
+        if self.input_mode == InputMode::Visual {
+            self.input_mode = InputMode::Normal;
+        }
+    }
+
+    fn jump_top(&mut self) {
+        if self.focus == Focus::Chat {
+            self.chat_autofollow = false;
+            self.chat_cursor = 0;
+            self.chat_scroll = 0;
+        } else {
+            self.cursor = 0;
+            self.scroll = 0;
+        }
+    }
+
+    fn jump_bottom(&mut self) {
+        if self.focus == Focus::Chat {
+            self.chat_autofollow = true;
+            self.chat_cursor = self.chat.len().saturating_sub(1);
+            self.chat_scroll = self.chat_total_rows.saturating_sub(self.chat_viewport_rows);
+        } else {
+            self.cursor = self.current_line_count().saturating_sub(1);
+            self.ensure_cursor_visible();
+        }
+    }
+
+    fn ensure_cursor_visible(&mut self) {
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll + self.viewport_height {
+            self.scroll = self.cursor + 1 - self.viewport_height;
+        }
+    }
+
+    fn ensure_chat_visible(&mut self) {
+        self.chat_scroll = self
+            .chat_scroll
+            .min(self.chat_total_rows.saturating_sub(self.chat_viewport_rows));
+    }
+
+    fn jump_to_search(&mut self) {
+        let needle = self.search.to_lowercase();
+        if needle.is_empty() {
+            return;
+        }
+        if self.focus == Focus::Chat {
+            if let Some(index) = self
+                .chat
+                .iter()
+                .enumerate()
+                .skip(self.chat_cursor.saturating_add(1))
+                .find(|(_, message)| message.text.to_lowercase().contains(&needle))
+                .map(|(index, _)| index)
+            {
+                self.chat_autofollow = false;
+                self.chat_cursor = index;
+                self.ensure_chat_visible();
+            } else {
+                self.status = format!("Pattern not found: {}", self.search);
+            }
+            return;
+        }
+        if self.focus == Focus::FilePicker {
+            if let Some((repo, file)) = self.file_positions().into_iter().find(|(repo, file)| {
+                let path = self.work_item.repos[*repo].diff.files[*file]
+                    .display_path
+                    .to_string_lossy()
+                    .to_lowercase();
+                fuzzy_contains(&path, &needle)
+                    && (*repo, *file) > (self.repo_index, self.file_index)
+            }) {
+                self.repo_index = repo;
+                self.file_index = file;
+                self.reset_file_position();
+            } else {
+                self.status = format!("Pattern not found: {}", self.search);
+            }
+            return;
+        }
+        let matches = self.current_file().and_then(|file| {
+            file.visible_lines()
+                .enumerate()
+                .skip(self.cursor.saturating_add(1))
+                .find(|(_, line)| line.content.to_lowercase().contains(&needle))
+                .map(|(index, _)| index)
+        });
+        if let Some(index) = matches {
+            self.cursor = index;
+            self.ensure_cursor_visible();
+        } else {
+            self.status = format!("Pattern not found: {}", self.search);
+        }
+    }
+
+    fn jump_to_search_reverse(&mut self) {
+        let needle = self.search.to_lowercase();
+        if needle.is_empty() {
+            return;
+        }
+        if self.focus == Focus::Chat {
+            if let Some(index) = self
+                .chat
+                .iter()
+                .enumerate()
+                .take(self.chat_cursor)
+                .filter(|(_, message)| message.text.to_lowercase().contains(&needle))
+                .map(|(index, _)| index)
+                .next_back()
+            {
+                self.chat_autofollow = false;
+                self.chat_cursor = index;
+                self.ensure_chat_visible();
+            } else {
+                self.status = format!("Pattern not found: {}", self.search);
+            }
+            return;
+        }
+        if self.focus == Focus::FilePicker {
+            if let Some((repo, file)) = self.file_positions().into_iter().rfind(|(repo, file)| {
+                let path = self.work_item.repos[*repo].diff.files[*file]
+                    .display_path
+                    .to_string_lossy()
+                    .to_lowercase();
+                fuzzy_contains(&path, &needle)
+                    && (*repo, *file) < (self.repo_index, self.file_index)
+            }) {
+                self.repo_index = repo;
+                self.file_index = file;
+                self.reset_file_position();
+            } else {
+                self.status = format!("Pattern not found: {}", self.search);
+            }
+            return;
+        }
+        let found = self.current_file().and_then(|file| {
+            file.visible_lines()
+                .enumerate()
+                .take(self.cursor)
+                .filter(|(_, line)| line.content.to_lowercase().contains(&needle))
+                .map(|(index, _)| index)
+                .last()
+        });
+        if let Some(index) = found {
+            self.cursor = index;
+            self.ensure_cursor_visible();
+        } else {
+            self.status = format!("Pattern not found: {}", self.search);
+        }
+    }
+
+    fn annotation_under_cursor(&self) -> Option<&(Annotation, Placement)> {
+        let repo = self.work_item.repos.get(self.repo_index)?;
+        let file = self.current_file()?;
+        self.annotations.iter().find(|(annotation, placement)| {
+            let line = file
+                .visible_lines()
+                .nth(self.cursor)
+                .and_then(|line| placement_line(line, Some(placement.side)))
+                .map(|line| line as i64);
+            annotation.repo_id == repo.record.id
+                && annotation.file_path == file.display_path
+                && line
+                    .is_some_and(|line| placement.line_start <= line && line <= placement.line_end)
+        })
+    }
+
+    fn file_positions(&self) -> Vec<(usize, usize)> {
+        self.work_item
+            .repos
+            .iter()
+            .enumerate()
+            .filter(|(_, repo)| !self.collapsed_repos.contains(&repo.record.id))
+            .flat_map(|(repo_index, repo)| {
+                (0..repo.diff.files.len()).map(move |file_index| (repo_index, file_index))
+            })
+            .collect()
+    }
+
+    fn current_repo_collapsed(&self) -> bool {
+        self.work_item
+            .repos
+            .get(self.repo_index)
+            .is_some_and(|repo| self.collapsed_repos.contains(&repo.record.id))
+    }
+
+    fn repo_is_visible(&self, index: usize) -> bool {
+        self.work_item.repos.get(index).is_some_and(|repo| {
+            !repo.diff.files.is_empty() && !self.collapsed_repos.contains(&repo.record.id)
+        })
+    }
+
+    fn collapse_current_repo(&mut self) {
+        if let Some(repo) = self.work_item.repos.get(self.repo_index) {
+            self.collapsed_repos.insert(repo.record.id.clone());
+            self.status = format!("Collapsed {}", repo.record.name);
+        }
+    }
+
+    fn expand_current_repo(&mut self) {
+        if let Some(repo) = self.work_item.repos.get(self.repo_index) {
+            self.collapsed_repos.remove(&repo.record.id);
+            self.status = format!("Expanded {}", repo.record.name);
+        }
+    }
+
+    fn cursor_on_fold(&self) -> bool {
+        self.current_file()
+            .and_then(|file| file.visible_lines().nth(self.cursor))
+            .is_some_and(|line| {
+                line.kind == LineKind::Meta && line.content.contains("unchanged lines")
+            })
+    }
+
+    pub(crate) fn next_context_lines(&mut self, all: bool) -> usize {
+        let Some(repo) = self.work_item.repos.get(self.repo_index) else {
+            return 6;
+        };
+        let Some(file) = repo.diff.files.get(self.file_index) else {
+            return 6;
+        };
+        let key = (
+            repo.record.id.clone(),
+            file.display_path.to_string_lossy().into_owned(),
+        );
+        let context = if all {
+            1_000_000
+        } else {
+            self.expanded_context
+                .get(&key)
+                .copied()
+                .unwrap_or(6)
+                .saturating_add(self.expand_step)
+        };
+        self.expanded_context.insert(key, context);
+        context
+    }
+
+    fn annotation_positions(&self) -> Vec<(usize, usize, usize)> {
+        let mut positions = Vec::new();
+        for (repo_index, repo) in self.work_item.repos.iter().enumerate() {
+            for (file_index, file) in repo.diff.files.iter().enumerate() {
+                for (_, placement) in self.annotations.iter().filter(|(annotation, _)| {
+                    annotation.repo_id == repo.record.id
+                        && annotation.file_path == file.display_path
+                }) {
+                    if let Some(cursor) = file.visible_lines().position(|line| {
+                        placement_line(line, Some(placement.side)).map(|number| number as i64)
+                            == Some(placement.line_start)
+                    }) {
+                        positions.push((repo_index, file_index, cursor));
+                    }
+                }
+            }
+        }
+        positions.sort_unstable();
+        positions.dedup();
+        positions
+    }
+
+    fn jump_annotation(&mut self, forward: bool) {
+        let positions = self.annotation_positions();
+        if positions.is_empty() {
+            self.status = "No annotations".into();
+            return;
+        }
+        let current = (self.repo_index, self.file_index, self.cursor);
+        let target = if forward {
+            positions
+                .iter()
+                .copied()
+                .find(|position| *position > current)
+                .unwrap_or(positions[0])
+        } else {
+            positions
+                .iter()
+                .rev()
+                .copied()
+                .find(|position| *position < current)
+                .unwrap_or(*positions.last().expect("not empty"))
+        };
+        (self.repo_index, self.file_index, self.cursor) = target;
+        self.ensure_cursor_visible();
+    }
+
+    fn jump_to_rail_annotation(&mut self) {
+        let Some(repo) = self.work_item.repos.get(self.repo_index) else {
+            return;
+        };
+        let Some(file) = repo.diff.files.get(self.file_index) else {
+            return;
+        };
+        let positions = self
+            .annotations
+            .iter()
+            .filter(|(annotation, _)| {
+                annotation.repo_id == repo.record.id && annotation.file_path == file.display_path
+            })
+            .filter_map(|(_, placement)| {
+                file.visible_lines().position(|line| {
+                    placement_line(line, Some(placement.side)).map(|number| number as i64)
+                        == Some(placement.line_start)
+                })
+            })
+            .collect::<Vec<_>>();
+        if positions.is_empty() {
+            return;
+        }
+        self.annotation_index = self.annotation_index.min(positions.len() - 1);
+        self.cursor = positions[self.annotation_index];
+        self.ensure_cursor_visible();
+    }
+
+    fn yank_current(&mut self) -> Vec<Effect> {
+        if self.focus == Focus::Chat {
+            let anchor = self.chat_visual_anchor.unwrap_or(self.chat_cursor);
+            let start = anchor.min(self.chat_cursor);
+            let end = anchor.max(self.chat_cursor);
+            let text = self
+                .chat
+                .iter()
+                .skip(start)
+                .take(end.saturating_sub(start) + 1)
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.input_mode = InputMode::Normal;
+            self.chat_visual_anchor = None;
+            return vec![Effect::Yank(text)];
+        }
+        if self.focus == Focus::FilePicker {
+            let text = self
+                .current_file()
+                .map(|file| file.display_path.display().to_string())
+                .unwrap_or_default();
+            self.input_mode = InputMode::Normal;
+            self.visual_anchor = None;
+            return vec![Effect::Yank(text)];
+        }
+        let Some(file) = self.current_file() else {
+            return Vec::new();
+        };
+        let (start, end) = if self.input_mode == InputMode::Visual {
+            self.selection()
+        } else {
+            (self.cursor, self.cursor)
+        };
+        let text = file
+            .visible_lines()
+            .skip(start)
+            .take(end.saturating_sub(start) + 1)
+            .filter(|line| line.kind != LineKind::Meta)
+            .map(|line| line.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.input_mode = InputMode::Normal;
+        self.visual_anchor = None;
+        vec![Effect::Yank(text)]
+    }
+}
+
+fn terminal_enter(key: &KeyEvent) -> bool {
+    (key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT))
+        || (matches!(key.code, KeyCode::Char('j' | 'm'))
+            && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn byte_at_char_column(text: &str, start: usize, end: usize, column: usize) -> usize {
+    text[start..end]
+        .char_indices()
+        .nth(column)
+        .map(|(offset, _)| start + offset)
+        .unwrap_or(end)
+}
+
+fn placement_line(line: &crate::diff::DiffLine, side: Option<AnchorSide>) -> Option<usize> {
+    match side.unwrap_or_default() {
+        AnchorSide::Old => line.old_line,
+        AnchorSide::New => line.new_line,
+    }
+}
+
+fn fuzzy_contains(haystack: &str, needle: &str) -> bool {
+    let mut characters = needle.chars();
+    let mut expected = characters.next();
+    for character in haystack.chars() {
+        if expected == Some(character) {
+            expected = characters.next();
+            if expected.is_none() {
+                return true;
+            }
+        }
+    }
+    expected.is_none()
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use std::path::PathBuf;
+
+    use super::AppState;
+    use crate::diff::{DiffFile, DiffLine, DiffSet, FileStatus, Hunk, LineKind};
+    use crate::domain::{BaseBranchSource, Repo, Version, VersionKind, WorkItem};
+    use crate::work_item::{ResolvedWorkItem, ReviewRepo};
+
+    pub(crate) fn state_for_ui() -> AppState {
+        let file = DiffFile {
+            old_path: Some("a.rs".into()),
+            new_path: Some("a.rs".into()),
+            display_path: "a.rs".into(),
+            status: FileStatus::Modified,
+            hunks: vec![Hunk {
+                header: "@@ -1 +1,2 @@".into(),
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 2,
+                lines: vec![
+                    DiffLine {
+                        kind: LineKind::Context,
+                        old_line: Some(1),
+                        new_line: Some(1),
+                        content: "one".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Addition,
+                        old_line: None,
+                        new_line: Some(2),
+                        content: "two".into(),
+                    },
+                ],
+            }],
+        };
+        AppState::new(ResolvedWorkItem {
+            item: WorkItem {
+                id: "w".into(),
+                name: "demo".into(),
+                workspace_root: PathBuf::from("/demo"),
+                created_at: String::new(),
+                updated_at: String::new(),
+                last_opened_at: None,
+            },
+            repos: vec![ReviewRepo {
+                record: Repo {
+                    id: "r".into(),
+                    work_item_id: "w".into(),
+                    name: "repo".into(),
+                    path: PathBuf::from("/demo"),
+                    remote_pr_url: None,
+                    pr_meta_json: None,
+                    base_branch: Some("main".into()),
+                    base_branch_source: BaseBranchSource::Auto,
+                    last_activity_at: None,
+                },
+                version: Version {
+                    id: "v".into(),
+                    repo_id: "r".into(),
+                    version_num: 0,
+                    kind: VersionKind::WorkingTree,
+                    created_at: String::new(),
+                    head_sha: "abc".into(),
+                    worktree_path: None,
+                    last_opened_at: None,
+                },
+                diff: DiffSet { files: vec![file] },
+            }],
+            session_root: PathBuf::from("/session"),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::tests_support::state_for_ui;
+    use super::{AppState, DiffLayout, Effect, Focus, InputMode, Screen};
+    use crate::domain::{AskMessage, DeliveryState};
+
+    fn state() -> AppState {
+        state_for_ui()
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn q_does_not_quit_top_level_but_command_does() {
+        let mut app = state();
+        assert!(app.handle_key(key(KeyCode::Char('q'))).is_empty());
+        assert!(!app.should_quit);
+        app.handle_key(key(KeyCode::Char(':')));
+        app.handle_key(key(KeyCode::Char('q')));
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(effects, vec![Effect::Quit { force: false }]);
+    }
+
+    #[test]
+    fn command_toggles_diff_layout() {
+        let mut app = state();
+        app.input_mode = InputMode::Command;
+        for character in "diff unified".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.layout, DiffLayout::Unified);
+    }
+
+    #[test]
+    fn tab_toggles_review_and_chat_only_in_normal_mode() {
+        let mut app = state();
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.screen, Screen::Chat);
+        app.input_mode = InputMode::Compose;
+        app.compose_target = Some(super::ComposeTarget::Annotation(
+            crate::domain::AnnotationKind::Comment,
+        ));
+        app.handle_key(key(KeyCode::Tab));
+        assert!(app.compose.ends_with("    "));
+        assert_eq!(app.screen, Screen::Chat);
+    }
+
+    #[test]
+    fn vim_prefixes_toggle_modes_and_preview() {
+        let mut app = state();
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(app.screen, Screen::Chat);
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(app.screen, Screen::Review);
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('m'))),
+            vec![Effect::Preview]
+        );
+    }
+
+    #[test]
+    fn recovery_requires_an_explicit_resend_or_discard() {
+        let mut app = state();
+        app.screen = Screen::Recovery;
+        app.pending_asks.push(AskMessage {
+            id: "message".into(),
+            annotation_id: "annotation".into(),
+            seq: 0,
+            role: "user".into(),
+            text: "was this sent?".into(),
+            sent: false,
+            delivery_state: DeliveryState::Pending,
+            ts: String::new(),
+        });
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('r'))).as_slice(),
+            [Effect::ResendPendingAsk(_)]
+        ));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('d'))),
+            vec![Effect::DiscardPendingAsk("message".into())]
+        );
+    }
+
+    #[test]
+    fn picker_repo_groups_collapse_and_expand_with_h_and_l() {
+        let mut app = state();
+        app.focus = Focus::FilePicker;
+        app.handle_key(key(KeyCode::Char('h')));
+        assert!(app.collapsed_repos.contains("r"));
+        app.handle_key(key(KeyCode::Char('l')));
+        assert!(!app.collapsed_repos.contains("r"));
+    }
+
+    #[test]
+    fn picker_enter_accepts_the_current_file_and_returns_focus_to_diff() {
+        let mut app = state();
+        app.picker_open = true;
+        app.focus = Focus::FilePicker;
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.picker_open);
+        assert_eq!(app.focus, Focus::Diff);
+    }
+
+    #[test]
+    fn context_expansion_increases_by_the_configured_step() {
+        let mut app = state();
+        assert_eq!(app.next_context_lines(false), 16);
+        assert_eq!(app.next_context_lines(false), 26);
+        assert_eq!(app.next_context_lines(true), 1_000_000);
+    }
+
+    #[test]
+    fn settings_screen_edits_the_expansion_step() {
+        let mut app = state();
+        app.screen = Screen::Settings;
+        app.settings_index = 4;
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.input_mode, InputMode::Compose);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+            vec![Effect::SetExpandStep(10)]
+        );
+    }
+
+    #[test]
+    fn stop_command_aborts_the_active_agent_turn() {
+        let mut app = state();
+        app.input_mode = InputMode::Command;
+        for character in "stop".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            vec![Effect::AbortAgent]
+        );
+    }
+
+    #[test]
+    fn ctrl_s_submits_chat_in_terminals_without_modified_enter() {
+        let mut app = state();
+        app.screen = Screen::Chat;
+        app.input_mode = InputMode::Compose;
+        app.compose_target = Some(super::ComposeTarget::Chat);
+        app.compose = "hello".into();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            vec![Effect::SendChat("hello".into())]
+        );
+        assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn ctrl_w_then_plain_direction_moves_focus_as_documented() {
+        let mut app = state();
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(app.focus, Focus::FilePicker);
+        assert!(app.picker_open);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.screen, Screen::Chat);
+        assert_eq!(app.focus, Focus::Chat);
+    }
+
+    #[test]
+    fn terminal_ctrl_j_equivalent_submits_composers_and_commands() {
+        let mut app = state();
+        app.input_mode = InputMode::Compose;
+        app.compose_target = Some(super::ComposeTarget::Chat);
+        app.compose = "hello".into();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            vec![Effect::SendChat("hello".into())]
+        );
+
+        app.input_mode = InputMode::Command;
+        app.command = "q!".into();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            vec![Effect::Quit { force: true }]
+        );
+    }
+}
