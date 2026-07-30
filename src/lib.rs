@@ -1,4 +1,5 @@
 pub(crate) mod annotations;
+pub(crate) mod agent_state;
 pub(crate) mod app;
 pub(crate) mod chat_render;
 pub(crate) mod chat_selection;
