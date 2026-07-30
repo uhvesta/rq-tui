@@ -46,6 +46,7 @@ current task. Answer only the side question below. Do not continue plans or inst
 This SIDE conversation is ephemeral and read-only; do not modify files or workspace state.";
 const SDK_CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 const SDK_INTERACTIVE_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+const SDK_STARTUP_HEARTBEAT: Duration = Duration::from_secs(2);
 const PENDING_INTERACTIVE_CONTROL_CAPACITY: usize = 16;
 const PENDING_PROMPT_CAPACITY: usize = 256;
 const PENDING_COMMAND_CAPACITY: usize = 512;
@@ -3345,10 +3346,15 @@ async fn worker(
     main_events.activity(
         None,
         AgentActivity::other(
-            "Starting Copilot CLI… the TUI remains interactive and prompts will queue until MAIN is ready",
+            "Copilot startup 1/3 · starting CLI (15s stage limit) · input remains available",
         ),
     );
-    let client = sdk_call("Copilot client startup", Client::start(options)).await?;
+    let client = sdk_startup_call(
+        &main_events,
+        "Copilot startup 1/3 · CLI",
+        Client::start(options),
+    )
+    .await?;
     for operation in ledger.pending_prune_operations()? {
         if operation.work_item_id == config.work_item_id {
             main_events.activity(
@@ -3411,9 +3417,12 @@ async fn worker(
     } = {
         main_events.activity(
             None,
-            AgentActivity::other("Opening the persistent Copilot session… input remains available"),
+            AgentActivity::other(
+                "Copilot startup 2/3 · opening persistent session (15s stage limit) · input remains available",
+            ),
         );
-        sdk_call(
+        sdk_startup_call(
+            &main_events,
             "Copilot session create/resume",
             create_or_resume_session(
                 &client,
@@ -3429,9 +3438,17 @@ async fn worker(
     if resumed {
         main_events.activity(
             None,
-            AgentActivity::other("Restoring Copilot conversation history… input remains available"),
+            AgentActivity::other(
+                "Copilot startup 3/3 · restoring history (15s stage limit) · input remains available",
+            ),
         );
-        match sdk_call("Copilot history reload", session.get_events()).await {
+        match sdk_startup_call(
+            &main_events,
+            "Copilot startup 3/3 · history",
+            session.get_events(),
+        )
+        .await
+        {
             Ok(history) => {
                 resumed_active = resumed_active_from_history(&history, session.id());
                 let history = history_entries(&history);
@@ -5493,6 +5510,63 @@ where
         .map_err(Into::into)
 }
 
+async fn sdk_startup_call<T, E, F>(
+    events: &impl EventOutput,
+    operation: &str,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = std::result::Result<T, E>>,
+    E: Into<anyhow::Error>,
+{
+    sdk_startup_call_with_limits(
+        events,
+        operation,
+        SDK_CONTROL_TIMEOUT,
+        SDK_STARTUP_HEARTBEAT,
+        future,
+    )
+    .await
+}
+
+async fn sdk_startup_call_with_limits<T, E, F>(
+    events: &impl EventOutput,
+    operation: &str,
+    timeout: Duration,
+    heartbeat_interval: Duration,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = std::result::Result<T, E>>,
+    E: Into<anyhow::Error>,
+{
+    let started = Instant::now();
+    let deadline = tokio::time::sleep(timeout);
+    let mut heartbeat = tokio::time::interval(heartbeat_interval);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await;
+    tokio::pin!(deadline);
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result.map_err(Into::into),
+            () = &mut deadline => {
+                anyhow::bail!("{operation} exceeded {} seconds", timeout.as_secs());
+            }
+            _ = heartbeat.tick() => {
+                let elapsed = started.elapsed().as_secs();
+                events.activity(
+                    None,
+                    AgentActivity::other(format!(
+                        "{operation} still working · {elapsed}s elapsed / {}s stage limit · input and queued prompts remain available",
+                        timeout.as_secs()
+                    )),
+                );
+            }
+        }
+    }
+}
+
 async fn sdk_interactive_call<T, E, F>(operation: &str, future: F) -> Result<T>
 where
     F: Future<Output = std::result::Result<T, E>>,
@@ -7333,12 +7407,12 @@ mod tests {
         delete_journaled_remote_sessions, durable_export_choice, enqueue_message,
         envelope_outbound_id, execute_prune_operation, handle_session_event, history_entries,
         model_option, now, register_sdk_message_root, resume_config, resume_config_with_broker,
-        resumed_active_from_history, retryable_cleanup_state, ActiveOutbound, ActivityKind,
-        AgentCommand, AgentEvent, AgentEventEnvelope, AgentLane, AgentRuntime, AgentSink,
-        BridgeConfig, ControlledAgent, CopilotBridge, EventPublisher, HistoryEntry, LaneEvent,
-        Outbound, OutboundKind, PendingInteractionBroker, PendingInteractionHandlers,
-        PendingInteractionKind, ProgressHooks, PruneExecution, ReadOnlyPermissionHandler,
-        SideCleanupBackend, WorkItemProcessLock,
+        resumed_active_from_history, retryable_cleanup_state, sdk_startup_call_with_limits,
+        ActiveOutbound, ActivityKind, AgentCommand, AgentEvent, AgentEventEnvelope, AgentLane,
+        AgentRuntime, AgentSink, BridgeConfig, ControlledAgent, CopilotBridge, EventPublisher,
+        HistoryEntry, LaneEvent, Outbound, OutboundKind, PendingInteractionBroker,
+        PendingInteractionHandlers, PendingInteractionKind, ProgressHooks, PruneExecution,
+        ReadOnlyPermissionHandler, SideCleanupBackend, WorkItemProcessLock,
     };
     use crate::config::AppPaths;
     use crate::domain::{EphemeralSessionRecord, SessionRecord, WorkItem};
@@ -7973,6 +8047,40 @@ mod tests {
             options.mode,
             Some(github_copilot_sdk::DeliveryMode::Enqueue)
         );
+    }
+
+    #[tokio::test]
+    async fn slow_startup_calls_emit_periodic_liveness_heartbeats() {
+        let (events, received) = mpsc::channel();
+
+        let result = sdk_startup_call_with_limits(
+            &events,
+            "test startup stage",
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+            async {
+                tokio::time::sleep(Duration::from_millis(35)).await;
+                Ok::<_, anyhow::Error>("ready")
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "ready");
+        let heartbeats = received
+            .try_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Activity { label, .. } => Some(label),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(heartbeats.len() >= 2);
+        assert!(heartbeats
+            .iter()
+            .all(|heartbeat| heartbeat.contains("still working")));
+        assert!(heartbeats
+            .iter()
+            .all(|heartbeat| heartbeat.contains("input and queued prompts remain available")));
     }
 
     #[test]
