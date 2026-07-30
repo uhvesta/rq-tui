@@ -6759,7 +6759,9 @@ fn create_config_with_broker(
         .with_skill_directories(config.skill_directories.clone())
         .with_plugin_directories(config.plugin_directories.clone())
         .with_system_message(system_message(&config.work_item_id))
-        .with_permission_handler(Arc::new(ReadOnlyPermissionHandler));
+        .with_permission_handler(Arc::new(ReadOnlyPermissionHandler::new(
+            config.session_root.clone(),
+        )));
     if let Some(effort) = &config.reasoning_effort {
         session = session.with_reasoning_effort(effort.clone());
     }
@@ -6806,7 +6808,9 @@ fn resume_config_with_broker(
         .with_skill_directories(config.skill_directories.clone())
         .with_plugin_directories(config.plugin_directories.clone())
         .with_system_message(system_message(&config.work_item_id))
-        .with_permission_handler(Arc::new(ReadOnlyPermissionHandler));
+        .with_permission_handler(Arc::new(ReadOnlyPermissionHandler::new(
+            config.session_root.clone(),
+        )));
     if let Some(effort) = &config.reasoning_effort {
         session = session.with_reasoning_effort(effort.clone());
     }
@@ -6988,7 +6992,44 @@ fn system_message(work_item_id: &str) -> SystemMessageConfig {
 }
 
 #[derive(Debug)]
-struct ReadOnlyPermissionHandler;
+struct ReadOnlyPermissionHandler {
+    root: PathBuf,
+}
+
+impl ReadOnlyPermissionHandler {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root: root.canonicalize().unwrap_or(root),
+        }
+    }
+
+    fn read_is_within_root(&self, data: &PermissionRequestData) -> bool {
+        let Some(path) = permission_read_path(&data.extra) else {
+            return false;
+        };
+        let path = PathBuf::from(path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            self.root.join(path)
+        };
+        path.canonicalize()
+            .is_ok_and(|path| path.starts_with(&self.root))
+    }
+}
+
+fn permission_read_path(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("path")
+        .or_else(|| value.get("filePath"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            ["args", "toolArgs", "permissionRequest", "request"]
+                .iter()
+                .filter_map(|key| value.get(key))
+                .find_map(permission_read_path)
+        })
+}
 
 #[async_trait]
 impl PermissionHandler for ReadOnlyPermissionHandler {
@@ -6999,7 +7040,12 @@ impl PermissionHandler for ReadOnlyPermissionHandler {
         data: PermissionRequestData,
     ) -> PermissionResult {
         match data.kind {
-            Some(PermissionRequestKind::Read) => PermissionResult::approve_once(),
+            Some(PermissionRequestKind::Read) if self.read_is_within_root(&data) => {
+                PermissionResult::approve_once()
+            }
+            Some(PermissionRequestKind::Read) => PermissionResult::reject(Some(
+                "rq-tui reads are restricted to the active review root".into(),
+            )),
             Some(PermissionRequestKind::CustomTool) => {
                 let tool = data
                     .extra
@@ -7747,22 +7793,39 @@ mod tests {
 
     #[tokio::test]
     async fn permission_handler_allows_reads_and_denies_shell_and_write() {
-        let handler = ReadOnlyPermissionHandler;
-        for kind in [PermissionRequestKind::Read] {
+        let root = tempfile::tempdir().unwrap();
+        let inside = root.path().join("inside.rs");
+        std::fs::write(&inside, "fn inside() {}").unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let handler = ReadOnlyPermissionHandler::new(root.path().to_path_buf());
+        let result = handler
+            .handle(
+                SessionId::new("s"),
+                RequestId::new("r"),
+                PermissionRequestData {
+                    kind: Some(PermissionRequestKind::Read),
+                    extra: serde_json::json!({"path": "inside.rs"}),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(format!("{result:?}").contains("Approve"));
+        for path in [
+            outside.path().to_string_lossy().into_owned(),
+            "../outside.rs".into(),
+        ] {
             let result = handler
                 .handle(
                     SessionId::new("s"),
                     RequestId::new("r"),
                     PermissionRequestData {
-                        kind: Some(kind),
+                        kind: Some(PermissionRequestKind::Read),
+                        extra: serde_json::json!({"toolArgs": {"path": path}}),
                         ..Default::default()
                     },
                 )
                 .await;
-            assert!(matches!(
-                result,
-                github_copilot_sdk::handler::PermissionResult::Decision(_)
-            ));
+            assert!(format!("{result:?}").contains("Reject"));
         }
         for kind in [PermissionRequestKind::Shell, PermissionRequestKind::Write] {
             let result = handler
