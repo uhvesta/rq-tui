@@ -1264,6 +1264,10 @@ pub(crate) fn handle_effect_failure(state: &mut AppState, effect: &Effect, error
                 }
             }
             state.side_starting = false;
+            // Consume the MAIN viewport snapshot captured before StartSide.
+            // Otherwise a failed fork can restore stale navigation during an
+            // unrelated later semantic-layout reset.
+            state.reset_chat_semantics();
             state.screen = Screen::Chat;
             state.input_return_mode = InputMode::Normal;
             state.input_mode = InputMode::Compose;
@@ -4849,12 +4853,13 @@ mod tests {
     use std::sync::Mutex;
 
     use anyhow::Result;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
     use super::{
-        handle_agent_envelope, handle_agent_event, handle_effect, markdown_to_html,
-        parse_review_context, render,
+        handle_agent_envelope, handle_agent_event, handle_effect, handle_effect_failure,
+        markdown_to_html, parse_review_context, render,
     };
     use crate::app::{tests_support::state_for_ui, ChatEntry, Effect, Focus, Screen};
     use crate::config::AppPaths;
@@ -4874,6 +4879,14 @@ mod tests {
         fn send(&self, command: AgentCommand) -> Result<()> {
             self.commands.lock().unwrap().push(command);
             Ok(())
+        }
+    }
+
+    struct RejectingAgent;
+
+    impl AgentSink for RejectingAgent {
+        fn send(&self, _command: AgentCommand) -> Result<()> {
+            anyhow::bail!("controlled send failure")
         }
     }
 
@@ -5010,6 +5023,45 @@ mod tests {
         assert_eq!(
             state.main_chat.as_ref().unwrap()[0].error.as_deref(),
             Some("connection lost")
+        );
+    }
+
+    #[test]
+    fn failed_side_start_consumes_saved_main_viewport_before_restoring_draft() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+        state.screen = Screen::Chat;
+        state.focus = Focus::Chat;
+        state.chat_scroll = 4;
+        state.chat_autofollow = false;
+
+        state.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for character in "/side retry me".chars() {
+            state.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        let effects = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let effect = effects
+            .into_iter()
+            .find(|effect| matches!(effect, Effect::StartSide(_)))
+            .expect("side effect");
+        let error = handle_effect(
+            &mut state,
+            &storage,
+            &paths(),
+            &RejectingAgent,
+            effect.clone(),
+        )
+        .expect_err("agent rejects SIDE start");
+        handle_effect_failure(&mut state, &effect, &error);
+
+        assert_eq!(state.compose, "/side retry me");
+        assert_eq!(state.input_mode, crate::app::InputMode::Compose);
+        state.focus = Focus::Diff;
+        state.reset_chat_semantics();
+        assert_eq!(
+            state.focus,
+            Focus::Diff,
+            "a stale MAIN snapshot must not restore during a later layout reset"
         );
     }
 
