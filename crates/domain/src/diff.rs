@@ -13,6 +13,10 @@ pub struct DiffFile {
     pub new_path: Option<PathBuf>,
     pub display_path: PathBuf,
     pub status: FileStatus,
+    /// Cached once while parsing so repainting the file picker is O(files),
+    /// not O(every changed line in the work item).
+    pub additions: usize,
+    pub deletions: usize,
     pub hunks: Vec<Hunk>,
 }
 
@@ -59,6 +63,14 @@ impl DiffFile {
     pub fn visible_lines(&self) -> impl Iterator<Item = &DiffLine> {
         self.hunks.iter().flat_map(|hunk| hunk.lines.iter())
     }
+
+    pub fn visible_line_count(&self) -> usize {
+        self.hunks.iter().map(|hunk| hunk.lines.len()).sum()
+    }
+
+    pub fn change_counts(&self) -> (usize, usize) {
+        (self.additions, self.deletions)
+    }
 }
 
 pub fn parse_unified(input: &str) -> Result<DiffSet> {
@@ -80,6 +92,8 @@ pub fn parse_unified(input: &str) -> Result<DiffSet> {
                 old_path: Some(old_path),
                 new_path: Some(new_path),
                 status: FileStatus::Modified,
+                additions: 0,
+                deletions: 0,
                 hunks: Vec::new(),
             });
         } else if let Some(path) = raw.strip_prefix("rename from ") {
@@ -181,6 +195,13 @@ fn parse_extended_path(path: &str) -> Result<PathBuf> {
 
 fn finish_hunk(file: &mut Option<DiffFile>, hunk: &mut Option<Hunk>) {
     if let (Some(file), Some(hunk)) = (file.as_mut(), hunk.take()) {
+        for line in &hunk.lines {
+            match line.kind {
+                LineKind::Addition => file.additions += 1,
+                LineKind::Deletion => file.deletions += 1,
+                LineKind::Context | LineKind::Meta => {}
+            }
+        }
         file.hunks.push(hunk);
     }
 }
@@ -285,6 +306,8 @@ index 1111111..2222222 100644
         assert_eq!(parsed.files.len(), 1);
         let file = &parsed.files[0];
         assert_eq!(file.status, FileStatus::Modified);
+        assert_eq!(file.change_counts(), (2, 1));
+        assert_eq!(file.visible_line_count(), 4);
         assert_eq!(file.hunks[0].lines[1].kind, LineKind::Deletion);
         assert_eq!(file.hunks[0].lines[1].old_line, Some(2));
         assert_eq!(file.hunks[0].lines[2].new_line, Some(2));

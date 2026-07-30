@@ -4841,14 +4841,7 @@ fn file_picker_line(file: &DiffFile, selected: bool, width: usize) -> Line<'stat
         FileStatus::Renamed => ("R", Color::Yellow),
         FileStatus::Modified => ("M", Color::Blue),
     };
-    let additions = file
-        .visible_lines()
-        .filter(|line| line.kind == LineKind::Addition)
-        .count();
-    let deletions = file
-        .visible_lines()
-        .filter(|line| line.kind == LineKind::Deletion)
-        .count();
+    let (additions, deletions) = file.change_counts();
     let marker = if selected { "▶ " } else { "  " };
     let badge = format!("{badge} ");
     let counts = format!(" +{additions} -{deletions}");

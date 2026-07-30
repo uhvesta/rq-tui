@@ -1024,6 +1024,8 @@ mod tests {
             new_path: Some(PathBuf::from("src/lib.rs")),
             display_path: PathBuf::from("src/lib.rs"),
             status: FileStatus::Modified,
+            additions: 1,
+            deletions: 1,
             hunks: vec![Hunk {
                 header: "@@ -4,3 +4,4 @@".into(),
                 old_start: 4,

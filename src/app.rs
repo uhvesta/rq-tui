@@ -973,7 +973,7 @@ impl AppState {
 
     pub(crate) fn current_line_count(&self) -> usize {
         self.current_file()
-            .map(|file| file.visible_lines().count())
+            .map(DiffFile::visible_line_count)
             .unwrap_or(0)
     }
 
@@ -5333,6 +5333,8 @@ pub(crate) mod tests_support {
             new_path: Some("a.rs".into()),
             display_path: "a.rs".into(),
             status: FileStatus::Modified,
+            additions: 1,
+            deletions: 0,
             hunks: vec![Hunk {
                 header: "@@ -1 +1,2 @@".into(),
                 old_start: 1,

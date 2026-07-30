@@ -417,6 +417,8 @@ mod tests {
             new_path: Some("x".into()),
             display_path: "x".into(),
             status: FileStatus::Modified,
+            additions: 0,
+            deletions: 0,
             hunks: vec![Hunk {
                 header: String::new(),
                 old_start: 1,
