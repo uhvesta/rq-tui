@@ -1467,6 +1467,20 @@ pub(crate) fn handle_effect(
             }
         }
         Effect::GenerateContext => {
+            // Keep the workflow destination authoritative at the effect
+            // boundary.  The command reducer opens this screen before
+            // returning the effect, but retries, recovery, and tests can
+            // dispatch the same effect directly.  Generation must never
+            // complete into an invisible draft held behind Review or Chat.
+            if state.screen != Screen::ContextEditor {
+                state.previous_screen = state.screen;
+                state.screen = Screen::ContextEditor;
+                state.input_mode = InputMode::Normal;
+                state.input_return_mode = InputMode::Normal;
+                state.compose_target = None;
+                state.compose.clear();
+                state.compose_cursor = 0;
+            }
             let changed_files = state
                 .work_item
                 .repos
@@ -7447,6 +7461,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
+        assert!(rendered.contains("Version History · 1-3/3"));
+        assert!(rendered.contains("▶ repo · s1"));
         assert!(rendered.contains("s1"));
         assert!(rendered.contains("1 asks · 1 comments"));
         assert!(rendered.contains("v0"));

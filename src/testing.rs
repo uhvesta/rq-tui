@@ -1442,6 +1442,56 @@ mod tests {
     }
 
     #[test]
+    fn generate_context_command_reaches_editable_draft_screen() {
+        let mut harness =
+            TuiHarness::from_unified_diff("context-command", workflow_diff(), 100, 24).unwrap();
+        harness.state.work_item.repos[0].record.remote_pr_url = None;
+        harness.state.work_item.repos[0].version.kind = VersionKind::WorkingTree;
+
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "generate-context");
+        harness.key(key(KeyCode::Enter)).unwrap();
+
+        let generating = harness.render().unwrap();
+        assert!(generating.contains("Generate Context · GENERATING"));
+        assert!(generating.contains("GENERATING · streaming correlated context"));
+        assert_eq!(harness.mode(), "NORMAL");
+        assert!(harness
+            .agent_commands()
+            .iter()
+            .any(|command| command.contains("ContextDraft")));
+
+        harness
+            .stream_next_response(&[
+                "Title: Safer review context\n",
+                "What: Captures the changed behavior\n",
+                "Why: Makes the local review actionable\n",
+                "How: Exercise the updated path\n",
+                "Considerations: Keep the generated text editable\n",
+                "Other approaches: Write it manually",
+            ])
+            .unwrap();
+
+        let ready = harness.render().unwrap();
+        assert!(ready.contains("Generate Context · DIRTY"));
+        assert!(ready.contains("Title: Safer review context"));
+        assert!(ready.contains("Other approaches: Write it manually"));
+        assert!(ready.contains("e/Enter edit · a attach"));
+        assert!(ready.contains("q discard"));
+        assert!(harness
+            .status()
+            .contains("Context draft ready; edit or accept it"));
+
+        harness.key(key(KeyCode::Char('e'))).unwrap();
+        assert_eq!(harness.mode(), "INSERT");
+        assert_eq!(harness.compose_text(), "Safer review context");
+        assert!(harness
+            .render()
+            .unwrap()
+            .contains("Generate Context · EDITING Title"));
+    }
+
+    #[test]
     fn review_navigation_is_one_cross_file_semantic_stream() {
         let output = super::run_ui_script(
             "manyfiles",
