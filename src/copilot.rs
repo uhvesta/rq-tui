@@ -470,25 +470,33 @@ impl CopilotBridge {
     pub(crate) fn start(config: BridgeConfig) -> Self {
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        // The worker can fail outside its async loop (for example while its
+        // runtime is being created). Keep its most recently visible lane so
+        // that a fatal Error/Stopped event is not silently filtered out while
+        // the UI is showing an ephemeral SIDE conversation.
+        let current_lane = Arc::new(std::sync::Mutex::new(AgentLane::Main));
+        let worker_lane = current_lane.clone();
         let thread = std::thread::spawn(move || {
             let runtime = match tokio::runtime::Runtime::new() {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     let _ = event_tx.send(AgentEventEnvelope::agent(
-                        AgentLane::Main,
+                        tracked_lane(&current_lane),
                         AgentEvent::Error(error.to_string()),
                     ));
                     return;
                 }
             };
-            if let Err(error) = runtime.block_on(worker(config, command_rx, event_tx.clone())) {
+            if let Err(error) =
+                runtime.block_on(worker(config, command_rx, event_tx.clone(), worker_lane))
+            {
                 let _ = event_tx.send(AgentEventEnvelope::agent(
-                    AgentLane::Main,
+                    tracked_lane(&current_lane),
                     AgentEvent::Error(format!("{error:#}")),
                 ));
             }
             let _ = event_tx.send(AgentEventEnvelope::agent(
-                AgentLane::Main,
+                tracked_lane(&current_lane),
                 AgentEvent::Stopped,
             ));
         });
@@ -547,6 +555,8 @@ struct ControlledState {
     active_side: Option<String>,
     next_side: u64,
     busy_until: Instant,
+    outbound_lanes: HashMap<String, AgentLane>,
+    active_outbound_id: Option<String>,
 }
 
 impl ControlledAgent {
@@ -569,6 +579,8 @@ impl ControlledAgent {
                 active_side: None,
                 next_side: 1,
                 busy_until: Instant::now(),
+                outbound_lanes: HashMap::new(),
+                active_outbound_id: None,
             }),
         }
     }
@@ -673,14 +685,15 @@ impl ControlledAgent {
             },
         );
         self.schedule_agent(
-            lane,
+            lane.clone(),
             delay + Duration::from_secs(16),
             AgentEvent::ResponseComplete {
-                outbound_id: id,
+                outbound_id: id.clone(),
                 aborted: false,
             },
         );
         let mut state = self.state.lock().expect("controlled agent lock");
+        state.outbound_lanes.insert(id.clone(), lane);
         state.busy_until = state
             .busy_until
             .max(Instant::now() + delay + Duration::from_secs(16));
@@ -700,18 +713,27 @@ impl AgentSink for ControlledAgent {
                 self.schedule_turn(AgentLane::Main, outbound, delay)
             }
             AgentCommand::Steer(outbound) => {
-                let lane = self
-                    .state
-                    .lock()
-                    .expect("controlled agent lock")
-                    .active_side
-                    .clone()
-                    .map(|id| AgentLane::Side { id })
-                    .unwrap_or(AgentLane::Main);
+                let (lane, outbound_id) = {
+                    let state = self.state.lock().expect("controlled agent lock");
+                    let outbound_id = state.active_outbound_id.clone().or_else(|| {
+                        state.events.iter().find_map(|(_, envelope)| {
+                            matches!(envelope.event, LaneEvent::Agent(AgentEvent::Queued { .. }))
+                                .then(|| envelope_outbound_id(envelope))
+                                .flatten()
+                        })
+                    });
+                    let lane = outbound_id
+                        .as_ref()
+                        .and_then(|id| state.outbound_lanes.get(id))
+                        .cloned()
+                        .or_else(|| state.active_side.clone().map(|id| AgentLane::Side { id }))
+                        .unwrap_or(AgentLane::Main);
+                    (lane, outbound_id)
+                };
                 self.schedule_activity(
                     lane,
                     Duration::ZERO,
-                    None,
+                    outbound_id,
                     AgentActivity {
                         kind: ActivityKind::Intent,
                         label: "Steering the active response".into(),
@@ -721,25 +743,38 @@ impl AgentSink for ControlledAgent {
                 );
             }
             AgentCommand::CancelQueued(outbound_id) => {
-                let lane = {
+                let (lane, cancelled) = {
                     let mut state = self.state.lock().expect("controlled agent lock");
-                    let lane = state
-                        .events
-                        .iter()
-                        .find(|(_, envelope)| {
-                            envelope_outbound_id(envelope).as_deref() == Some(outbound_id.as_str())
-                        })
-                        .map(|(_, envelope)| envelope.lane.clone());
-                    state.events.retain(|(_, envelope)| {
-                        envelope_outbound_id(envelope).as_deref() != Some(outbound_id.as_str())
+                    let queued = state.events.iter().any(|(_, envelope)| {
+                        matches!(
+                            &envelope.event,
+                            LaneEvent::Agent(AgentEvent::Queued {
+                                outbound_id: queued_id,
+                                ..
+                            }) if queued_id == &outbound_id
+                        )
                     });
-                    lane
+                    let lane = state.outbound_lanes.get(&outbound_id).cloned();
+                    if queued {
+                        state.events.retain(|(_, envelope)| {
+                            envelope_outbound_id(envelope).as_deref() != Some(outbound_id.as_str())
+                        });
+                        state.outbound_lanes.remove(&outbound_id);
+                    }
+                    (lane, queued)
                 };
-                if let Some(lane) = lane {
+                if cancelled {
                     self.schedule_agent(
-                        lane,
+                        lane.unwrap_or(AgentLane::Main),
                         Duration::ZERO,
                         AgentEvent::QueueCancelled { outbound_id },
+                    );
+                } else {
+                    self.schedule_activity(
+                        lane.unwrap_or(AgentLane::Main),
+                        Duration::ZERO,
+                        Some(outbound_id),
+                        AgentActivity::other("Prompt was already active or no longer queued"),
                     );
                 }
             }
@@ -748,7 +783,7 @@ impl AgentSink for ControlledAgent {
                 replacement,
             } => {
                 let replacement_id = replacement.id.clone();
-                let (scheduled, original_active) = {
+                let (scheduled, owner, original_active) = {
                     let mut state = self.state.lock().expect("controlled agent lock");
                     let queued = state.events.iter().find_map(|(available_at, envelope)| {
                         matches!(
@@ -760,16 +795,20 @@ impl AgentSink for ControlledAgent {
                         )
                         .then(|| (*available_at, envelope.lane.clone()))
                     });
+                    let owner = state.outbound_lanes.get(&outbound_id).cloned();
                     let original_active = queued.is_none()
-                        && state.events.iter().any(|(_, envelope)| {
-                            envelope_outbound_id(envelope).as_deref() == Some(outbound_id.as_str())
-                        });
+                        && (state.active_outbound_id.as_deref() == Some(outbound_id.as_str())
+                            || state.events.iter().any(|(_, envelope)| {
+                                envelope_outbound_id(envelope).as_deref()
+                                    == Some(outbound_id.as_str())
+                            }));
                     if queued.is_some() {
                         state.events.retain(|(_, envelope)| {
                             envelope_outbound_id(envelope).as_deref() != Some(outbound_id.as_str())
                         });
+                        state.outbound_lanes.remove(&outbound_id);
                     }
-                    (queued, original_active)
+                    (queued, owner, original_active)
                 };
                 if let Some((available_at, lane)) = scheduled {
                     let delay = available_at.saturating_duration_since(Instant::now());
@@ -784,14 +823,15 @@ impl AgentSink for ControlledAgent {
                     );
                     self.schedule_turn(lane, replacement, delay);
                 } else {
-                    let lane = self
-                        .state
-                        .lock()
-                        .expect("controlled agent lock")
-                        .active_side
-                        .clone()
-                        .map(|id| AgentLane::Side { id })
-                        .unwrap_or(AgentLane::Main);
+                    let lane = owner.unwrap_or_else(|| {
+                        self.state
+                            .lock()
+                            .expect("controlled agent lock")
+                            .active_side
+                            .clone()
+                            .map(|id| AgentLane::Side { id })
+                            .unwrap_or(AgentLane::Main)
+                    });
                     self.schedule_agent(
                         lane,
                         Duration::ZERO,
@@ -1012,7 +1052,23 @@ impl AgentRuntime for ControlledAgent {
             .front()
             .is_some_and(|(available_at, _)| *available_at <= Instant::now())
         {
-            return state.events.pop_front().map(|(_, event)| event);
+            let event = state.events.pop_front().map(|(_, event)| event)?;
+            match &event.event {
+                LaneEvent::Agent(AgentEvent::ResponseStarted { outbound_id, .. }) => {
+                    state.active_outbound_id = Some(outbound_id.clone());
+                }
+                LaneEvent::Agent(
+                    AgentEvent::ResponseComplete { outbound_id, .. }
+                    | AgentEvent::TurnFailed { outbound_id, .. },
+                ) => {
+                    if state.active_outbound_id.as_deref() == Some(outbound_id.as_str()) {
+                        state.active_outbound_id = None;
+                    }
+                    state.outbound_lanes.remove(outbound_id);
+                }
+                _ => {}
+            }
+            return Some(event);
         }
         None
     }
@@ -1025,6 +1081,17 @@ impl Drop for CopilotBridge {
             let _ = thread.join();
         }
     }
+}
+
+fn tracked_lane(current_lane: &Arc<std::sync::Mutex<AgentLane>>) -> AgentLane {
+    current_lane
+        .lock()
+        .expect("current Copilot lane lock")
+        .clone()
+}
+
+fn set_current_lane(current_lane: &Arc<std::sync::Mutex<AgentLane>>, lane: AgentLane) {
+    *current_lane.lock().expect("current Copilot lane lock") = lane;
 }
 
 fn envelope_outbound_id(envelope: &AgentEventEnvelope) -> Option<String> {
@@ -1064,6 +1131,56 @@ struct ActiveOutbound {
     message_order: Vec<String>,
     emitted_text: String,
     hidden_message_ids: HashSet<String>,
+}
+
+fn queue_position(
+    queue: &VecDeque<Outbound>,
+    active: &Option<ActiveOutbound>,
+    active_lane: &AgentLane,
+    queue_lane: &AgentLane,
+) -> usize {
+    queue.len() + usize::from(active.is_some() && active_lane == queue_lane)
+}
+
+fn side_lane(side: Option<&SideSession>) -> Option<AgentLane> {
+    side.map(|side| AgentLane::Side {
+        id: side.id.clone(),
+    })
+}
+
+fn queued_outbound_lane(
+    outbound_id: &str,
+    main_queue: &VecDeque<Outbound>,
+    side_queue: &VecDeque<Outbound>,
+    side_lane: Option<AgentLane>,
+) -> Option<AgentLane> {
+    if main_queue.iter().any(|outbound| outbound.id == outbound_id) {
+        Some(AgentLane::Main)
+    } else if side_queue.iter().any(|outbound| outbound.id == outbound_id) {
+        // A SIDE request can be buffered before the fork has an ID. MAIN is
+        // deliberately used then: it remains visible while SIDE is starting.
+        Some(side_lane.unwrap_or(AgentLane::Main))
+    } else {
+        None
+    }
+}
+
+fn outbound_lane(
+    outbound_id: &str,
+    active: &Option<ActiveOutbound>,
+    active_lane: &AgentLane,
+    main_queue: &VecDeque<Outbound>,
+    side_queue: &VecDeque<Outbound>,
+    side: Option<&SideSession>,
+) -> Option<AgentLane> {
+    if active
+        .as_ref()
+        .is_some_and(|turn| turn.outbound.id == outbound_id)
+    {
+        Some(active_lane.clone())
+    } else {
+        queued_outbound_lane(outbound_id, main_queue, side_queue, side_lane(side))
+    }
 }
 
 trait EventOutput {
@@ -1226,6 +1343,7 @@ async fn worker(
     config: BridgeConfig,
     mut commands: UnboundedReceiver<AgentCommand>,
     raw_events: Sender<AgentEventEnvelope>,
+    current_lane: Arc<std::sync::Mutex<AgentLane>>,
 ) -> Result<()> {
     let main_events = EventPublisher::new(raw_events, AgentLane::Main);
     let cli = find_copilot_cli().context(
@@ -1351,6 +1469,7 @@ async fn worker(
                                                 boundary_sent,
                                             });
                                             active_lane = lane;
+                                            set_current_lane(&current_lane, active_lane.clone());
                                             side_events.lifecycle(LaneEvent::SideStarted {
                                                 parent_id,
                                                 side_id: side_id.clone(),
@@ -1436,6 +1555,7 @@ async fn worker(
                             side_queue.clear();
                             side_requested = false;
                             active_lane = AgentLane::Main;
+                            set_current_lane(&current_lane, active_lane.clone());
                         } else {
                             side_requested = false;
                             side_queue.clear();
@@ -1650,7 +1770,12 @@ async fn worker(
                         }
                     }
                     AgentCommand::Send(outbound) => {
-                        let position = main_queue.len() + usize::from(active.is_some());
+                        let position = queue_position(
+                            &main_queue,
+                            &active,
+                            &active_lane,
+                            &AgentLane::Main,
+                        );
                         let outbound_id = outbound.id.clone();
                         main_queue.push_back(outbound);
                         main_events.emit(AgentEvent::Queued { outbound_id, position });
@@ -1664,7 +1789,7 @@ async fn worker(
                             } else {
                                 &mut side_queue
                             };
-                            let position = queue.len();
+                            let position = queue_position(queue, &active, &active_lane, &active_lane);
                             queue.push_back(outbound);
                             events.emit(AgentEvent::Queued {
                                 outbound_id,
@@ -1713,16 +1838,33 @@ async fn worker(
                         }
                     }
                     AgentCommand::CancelQueued(outbound_id) => {
-                        let before = main_queue.len() + side_queue.len();
-                        main_queue.retain(|outbound| outbound.id != outbound_id);
-                        side_queue.retain(|outbound| outbound.id != outbound_id);
-                        let removed = main_queue.len() + side_queue.len() != before;
-                        let events = main_events.on_lane(active_lane.clone());
-                        if removed {
-                            events.emit(AgentEvent::QueueCancelled { outbound_id });
+                        let owner = queued_outbound_lane(
+                            &outbound_id,
+                            &main_queue,
+                            &side_queue,
+                            side_lane(side.as_ref()),
+                        );
+                        if let Some(owner) = owner {
+                            main_queue.retain(|outbound| outbound.id != outbound_id);
+                            side_queue.retain(|outbound| outbound.id != outbound_id);
+                            main_events.on_lane(owner).emit(AgentEvent::QueueCancelled { outbound_id });
                         } else {
+                            let owner = outbound_lane(
+                                &outbound_id,
+                                &active,
+                                &active_lane,
+                                &main_queue,
+                                &side_queue,
+                                side.as_ref(),
+                            )
+                            .unwrap_or_else(|| active_lane.clone());
+                            let events = main_events.on_lane(owner);
+                            let activity_id = active
+                                .as_ref()
+                                .filter(|turn| turn.outbound.id == outbound_id)
+                                .map(|turn| turn.outbound.id.clone());
                             events.activity(
-                                active.as_ref().map(|turn| turn.outbound.id.clone()),
+                                activity_id,
                                 AgentActivity::other(
                                     "Prompt was already active or no longer queued",
                                 ),
@@ -1762,15 +1904,22 @@ async fn worker(
                                 outbound_id,
                                 replacement_id,
                                 position: position
-                                    + usize::from(
-                                        active_lane != AgentLane::Main && active.is_some(),
-                                    ),
+                                    + usize::from(active_lane != AgentLane::Main && active.is_some()),
                             });
                         } else {
                             let original_active = active
                                 .as_ref()
                                 .is_some_and(|turn| turn.outbound.id == outbound_id);
-                            main_events.on_lane(active_lane.clone()).emit(
+                            let owner = outbound_lane(
+                                &outbound_id,
+                                &active,
+                                &active_lane,
+                                &main_queue,
+                                &side_queue,
+                                side.as_ref(),
+                            )
+                            .unwrap_or_else(|| active_lane.clone());
+                            main_events.on_lane(owner).emit(
                                 AgentEvent::QueueReplaceRejected {
                                     outbound_id,
                                     replacement_id,
@@ -1790,13 +1939,19 @@ async fn worker(
                                 apply_side_boundary(&mut outbound);
                                 side_session.boundary_sent = true;
                             }
-                            let position = side_queue.len() + usize::from(active.is_some());
+                            let lane = AgentLane::Side {
+                                id: side_session.id.clone(),
+                            };
+                            let position = queue_position(
+                                &side_queue,
+                                &active,
+                                &active_lane,
+                                &lane,
+                            );
                             let outbound_id = outbound.id.clone();
                             side_queue.push_back(outbound);
                             main_events
-                                .on_lane(AgentLane::Side {
-                                    id: side_session.id.clone(),
-                                })
+                                .on_lane(lane)
                                 .emit(AgentEvent::Queued { outbound_id, position });
                         } else if side_requested {
                             side_queue.push_back(outbound);
@@ -3014,10 +3169,10 @@ fn find_copilot_cli() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashSet, VecDeque};
     use std::env;
     use std::path::PathBuf;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
 
     use github_copilot_sdk::handler::PermissionHandler;
@@ -3771,6 +3926,183 @@ mod tests {
         let exited = agent.try_recv_laned().expect("immediate side exit");
         assert!(matches!(exited.event, LaneEvent::SideExited { .. }));
         assert!(agent.try_recv_laned().is_none());
+    }
+
+    #[test]
+    fn controlled_queue_cancellation_stays_on_the_outbound_lane() {
+        let agent = ControlledAgent::new("work-item".into());
+        let _ = agent.try_recv_laned();
+        agent
+            .send(AgentCommand::StartSide { outbound: None })
+            .expect("start side");
+        let _ = agent.try_recv_laned();
+        let _ = agent.try_recv_laned();
+
+        let outbound = Outbound::new(OutboundKind::Chat, "main queue item".into());
+        let outbound_id = outbound.id.clone();
+        agent
+            .send(AgentCommand::Send(outbound))
+            .expect("queue main");
+        agent
+            .send(AgentCommand::CancelQueued(outbound_id.clone()))
+            .expect("cancel main");
+
+        let events = std::iter::from_fn(|| agent.try_recv_laned()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                super::AgentEventEnvelope {
+                    lane: AgentLane::Main,
+                    event: LaneEvent::Agent(AgentEvent::QueueCancelled { outbound_id: id }),
+                    ..
+                } if id == &outbound_id
+            )
+        }));
+    }
+
+    #[test]
+    fn controlled_queue_replacement_stays_on_the_outbound_lane() {
+        let agent = ControlledAgent::new("work-item".into());
+        let _ = agent.try_recv_laned();
+        agent
+            .send(AgentCommand::StartSide { outbound: None })
+            .expect("start side");
+        let _ = agent.try_recv_laned();
+        let _ = agent.try_recv_laned();
+
+        let original = Outbound::new(OutboundKind::Chat, "main queue item".into());
+        let original_id = original.id.clone();
+        agent
+            .send(AgentCommand::Send(original))
+            .expect("queue main");
+        let replacement = Outbound::new(OutboundKind::Chat, "replacement".into());
+        let replacement_id = replacement.id.clone();
+        agent
+            .send(AgentCommand::ReplaceQueued {
+                outbound_id: original_id.clone(),
+                replacement,
+            })
+            .expect("replace main");
+
+        let event = agent.try_recv_laned().expect("replacement acknowledgement");
+        assert!(matches!(
+            event,
+            super::AgentEventEnvelope {
+                lane: AgentLane::Main,
+                event: LaneEvent::Agent(AgentEvent::QueueReplaced {
+                    outbound_id,
+                    replacement_id: actual_replacement_id,
+                    ..
+                }),
+                ..
+            } if outbound_id == original_id && actual_replacement_id == replacement_id
+        ));
+    }
+
+    #[test]
+    fn controlled_queue_rejection_stays_on_the_original_lane() {
+        let agent = ControlledAgent::new("work-item".into());
+        let _ = agent.try_recv_laned();
+        let original = Outbound::new(OutboundKind::Chat, "main queue item".into());
+        let original_id = original.id.clone();
+        agent
+            .send(AgentCommand::Send(original))
+            .expect("queue main");
+        let _ = agent.try_recv_laned(); // The item has left its cancellable queue.
+
+        agent
+            .send(AgentCommand::StartSide { outbound: None })
+            .expect("start side");
+        let _ = agent.try_recv_laned();
+        let _ = agent.try_recv_laned();
+
+        let replacement = Outbound::new(OutboundKind::Chat, "replacement".into());
+        let replacement_id = replacement.id.clone();
+        agent
+            .send(AgentCommand::ReplaceQueued {
+                outbound_id: original_id.clone(),
+                replacement,
+            })
+            .expect("replace rejected main item");
+
+        let event = agent.try_recv_laned().expect("replacement rejection");
+        assert!(matches!(
+            event,
+            super::AgentEventEnvelope {
+                lane: AgentLane::Main,
+                event: LaneEvent::Agent(AgentEvent::QueueReplaceRejected {
+                    outbound_id,
+                    replacement_id: actual_replacement_id,
+                    ..
+                }),
+                ..
+            } if outbound_id == original_id && actual_replacement_id == replacement_id
+        ));
+    }
+
+    #[test]
+    fn controlled_steering_is_correlated_to_the_actual_outbound() {
+        let agent = ControlledAgent::new("work-item".into());
+        let _ = agent.try_recv_laned();
+        let outbound = Outbound::new(OutboundKind::Chat, "main work".into());
+        let outbound_id = outbound.id.clone();
+        agent
+            .send(AgentCommand::Send(outbound))
+            .expect("queue main");
+        agent
+            .send(AgentCommand::Steer(Outbound::new(
+                OutboundKind::Chat,
+                "focus on the failure".into(),
+            )))
+            .expect("steer main");
+
+        let events = std::iter::from_fn(|| agent.try_recv_laned()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                super::AgentEventEnvelope {
+                    lane: AgentLane::Main,
+                    activity: Some(activity),
+                    ..
+                } if activity.label == "Steering the active response"
+                    && matches!(
+                        &event.event,
+                        LaneEvent::Agent(AgentEvent::Activity {
+                            outbound_id: Some(id),
+                            ..
+                        }) if id == &outbound_id
+                    )
+            )
+        }));
+    }
+
+    #[test]
+    fn queue_positions_only_count_an_active_turn_in_its_own_lane() {
+        let main_queue = VecDeque::from([Outbound::new(OutboundKind::Chat, "main".into())]);
+        let side_queue = VecDeque::from([Outbound::new(OutboundKind::Chat, "side".into())]);
+        let active = active();
+        let side_lane = AgentLane::Side {
+            id: "side-1".into(),
+        };
+
+        assert_eq!(
+            super::queue_position(&main_queue, &active, &side_lane, &AgentLane::Main),
+            1
+        );
+        assert_eq!(
+            super::queue_position(&side_queue, &active, &side_lane, &side_lane),
+            2
+        );
+    }
+
+    #[test]
+    fn worker_fatal_events_follow_the_last_visible_lane() {
+        let current_lane = Arc::new(std::sync::Mutex::new(AgentLane::Main));
+        let side = AgentLane::Side {
+            id: "side-1".into(),
+        };
+        super::set_current_lane(&current_lane, side.clone());
+        assert_eq!(super::tracked_lane(&current_lane), side);
     }
 
     #[test]
