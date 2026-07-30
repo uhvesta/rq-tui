@@ -1942,12 +1942,24 @@ impl AppState {
                         self.status = "No runtime models are available".into();
                         return Vec::new();
                     };
+                    let has_reasoning = !model.supported_reasoning_efforts.is_empty();
+                    let has_context = !model.context_tiers.is_empty();
                     self.pending_model_selection = Some(ModelSelection {
                         model_id: model.id,
                         reasoning_effort: model.default_reasoning_effort.clone(),
                         context_tier: None,
                     });
-                    if model.supported_reasoning_efforts.is_empty() {
+                    if !has_reasoning && !has_context {
+                        let selection = self
+                            .pending_model_selection
+                            .take()
+                            .expect("model selection was just created");
+                        self.screen = self.previous_screen;
+                        self.status =
+                            "Model uses runtime-default reasoning and context settings".into();
+                        return vec![Effect::SelectModel(selection)];
+                    }
+                    if !has_reasoning {
                         self.model_picker_stage = ModelPickerStage::Context;
                         self.model_picker_index = 0;
                     } else {
@@ -1979,6 +1991,15 @@ impl AppState {
                         .supported_reasoning_efforts
                         .get(self.model_picker_index)
                         .cloned();
+                    if model.context_tiers.is_empty() {
+                        let selection = self
+                            .pending_model_selection
+                            .take()
+                            .expect("reasoning stage requires a pending selection");
+                        self.screen = self.previous_screen;
+                        self.status = "Model has no additional context-tier choice".into();
+                        return vec![Effect::SelectModel(selection)];
+                    }
                     self.model_picker_stage = ModelPickerStage::Context;
                     self.model_picker_index = 0;
                 }
@@ -2380,12 +2401,14 @@ impl AppState {
             }
             self.command.clear();
             self.input_mode = InputMode::Normal;
+            self.status.clear();
             return self.execute_command(command.trim());
         }
         match key.code {
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
                 self.command.clear();
+                self.status = "NORMAL · command palette closed".into();
                 Vec::new()
             }
             KeyCode::Backspace => {

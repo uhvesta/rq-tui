@@ -2171,6 +2171,15 @@ mod tests {
             compact_frame.contains("▶ :"),
             "selected command must remain visible:\n{compact_frame}"
         );
+
+        let mut escape =
+            TuiHarness::from_unified_diff("command escape", workflow_diff(), 80, 12).unwrap();
+        escape.key(key(KeyCode::Tab)).unwrap();
+        escape.key(key(KeyCode::Char(':'))).unwrap();
+        escape.key(key(KeyCode::Esc)).unwrap();
+        assert_eq!(escape.mode(), "NORMAL");
+        assert!(!escape.status().contains("COMMAND mode"));
+        assert!(escape.status().contains("command palette closed"));
     }
 
     #[test]
@@ -2341,6 +2350,36 @@ mod tests {
         assert!(selection.contains("capable-model"));
         assert!(selection.contains("high"));
         assert!(selection.contains("long_context"));
+    }
+
+    #[test]
+    fn model_picker_skips_capability_stages_the_runtime_does_not_offer() {
+        let mut harness =
+            TuiHarness::from_unified_diff("fixed-model", workflow_diff(), 100, 24).unwrap();
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "model");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness
+            .inject_agent_event(AgentEvent::ModelsListed(vec![ModelOption {
+                id: "fixed-model".into(),
+                name: "Fixed Model".into(),
+                supported_reasoning_efforts: Vec::new(),
+                default_reasoning_effort: None,
+                max_context_tokens: Some(64_000),
+                context_tiers: Vec::new(),
+            }]))
+            .unwrap();
+        harness.key(key(KeyCode::Enter)).unwrap();
+
+        assert_ne!(harness.state.screen, crate::app::Screen::ModelPicker);
+        let selection = harness
+            .agent_commands()
+            .into_iter()
+            .find(|command| command.starts_with("SelectModel"))
+            .expect("fixed-capability model is applied immediately");
+        assert!(selection.contains("fixed-model"));
+        assert!(selection.contains("reasoning_effort: None"));
+        assert!(selection.contains("context_tier: None"));
     }
 
     #[test]
