@@ -93,6 +93,10 @@ pub(crate) struct InlineAnnotation {
     pub(crate) line_end: usize,
     pub(crate) title: String,
     pub(crate) body: String,
+    /// Optional affordance rendered inside this annotation's border.  Keeping
+    /// the prompt on the annotation makes follow-up focus stable while the
+    /// response body grows.
+    pub(crate) prompt: Option<String>,
     pub(crate) collapsed: bool,
 }
 
@@ -115,6 +119,7 @@ impl InlineAnnotation {
             line_end: line_end.max(line_start),
             title: title.into(),
             body: body.into(),
+            prompt: None,
             collapsed: false,
         }
     }
@@ -159,6 +164,7 @@ pub(crate) enum ReviewRowKey {
 pub(crate) enum AnnotationRowPart {
     Header { collapsed: bool },
     Body { line: usize, total: usize },
+    Prompt,
     Footer,
 }
 
@@ -750,7 +756,7 @@ fn append_annotation_rows(
     let total_rows = if annotation.collapsed {
         1
     } else {
-        total_body_lines + 2
+        total_body_lines + 2 + usize::from(annotation.prompt.is_some())
     };
     for block_line in 0..total_rows {
         let (part, text) = if annotation.collapsed {
@@ -774,6 +780,11 @@ fn append_annotation_rows(
                     total: total_body_lines,
                 },
                 text,
+            )
+        } else if annotation.prompt.is_some() && block_line == total_body_lines + 1 {
+            (
+                AnnotationRowPart::Prompt,
+                annotation.prompt.clone().unwrap_or_default(),
             )
         } else {
             (AnnotationRowPart::Footer, String::new())
@@ -890,6 +901,47 @@ mod tests {
             .count();
         assert_eq!(annotation_rows, 4); // title, two body rows, footer
         assert_eq!(stream.row_count(), 10);
+    }
+
+    #[test]
+    fn ask_prompt_is_part_of_the_existing_annotation_and_disappears_when_folded() {
+        let mut ask = annotation("ask", 5, "first\nsecond");
+        ask.prompt = Some("❯ follow up · press i or Enter".into());
+        let stream = ReviewStream::new(&[file()], &[ask.clone()]);
+        let rows: Vec<_> = stream
+            .rows()
+            .iter()
+            .filter_map(|row| match row {
+                ReviewRow::Annotation { block, .. } => Some(block),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 5);
+        assert!(matches!(
+            rows[0].part,
+            AnnotationRowPart::Header { collapsed: false }
+        ));
+        assert!(matches!(rows[1].part, AnnotationRowPart::Body { .. }));
+        assert!(matches!(rows[2].part, AnnotationRowPart::Body { .. }));
+        assert!(matches!(rows[3].part, AnnotationRowPart::Prompt));
+        assert!(matches!(rows[4].part, AnnotationRowPart::Footer));
+        assert!(rows.iter().all(|row| row.annotation_id == "ask"));
+
+        ask.collapsed = true;
+        let folded = ReviewStream::new(&[file()], &[ask]);
+        let folded_rows: Vec<_> = folded
+            .rows()
+            .iter()
+            .filter_map(|row| match row {
+                ReviewRow::Annotation { block, .. } => Some(block),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(folded_rows.len(), 1);
+        assert!(matches!(
+            folded_rows[0].part,
+            AnnotationRowPart::Header { collapsed: true }
+        ));
     }
 
     #[test]
