@@ -13,14 +13,17 @@ use tempfile::TempDir;
 use crate::app::{AppState, Effect, InputMode, Screen};
 use crate::config::AppPaths;
 use crate::copilot::{
-    ActivityKind, AgentActivity, AgentCommand, AgentEvent, AgentEventEnvelope, AgentLane,
-    AgentSink, ContextTierOption, HistoryEntry, LaneEvent, ModelOption, Outbound,
+    deterministic_outbound_ids, ActivityKind, AgentActivity, AgentCommand, AgentEvent,
+    AgentEventEnvelope, AgentLane, AgentSink, ContextTierOption, HistoryEntry, LaneEvent,
+    ModelOption, Outbound,
 };
 use crate::diff::{parse_unified, DiffSet};
 use crate::domain::{BaseBranchSource, DeliveryState, Repo, Version, VersionKind, WorkItem};
 use crate::highlight::PlainHighlighter;
 use crate::storage::Storage;
-use crate::ui::{handle_agent_event, handle_effect, handle_effect_failure, render};
+use crate::ui::{
+    handle_agent_envelope, handle_agent_event, handle_effect, handle_effect_failure, render,
+};
 use crate::work_item::{ResolvedWorkItem, ReviewRepo};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,7 +94,7 @@ pub struct TuiHarness {
     agent: FakeAgent,
     effects: Vec<String>,
     last_yank: Option<String>,
-    active_stream: Option<Outbound>,
+    active_stream: Option<(Outbound, AgentLane)>,
     width: u16,
     height: u16,
     _temp: TempDir,
@@ -203,56 +206,93 @@ impl TuiHarness {
 
     /// Starts, but deliberately does not complete, the oldest fake-agent turn.
     pub fn start_next_response(&mut self, first_delta: &str) -> Result<()> {
+        let lane = if self.state.side_active {
+            AgentLane::Side {
+                id: self
+                    .state
+                    .side_session_id
+                    .clone()
+                    .context("SIDE is active without a session id")?,
+            }
+        } else {
+            AgentLane::Main
+        };
+        self.start_next_response_on_lane(lane, first_delta)
+    }
+
+    pub(crate) fn start_next_response_on_lane(
+        &mut self,
+        lane: AgentLane,
+        first_delta: &str,
+    ) -> Result<()> {
         anyhow::ensure!(
             self.active_stream.is_none(),
             "a fake-agent response is already streaming"
         );
-        let outbound = self
-            .agent
-            .pending
-            .lock()
-            .expect("agent lock")
-            .pop_front()
-            .context("no queued fake-agent outbound")?;
-        handle_agent_event(
+        let wants_side = matches!(lane, AgentLane::Side { .. });
+        let outbound = {
+            let mut pending = self.agent.pending.lock().expect("agent lock");
+            let position = pending
+                .iter()
+                .position(|outbound| {
+                    self.state.side_outbound_ids.contains(&outbound.id) == wants_side
+                })
+                .context("no queued fake-agent outbound on the requested lane")?;
+            pending
+                .remove(position)
+                .expect("located fake-agent outbound remains queued")
+        };
+        handle_agent_envelope(
             &mut self.state,
             &self.storage,
-            AgentEvent::ResponseStarted {
-                outbound_id: outbound.id.clone(),
-                outbound: outbound.kind.clone(),
-                first_delta: first_delta.to_owned(),
+            AgentEventEnvelope {
+                lane: lane.clone(),
+                event: LaneEvent::Agent(AgentEvent::ResponseStarted {
+                    outbound_id: outbound.id.clone(),
+                    outbound: outbound.kind.clone(),
+                    first_delta: first_delta.to_owned(),
+                }),
+                activity: None,
             },
         )?;
-        self.active_stream = Some(outbound);
+        self.active_stream = Some((outbound, lane));
         Ok(())
     }
 
     pub fn push_response_delta(&mut self, delta: &str) -> Result<()> {
-        let outbound = self
+        let (outbound, lane) = self
             .active_stream
             .as_ref()
             .context("no fake-agent response is streaming")?;
-        handle_agent_event(
+        handle_agent_envelope(
             &mut self.state,
             &self.storage,
-            AgentEvent::ResponseDelta {
-                outbound_id: outbound.id.clone(),
-                delta: delta.to_owned(),
+            AgentEventEnvelope {
+                lane: lane.clone(),
+                event: LaneEvent::Agent(AgentEvent::ResponseDelta {
+                    outbound_id: outbound.id.clone(),
+                    delta: delta.to_owned(),
+                }),
+                activity: None,
             },
         )
     }
 
     pub fn complete_response(&mut self, aborted: bool) -> Result<()> {
-        let outbound = self
+        let (outbound, lane) = self
             .active_stream
             .take()
             .context("no fake-agent response is streaming")?;
-        handle_agent_event(
+        handle_agent_envelope(
             &mut self.state,
             &self.storage,
-            AgentEvent::ResponseComplete {
-                outbound_id: outbound.id,
-                aborted,
+            AgentEventEnvelope {
+                lane,
+                event: LaneEvent::Agent(AgentEvent::ResponseComplete {
+                    outbound_id: outbound.id,
+                    aborted,
+                }),
+                activity: None,
             },
         )
     }
@@ -613,6 +653,7 @@ fn fixture_state(name: String, diff: DiffSet) -> AppState {
 /// Render a deterministic, production-data-free UI state through the same
 /// reducer/effect/renderer path as the interactive binary.
 pub fn render_ui_scenario(name: &str, width: u16, height: u16) -> Result<String> {
+    let _deterministic_ids = deterministic_outbound_ids();
     const DIFF: &str = concat!(
         "diff --git a/src/lib.rs b/src/lib.rs\n",
         "--- a/src/lib.rs\n",
@@ -891,7 +932,8 @@ fn parse_key_spec(spec: &str) -> Result<KeyEvent> {
 ///   type <text>       press every remaining character on the line in order
 ///   resize <w> <h>    change terminal dimensions
 ///   stream <text>     deliver and complete a single-chunk fake-agent response
-///   stream-start <text> start a response and leave it active
+///   stream-start [main|side] <text>
+///                     start a response on the visible or explicit lane
 ///   stream-delta <text> append a delta to the active response
 ///   stream-complete   complete the active response
 ///   stream-abort      abort the active response
@@ -906,6 +948,7 @@ fn parse_key_spec(spec: &str) -> Result<KeyEvent> {
 ///   side-exit         complete deterministic SIDE teardown
 ///   snapshot [label]  render the current frame into the output now
 pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Result<String> {
+    let _deterministic_ids = deterministic_outbound_ids();
     let (name, diff) = ui_script_fixture(fixture)?;
     let mut harness = TuiHarness::from_unified_diff(name, &diff, width, height)?;
     let mut output = String::new();
@@ -985,8 +1028,22 @@ pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Re
                     .with_context(|| format!("line {}: {raw_line:?}", line_number + 1))?;
             }
             "stream-start" => {
-                harness
-                    .start_next_response(argument)
+                let result = if let Some(first_delta) = argument.strip_prefix("main ") {
+                    harness.start_next_response_on_lane(AgentLane::Main, first_delta)
+                } else if let Some(first_delta) = argument.strip_prefix("side ") {
+                    let side_id = harness
+                        .state
+                        .side_session_id
+                        .clone()
+                        .context("stream-start side requires an active SIDE session")?;
+                    harness.start_next_response_on_lane(
+                        AgentLane::Side { id: side_id },
+                        first_delta,
+                    )
+                } else {
+                    harness.start_next_response(argument)
+                };
+                result
                     .with_context(|| format!("line {}: {raw_line:?}", line_number + 1))?;
             }
             "stream-delta" => {
@@ -1550,6 +1607,15 @@ mod tests {
         assert!(output.contains("Script Model"));
         assert!(output.contains("last_yank:"));
         assert!(output.contains("effects:"));
+    }
+
+    #[test]
+    fn ui_snapshots_are_byte_deterministic_across_independent_runs() {
+        let first = super::render_ui_scenario("queue", 100, 28).unwrap();
+        let second = super::render_ui_scenario("queue", 100, 28).unwrap();
+        assert_eq!(first, second);
+        assert!(first.contains("00000001"));
+        assert!(first.contains("00000002"));
     }
 
     #[test]
@@ -2706,6 +2772,52 @@ mod tests {
             )
             .unwrap();
         assert!(harness.render().unwrap().contains("VISIBLE SIDE CONTENT"));
+    }
+
+    #[test]
+    fn fake_streaming_targets_main_and_side_lanes_explicitly() {
+        let mut harness =
+            TuiHarness::from_unified_diff("lane-streams", workflow_diff(), 100, 24).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "main background work");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "/side isolated");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness
+            .inject_side_started("main-session", "side-session")
+            .unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "side foreground work");
+        harness.key(key(KeyCode::Enter)).unwrap();
+
+        harness
+            .start_next_response_on_lane(AgentLane::Main, "PARKED MAIN STREAM")
+            .unwrap();
+        assert!(!harness
+            .state
+            .chat
+            .iter()
+            .any(|entry| entry.text.contains("PARKED MAIN STREAM")));
+        assert!(harness.state.main_chat.as_ref().is_some_and(|chat| chat
+            .iter()
+            .any(|entry| entry.text.contains("PARKED MAIN STREAM"))));
+        harness.complete_response(false).unwrap();
+
+        harness
+            .start_next_response_on_lane(
+                AgentLane::Side {
+                    id: "side-session".into(),
+                },
+                "VISIBLE SIDE STREAM",
+            )
+            .unwrap();
+        assert!(harness
+            .state
+            .chat
+            .iter()
+            .any(|entry| entry.text.contains("VISIBLE SIDE STREAM")));
     }
 
     #[test]

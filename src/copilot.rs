@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::future::Future;
@@ -125,11 +126,42 @@ pub(crate) struct Outbound {
 impl Outbound {
     pub(crate) fn new(kind: OutboundKind, text: String) -> Self {
         Self {
-            id: Uuid::new_v4().to_string(),
+            id: next_outbound_id(),
             kind,
             text,
         }
     }
+}
+
+thread_local! {
+    static DETERMINISTIC_OUTBOUND_COUNTER: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+pub(crate) struct DeterministicOutboundIds {
+    previous: Option<u64>,
+}
+
+impl Drop for DeterministicOutboundIds {
+    fn drop(&mut self) {
+        DETERMINISTIC_OUTBOUND_COUNTER.with(|counter| counter.set(self.previous));
+    }
+}
+
+pub(crate) fn deterministic_outbound_ids() -> DeterministicOutboundIds {
+    let previous = DETERMINISTIC_OUTBOUND_COUNTER.with(|counter| counter.replace(Some(0)));
+    DeterministicOutboundIds { previous }
+}
+
+fn next_outbound_id() -> String {
+    DETERMINISTIC_OUTBOUND_COUNTER
+        .with(|counter| {
+            counter.get().map(|current| {
+                let next = current.saturating_add(1);
+                counter.set(Some(next));
+                format!("{next:08x}-0000-4000-8000-000000000000")
+            })
+        })
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
 }
 
 fn model_option(model: &github_copilot_sdk::Model) -> ModelOption {
