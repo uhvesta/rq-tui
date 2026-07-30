@@ -215,15 +215,11 @@ impl<R: CommandRunner> Git<R> {
             }
         }
 
-        if let Ok(remote) = self.git_stdout(repo, ["remote", "show", "origin"]) {
-            if let Some(branch) = remote
-                .lines()
-                .find_map(|line| line.trim().strip_prefix("HEAD branch: "))
-            {
-                return Ok(format!("origin/{branch}"));
-            }
-        }
-
+        // Keep local review startup strictly local. `git remote show origin`
+        // refreshes remote metadata by default and can block the TUI launch on
+        // DNS, authentication, or an unavailable network. The symbolic ref
+        // above and these common refs cover normal clones without any I/O
+        // outside the repository; uncommon layouts can use `review --base`.
         for candidate in ["origin/main", "main", "origin/master", "master"] {
             if self
                 .git_status(repo, ["rev-parse", "--verify", "--quiet", candidate])
@@ -328,12 +324,51 @@ fn ensure_success(operation: &str, repo: &Path, output: &Output) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::{OsStr, OsString};
     use std::fs;
-    use std::process::Command;
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::{Command, ExitStatus, Output};
+    use std::sync::Mutex;
 
     use tempfile::tempdir;
 
-    use super::{snapshot_ref, Git};
+    use super::{snapshot_ref, CommandRunner, Git};
+
+    #[derive(Default)]
+    struct LocalOnlyRunner {
+        commands: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl CommandRunner for LocalOnlyRunner {
+        fn output(&self, _program: &OsStr, args: &[OsString]) -> anyhow::Result<Output> {
+            let command = args
+                .iter()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            self.commands.lock().unwrap().push(command.clone());
+            assert!(
+                !command
+                    .windows(3)
+                    .any(|parts| parts == ["remote", "show", "origin"]),
+                "default branch detection attempted network-dependent remote inspection"
+            );
+            let symbolic = command
+                .windows(3)
+                .any(|parts| parts == ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
+            let origin_main = command
+                .windows(4)
+                .any(|parts| parts == ["rev-parse", "--verify", "--quiet", "origin/main"]);
+            Ok(Output {
+                status: ExitStatus::from_raw(if origin_main { 0 } else { 1 }),
+                stdout: if symbolic {
+                    Vec::new()
+                } else {
+                    b"deadbeef\n".to_vec()
+                },
+                stderr: Vec::new(),
+            })
+        }
+    }
 
     fn git(path: &std::path::Path, args: &[&str]) {
         let status = Command::new("git")
@@ -380,6 +415,19 @@ mod tests {
             temp.path().file_name().unwrap().to_string_lossy()
         );
         assert_eq!(state.base_branch, "main");
+    }
+
+    #[test]
+    fn default_branch_detection_never_queries_the_remote() {
+        let git = Git {
+            runner: LocalOnlyRunner::default(),
+        };
+        assert_eq!(
+            git.detect_default_branch(std::path::Path::new("/local/repo"))
+                .unwrap(),
+            "origin/main"
+        );
+        assert_eq!(git.runner.commands.lock().unwrap().len(), 2);
     }
 
     #[test]
