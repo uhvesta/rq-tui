@@ -5141,6 +5141,7 @@ fn review_row_selection(
     visible_line.and_then(|line| state.review_row_selection(line))
 }
 
+#[cfg(test)]
 fn review_row_lines(
     row: &ReviewRow,
     selection: Option<ReviewRowSelection>,
