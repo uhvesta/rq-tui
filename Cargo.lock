@@ -1622,6 +1622,7 @@ dependencies = [
  "lru 0.16.4",
  "pretty_assertions",
  "ratatui",
+ "rq-tui-app",
  "rq-tui-domain",
  "rusqlite",
  "serde",
@@ -1637,6 +1638,10 @@ dependencies = [
  "uuid",
  "walkdir",
 ]
+
+[[package]]
+name = "rq-tui-app"
+version = "0.1.0"
 
 [[package]]
 name = "rq-tui-domain"

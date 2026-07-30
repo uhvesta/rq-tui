@@ -1,0 +1,10 @@
+[package]
+name = "rq-tui-app"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rq_tui_app"
+path = "src/lib.rs"
+
+[dependencies]

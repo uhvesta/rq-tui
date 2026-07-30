@@ -1,0 +1,30 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rustfmt_test")
+
+rust_library(
+    name = "app_lib",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "rq_tui_app",
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    visibility = ["//src:__pkg__"],
+)
+
+rust_test(
+    name = "app_tests",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    visibility = ["//visibility:private"],
+)
+
+rustfmt_test(
+    name = "rustfmt_test",
+    targets = [":app_lib", ":app_tests"],
+    visibility = ["//visibility:private"],
+)
+
+test_suite(
+    name = "app_test_suite",
+    tests = [":app_tests", ":rustfmt_test"],
+    visibility = ["//:__pkg__"],
+)

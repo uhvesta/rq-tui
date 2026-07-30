@@ -49,6 +49,7 @@ sh_test(
 test_suite(
     name = "rq_tui_tests",
     tests = [
+        "//crates/app:app_test_suite",
         ":bootstrap_bazelisk_test",
         ":non_tty_cli_test",
         ":pty_smoke_test",

@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use rq_tui_app::{reduce as reduce_modal, ModalEffect, ModalKey, ModalState};
 
 use crate::annotations::anchor_from_diff;
 use crate::chat_render::{render_markdown_mapped, MappedMarkdown};
@@ -33,6 +34,8 @@ use crate::terminal_text::{
     previous_grapheme_boundary,
 };
 use crate::work_item::ResolvedWorkItem;
+
+pub(crate) use rq_tui_app::{Focus, InputMode, Screen};
 
 pub(crate) const INLINE_COMPOSER_ID: &str = "zzzzzzzz-inline-composer";
 
@@ -113,45 +116,10 @@ pub(crate) struct ChatRenderProgress {
     pub(crate) total_rows: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum Screen {
-    #[default]
-    Review,
-    Chat,
-    Settings,
-    Versions,
-    ContextEditor,
-    Prune,
-    Recovery,
-    AgentStatus,
-    Queue,
-    ModelPicker,
-    Preview,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum InputMode {
-    #[default]
-    Normal,
-    Visual,
-    Command,
-    Search,
-    Compose,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChatSearchOutcome {
     Found { wrapped: bool },
     NotFound,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum Focus {
-    FilePicker,
-    #[default]
-    Diff,
-    Chat,
-    InlineAsk,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2275,6 +2243,60 @@ impl AppState {
         self.handle_normal_key(key)
     }
 
+    /// Adapt the terminal event at the pure modal boundary. Pane movement and
+    /// text editing stay in this crate until their own reducer slice is ready.
+    fn handle_modal_key(&mut self, key: KeyEvent) -> Option<Vec<Effect>> {
+        let modal_key = match key.code {
+            KeyCode::Char(character @ (':' | '/' | 't')) => ModalKey::Character(character),
+            KeyCode::Tab => ModalKey::Tab,
+            KeyCode::Esc => ModalKey::Escape,
+            _ => return None,
+        };
+        let transition = reduce_modal(
+            ModalState {
+                screen: self.screen,
+                previous_screen: self.previous_screen,
+                input_mode: self.input_mode,
+                input_return_mode: self.input_return_mode,
+                focus: self.focus,
+                picker_open: self.picker_open,
+            },
+            modal_key,
+        );
+        if !transition.handled {
+            return None;
+        }
+
+        self.screen = transition.state.screen;
+        self.previous_screen = transition.state.previous_screen;
+        self.input_mode = transition.state.input_mode;
+        self.input_return_mode = transition.state.input_return_mode;
+        self.focus = transition.state.focus;
+        self.picker_open = transition.state.picker_open;
+        for effect in transition.effects {
+            match effect {
+                ModalEffect::EnterCommand => {
+                    self.command.clear();
+                    self.command_index = 0;
+                    self.command_scroll = 0;
+                    self.status = "COMMAND mode · type to filter, ↑/↓ choose, Tab complete".into();
+                }
+                ModalEffect::EnterSearch => self.search.clear(),
+                ModalEffect::ToggleReviewChat => self.clear_visual_selection(),
+                ModalEffect::ToggleFilePicker => {
+                    self.clear_visual_selection();
+                    self.status = if self.picker_open {
+                        "File tree opened · Focus: files → diff".into()
+                    } else {
+                        "File tree closed · Focus: diff".into()
+                    };
+                }
+                ModalEffect::DismissVisualSelection => self.clear_visual_selection(),
+            }
+        }
+        Some(Vec::new())
+    }
+
     fn inline_review_compose_active(&self) -> bool {
         self.input_mode == InputMode::Compose
             && matches!(
@@ -2495,35 +2517,10 @@ impl AppState {
             };
             return Vec::new();
         }
+        if let Some(effects) = self.handle_modal_key(key) {
+            return effects;
+        }
         match key.code {
-            KeyCode::Char(':') => {
-                self.input_return_mode = self.input_mode;
-                self.input_mode = InputMode::Command;
-                self.command.clear();
-                self.command_index = 0;
-                self.command_scroll = 0;
-                self.status = "COMMAND mode · type to filter, ↑/↓ choose, Tab complete".into();
-            }
-            KeyCode::Char('/') => {
-                self.input_return_mode = self.input_mode;
-                self.input_mode = InputMode::Search;
-                self.search.clear();
-            }
-            KeyCode::Tab if self.input_mode == InputMode::Normal => self.toggle_review_chat(),
-            KeyCode::Char('t') if self.screen == Screen::Review => {
-                self.picker_open = !self.picker_open;
-                self.focus = if self.picker_open {
-                    Focus::FilePicker
-                } else {
-                    Focus::Diff
-                };
-                self.clear_visual_selection();
-                self.status = if self.picker_open {
-                    "File tree opened · Focus: files → diff".into()
-                } else {
-                    "File tree closed · Focus: diff".into()
-                };
-            }
             KeyCode::Char('j') | KeyCode::Down => self.move_down(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_up(1),
             KeyCode::Char('h') if self.focus == Focus::Chat => {
@@ -2604,9 +2601,6 @@ impl AppState {
                     && matches!(self.focus, Focus::Diff | Focus::InlineAsk) =>
             {
                 self.enter_review_visual(ReviewSelectionMode::Line);
-            }
-            KeyCode::Esc if self.input_mode == InputMode::Visual => {
-                self.clear_visual_selection();
             }
             KeyCode::Esc if !self.search.is_empty() => {
                 self.search.clear();

@@ -13,6 +13,7 @@ crate.from_cargo(
     cargo_lockfile = "//:Cargo.lock",
     manifests = [
         "//:Cargo.toml",
+        "//crates/app:Cargo.toml",
         "//crates/domain:Cargo.toml",
     ],
 )
