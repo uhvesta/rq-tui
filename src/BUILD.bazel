@@ -44,7 +44,7 @@ rust_library(
     crate_name = "rq_tui",
     crate_root = "lib.rs",
     edition = "2021",
-    deps = RUNTIME_DEPS,
+    deps = RUNTIME_DEPS + ["//crates/domain:domain_lib"],
     proc_macro_deps = PROC_MACRO_DEPS,
     visibility = [
         "//:__pkg__",
@@ -66,7 +66,7 @@ rust_test(
     compile_data = ["//:migrations"],
     crate_root = "lib.rs",
     edition = "2021",
-    deps = RUNTIME_DEPS + crate_deps(["pretty_assertions"], package_name = ""),
+    deps = RUNTIME_DEPS + ["//crates/domain:domain_lib"] + crate_deps(["pretty_assertions"], package_name = ""),
     proc_macro_deps = PROC_MACRO_DEPS,
     visibility = ["//:__pkg__"],
 )

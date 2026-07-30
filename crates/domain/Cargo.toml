@@ -1,0 +1,12 @@
+[package]
+name = "rq-tui-domain"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rq_tui_domain"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }

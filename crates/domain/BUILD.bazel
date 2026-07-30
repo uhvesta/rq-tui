@@ -1,0 +1,26 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@crates//:defs.bzl", "crate_deps")
+
+DOMAIN_DEPS = crate_deps(
+    ["anyhow", "serde"],
+    package_name = "crates/domain",
+)
+
+rust_library(
+    name = "domain_lib",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "rq_tui_domain",
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    deps = DOMAIN_DEPS,
+    visibility = ["//src:__pkg__"],
+)
+
+rust_test(
+    name = "domain_tests",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    deps = DOMAIN_DEPS,
+    visibility = ["//visibility:private"],
+)
