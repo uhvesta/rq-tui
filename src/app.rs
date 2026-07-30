@@ -946,6 +946,23 @@ impl AppState {
                         .filter(|thread| !thread.is_empty())
                         .unwrap_or_else(|| "⏺ Ask queued · waiting for Copilot".into()),
                 };
+                let prompt = (annotation.kind == AnnotationKind::Ask).then(|| {
+                    let active_follow_up = self.input_mode == InputMode::Compose
+                        && matches!(
+                            self.compose_target.as_ref(),
+                            Some(ComposeTarget::FollowUp(id)) if id == &annotation.id
+                        );
+                    if active_follow_up {
+                        let mut draft = self.compose.clone();
+                        let cursor = floor_grapheme_boundary(&draft, self.compose_cursor);
+                        draft.insert(cursor, '▏');
+                        format!("❯ {draft}")
+                    } else if self.side_active {
+                        "❯ follow-up unavailable · /main".into()
+                    } else {
+                        "❯ follow up · press i or Enter".into()
+                    }
+                });
                 let mut inline = InlineAnnotation::new(
                     annotation.id.clone(),
                     annotation.file_path.clone(),
@@ -961,6 +978,7 @@ impl AppState {
                     body,
                 )
                 .in_repo(annotation.repo_id.clone());
+                inline.prompt = prompt;
                 inline.collapsed = self.collapsed_annotations.contains(&annotation.id);
                 inline
             })
@@ -995,23 +1013,8 @@ impl AppState {
                     .to_owned(),
                 )
             }
-            ComposeTarget::FollowUp(id) => {
-                let (annotation, placement) = self
-                    .annotations
-                    .iter()
-                    .find(|(annotation, _)| &annotation.id == id)?;
-                (
-                    annotation.repo_id.clone(),
-                    annotation.file_path.clone(),
-                    match placement.side {
-                        AnchorSide::Old => SourceSide::Old,
-                        AnchorSide::New => SourceSide::New,
-                    },
-                    placement.line_start.max(0) as usize,
-                    placement.line_end.max(placement.line_start).max(0) as usize,
-                    "Ask follow-up · draft".into(),
-                )
-            }
+            // Follow-ups are rendered inside their existing Ask annotation.
+            ComposeTarget::FollowUp(_) => return None,
             ComposeTarget::EditAnnotation(id)
             | ComposeTarget::EditAskMessage {
                 annotation_id: id, ..
@@ -1072,11 +1075,18 @@ impl AppState {
                 matches!(
                     row,
                     ReviewRow::Annotation { block, .. }
-                        if block.annotation_id == INLINE_COMPOSER_ID
+                        if (block.annotation_id == INLINE_COMPOSER_ID
                             && matches!(
                                 block.part,
                                 crate::review_stream::AnnotationRowPart::Body { .. }
-                            )
+                            ))
+                            || (matches!(
+                                self.compose_target.as_ref(),
+                                Some(ComposeTarget::FollowUp(id)) if id == &block.annotation_id
+                            ) && matches!(
+                                block.part,
+                                crate::review_stream::AnnotationRowPart::Prompt
+                            ))
                 )
             })
             .unwrap_or(self.review_cursor);

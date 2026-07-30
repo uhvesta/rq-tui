@@ -4733,6 +4733,7 @@ fn render_unified(
     state.compose_wrap_width = body.width.saturating_sub(4).max(1) as usize;
     state.set_review_content_width(body.width.saturating_sub(9) as usize);
     let stream = state.review_stream();
+    sync_active_follow_up_cursor(state, stream.rows());
     let (layout, semantic_rows, composer_cursor) =
         review_display_layout(stream.rows(), body.width.max(1) as usize);
     clamp_review_display_scroll(
@@ -4820,6 +4821,7 @@ fn render_split(
             .min(body_columns[1].width.saturating_sub(6)) as usize,
     );
     let stream = state.review_stream();
+    sync_active_follow_up_cursor(state, stream.rows());
     let selection_side = state.review_selection_side();
     let (layout, semantic_rows, composer_cursor) =
         review_display_layout(stream.rows(), body.width.max(1) as usize);
@@ -4971,18 +4973,44 @@ fn review_display_layout(
     (layout, semantic_rows, composer_cursor)
 }
 
+/// Keep the semantic cursor attached to the prompt row when streamed Ask
+/// messages insert body rows above it.  The row index is intentionally
+/// refreshed from the stable annotation ID on every render.
+fn sync_active_follow_up_cursor(state: &mut AppState, rows: &[ReviewRow]) {
+    let Some(ComposeTarget::FollowUp(annotation_id)) = state.compose_target.as_ref() else {
+        return;
+    };
+    if state.input_mode != InputMode::Compose {
+        return;
+    }
+    if let Some(index) = rows.iter().rposition(|row| {
+        matches!(
+            row,
+            ReviewRow::Annotation { block, .. }
+                if block.annotation_id == *annotation_id
+                    && matches!(block.part, AnnotationRowPart::Prompt)
+        )
+    }) {
+        state.review_cursor = index;
+    }
+}
+
 fn review_row_geometry(row: &ReviewRow, width: usize) -> (usize, Option<usize>) {
     let ReviewRow::Annotation { block, .. } = row else {
         return (1, None);
     };
-    let AnnotationRowPart::Body { .. } = block.part else {
-        return (1, None);
-    };
     let available = width.saturating_sub(4).max(1);
+    if !matches!(
+        block.part,
+        AnnotationRowPart::Body { .. } | AnnotationRowPart::Prompt
+    ) {
+        return (1, None);
+    }
     let lines = wrapped_editor_lines(&block.text, block.text.len(), available).0;
-    let cursor = (block.annotation_id == INLINE_COMPOSER_ID)
-        .then(|| lines.iter().position(|line| line.contains('▏')))
-        .flatten();
+    let cursor = (block.annotation_id == INLINE_COMPOSER_ID
+        || matches!(block.part, AnnotationRowPart::Prompt))
+    .then(|| lines.iter().position(|line| line.contains('▏')))
+    .flatten();
     (lines.len().max(1), cursor)
 }
 
@@ -5261,6 +5289,13 @@ fn review_row_lines_with_search(
                     )]
                 }
                 AnnotationRowPart::Body { .. } => {
+                    let wrapped = wrapped_editor_lines(&block.text, block.text.len(), available).0;
+                    wrapped
+                        .into_iter()
+                        .map(|line| bordered_body(&line, width))
+                        .collect()
+                }
+                AnnotationRowPart::Prompt => {
                     let wrapped = wrapped_editor_lines(&block.text, block.text.len(), available).0;
                     wrapped
                         .into_iter()

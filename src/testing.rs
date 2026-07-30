@@ -2676,9 +2676,79 @@ mod tests {
         type_text(&mut ask, "first question");
         ask.key(key(KeyCode::Enter)).unwrap();
         ask.stream_next_response(&["first ", "answer"]).unwrap();
+        let completed_stream = ask.state.review_stream();
+        let completed_rows: Vec<_> = completed_stream
+            .rows()
+            .iter()
+            .filter_map(|row| match row {
+                crate::review_stream::ReviewRow::Annotation { block, .. }
+                    if block.annotation_id != crate::app::INLINE_COMPOSER_ID =>
+                {
+                    Some(block)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(completed_rows.iter().any(|row| {
+            matches!(row.part, crate::review_stream::AnnotationRowPart::Prompt)
+                && row.text.contains("follow up")
+        }));
+        assert!(completed_rows
+            .iter()
+            .all(|row| row.annotation_id == completed_rows[0].annotation_id));
         ask.key(key(KeyCode::Enter)).unwrap();
         assert_eq!(ask.mode(), "INSERT");
         type_text(&mut ask, "follow-up question");
+        let active_stream = ask.state.review_stream();
+        let active_rows: Vec<_> = active_stream
+            .rows()
+            .iter()
+            .filter_map(|row| match row {
+                crate::review_stream::ReviewRow::Annotation { block, .. }
+                    if block.annotation_id != crate::app::INLINE_COMPOSER_ID =>
+                {
+                    Some(block)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(active_rows.iter().any(|row| {
+            matches!(row.part, crate::review_stream::AnnotationRowPart::Prompt)
+                && row.text.contains("follow-up question")
+                && row.text.contains('▏')
+        }));
+        assert!(active_rows
+            .iter()
+            .all(|row| row.annotation_id == active_rows[0].annotation_id));
+        let prompt_before = active_stream
+            .rows()
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    crate::review_stream::ReviewRow::Annotation { block, .. }
+                        if block.annotation_id == active_rows[0].annotation_id
+                            && matches!(block.part, crate::review_stream::AnnotationRowPart::Prompt)
+                )
+            })
+            .unwrap();
+        let annotation_id = active_rows[0].annotation_id.clone();
+        let thread = ask.state.ask_threads.get_mut(&annotation_id).unwrap();
+        let mut streamed = thread.last().cloned().unwrap();
+        streamed.id = "synthetic-streamed-follow-up".into();
+        streamed.seq += 1;
+        streamed.role = "assistant".into();
+        streamed.text = "a response inserted above the still-editable prompt".into();
+        streamed.sent = true;
+        streamed.delivery_state = DeliveryState::Sent;
+        streamed.ts = "2026-01-01T00:00:00Z".into();
+        thread.push(streamed);
+        ask.render().unwrap();
+        assert!(ask.state.review_cursor > prompt_before);
+        let active_frame = ask.render().unwrap();
+        assert!(active_frame.contains("follow-up question"));
+        assert!(active_frame.contains('▏'));
+        assert!(!active_frame.contains("Ask follow-up · draft"));
         ask.key(key(KeyCode::Enter)).unwrap();
         assert_eq!(ask.agent_commands().len(), 2);
         ask.stream_next_response(&["follow-up ", "answer"]).unwrap();
@@ -2688,6 +2758,19 @@ mod tests {
         let frame = ask.render().unwrap();
         assert!(frame.contains("follow-up question"));
         assert!(frame.contains("follow-up answer"));
+    }
+
+    #[test]
+    fn ask_follow_up_affordance_explains_side_mode_is_disabled() {
+        let mut harness =
+            TuiHarness::from_unified_diff("side-follow-up-affordance", workflow_diff(), 100, 24)
+                .unwrap();
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        type_text(&mut harness, "question");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.state.side_active = true;
+        let frame = harness.render().unwrap();
+        assert!(frame.contains("follow-up unavailable · /main"));
     }
 
     #[test]
