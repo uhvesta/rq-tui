@@ -1808,35 +1808,23 @@ failure paths, `≈` ambiguous-anchor and outdated-placement rendering,
 startup pending-delivery recovery prompt, and the browser preview
 fallback.
 
-### 14.5 Spec errata found during this audit
+### 14.5 Spec errata found during this audit — resolved
 
-Fix these in this document — they will mislead exactly the low-context
-implementer this section targets:
+All seven errata discovered by the live audit are incorporated into the
+authoritative sections above. This ledger remains so a later edit does not
+accidentally reintroduce one of the rejected designs:
 
-- **E1.** §8's change note for `placements.side` still says "with the
-  split old|new diff layout **gone**" — split was restored in §3.2 and
-  stays. The column's rationale (unified's single gutter needs a side
-  tag) survives; the clause about split's removal is residue from the
-  rejected draft and must go.
-- **E2.** §10's FSM still labels the `gm` box "[MD PREVIEW] opens
-  browser" — §3.11 made inline the default with browser as fallback.
-  Update the FSM box.
-- **E3.** Neither §3.4 nor §7.5 says what happens to an inline
-  ask/comment *block* on `Esc` (kept as resumable draft vs removed).
-  The build keeps it ("Draft kept"); testers read the spec as promising
-  removal. Write the intended behavior down (see J19).
-- **E4.** §7.5's composer "safe height cap" has no value (fraction of
-  terminal height? fixed rows?). The build picked one; the spec should
-  state it.
-- **E5.** §8 has no table for MAIN Chat transcript messages/outbox,
-  yet §6.2 assigns delivery states to "every outbound message"
-  including chat prompts, and §7.1 requires restoring MAIN history.
-  The implementation solved this; the schema section should document
-  the table(s) it actually uses.
-- **E6.** §3.10 scopes `:prune` to rows "with at least one **open
-  event** or annotation" — there is no events table in §8;
-  `last_opened_at` columns are the real mechanism. Align the wording.
-- **E7.** §4.1's "`i` (or **starting to type** in an input context)
-  enters INSERT" never defines which keys auto-enter INSERT where.
-  This ambiguity is load-bearing: it's the same transition J2's race
-  lives in. Specify the exact trigger set per context.
+- **E1 resolved:** §8 explains `placements.side` using unified's
+  side-dependent gutter while explicitly retaining split layout.
+- **E2 resolved:** §10 describes `gm` as an inline Markdown preview; browser
+  rendering is only the fallback from §3.11.
+- **E3 resolved:** §3.4 and §7.5 say `Esc` preserves a non-empty inline draft
+  block and `Ctrl-C` explicitly discards it.
+- **E4 resolved:** §7.5 defines the composer cap as one third of terminal
+  height, with a three-row minimum and twelve-row maximum.
+- **E5 resolved:** §8 documents `chat_outbox`; acknowledged transcript
+  history remains owned by the resumed SDK session.
+- **E6 resolved:** §3.10 scopes prune history with `last_opened_at` or at
+  least one annotation, matching the schema.
+- **E7 resolved:** §4.1 enumerates the exact commands that synchronously
+  enter INSERT; printable text never auto-enters from NORMAL.
