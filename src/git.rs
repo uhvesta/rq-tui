@@ -15,6 +15,7 @@ pub(crate) struct LocalRepoState {
     pub(crate) name: String,
     pub(crate) base_branch: String,
     pub(crate) merge_base: String,
+    pub(crate) raw_diff: String,
     pub(crate) last_activity_at: String,
 }
 
@@ -86,7 +87,12 @@ impl<R: CommandRunner> Git<R> {
             None => self.detect_default_branch(&path)?,
         };
         let merge_base = self.git_stdout(&path, ["merge-base", "HEAD", &base_branch])?;
-        if !self.has_diff(&path, &merge_base)? {
+        // Materialize the review diff once. The old quiet probe scanned every
+        // changed repository and then immediately ran the full diff again.
+        // Clean repositories still produce an empty string, while changed
+        // repositories carry their already-computed payload into resolution.
+        let raw_diff = self.diff(&path, &merge_base, 6)?;
+        if raw_diff.is_empty() {
             return Ok(None);
         }
         let last_activity_at = self.last_tracked_activity(&path)?;
@@ -100,6 +106,7 @@ impl<R: CommandRunner> Git<R> {
             name,
             base_branch,
             merge_base,
+            raw_diff,
             last_activity_at,
         }))
     }
@@ -235,20 +242,6 @@ impl<R: CommandRunner> Git<R> {
         Ok(PathBuf::from(
             self.git_stdout(path, ["rev-parse", "--show-toplevel"])?,
         ))
-    }
-
-    fn has_diff(&self, repo: &Path, merge_base: &str) -> Result<bool> {
-        let output =
-            self.git_output(repo, ["diff", "--quiet", "--no-ext-diff", merge_base, "--"])?;
-        match output.status.code() {
-            Some(0) => Ok(false),
-            Some(1) => Ok(true),
-            _ => bail!(
-                "git diff failed in {}: {}",
-                repo.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        }
     }
 
     fn last_tracked_activity(&self, repo: &Path) -> Result<String> {
@@ -415,6 +408,7 @@ mod tests {
             temp.path().file_name().unwrap().to_string_lossy()
         );
         assert_eq!(state.base_branch, "main");
+        assert!(state.raw_diff.contains("println!"));
     }
 
     #[test]

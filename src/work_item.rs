@@ -149,7 +149,7 @@ pub(crate) fn resolve_local(
 
     let repos = states
         .into_iter()
-        .map(|(state, overridden)| resolve_repo(&git, &item, state, overridden, storage))
+        .map(|(state, overridden)| resolve_repo(&item, state, overridden, storage))
         .collect::<Result<Vec<_>>>()?;
 
     let session_root = paths.roots.join(&item.id);
@@ -162,7 +162,6 @@ pub(crate) fn resolve_local(
 }
 
 fn resolve_repo(
-    git: &Git,
     item: &WorkItem,
     state: LocalRepoState,
     overridden: bool,
@@ -197,8 +196,7 @@ fn resolve_repo(
         last_opened_at: Some(now()),
     };
     storage.upsert_version(&version)?;
-    let raw = git.diff(&repo.path, &state.merge_base, 6)?;
-    let diff = parse_unified(&raw)?;
+    let diff = parse_unified(&state.raw_diff)?;
     refresh_local_placements(storage, &repo, &version, &diff)?;
     Ok(ReviewRepo {
         record: repo,
