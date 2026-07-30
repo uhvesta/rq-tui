@@ -204,6 +204,29 @@ pub(crate) struct DiffSelection {
     pub(crate) end_row: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewSelectionMode {
+    Character,
+    Line,
+    Block,
+}
+
+impl ReviewSelectionMode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Character => "CHAR",
+            Self::Line => "LINE",
+            Self::Block => "BLOCK",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewRowSelection {
+    Whole,
+    Columns { start: usize, end: usize },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ComposeTarget {
     Annotation(AnnotationKind),
@@ -529,6 +552,12 @@ pub(crate) struct AppState {
     pub(crate) review_cursor: usize,
     pub(crate) review_scroll: usize,
     pub(crate) visual_anchor: Option<usize>,
+    pub(crate) review_visual_mode: Option<ReviewSelectionMode>,
+    pub(crate) review_visual_anchor_column: usize,
+    pub(crate) review_visual_column: usize,
+    pub(crate) review_visual_preferred_column: usize,
+    pub(crate) review_horizontal_scroll: usize,
+    pub(crate) review_content_width: usize,
     /// Width-specific renderer index. Cursor and selection endpoints remain
     /// source based, therefore survive a layout rebuild.
     pub(crate) chat_layout: Option<ChatLayout>,
@@ -631,6 +660,12 @@ impl AppState {
             review_cursor: 0,
             review_scroll: 0,
             visual_anchor: None,
+            review_visual_mode: None,
+            review_visual_anchor_column: 0,
+            review_visual_column: 0,
+            review_visual_preferred_column: 0,
+            review_horizontal_scroll: 0,
+            review_content_width: 1,
             chat_layout: None,
             chat_navigation: None,
             chat_selection: None,
@@ -1078,6 +1113,39 @@ impl AppState {
             .unwrap_or(0);
     }
 
+    fn sync_review_cursor_to_current_source(&mut self) {
+        let repo_id = self
+            .work_item
+            .repos
+            .get(self.repo_index)
+            .map(|repo| repo.record.id.clone());
+        let file = self
+            .current_file()
+            .map(|file| file.path().to_string_lossy().into_owned());
+        let (Some(repo_id), Some(file)) = (repo_id, file) else {
+            return;
+        };
+        if let Some(index) = self.review_stream().rows().iter().position(|row| {
+            matches!(
+                row,
+                ReviewRow::Source {
+                    repo_id: row_repo,
+                    file: path,
+                    old_anchor,
+                    new_anchor,
+                    ..
+                } if row_repo == &repo_id
+                    && path == &file
+                    && new_anchor
+                        .as_ref()
+                        .or(old_anchor.as_ref())
+                        .is_some_and(|anchor| anchor.visible_line == self.cursor)
+            )
+        }) {
+            self.review_cursor = index;
+        }
+    }
+
     pub(crate) fn selection(&self) -> (usize, usize) {
         let anchor = self.visual_anchor.unwrap_or(self.cursor);
         (cmp::min(anchor, self.cursor), cmp::max(anchor, self.cursor))
@@ -1086,6 +1154,84 @@ impl AppState {
     pub(crate) fn diff_selection(&self) -> DiffSelection {
         let (start_row, end_row) = self.selection();
         DiffSelection { start_row, end_row }
+    }
+
+    pub(crate) fn review_selection_mode(&self) -> Option<ReviewSelectionMode> {
+        if self.input_mode == InputMode::Visual && self.focus != Focus::Chat {
+            self.review_visual_mode
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn review_selection_side(&self) -> Option<AnchorSide> {
+        let selection = self.diff_selection();
+        self.current_file()
+            .and_then(|file| {
+                anchor_from_diff(file, selection.start_row, selection.end_row)
+                    .ok()
+                    .map(|anchor| anchor.side)
+            })
+            .or_else(|| {
+                self.current_file()
+                    .and_then(|file| file.visible_lines().nth(self.cursor))
+                    .map(|line| {
+                        if line.kind == LineKind::Deletion {
+                            AnchorSide::Old
+                        } else {
+                            AnchorSide::New
+                        }
+                    })
+            })
+    }
+
+    pub(crate) fn review_row_selection(&self, row: usize) -> Option<ReviewRowSelection> {
+        let mode = self.review_selection_mode()?;
+        let (start_row, end_row) = self.selection();
+        if !(start_row..=end_row).contains(&row) {
+            return None;
+        }
+        match mode {
+            ReviewSelectionMode::Line => Some(ReviewRowSelection::Whole),
+            ReviewSelectionMode::Block => Some(ReviewRowSelection::Columns {
+                start: self
+                    .review_visual_anchor_column
+                    .min(self.review_visual_column),
+                end: self
+                    .review_visual_anchor_column
+                    .max(self.review_visual_column),
+            }),
+            ReviewSelectionMode::Character => {
+                let anchor = (
+                    self.visual_anchor.unwrap_or(self.cursor),
+                    self.review_visual_anchor_column,
+                );
+                let active = (self.cursor, self.review_visual_column);
+                let (start, end) = if anchor <= active {
+                    (anchor, active)
+                } else {
+                    (active, anchor)
+                };
+                if start.0 == end.0 {
+                    Some(ReviewRowSelection::Columns {
+                        start: start.1,
+                        end: end.1,
+                    })
+                } else if row == start.0 {
+                    Some(ReviewRowSelection::Columns {
+                        start: start.1,
+                        end: usize::MAX,
+                    })
+                } else if row == end.0 {
+                    Some(ReviewRowSelection::Columns {
+                        start: 0,
+                        end: end.1,
+                    })
+                } else {
+                    Some(ReviewRowSelection::Whole)
+                }
+            }
+        }
     }
 
     pub(crate) fn has_unsubmitted_work(&self) -> bool {
@@ -1266,6 +1412,147 @@ impl AppState {
         self.chat_autofollow = false;
         self.input_mode = InputMode::Visual;
         true
+    }
+
+    fn enter_review_visual(&mut self, mode: ReviewSelectionMode) -> bool {
+        let mut stream = self.review_stream();
+        stream.set_cursor(self.review_cursor);
+        if !matches!(stream.current(), Some(ReviewRow::Source { .. })) {
+            self.status =
+                "Visual selection starts on source rows, not headers or annotation blocks".into();
+            return false;
+        }
+        self.input_mode = InputMode::Visual;
+        self.visual_anchor = Some(self.cursor);
+        self.review_visual_mode = Some(mode);
+        self.review_visual_anchor_column = 0;
+        self.review_visual_column = 0;
+        self.review_visual_preferred_column = 0;
+        self.review_horizontal_scroll = 0;
+        self.status = format!(
+            "VISUAL {} · h/l columns · j/k rows · y copy · a ask · c comment",
+            mode.label()
+        );
+        true
+    }
+
+    fn move_review_visual_horizontal(&mut self, forward: bool) {
+        let Some(mode) = self.review_selection_mode() else {
+            return;
+        };
+        if mode == ReviewSelectionMode::Line {
+            self.status = "VISUAL LINE spans complete rows · use j/k to extend".into();
+            return;
+        }
+        let Some(text) = self
+            .current_file()
+            .and_then(|file| file.visible_lines().nth(self.cursor))
+            .map(|line| line.content.as_str())
+        else {
+            return;
+        };
+        self.review_visual_column = match mode {
+            ReviewSelectionMode::Character if forward => {
+                next_source_column(text, self.review_visual_column)
+            }
+            ReviewSelectionMode::Character => {
+                previous_source_column(text, self.review_visual_column)
+            }
+            ReviewSelectionMode::Block if forward => self
+                .review_visual_column
+                .saturating_add(1)
+                .min(cell_width(text).saturating_sub(1)),
+            ReviewSelectionMode::Block => self.review_visual_column.saturating_sub(1),
+            ReviewSelectionMode::Line => unreachable!(),
+        };
+        self.review_visual_preferred_column = self.review_visual_column;
+        self.ensure_review_column_visible();
+    }
+
+    fn move_review_visual_to_edge(&mut self, end: bool) {
+        if self.review_selection_mode() == Some(ReviewSelectionMode::Line) {
+            self.status = "VISUAL LINE spans complete rows · use j/k to extend".into();
+            return;
+        }
+        let Some(text) = self.current_review_source_text() else {
+            return;
+        };
+        self.review_visual_column = if end {
+            source_grapheme_columns(text).last().copied().unwrap_or(0)
+        } else {
+            0
+        };
+        self.review_visual_preferred_column = self.review_visual_column;
+        self.ensure_review_column_visible();
+    }
+
+    fn move_review_visual_word(&mut self, forward: bool) {
+        if self.review_selection_mode() == Some(ReviewSelectionMode::Line) {
+            self.status = "VISUAL LINE spans complete rows · use j/k to extend".into();
+            return;
+        }
+        let Some(text) = self.current_review_source_text() else {
+            return;
+        };
+        self.review_visual_column = if forward {
+            next_source_word_column(text, self.review_visual_column)
+        } else {
+            previous_source_word_column(text, self.review_visual_column)
+        };
+        self.review_visual_preferred_column = self.review_visual_column;
+        self.ensure_review_column_visible();
+    }
+
+    fn current_review_source_text(&self) -> Option<&str> {
+        self.current_file()
+            .and_then(|file| file.visible_lines().nth(self.cursor))
+            .map(|line| line.content.as_str())
+    }
+
+    pub(crate) fn set_review_content_width(&mut self, width: usize) {
+        self.review_content_width = width.max(1);
+        self.ensure_review_column_visible();
+    }
+
+    fn ensure_review_column_visible(&mut self) {
+        let Some(text) = self.current_review_source_text() else {
+            return;
+        };
+        let total_width = cell_width(text);
+        let active_end = source_column_end(text, self.review_visual_column);
+        for _ in 0..2 {
+            let marker_width = usize::from(self.review_horizontal_scroll > 0)
+                + usize::from(active_end < total_width);
+            let usable = self
+                .review_content_width
+                .saturating_sub(marker_width)
+                .max(1);
+            if self.review_visual_column < self.review_horizontal_scroll {
+                self.review_horizontal_scroll = self.review_visual_column;
+            } else if active_end > self.review_horizontal_scroll.saturating_add(usable) {
+                self.review_horizontal_scroll = active_end.saturating_sub(usable);
+            }
+        }
+    }
+
+    fn sync_review_visual_column(&mut self) {
+        if self.review_selection_mode() != Some(ReviewSelectionMode::Character) {
+            return;
+        }
+        let Some(text) = self
+            .current_file()
+            .and_then(|file| file.visible_lines().nth(self.cursor))
+            .map(|line| line.content.as_str())
+        else {
+            self.review_visual_column = 0;
+            return;
+        };
+        self.review_visual_column = source_grapheme_columns(text)
+            .into_iter()
+            .take_while(|column| *column <= self.review_visual_preferred_column)
+            .last()
+            .unwrap_or(0);
+        self.ensure_review_column_visible();
     }
 
     fn move_chat_semantic(&mut self, movement: Movement) -> bool {
@@ -1485,7 +1772,7 @@ impl AppState {
         }
         match key.code {
             KeyCode::Char(':') => {
-                self.clear_visual_selection();
+                self.input_return_mode = self.input_mode;
                 self.input_mode = InputMode::Command;
                 self.command.clear();
                 self.command_index = 0;
@@ -1532,6 +1819,36 @@ impl AppState {
             KeyCode::Char('b') if self.focus == Focus::Chat => {
                 self.move_chat_semantic(Movement::WordBackward);
             }
+            KeyCode::Char('0')
+                if self.focus == Focus::Diff && self.input_mode == InputMode::Visual =>
+            {
+                self.move_review_visual_to_edge(false);
+            }
+            KeyCode::Char('$')
+                if self.focus == Focus::Diff && self.input_mode == InputMode::Visual =>
+            {
+                self.move_review_visual_to_edge(true);
+            }
+            KeyCode::Char('w')
+                if self.focus == Focus::Diff && self.input_mode == InputMode::Visual =>
+            {
+                self.move_review_visual_word(true);
+            }
+            KeyCode::Char('b')
+                if self.focus == Focus::Diff && self.input_mode == InputMode::Visual =>
+            {
+                self.move_review_visual_word(false);
+            }
+            KeyCode::Char('h')
+                if self.focus == Focus::Diff && self.input_mode == InputMode::Visual =>
+            {
+                self.move_review_visual_horizontal(false);
+            }
+            KeyCode::Char('l')
+                if self.focus == Focus::Diff && self.input_mode == InputMode::Visual =>
+            {
+                self.move_review_visual_horizontal(true);
+            }
             KeyCode::Char('h') if self.focus == Focus::Diff => self.previous_file(),
             KeyCode::Char('l') if self.focus == Focus::Diff => self.next_file(),
             KeyCode::Char('h') if self.focus == Focus::FilePicker => self.collapse_current_repo(),
@@ -1544,24 +1861,19 @@ impl AppState {
                 self.enter_chat_visual(ChatSelectionMode::Line);
             }
             KeyCode::Char('v')
-                if matches!(self.screen, Screen::Review | Screen::Chat)
+                if self.screen == Screen::Review
                     && matches!(self.focus, Focus::Diff | Focus::InlineAsk) =>
             {
-                let mut stream = self.review_stream();
-                stream.set_cursor(self.review_cursor);
-                if matches!(stream.current(), Some(ReviewRow::Source { .. })) {
-                    self.input_mode = InputMode::Visual;
-                    self.visual_anchor = Some(self.cursor);
-                } else {
-                    self.status =
-                        "Visual selection starts on source rows, not headers or annotation blocks"
-                            .into();
-                }
+                self.enter_review_visual(ReviewSelectionMode::Character);
+            }
+            KeyCode::Char('V')
+                if self.screen == Screen::Review
+                    && matches!(self.focus, Focus::Diff | Focus::InlineAsk) =>
+            {
+                self.enter_review_visual(ReviewSelectionMode::Line);
             }
             KeyCode::Esc if self.input_mode == InputMode::Visual => {
-                self.input_mode = InputMode::Normal;
-                self.visual_anchor = None;
-                self.chat_selection = None;
+                self.clear_visual_selection();
             }
             KeyCode::Esc if !self.search.is_empty() => {
                 self.search.clear();
@@ -1680,8 +1992,7 @@ impl AppState {
                 {
                     if ambiguous || outdated {
                         let selection = self.diff_selection();
-                        self.input_mode = InputMode::Normal;
-                        self.visual_anchor = None;
+                        self.clear_visual_selection();
                         return vec![Effect::RepinAnnotation {
                             annotation_id,
                             selection,
@@ -2452,6 +2763,13 @@ impl AppState {
                 self.enter_chat_visual(ChatSelectionMode::Block);
                 return Vec::new();
             }
+            KeyCode::Char('v')
+                if self.screen == Screen::Review
+                    && matches!(self.focus, Focus::Diff | Focus::InlineAsk) =>
+            {
+                self.enter_review_visual(ReviewSelectionMode::Block);
+                return Vec::new();
+            }
             KeyCode::Char('c') => {
                 if self.side_starting {
                     return vec![Effect::ExitSide];
@@ -2572,15 +2890,30 @@ impl AppState {
                 return Vec::new();
             }
             self.command.clear();
-            self.input_mode = InputMode::Normal;
+            let restore_visual = self.input_return_mode == InputMode::Visual
+                && matches!(command.trim(), "diff split" | "diff unified");
+            if restore_visual {
+                self.input_mode = InputMode::Visual;
+            } else {
+                if self.input_return_mode == InputMode::Visual {
+                    self.clear_visual_selection();
+                }
+                self.input_mode = InputMode::Normal;
+            }
+            self.input_return_mode = InputMode::Normal;
             self.status.clear();
             return self.execute_command(command.trim());
         }
         match key.code {
             KeyCode::Esc => {
-                self.input_mode = InputMode::Normal;
+                self.input_mode = self.input_return_mode;
+                self.input_return_mode = InputMode::Normal;
                 self.command.clear();
-                self.status = "NORMAL · command palette closed".into();
+                self.status = if self.input_mode == InputMode::Visual {
+                    "VISUAL · command palette closed · selection preserved".into()
+                } else {
+                    "NORMAL · command palette closed".into()
+                };
                 Vec::new()
             }
             KeyCode::Backspace => {
@@ -2732,6 +3065,9 @@ impl AppState {
                     self.compose_scroll = 0;
                     self.input_mode = self.input_return_mode;
                     self.compose_target = None;
+                    if self.input_mode == InputMode::Visual {
+                        self.sync_review_cursor_to_current_source();
+                    }
                     self.status = "Draft cancelled".into();
                     return Vec::new();
                 }
@@ -2783,6 +3119,9 @@ impl AppState {
                     self.compose.clear();
                     self.compose_cursor = 0;
                     self.compose_target = None;
+                }
+                if self.input_mode == InputMode::Visual {
+                    self.sync_review_cursor_to_current_source();
                 }
                 Vec::new()
             }
@@ -2885,8 +3224,8 @@ impl AppState {
             .take()
             .expect("compose mode always has a target");
         let selection = self.diff_selection();
+        self.clear_review_visual_selection();
         self.input_mode = InputMode::Normal;
-        self.visual_anchor = None;
         let slash_commands_enabled = matches!(
             &target,
             ComposeTarget::Chat
@@ -2988,14 +3327,12 @@ impl AppState {
             (Some("q!" | "quit!"), _) => vec![Effect::Quit { force: true }],
             (Some("diff"), Some("split")) => {
                 self.layout = DiffLayout::Split;
-                self.clear_visual_selection();
-                self.status = "Diff layout: split · annotations remain inline".into();
+                self.status = "Diff layout: split · semantic selection preserved".into();
                 Vec::new()
             }
             (Some("diff"), Some("unified")) => {
                 self.layout = DiffLayout::Unified;
-                self.clear_visual_selection();
-                self.status = "Diff layout: unified".into();
+                self.status = "Diff layout: unified · semantic selection preserved".into();
                 Vec::new()
             }
             (Some("diff"), Some("expand")) => {
@@ -3277,6 +3614,8 @@ impl AppState {
             _ => {
                 let last = self.current_line_count().saturating_sub(1);
                 self.cursor = cmp::min(last, self.cursor.saturating_add(amount));
+                self.sync_review_visual_column();
+                self.sync_review_cursor_to_current_source();
                 self.ensure_cursor_visible();
             }
         }
@@ -3311,6 +3650,8 @@ impl AppState {
             }
             _ => {
                 self.cursor = self.cursor.saturating_sub(amount);
+                self.sync_review_visual_column();
+                self.sync_review_cursor_to_current_source();
                 self.ensure_cursor_visible();
             }
         }
@@ -3372,11 +3713,20 @@ impl AppState {
     }
 
     fn clear_visual_selection(&mut self) {
-        self.visual_anchor = None;
+        self.clear_review_visual_selection();
         self.chat_selection = None;
         if self.input_mode == InputMode::Visual {
             self.input_mode = InputMode::Normal;
         }
+    }
+
+    fn clear_review_visual_selection(&mut self) {
+        self.visual_anchor = None;
+        self.review_visual_mode = None;
+        self.review_visual_anchor_column = 0;
+        self.review_visual_column = 0;
+        self.review_visual_preferred_column = 0;
+        self.review_horizontal_scroll = 0;
     }
 
     fn jump_top(&mut self) {
@@ -3386,6 +3736,10 @@ impl AppState {
                 self.chat_cursor = 0;
                 self.chat_scroll = 0;
             }
+        } else if self.input_mode == InputMode::Visual {
+            self.cursor = 0;
+            self.sync_review_visual_column();
+            self.sync_review_cursor_to_current_source();
         } else {
             self.move_review_stream(StreamMovement::First);
         }
@@ -3402,6 +3756,10 @@ impl AppState {
                 self.chat_cursor = self.chat.len().saturating_sub(1);
                 self.chat_scroll = self.chat_total_rows.saturating_sub(self.chat_viewport_rows);
             }
+        } else if self.input_mode == InputMode::Visual {
+            self.cursor = self.current_line_count().saturating_sub(1);
+            self.sync_review_visual_column();
+            self.sync_review_cursor_to_current_source();
         } else {
             self.move_review_stream(StreamMovement::Last);
         }
@@ -3452,6 +3810,8 @@ impl AppState {
         });
         if let Some(index) = matches {
             self.cursor = index;
+            self.sync_review_visual_column();
+            self.sync_review_cursor_to_current_source();
             self.ensure_cursor_visible();
         } else {
             self.status = format!("Pattern not found: {}", self.search);
@@ -3496,6 +3856,8 @@ impl AppState {
         });
         if let Some(index) = found {
             self.cursor = index;
+            self.sync_review_visual_column();
+            self.sync_review_cursor_to_current_source();
             self.ensure_cursor_visible();
         } else {
             self.status = format!("Pattern not found: {}", self.search);
@@ -3793,8 +4155,7 @@ impl AppState {
                 .current_file()
                 .map(|file| file.display_path.display().to_string())
                 .unwrap_or_default();
-            self.input_mode = InputMode::Normal;
-            self.visual_anchor = None;
+            self.clear_visual_selection();
             return vec![Effect::Yank(text)];
         }
         let Some(file) = self.current_file() else {
@@ -3805,18 +4166,164 @@ impl AppState {
         } else {
             (self.cursor, self.cursor)
         };
-        let text = file
+        let selected = file
             .visible_lines()
+            .enumerate()
             .skip(start)
             .take(end.saturating_sub(start) + 1)
-            .filter(|line| line.kind != LineKind::Meta)
-            .map(|line| line.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.input_mode = InputMode::Normal;
-        self.visual_anchor = None;
+            .filter(|(_, line)| line.kind != LineKind::Meta)
+            .collect::<Vec<_>>();
+        let text = match self.review_selection_mode() {
+            Some(ReviewSelectionMode::Line) => {
+                let mut text = selected
+                    .iter()
+                    .map(|(_, line)| line.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text
+            }
+            Some(ReviewSelectionMode::Character | ReviewSelectionMode::Block) => selected
+                .iter()
+                .map(|(row, line)| match self.review_row_selection(*row) {
+                    Some(ReviewRowSelection::Whole) => line.content.clone(),
+                    Some(ReviewRowSelection::Columns { start, end }) => {
+                        source_cell_slice(&line.content, start, end)
+                    }
+                    None => String::new(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None => selected
+                .iter()
+                .map(|(_, line)| line.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        self.clear_visual_selection();
         vec![Effect::Yank(text)]
     }
+}
+
+fn source_grapheme_columns(text: &str) -> Vec<usize> {
+    let mut columns = Vec::new();
+    let mut column = 0usize;
+    for (_, grapheme) in grapheme_indices(text) {
+        columns.push(column);
+        column = column.saturating_add(cell_width(grapheme).max(1));
+    }
+    columns
+}
+
+fn next_source_column(text: &str, current: usize) -> usize {
+    let columns = source_grapheme_columns(text);
+    columns
+        .iter()
+        .copied()
+        .find(|column| *column > current)
+        .unwrap_or_else(|| columns.last().copied().unwrap_or(0))
+}
+
+fn previous_source_column(text: &str, current: usize) -> usize {
+    source_grapheme_columns(text)
+        .into_iter()
+        .take_while(|column| *column < current)
+        .last()
+        .unwrap_or(0)
+}
+
+fn source_column_end(text: &str, current: usize) -> usize {
+    let mut column = 0usize;
+    for (_, grapheme) in grapheme_indices(text) {
+        let end = column.saturating_add(cell_width(grapheme).max(1));
+        if column >= current || end > current {
+            return end;
+        }
+        column = end;
+    }
+    column
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceWordClass {
+    Space,
+    Word,
+    Punctuation,
+}
+
+fn source_word_columns(text: &str) -> Vec<(usize, SourceWordClass)> {
+    let mut column = 0usize;
+    grapheme_indices(text)
+        .map(|(_, grapheme)| {
+            let class = if grapheme.chars().all(char::is_whitespace) {
+                SourceWordClass::Space
+            } else if grapheme
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == '_')
+            {
+                SourceWordClass::Word
+            } else {
+                SourceWordClass::Punctuation
+            };
+            let start = column;
+            column = column.saturating_add(cell_width(grapheme).max(1));
+            (start, class)
+        })
+        .collect()
+}
+
+fn next_source_word_column(text: &str, current: usize) -> usize {
+    let columns = source_word_columns(text);
+    let Some(mut index) = columns.iter().rposition(|(column, _)| *column <= current) else {
+        return 0;
+    };
+    let class = columns[index].1;
+    while index + 1 < columns.len() && columns[index + 1].1 == class {
+        index += 1;
+    }
+    while index + 1 < columns.len() && columns[index + 1].1 == SourceWordClass::Space {
+        index += 1;
+    }
+    columns
+        .get(index + 1)
+        .or_else(|| columns.last())
+        .map(|(column, _)| *column)
+        .unwrap_or(0)
+}
+
+fn previous_source_word_column(text: &str, current: usize) -> usize {
+    let columns = source_word_columns(text);
+    let Some(mut index) = columns.iter().position(|(column, _)| *column >= current) else {
+        return columns.last().map(|(column, _)| *column).unwrap_or(0);
+    };
+    index = index.saturating_sub(1);
+    while index > 0 && columns[index].1 == SourceWordClass::Space {
+        index -= 1;
+    }
+    let class = columns[index].1;
+    while index > 0 && columns[index - 1].1 == class {
+        index -= 1;
+    }
+    columns[index].0
+}
+
+fn source_cell_slice(text: &str, start: usize, end: usize) -> String {
+    let mut output = String::new();
+    let mut column = 0usize;
+    for (_, grapheme) in grapheme_indices(text) {
+        let width = cell_width(grapheme).max(1);
+        let grapheme_end = column.saturating_add(width).saturating_sub(1);
+        if column <= end && grapheme_end >= start {
+            output.push_str(grapheme);
+        }
+        column = column.saturating_add(width);
+        if column > end {
+            break;
+        }
+    }
+    output
 }
 
 fn terminal_enter(key: &KeyEvent) -> bool {

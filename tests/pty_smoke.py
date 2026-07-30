@@ -523,6 +523,10 @@ def main() -> int:
             child.wait_for_screen("rows 2-2", timeout=4)
             child.send(b"\x1b")
             child.wait_for_screen("NORMAL", timeout=4)
+            child.send(b"\x16")
+            child.wait_for_screen("VISUAL BLOCK", timeout=4)
+            child.send(b"\x1b")
+            child.wait_for_screen("NORMAL", timeout=4)
 
             # The compiled TUI's prune screen must visibly disable the open
             # Work Item and retain the live Copilot progress surface.

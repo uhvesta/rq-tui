@@ -536,6 +536,15 @@ impl TuiHarness {
             .count())
     }
 
+    pub fn selected_cell_count_in_columns(&mut self, start: u16, end: u16) -> Result<usize> {
+        let terminal = self.draw()?;
+        let buffer = terminal.backend().buffer();
+        Ok((0..self.height)
+            .flat_map(|row| (start..end.min(self.width)).map(move |column| (column, row)))
+            .filter(|(column, row)| buffer[(*column, *row)].bg == Color::Rgb(40, 50, 65))
+            .count())
+    }
+
     pub fn resize(&mut self, width: u16, height: u16) {
         self.width = width;
         self.height = height;
@@ -1439,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn global_review_jumps_clear_visual_selection_at_file_boundaries() {
+    fn review_visual_top_and_bottom_stay_inside_the_current_file() {
         let mut harness = TuiHarness::from_unified_diff(
             "manyfiles",
             &super::ui_script_fixture("manyfiles").unwrap().1,
@@ -1447,11 +1456,17 @@ mod tests {
             20,
         )
         .unwrap();
-        harness.key(key(KeyCode::Char('v'))).unwrap();
+        let first_file_lines = harness.state.current_line_count();
+        harness.key(key(KeyCode::Char('V'))).unwrap();
         harness.key(key(KeyCode::Char('G'))).unwrap();
-        assert_eq!(harness.mode(), "NORMAL");
-        assert!(harness.status().contains("file boundary"));
-        assert!(harness.render().unwrap().contains("src/module_12.rs"));
+        assert_eq!(harness.mode(), "VISUAL");
+        assert_eq!(harness.state.file_index, 0);
+        assert_eq!(harness.state.cursor, first_file_lines.saturating_sub(1));
+        harness.key(key(KeyCode::Char('g'))).unwrap();
+        harness.key(key(KeyCode::Char('g'))).unwrap();
+        assert_eq!(harness.mode(), "VISUAL");
+        assert_eq!(harness.state.file_index, 0);
+        assert_eq!(harness.state.cursor, 0);
     }
 
     #[test]
@@ -1755,7 +1770,7 @@ mod tests {
     fn visual_range_ask_uses_exact_new_source_range() {
         let mut harness =
             TuiHarness::from_unified_diff("workflow", workflow_diff(), 110, 28).unwrap();
-        harness.key(key(KeyCode::Char('v'))).unwrap();
+        harness.key(key(KeyCode::Char('V'))).unwrap();
         harness.key(key(KeyCode::Char('j'))).unwrap();
         harness.key(key(KeyCode::Char('j'))).unwrap();
         assert_eq!(harness.mode(), "VISUAL");
@@ -1800,7 +1815,7 @@ mod tests {
 
         let mut visual = TuiHarness::from_unified_diff("visual", workflow_diff(), 110, 28).unwrap();
         visual.key(key(KeyCode::Char('j'))).unwrap();
-        visual.key(key(KeyCode::Char('v'))).unwrap();
+        visual.key(key(KeyCode::Char('V'))).unwrap();
         visual.key(key(KeyCode::Char('j'))).unwrap();
         visual.key(key(KeyCode::Char('c'))).unwrap();
         type_text(&mut visual, "Two-line note");
@@ -1814,13 +1829,13 @@ mod tests {
     #[test]
     fn visual_yank_preserves_source_order_across_addition_and_context() {
         let mut harness = TuiHarness::from_unified_diff("yank", workflow_diff(), 100, 24).unwrap();
-        harness.key(key(KeyCode::Char('v'))).unwrap();
+        harness.key(key(KeyCode::Char('V'))).unwrap();
         harness.key(key(KeyCode::Char('j'))).unwrap();
         harness.key(key(KeyCode::Char('j'))).unwrap();
         harness.key(key(KeyCode::Char('y'))).unwrap();
         assert_eq!(
             harness.last_yank(),
-            Some("fn review() {\n    let added = true;\n    use_added();")
+            Some("fn review() {\n    let added = true;\n    use_added();\n")
         );
         assert_eq!(harness.mode(), "NORMAL");
     }
@@ -1970,7 +1985,7 @@ mod tests {
     }
 
     #[test]
-    fn file_switch_clears_visual_mode_and_split_unified_render_selection() {
+    fn file_switch_clears_visual_mode_and_layout_changes_preserve_selection() {
         let two_files = format!(
             "{}{}",
             workflow_diff(),
@@ -1984,7 +1999,7 @@ mod tests {
             )
         );
         let mut harness = TuiHarness::from_unified_diff("switch", &two_files, 110, 28).unwrap();
-        harness.key(key(KeyCode::Char('v'))).unwrap();
+        harness.key(key(KeyCode::Char('V'))).unwrap();
         harness.key(key(KeyCode::Char('j'))).unwrap();
         let split_selected = harness.selected_cell_count().unwrap();
         assert!(split_selected > 110);
@@ -1992,16 +2007,145 @@ mod tests {
         harness.key(key(KeyCode::Char(':'))).unwrap();
         type_text(&mut harness, "diff unified");
         harness.key(key(KeyCode::Enter)).unwrap();
-        harness.key(key(KeyCode::Char('v'))).unwrap();
-        harness.key(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(harness.mode(), "VISUAL");
+        assert!(harness.render().unwrap().contains("VISUAL LINE"));
         assert!(harness.selected_cell_count().unwrap() > 110);
 
-        harness.key(key(KeyCode::Esc)).unwrap();
         harness.key(key(KeyCode::Char('l'))).unwrap();
-        harness.key(key(KeyCode::Char('v'))).unwrap();
+        assert_eq!(harness.mode(), "VISUAL");
+        assert!(harness.render().unwrap().contains("src/lib.rs"));
+        harness.key(key(KeyCode::Esc)).unwrap();
         harness.key(key(KeyCode::Char('l'))).unwrap();
         assert_eq!(harness.mode(), "NORMAL");
         assert!(harness.render().unwrap().contains("src/two.rs"));
+    }
+
+    #[test]
+    fn review_visual_modes_have_distinct_rendering_and_exact_copy_semantics() {
+        let mut character =
+            TuiHarness::from_unified_diff("review-char", workflow_diff(), 90, 20).unwrap();
+        character.key(key(KeyCode::Char('v'))).unwrap();
+        character.key(key(KeyCode::Char('l'))).unwrap();
+        character.key(key(KeyCode::Char('l'))).unwrap();
+        assert!(character.render().unwrap().contains("VISUAL CHAR"));
+        character.key(key(KeyCode::Char('y'))).unwrap();
+        assert_eq!(character.last_yank(), Some("fn "));
+
+        let mut line =
+            TuiHarness::from_unified_diff("review-line", workflow_diff(), 90, 20).unwrap();
+        line.key(key(KeyCode::Char('V'))).unwrap();
+        line.key(key(KeyCode::Char('j'))).unwrap();
+        assert!(line.render().unwrap().contains("VISUAL LINE"));
+        line.key(key(KeyCode::Char('y'))).unwrap();
+        assert_eq!(
+            line.last_yank(),
+            Some("fn review() {\n    let added = true;\n")
+        );
+
+        let mut block =
+            TuiHarness::from_unified_diff("review-block", workflow_diff(), 90, 20).unwrap();
+        block
+            .key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL))
+            .unwrap();
+        block.key(key(KeyCode::Char('l'))).unwrap();
+        block.key(key(KeyCode::Char('j'))).unwrap();
+        assert!(block.render().unwrap().contains("VISUAL BLOCK"));
+        block.key(key(KeyCode::Char('y'))).unwrap();
+        assert_eq!(block.last_yank(), Some("fn\n  "));
+    }
+
+    #[test]
+    fn review_character_selection_moves_and_copies_extended_graphemes_atomically() {
+        let diff = "diff --git a/unicode.rs b/unicode.rs\n\
+                    --- a/unicode.rs\n\
+                    +++ b/unicode.rs\n\
+                    @@ -0,0 +1 @@\n\
+                    +e\u{301}👩\u{200d}💻漢字\n";
+        let mut harness = TuiHarness::from_unified_diff("review-unicode", diff, 80, 18).unwrap();
+        harness.key(key(KeyCode::Char('v'))).unwrap();
+        harness.key(key(KeyCode::Char('l'))).unwrap();
+        harness.key(key(KeyCode::Char('y'))).unwrap();
+
+        assert_eq!(harness.last_yank(), Some("e\u{301}👩\u{200d}💻"));
+    }
+
+    #[test]
+    fn review_character_selection_projects_to_full_annotation_lines() {
+        let mut harness =
+            TuiHarness::from_unified_diff("review-annotation", workflow_diff(), 90, 20).unwrap();
+        harness.key(key(KeyCode::Char('v'))).unwrap();
+        harness.key(key(KeyCode::Char('l'))).unwrap();
+        harness.key(key(KeyCode::Char('j'))).unwrap();
+        harness.key(key(KeyCode::Char('c'))).unwrap();
+        type_text(&mut harness, "character selection comment");
+        harness.key(key(KeyCode::Enter)).unwrap();
+
+        let annotation = harness.persisted_annotations().unwrap().remove(0);
+        assert_eq!((annotation.line_start, annotation.line_end), (10, 11));
+        assert_eq!(annotation.side, "new");
+        assert_eq!(harness.mode(), "NORMAL");
+    }
+
+    #[test]
+    fn review_visual_cancel_restores_the_exact_character_range() {
+        let mut harness =
+            TuiHarness::from_unified_diff("review-cancel-range", workflow_diff(), 90, 20).unwrap();
+        harness.key(key(KeyCode::Char('v'))).unwrap();
+        harness.key(key(KeyCode::Char('l'))).unwrap();
+        harness.key(key(KeyCode::Char('l'))).unwrap();
+        harness.key(key(KeyCode::Char('j'))).unwrap();
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        type_text(&mut harness, "discard this draft");
+        harness.key(key(KeyCode::Esc)).unwrap();
+
+        assert_eq!(harness.mode(), "VISUAL");
+        let frame = harness.render().unwrap();
+        assert!(frame.contains("VISUAL CHAR · rows 1-2 · cols 1-3"));
+        assert!(!frame.contains("discard this draft"));
+        harness.key(key(KeyCode::Char('y'))).unwrap();
+        assert_eq!(harness.last_yank(), Some("fn review() {\n   "));
+    }
+
+    #[test]
+    fn split_visual_selection_paints_only_the_annotation_side() {
+        let mut harness =
+            TuiHarness::from_unified_diff("review-side", workflow_diff(), 100, 20).unwrap();
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "diff split");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.key(key(KeyCode::Char('V'))).unwrap();
+
+        assert!(harness.render().unwrap().contains("side new"));
+        assert_eq!(harness.selected_cell_count_in_columns(0, 50).unwrap(), 0);
+        assert!(harness.selected_cell_count_in_columns(50, 100).unwrap() > 0);
+    }
+
+    #[test]
+    fn long_review_selection_pans_to_semantic_end_and_back() {
+        let source = "let value = \"this source line is intentionally much wider than the review pane and its hidden tail is END\";";
+        let diff = format!(
+            "diff --git a/src/long.rs b/src/long.rs\n\
+             --- a/src/long.rs\n\
+             +++ b/src/long.rs\n\
+             @@ -0,0 +1 @@\n\
+             +{source}\n"
+        );
+        let mut harness = TuiHarness::from_unified_diff("review-long-pan", &diff, 58, 14).unwrap();
+        harness.render().unwrap();
+        harness.key(key(KeyCode::Char('v'))).unwrap();
+        harness.key(key(KeyCode::Char('$'))).unwrap();
+        let end = harness.render().unwrap();
+        assert!(end.contains("END"), "{end}");
+        assert!(end.contains('‹'));
+        assert!(end.contains("view cols"));
+
+        harness.key(key(KeyCode::Char('0'))).unwrap();
+        let start = harness.render().unwrap();
+        assert!(start.contains("let value"), "{start}");
+        assert!(start.contains('…'));
+        harness.key(key(KeyCode::Char('$'))).unwrap();
+        harness.key(key(KeyCode::Char('y'))).unwrap();
+        assert_eq!(harness.last_yank(), Some(source));
     }
 
     #[test]
@@ -2195,7 +2339,7 @@ mod tests {
     #[test]
     fn visual_search_extends_the_fixed_anchor_and_chat_visual_yanks_messages() {
         let mut review = TuiHarness::from_unified_diff("search", workflow_diff(), 100, 24).unwrap();
-        review.key(key(KeyCode::Char('v'))).unwrap();
+        review.key(key(KeyCode::Char('V'))).unwrap();
         review.key(key(KeyCode::Char('/'))).unwrap();
         type_text(&mut review, "use_added");
         review.key(key(KeyCode::Enter)).unwrap();
@@ -2525,10 +2669,10 @@ mod tests {
         }
         let mut review = TuiHarness::from_unified_diff("large", &large, 90, 16).unwrap();
         review.render().unwrap();
-        review.key(key(KeyCode::Char('v'))).unwrap();
+        review.key(key(KeyCode::Char('V'))).unwrap();
         review.key(key(KeyCode::PageDown)).unwrap();
         assert_eq!(review.mode(), "VISUAL");
-        assert!(review.render().unwrap().contains("VISUAL  rows 1-"));
+        assert!(review.render().unwrap().contains("VISUAL LINE · rows 1-"));
         assert!(review.selected_cell_count().unwrap() > 0);
 
         let mut chat =

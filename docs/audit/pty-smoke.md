@@ -44,9 +44,10 @@ Agent: `RQ_TUI_CONTROLLED_AGENT=1`
 | PTY-24 | Submit two long prompts while the first controlled response is active; resize Chat to 44×14; drive Up, PageUp, SGR mouse-wheel down/up, character and line Visual yanks, `G`, then resize to 100×24 | Input stayed responsive, the queue retained `ACTIVE`/`QUEUED` identities, every scroll source changed the rendered `rows A-B/T` viewport, OSC 52 decoded to the exact inclusive character bytes `First` and exact line bytes `First alpha beta gamma delta epsilon z\n`, the whole-transcript Visual payload began at `you: First` and reached streamed `audit-token-349`, `G` exposed latest source rather than only reaching a row count, and wide reflow reduced the rendered-row total. |
 | PTY-25 | Open `:agent-status`, scroll to controlled skill/subagent/retry events, wait for the response to become visibly quiet, press `Ctrl-C`, then cancel the remaining queued prompt through `:queue` | Agent Status kept a sticky `q/Esc`/scroll/stop footer while its timeline moved, tool/skill/subagent/retry work and outbound liveness remained inspectable, the active turn transitioned through quiet → `STOPPING` → `response cancelled`, the waiting prompt remained independently cancellable, and the reusable Chat composer never disappeared. |
 | PTY-26 | Enter Chat/Insert in a fresh compiled process and send `ESC[200~PASTE_FIRST_LINE\nPASTE_SECOND_LINE ESC[201~` | Both lines remained visible inside one bordered composer, the title reported the pasted byte/line count, no partial prompt was submitted, and `Ctrl-C` discarded the intact draft. |
+| PTY-27 | On a Review source row send the real terminal byte `0x16` (`Ctrl-V`), then `Esc` | The compiled binary visibly entered `VISUAL BLOCK`, proving Crossterm delivers the control sequence to Review's block-selection path, then returned cleanly to `NORMAL`. |
 
 PTY-16 through PTY-21 are retained manual compiled-binary captures. PTY-22
-through PTY-26 are reproduced on every `//:pty_smoke_test` run; the automated
+through PTY-27 are reproduced on every `//:pty_smoke_test` run; the automated
 test now also holds the cancelled/empty queue state beyond the controlled
 agent's late-delta and completion deadlines to detect turn resurrection.
 

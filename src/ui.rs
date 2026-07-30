@@ -26,8 +26,8 @@ use crate::annotations::{
 };
 use crate::app::{
     command_matches, AgentPhase, AppState, ChatEntry, ComposeTarget, DiffLayout, Effect, Focus,
-    InputMode, MarkdownPreview, ModelPickerStage, PendingPrune, PruneChoice, ReadyPrune, Screen,
-    VersionChoice,
+    InputMode, MarkdownPreview, ModelPickerStage, PendingPrune, PruneChoice, ReadyPrune,
+    ReviewRowSelection, Screen, VersionChoice,
 };
 use crate::chat_render::{render_markdown_mapped, CellSource, MappedMarkdown, MappedRow};
 use crate::chat_selection::{
@@ -41,8 +41,8 @@ use crate::copilot::{
 };
 use crate::diff::{DiffFile, DiffLine, FileStatus, LineKind};
 use crate::domain::{
-    AnnotationKind, AskMessage, BaseBranchSource, DeliveryState, PendingChat, Placement,
-    ReviewContext, SessionRecord,
+    AnchorSide, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState, PendingChat,
+    Placement, ReviewContext, SessionRecord,
 };
 use crate::export::{CommentExport, ExportFormat};
 use crate::git::Git;
@@ -4432,6 +4432,7 @@ fn render_unified(
     let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
     state.viewport_height = body.height.max(1) as usize;
     state.compose_wrap_width = body.width.saturating_sub(4).max(1) as usize;
+    state.set_review_content_width(body.width.saturating_sub(9) as usize);
     let stream = state.review_stream();
     let rendered = stream
         .rows()
@@ -4440,8 +4441,9 @@ fn render_unified(
         .flat_map(|(index, row)| {
             review_row_lines(
                 row,
-                review_row_selected(state, row, index),
+                review_row_selection(state, row, index),
                 body.width.max(1) as usize,
+                state.review_horizontal_scroll,
                 highlighter,
             )
             .into_iter()
@@ -4510,10 +4512,17 @@ fn render_split(
         .split(body);
     state.viewport_height = body.height.max(1) as usize;
     state.compose_wrap_width = body.width.saturating_sub(4).max(1) as usize;
+    state.set_review_content_width(
+        body_columns[0]
+            .width
+            .saturating_sub(7)
+            .min(body_columns[1].width.saturating_sub(6)) as usize,
+    );
     let stream = state.review_stream();
+    let selection_side = state.review_selection_side();
     let mut rendered_rows = Vec::new();
     for (index, row) in stream.rows().iter().enumerate() {
-        let selected = review_row_selected(state, row, index);
+        let selection = review_row_selection(state, row, index);
         match row {
             ReviewRow::Source {
                 file,
@@ -4536,29 +4545,39 @@ fn render_split(
                     LineKind::Context => (Some(&source), Some(&source)),
                     LineKind::Meta => (None, None),
                 };
-                let old = truncate_styled_line(
+                let old = clip_styled_line_content(
                     split_line(
                         old,
                         Some(std::path::Path::new(file)),
-                        selected && old.is_some(),
+                        old.and(selection.filter(|_| selection_side == Some(AnchorSide::Old))),
                         highlighter,
                     ),
+                    1,
+                    state.review_horizontal_scroll,
                     body_columns[0].width.saturating_sub(1) as usize,
                 );
-                let new = truncate_styled_line(
+                let new = clip_styled_line_content(
                     split_line(
                         new,
                         Some(std::path::Path::new(file)),
-                        selected && new.is_some(),
+                        new.and(selection.filter(|_| selection_side == Some(AnchorSide::New))),
                         highlighter,
                     ),
+                    1,
+                    state.review_horizontal_scroll,
                     body_columns[1].width as usize,
                 );
                 rendered_rows.push((index, old, new, None));
                 let _ = line;
             }
             _ => {
-                for line in review_row_lines(row, selected, body.width as usize, highlighter) {
+                for line in review_row_lines(
+                    row,
+                    selection,
+                    body.width as usize,
+                    state.review_horizontal_scroll,
+                    highlighter,
+                ) {
                     rendered_rows.push((index, Line::from(""), Line::from(""), Some(line)));
                 }
             }
@@ -4740,9 +4759,13 @@ fn render_compact_inline_composer(
     true
 }
 
-fn review_row_selected(state: &AppState, row: &ReviewRow, index: usize) -> bool {
+fn review_row_selection(
+    state: &AppState,
+    row: &ReviewRow,
+    index: usize,
+) -> Option<ReviewRowSelection> {
     if state.input_mode != InputMode::Visual {
-        return index == state.review_cursor;
+        return (index == state.review_cursor).then_some(ReviewRowSelection::Whole);
     }
     let ReviewRow::Source {
         repo_id,
@@ -4752,34 +4775,32 @@ fn review_row_selected(state: &AppState, row: &ReviewRow, index: usize) -> bool 
         ..
     } = row
     else {
-        return false;
+        return None;
     };
-    let Some(current_repo) = state.work_item.repos.get(state.repo_index) else {
-        return false;
-    };
-    let Some(current_file) = state.current_file() else {
-        return false;
-    };
+    let current_repo = state.work_item.repos.get(state.repo_index)?;
+    let current_file = state.current_file()?;
     if repo_id != &current_repo.record.id
         || file.as_str() != current_file.path().to_string_lossy().as_ref()
     {
-        return false;
+        return None;
     }
     let visible_line = new_anchor
         .as_ref()
         .or(old_anchor.as_ref())
         .map(|anchor| anchor.visible_line);
-    let (start, end) = state.selection();
-    visible_line.is_some_and(|line| (start..=end).contains(&line))
+    visible_line.and_then(|line| state.review_row_selection(line))
 }
 
 fn review_row_lines(
     row: &ReviewRow,
-    selected: bool,
+    selection: Option<ReviewRowSelection>,
     width: usize,
+    horizontal_scroll: usize,
     highlighter: &mut dyn Highlighter,
 ) -> Vec<Line<'static>> {
-    let selected_style = selected.then_some(Style::default().bg(Color::Rgb(40, 50, 65)));
+    let selected = selection.is_some();
+    let selected_style = matches!(selection, Some(ReviewRowSelection::Whole))
+        .then_some(Style::default().bg(Color::Rgb(40, 50, 65)));
     match row {
         ReviewRow::FileHeader {
             repo_name,
@@ -4846,13 +4867,16 @@ fn review_row_lines(
                 selected,
                 highlighter,
             );
-            rendered = rendered.style(match (selected, kind) {
-                (true, _) => Style::default().bg(Color::Rgb(40, 50, 65)),
-                (false, LineKind::Addition) => Style::default().bg(Color::Rgb(18, 48, 31)),
-                (false, LineKind::Deletion) => Style::default().bg(Color::Rgb(56, 25, 29)),
+            rendered = rendered.style(match (selection, kind) {
+                (Some(ReviewRowSelection::Whole), _) => Style::default().bg(Color::Rgb(40, 50, 65)),
+                (_, LineKind::Addition) => Style::default().bg(Color::Rgb(18, 48, 31)),
+                (_, LineKind::Deletion) => Style::default().bg(Color::Rgb(56, 25, 29)),
                 _ => Style::default(),
             });
-            rendered = truncate_styled_line(rendered, width);
+            if let Some(ReviewRowSelection::Columns { start, end }) = selection {
+                paint_content_columns(&mut rendered, 1, start, end);
+            }
+            rendered = clip_styled_line_content(rendered, 1, horizontal_scroll, width);
             let padding = width.saturating_sub(rendered.width());
             if padding > 0 {
                 rendered.spans.push(Span::raw(" ".repeat(padding)));
@@ -4994,6 +5018,93 @@ fn truncate_styled_line(mut line: Line<'static>, width: usize) -> Line<'static> 
     line
 }
 
+fn clip_styled_line_content(
+    mut line: Line<'static>,
+    prefix_spans: usize,
+    horizontal_scroll: usize,
+    width: usize,
+) -> Line<'static> {
+    if width == 0 {
+        line.spans.clear();
+        return line;
+    }
+    let prefix_len = prefix_spans.min(line.spans.len());
+    let mut output = line.spans.drain(..prefix_len).collect::<Vec<_>>();
+    let prefix_width = output.iter().map(|span| span.width()).sum::<usize>();
+    let available = width.saturating_sub(prefix_width);
+    if available == 0 {
+        line.spans = output;
+        return truncate_styled_line(line, width);
+    }
+    let content_width = line
+        .spans
+        .iter()
+        .map(|span| cell_width(span.content.as_ref()))
+        .sum::<usize>();
+    let show_left = horizontal_scroll > 0;
+    let left_width = usize::from(show_left);
+    let show_right =
+        content_width > horizontal_scroll.saturating_add(available.saturating_sub(left_width));
+    let content_capacity = available
+        .saturating_sub(left_width)
+        .saturating_sub(usize::from(show_right));
+    let marker_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    if show_left {
+        output.push(Span::styled("‹", marker_style));
+    }
+    let mut source_column = 0usize;
+    let mut used = 0usize;
+    'spans: for span in line.spans {
+        for (_, grapheme) in grapheme_indices(span.content.as_ref()) {
+            let grapheme_width = cell_width(grapheme).max(1);
+            let grapheme_end = source_column.saturating_add(grapheme_width);
+            if grapheme_end <= horizontal_scroll {
+                source_column = grapheme_end;
+                continue;
+            }
+            if used.saturating_add(grapheme_width) > content_capacity {
+                break 'spans;
+            }
+            output.push(Span::styled(grapheme.to_owned(), span.style));
+            used = used.saturating_add(grapheme_width);
+            source_column = grapheme_end;
+        }
+    }
+    if show_right {
+        output.push(Span::styled("…", marker_style));
+    }
+    line.spans = output;
+    line
+}
+
+fn paint_content_columns(
+    line: &mut Line<'static>,
+    content_span_start: usize,
+    start: usize,
+    end: usize,
+) {
+    let mut column = 0usize;
+    let prefix_len = content_span_start.min(line.spans.len());
+    let mut painted = line.spans.drain(..prefix_len).collect::<Vec<_>>();
+    let selection = Style::default().bg(Color::Rgb(40, 50, 65));
+    for span in line.spans.drain(..) {
+        for (_, grapheme) in grapheme_indices(span.content.as_ref()) {
+            let width = cell_width(grapheme).max(1);
+            let grapheme_end = column.saturating_add(width).saturating_sub(1);
+            let style = if column <= end && grapheme_end >= start {
+                span.style.patch(selection)
+            } else {
+                span.style
+            };
+            painted.push(Span::styled(grapheme.to_owned(), style));
+            column = column.saturating_add(width);
+        }
+    }
+    line.spans = painted;
+}
+
 fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let mode = match state.input_mode {
         InputMode::Normal => "NORMAL",
@@ -5029,11 +5140,30 @@ fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
         ),
         InputMode::Visual => {
             let (start, end) = state.selection();
+            let visual = state
+                .review_selection_mode()
+                .map(|mode| mode.label())
+                .unwrap_or("SELECT");
+            let side = state
+                .review_selection_side()
+                .map(|side| side.as_str())
+                .unwrap_or("none");
+            let viewport = if state.review_horizontal_scroll > 0 {
+                format!(
+                    " · view cols {}-{}",
+                    state.review_horizontal_scroll + 1,
+                    state.review_horizontal_scroll + state.review_content_width,
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "VISUAL  rows {}-{} · a ask · c comment · y yank · Esc clear  {}",
+                "VISUAL {visual} · rows {}-{} · cols {}-{} · side {side}{} · a ask · c comment · y yank · Esc clear",
                 start + 1,
                 end + 1,
-                state.status
+                state.review_visual_anchor_column.min(state.review_visual_column) + 1,
+                state.review_visual_anchor_column.max(state.review_visual_column) + 1,
+                viewport,
             )
         }
         _ => format!(
@@ -6211,12 +6341,13 @@ fn unified_line(
 fn split_line(
     line: Option<&DiffLine>,
     path: Option<&std::path::Path>,
-    selected: bool,
+    selection: Option<ReviewRowSelection>,
     highlighter: &mut dyn Highlighter,
 ) -> Line<'static> {
     let Some(line) = line else {
         return Line::from("");
     };
+    let selected = selection.is_some();
     let number = line.new_line.or(line.old_line).unwrap_or(0);
     let mut spans = vec![Span::styled(
         format!("{}{:>4} ", if selected { "▶" } else { " " }, number),
@@ -6227,8 +6358,11 @@ fn split_line(
             .unwrap_or_else(|| plain_segments(&line.content)),
     ));
     let mut rendered = Line::from(spans);
-    if selected {
+    if matches!(selection, Some(ReviewRowSelection::Whole)) {
         rendered = rendered.style(Style::default().bg(Color::Rgb(40, 50, 65)));
+    }
+    if let Some(ReviewRowSelection::Columns { start, end }) = selection {
+        paint_content_columns(&mut rendered, 1, start, end);
     }
     rendered
 }

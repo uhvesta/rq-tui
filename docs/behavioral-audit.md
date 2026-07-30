@@ -14,17 +14,17 @@ Evidence abbreviations:
 - `PTY-xx` refers to [`audit/pty-smoke.md`](audit/pty-smoke.md).
 - Other test names identify their Rust module directly.
 
-Current-evidence boundary: 262 tests are discovered: 261 regular tests pass
+Current-evidence boundary: 268 tests are discovered: 267 regular tests pass
 and 1 authenticated live test is ignored by default. The ignored
 stream/resume test was also run explicitly against the installed Copilot CLI
-and passed. PTY-16 through PTY-26 are current compiled-binary evidence; earlier
+and passed. PTY-16 through PTY-27 are current compiled-binary evidence; earlier
 PTY references remain useful historical records.
 
 ## Findings remediated during this audit
 
 | Priority | Finding | Resolution and evidence |
 |---|---|---|
-| P0 | Split view paired deletions/additions into fewer rows than the reducer used, so cursor and persisted anchors could diverge. | Split rendering is now one canonical parsed row per display row. `WF::file_switch_clears_visual_mode_and_split_unified_render_selection`. |
+| P0 | Split view paired deletions/additions into fewer rows than the reducer used, so cursor and persisted anchors could diverge. | Split rendering is now one canonical parsed row per display row. `WF::file_switch_clears_visual_mode_and_layout_changes_preserve_selection`. |
 | P0 | Placements could not distinguish old-file and new-file line numbers. | Migration 2 adds placement `side`; deleted selections persist as `old`, new/context selections as `new`. `WF::deleted_line_annotation_records_the_old_side`. |
 | P0 | Fold/meta selections could persist as line 0; replacement selections could mix incompatible old/new coordinates. | Annotation validation rejects metadata and mixed-side ranges with an explanatory status. `WF::folds_and_mixed_old_new_ranges_fail_safely`. |
 | P0 | Local Ask/Comment always failed while pinning the first snapshot because `:` from the version ID was placed in a Git ref. | Snapshot refs use a deterministic Git-safe SHA-256 name. `git::tests::snapshot_preserves_head_and_index_and_pins_the_worktree`, PTY-04. |
@@ -33,8 +33,9 @@ PTY references remain useful historical records.
 | P0 | Persistence errors discarded the composer draft and could terminate the interaction loop. | Effect failures are contained; contextual mode, range, target, and draft are restored. `WF::failed_persistence_restores_the_contextual_composer_and_draft`. |
 | P0 | A closed agent command channel could restore an already-persisted Ask composer, allowing a duplicate on retry. | The single Ask remains visibly failed and pending for explicit recovery; the composer is not recreated. `WF::closed_agent_channel_keeps_one_pending_ask_without_duplicate_retry`. |
 | P0 | Some terminal setup failures could skip raw/alternate-screen restoration. | Setup and all run-loop exits now execute cleanup. PTY-10/11 prove normal and forced exits. |
-| P1 | Visual mode was cleared or left stale inconsistently across search, cancel, file/screen/layout changes. | Search returns to Visual and extends its fixed anchor; cancel restores Visual; file/screen/layout changes clear predictably. `WF::cancel_restores_visual_selection_without_stale_draft`, `WF::visual_search_extends_the_fixed_anchor_and_chat_visual_yanks_messages`, `WF::file_switch_clears_visual_mode_and_split_unified_render_selection`. |
-| P1 | Split mode highlighted only the cursor, not the Visual range. | Every selected canonical row now styles its applicable old/new cell. `WF::file_switch_clears_visual_mode_and_split_unified_render_selection`. |
+| P1 | Visual mode was cleared or left stale inconsistently across search, cancel, file/screen/layout changes. | Search returns to Visual and extends its fixed anchor; cancel restores the exact semantic mode/range; file and screen changes clear predictably while split/unified layout changes preserve and reproject the selection. `WF::review_visual_cancel_restores_the_exact_character_range`, `WF::visual_search_extends_the_fixed_anchor_and_chat_visual_yanks_messages`, `WF::file_switch_clears_visual_mode_and_layout_changes_preserve_selection`. |
+| P1 | Split mode highlighted both copies of context or only the cursor, rather than the selection's valid source side. | Every selected canonical row now styles only its annotation-valid old/new cell; context defaults to new, context plus deletion resolves old, and the opposite pane stays unpainted. `WF::split_visual_selection_paints_only_the_annotation_side`. |
+| P1 | Review Visual was whole-line only, so `v`, `V`, and `Ctrl-V` were indistinguishable and long-line endpoints were unreachable. | Review now has semantic character, line, and block modes; grapheme/cell-aware `h/l/0/$/w/b`; exact mode-specific copy; full-line annotation projection; horizontal source viewport markers; and explicit mode, side, row, column, and viewport feedback. `WF::review_visual_modes_have_distinct_rendering_and_exact_copy_semantics`, `WF::review_character_selection_moves_and_copies_extended_graphemes_atomically`, `WF::long_review_selection_pans_to_semantic_end_and_back`, PTY-27. |
 | P1 | Visual `y` was unreachable as a one-key action. | Visual `y` executes immediately; `yy` remains Normal-mode yank. `WF::visual_yank_preserves_source_order_across_addition_and_context`. |
 | P1 | `Ctrl-w h/j/k/l` required Control on the second key, contrary to the documented sequence. | A plain second direction is accepted. `app::tests::ctrl_w_then_plain_direction_moves_focus_as_documented`. |
 | P1 | File-tree and annotation navigation exposed obsolete third-pane behavior. | `t` is the sole direct file-tree toggle, Enter accepts the current file, and the annotation rail/focus target is removed. Both diff layouts render annotations as full-width inline blocks. |
@@ -74,7 +75,7 @@ PTY references remain useful historical records.
 | R-16 | Comment persists locally and does not contact Copilot until export | Working end-to-end | `WF::normal_and_visual_comments_persist_without_contacting_agent`; PTY-04. |
 | R-17 | `:fork` child session becomes active | Partially working | Command, queued control sequencing, SDK call, and storage handling exist; no authenticated fork smoke test. |
 | R-18 | Structured local context generation, editing, acceptance, persistence | Partially working | Parser/editor/effects and controlled-agent shape exist; no complete attach/restart workflow test. |
-| R-19 | Split and unified review layouts with inline annotations and no rail | Working in deterministic tests | Unified is the default. Both layouts retain one diff cursor and render Comment/Ask content inline; split blocks span both columns. `WF::file_switch_clears_visual_mode_and_split_unified_render_selection` and `WF::normal_and_visual_comments_persist_without_contacting_agent`. Navigation through individual block rows remains a follow-up. |
+| R-19 | Split and unified review layouts with inline annotations and no rail | Working in deterministic tests | Unified is the default. Both layouts retain one diff cursor, preserve semantic selection across layout changes, and render Comment/Ask content inline; split blocks span both columns while source selection paints only its valid side. `WF::file_switch_clears_visual_mode_and_layout_changes_preserve_selection`, `WF::split_visual_selection_paints_only_the_annotation_side`, and `WF::normal_and_visual_comments_persist_without_contacting_agent`. Navigation through individual block rows remains a follow-up. |
 | R-20 | Multi-repo grouped file/folder picker ordered by activity | Partially working | Repo grouping, collapse/expand, fuzzy filtering, and Enter work; folder hierarchy and complete activity-order workflow are absent. |
 | R-21 | Full Chat panel with streaming, queue/activity/usage, model/session controls | Working end-to-end for the audited Chat sequence | Streaming, durable queued-chat recovery, activity, usage, rendered-row scrolling, sticky composer, and character/line/block selection are deterministic; PTY-24 additionally proves exact character/line clipboard bytes. Model capability picking, steering, quiet detection, active cancellation, and queued cancellation are covered by deterministic `WF::*` tests plus the scoped PTY-16–25 evidence. Optional SDK surfaces remain classified separately in `copilot-sdk-audit.md`. |
 | R-22 | Top command palette with autocomplete and execution | Working end-to-end | `WF::narrow_terminal_keeps_selection_composer_and_top_palette_visible`; PTY-08. |
@@ -97,11 +98,11 @@ PTY references remain useful historical records.
 
 | ID | Required Visual behavior | Classification | Evidence |
 |---|---|---|---|
-| V-01 | `v` enters Visual in diff | Working end-to-end | Multiple `WF::*`; PTY-02. |
-| V-02 | Visible `VISUAL` mode indicator | Working end-to-end | `WF::visual_range_ask_uses_exact_new_source_range`; PTY-02. |
+| V-01 | `v`, `V`, and `Ctrl-V` enter character, line, and block Visual modes in diff | Working end-to-end | `WF::review_visual_modes_have_distinct_rendering_and_exact_copy_semantics`; PTY-02/27. |
+| V-02 | Visible Visual mode, side, rows, columns, and horizontal viewport | Working end-to-end | `WF::review_visual_modes_have_distinct_rendering_and_exact_copy_semantics`, `WF::long_review_selection_pans_to_semantic_end_and_back`; PTY-02/27. |
 | V-03 | Fixed anchor while `j/k`, page, and search movement extend | Working end-to-end | `WF::visual_search_extends_the_fixed_anchor_and_chat_visual_yanks_messages`; range workflows exercise `j`. |
 | V-04 | Every selected row has restrained visible styling | Working end-to-end | Styled-cell assertions in split/unified workflow test. |
-| V-05 | Selection understandable in split and unified | Working end-to-end | `WF::file_switch_clears_visual_mode_and_split_unified_render_selection`. |
+| V-05 | Selection understandable in split and unified | Working end-to-end | Layout switches preserve semantic selection, and split context paints only the valid source side. `WF::file_switch_clears_visual_mode_and_layout_changes_preserve_selection`; `WF::split_visual_selection_paints_only_the_annotation_side`. |
 | V-06 | Fold/meta rows cannot become invalid anchors | Working end-to-end | `WF::folds_and_mixed_old_new_ranges_fail_safely`. |
 | V-07 | `a` opens exact-range contextual Ask composer | Working end-to-end | `WF::visual_range_ask_uses_exact_new_source_range`; PTY-03 demonstrates contextual placement for the sibling composer. |
 | V-08 | `c` opens exact-range contextual Comment composer | Working end-to-end | Comment workflow; PTY-03. |
@@ -109,18 +110,20 @@ PTY references remain useful historical records.
 | V-10 | Annotation appears immediately at its anchor | Working end-to-end | Unified workflow frames and PTY-04. |
 | V-11 | Ask queues and streams inline | Working end-to-end | Ask workflows and PTY-05/06. |
 | V-12 | Comment remains local | Working end-to-end | Comment workflow checks zero agent commands; PTY-04. |
-| V-13 | `y` copies complete selected source text in order | Working end-to-end | `WF::visual_yank_preserves_source_order_across_addition_and_context`. |
+| V-13 | `y` copies exact character/block source text or complete newline-terminated selected lines | Working end-to-end | `WF::review_visual_modes_have_distinct_rendering_and_exact_copy_semantics`, Unicode and long-line workflows, and `WF::visual_yank_preserves_source_order_across_addition_and_context`. |
 | V-14 | `Esc` clears Visual | Working end-to-end | File-switch/cancel workflows. |
 | V-15 | File/repo/version/screen/layout transitions clear or preserve predictably | Working end-to-end for file/screen/layout; partially working for version | File/screen/layout tests pass. Old-version switching lacks full workflow coverage. |
 | V-16 | Normal `a`/`c` uses current code line | Working end-to-end | Normal Ask and Comment workflows. |
 | V-17 | Binary/empty/deleted/renamed/fold cases fail safely | Working end-to-end | `WF::binary_empty_and_renamed_files_have_explicit_safe_behavior`, deleted-line workflow, and fold/mixed-side workflow. |
 | V-18 | Chat Visual selects visible meaningful text | Working in deterministic tests | `v`, `V`, and `Ctrl-V` select mapped rendered text by character, line, and block. Source-based endpoints survive Markdown wrapping, resize/reflow, Unicode, fenced code, and streaming updates; `WF::chat_semantic_modes_map_markdown_code_and_unicode_without_message_wide_highlighting` and `WF::chat_page_keys_extend_semantic_selection_across_wrap_resize_and_streaming`. Compiled-terminal evidence remains to be recaptured. |
 | V-19 | Footer exposes Visual actions | Working end-to-end | Frame assertions and PTY-02. |
-| V-20 | Composer cancellation restores prior mode without stale draft | Working end-to-end | `WF::cancel_restores_visual_selection_without_stale_draft`. |
+| V-20 | Composer cancellation restores the exact prior mode/range without stale draft | Working end-to-end | `WF::review_visual_cancel_restores_the_exact_character_range`, `WF::cancel_restores_visual_selection_without_stale_draft`. |
 
 Source-line policy established by the audit:
 
-- The reducer stores a canonical parsed-diff row selection only until submit.
+- The reducer stores canonical parsed-diff rows plus semantic
+  character/block terminal-cell columns; syntax spans and gutters are never
+  selection coordinates.
 - `anchor_from_diff` converts it to old/new source coordinates.
 - Context plus additions use the new side; context plus deletions use the old
   side.
@@ -218,7 +221,7 @@ matrix so that new evidence is not confused with the earlier PTY run.
 The current checked-in regular-test baseline is:
 
 ```text
-262 total tests; 261 passed; 1 authenticated live Copilot test ignored by default
+268 total tests; 267 passed; 1 authenticated live Copilot test ignored by default
 ```
 
 The regular baseline includes the reducer/effect, storage, rendering, SDK
@@ -226,14 +229,14 @@ adapter, deterministic UI, model-picker, queue/steering, liveness, and
 MAIN/SIDE tests. The ignored test is the authenticated
 `copilot::tests::live_copilot_streams_and_resumes_persisted_history`; it is not
 part of the regular count. It was run separately with
-`RQ_TUI_LIVE_COPILOT=1` and passed as LIVE-01. PTY-16 through PTY-26 were
+`RQ_TUI_LIVE_COPILOT=1` and passed as LIVE-01. PTY-16 through PTY-27 were
 captured from the current Bazel-built binary, with PTY-22/23 added by the
 automated compiled-binary smoke test and PTY-24/25/26 extending that same test.
 
 ### Compiled PTY evidence
 
 Earlier records are kept for reproducibility and design context. The current
-pass is PTY-16 through PTY-26 in [`audit/pty-smoke.md`](audit/pty-smoke.md).
+pass is PTY-16 through PTY-27 in [`audit/pty-smoke.md`](audit/pty-smoke.md).
 
 The second compiled-binary audit used the Bazel-built binary and a controlled
 agent. It captured the following behaviors in a 100×28 tmux pane:
