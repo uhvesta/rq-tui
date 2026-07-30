@@ -5,7 +5,7 @@ edition = "2021"
 
 [workspace]
 resolver = "2"
-members = ["crates/app", "crates/domain"]
+members = ["crates/app", "crates/domain", "crates/storage"]
 
 [dependencies]
 anyhow = "1"
@@ -19,8 +19,8 @@ github-copilot-sdk = { version = "1.0.8", default-features = false }
 lru = "0.16"
 rq-tui-domain = { path = "crates/domain" }
 rq-tui-app = { path = "crates/app" }
+rq-tui-storage = { path = "crates/storage" }
 ratatui = "0.29"
-rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

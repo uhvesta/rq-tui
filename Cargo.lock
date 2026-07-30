@@ -1624,7 +1624,7 @@ dependencies = [
  "ratatui",
  "rq-tui-app",
  "rq-tui-domain",
- "rusqlite",
+ "rq-tui-storage",
  "serde",
  "serde_json",
  "sha2",
@@ -1650,6 +1650,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
+]
+
+[[package]]
+name = "rq-tui-storage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rq-tui-domain",
+ "rusqlite",
+ "tempfile",
 ]
 
 [[package]]

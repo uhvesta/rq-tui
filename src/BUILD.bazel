@@ -18,7 +18,6 @@ RUNTIME_DEPS = crate_deps([
     "github-copilot-sdk",
     "lru",
     "ratatui",
-    "rusqlite",
     "serde",
     "serde_json",
     "sha2",
@@ -41,11 +40,14 @@ LIB_SRCS = glob(["**/*.rs"], exclude = ["main.rs"])
 rust_library(
     name = "rq_tui_lib",
     srcs = LIB_SRCS,
-    compile_data = ["//:migrations"],
     crate_name = "rq_tui",
     crate_root = "lib.rs",
     edition = "2021",
-    deps = RUNTIME_DEPS + ["//crates/app:app_lib", "//crates/domain:domain_lib"],
+    deps = RUNTIME_DEPS + [
+        "//crates/app:app_lib",
+        "//crates/domain:domain_lib",
+        "//crates/storage:storage_lib",
+    ],
     proc_macro_deps = PROC_MACRO_DEPS,
     visibility = [
         "//:__pkg__",
@@ -64,10 +66,13 @@ rust_binary(
 rust_test(
     name = "rq_tui_tests",
     srcs = LIB_SRCS,
-    compile_data = ["//:migrations"],
     crate_root = "lib.rs",
     edition = "2021",
-    deps = RUNTIME_DEPS + ["//crates/app:app_lib", "//crates/domain:domain_lib"] + crate_deps(["pretty_assertions"], package_name = ""),
+    deps = RUNTIME_DEPS + [
+        "//crates/app:app_lib",
+        "//crates/domain:domain_lib",
+        "//crates/storage:storage_lib",
+    ] + crate_deps(["pretty_assertions"], package_name = ""),
     proc_macro_deps = PROC_MACRO_DEPS,
     visibility = ["//:__pkg__"],
 )

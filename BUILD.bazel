@@ -1,11 +1,5 @@
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
-filegroup(
-    name = "migrations",
-    srcs = glob(["migrations/*.sql"]),
-    visibility = ["//src:__pkg__"],
-)
-
 alias(
     name = "rq_tui_lib",
     actual = "//src:rq_tui_lib",
@@ -50,6 +44,7 @@ test_suite(
     name = "rq_tui_tests",
     tests = [
         "//crates/app:app_test_suite",
+        "//crates/storage:storage_test_suite",
         ":bootstrap_bazelisk_test",
         ":non_tty_cli_test",
         ":pty_smoke_test",

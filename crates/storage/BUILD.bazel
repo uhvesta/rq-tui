@@ -1,0 +1,48 @@
+load("@rules_rust//rust:defs.bzl", "rust_clippy_test", "rust_library", "rust_test", "rustfmt_test")
+load("@crates//:defs.bzl", "crate_deps")
+
+STORAGE_DEPS = crate_deps(
+    ["anyhow", "chrono", "rusqlite"],
+    package_name = "crates/storage",
+)
+
+rust_library(
+    name = "storage_lib",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = glob(["migrations/*.sql"]),
+    crate_name = "rq_tui_storage",
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    deps = STORAGE_DEPS + ["//crates/domain:domain_lib"],
+    visibility = ["//src:__pkg__"],
+)
+
+rust_test(
+    name = "storage_tests",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = glob(["migrations/*.sql"]),
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    deps = STORAGE_DEPS + [
+        "//crates/domain:domain_lib",
+    ] + crate_deps(["tempfile"], package_name = "crates/storage"),
+    visibility = ["//visibility:private"],
+)
+
+rust_clippy_test(
+    name = "clippy_test",
+    targets = [":storage_lib", ":storage_tests"],
+    visibility = ["//visibility:private"],
+)
+
+rustfmt_test(
+    name = "rustfmt_test",
+    targets = [":storage_lib", ":storage_tests"],
+    visibility = ["//visibility:private"],
+)
+
+test_suite(
+    name = "storage_test_suite",
+    tests = [":storage_tests", ":clippy_test", ":rustfmt_test"],
+    visibility = ["//:__pkg__"],
+)
