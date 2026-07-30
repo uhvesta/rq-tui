@@ -17,6 +17,7 @@ const MIGRATION_3: &str = include_str!("../migrations/0003_chat_outbox.sql");
 const MIGRATION_4: &str = include_str!("../migrations/0004_ephemeral_sessions.sql");
 const MIGRATION_5: &str = include_str!("../migrations/0005_prune_journal.sql");
 const MIGRATION_6: &str = include_str!("../migrations/0006_outbox_metadata.sql");
+const MIGRATION_7: &str = include_str!("../migrations/0007_session_ephemeral.sql");
 
 pub(crate) struct Storage {
     connection: Connection,
@@ -55,6 +56,22 @@ pub(crate) struct PruneTarget {
     pub(crate) last_error: Option<String>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
+}
+
+/// The canonical persisted representation of a SIDE session.
+///
+/// This is intentionally separate from `domain::SessionRecord`: the latter is
+/// used by existing MAIN/fork integration call sites that predate the
+/// `sessions.ephemeral` column. Keeping that input type stable lets storage
+/// expose the new schema contract without requiring a runtime integration
+/// change in this migration-only step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SideSessionRecord {
+    pub(crate) id: String,
+    pub(crate) work_item_id: String,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) active: bool,
+    pub(crate) created_at: String,
 }
 
 impl Storage {
@@ -133,6 +150,7 @@ impl Storage {
             (4, MIGRATION_4),
             (5, MIGRATION_5),
             (6, MIGRATION_6),
+            (7, MIGRATION_7),
         ] {
             let applied = tx
                 .query_row(
@@ -524,6 +542,28 @@ impl Storage {
 
     pub(crate) fn activate_session(&self, session: &SessionRecord) -> Result<()> {
         let tx = self.connection.unchecked_transaction()?;
+        if let Some((work_item_id, ephemeral)) = tx
+            .query_row(
+                "SELECT work_item_id, ephemeral FROM sessions WHERE id = ?1",
+                [&session.id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()?
+        {
+            if work_item_id != session.work_item_id {
+                anyhow::bail!(
+                    "session {} already belongs to Work Item {}",
+                    session.id,
+                    work_item_id
+                );
+            }
+            if ephemeral {
+                anyhow::bail!(
+                    "session {} is an ephemeral SIDE session; activate it with the SIDE API",
+                    session.id
+                );
+            }
+        }
         let pruning_operation = tx
             .query_row(
                 "SELECT operation_id
@@ -558,13 +598,15 @@ impl Storage {
             [&session.work_item_id],
         )?;
         tx.execute(
-            "INSERT INTO sessions(id, work_item_id, parent_id, active, created_at)
-             VALUES (?1, ?2, ?3, 1, ?4)
-             ON CONFLICT(id) DO UPDATE SET active = 1",
+            "INSERT INTO sessions(id, work_item_id, parent_id, active, ephemeral, created_at)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET active = 1, parent_id = excluded.parent_id
+             WHERE sessions.ephemeral = 0",
             params![
                 session.id,
                 session.work_item_id,
                 session.parent_id,
+                0,
                 session.created_at
             ],
         )?;
@@ -608,11 +650,12 @@ impl Storage {
             [&session.work_item_id],
         )?;
         tx.execute(
-            "INSERT INTO sessions(id, work_item_id, parent_id, active, created_at)
-             VALUES (?1, ?2, ?3, 1, ?4)
+            "INSERT INTO sessions(id, work_item_id, parent_id, active, ephemeral, created_at)
+             VALUES (?1, ?2, ?3, 1, 0, ?4)
              ON CONFLICT(id) DO UPDATE SET
                 parent_id = excluded.parent_id,
-                active = 1",
+                active = 1,
+                ephemeral = 0",
             params![
                 session.id,
                 session.work_item_id,
@@ -630,6 +673,175 @@ impl Storage {
         }
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Persists the canonical SIDE row. When `session.active` is true, the
+    /// ownership switch happens in the same transaction as the upsert, so a
+    /// reader can never observe two active sessions for this Work Item.
+    pub(crate) fn persist_ephemeral_side_session(
+        &self,
+        session: &SideSessionRecord,
+    ) -> Result<()> {
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        if let Some((work_item_id, ephemeral)) = tx
+            .query_row(
+                "SELECT work_item_id, ephemeral FROM sessions WHERE id = ?1",
+                [&session.id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()?
+        {
+            if work_item_id != session.work_item_id {
+                anyhow::bail!(
+                    "session {} already belongs to Work Item {}",
+                    session.id,
+                    work_item_id
+                );
+            }
+            if !ephemeral {
+                anyhow::bail!(
+                    "session {} is persistent and cannot be reused as SIDE",
+                    session.id
+                );
+            }
+        }
+        if session.active {
+            tx.execute(
+                "UPDATE sessions SET active = 0 WHERE work_item_id = ?1",
+                [&session.work_item_id],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO sessions(
+                id, work_item_id, parent_id, active, ephemeral, created_at
+             ) VALUES (?1, ?2, ?3, ?4, 1, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                parent_id = excluded.parent_id,
+                active = excluded.active,
+                ephemeral = 1",
+            params![
+                session.id,
+                session.work_item_id,
+                session.parent_id,
+                session.active as i64,
+                session.created_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Returns the active canonical SIDE session, if one exists.
+    pub(crate) fn ephemeral_side_session(
+        &self,
+        work_item_id: &str,
+    ) -> Result<Option<SideSessionRecord>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT id, work_item_id, parent_id, active, created_at
+                 FROM sessions
+                 WHERE work_item_id = ?1 AND ephemeral = 1 AND active = 1",
+                [work_item_id],
+                |row| {
+                    Ok(SideSessionRecord {
+                        id: row.get(0)?,
+                        work_item_id: row.get(1)?,
+                        parent_id: row.get(2)?,
+                        active: row.get::<_, i64>(3)? != 0,
+                        created_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Returns all persisted SIDE rows, including an inactive row awaiting
+    /// teardown. The cleanup ledger remains separate and is not replaced by
+    /// this canonical session history.
+    pub(crate) fn ephemeral_side_sessions_for_work_item(
+        &self,
+        work_item_id: &str,
+    ) -> Result<Vec<SideSessionRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, work_item_id, parent_id, active, created_at
+             FROM sessions
+             WHERE work_item_id = ?1 AND ephemeral = 1
+             ORDER BY created_at, id",
+        )?;
+        let rows = statement.query_map([work_item_id], |row| {
+            Ok(SideSessionRecord {
+                id: row.get(0)?,
+                work_item_id: row.get(1)?,
+                parent_id: row.get(2)?,
+                active: row.get::<_, i64>(3)? != 0,
+                created_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Atomically moves active ownership to an already-persisted SIDE row.
+    /// Returns false when the requested row is not an ephemeral SIDE for the
+    /// supplied Work Item; in that case no ownership is changed.
+    pub(crate) fn activate_ephemeral_side_session(
+        &self,
+        work_item_id: &str,
+        session_id: &str,
+    ) -> Result<bool> {
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let exists = tx
+            .query_row(
+                "SELECT 1 FROM sessions
+                 WHERE id = ?1 AND work_item_id = ?2 AND ephemeral = 1",
+                params![session_id, work_item_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE sessions SET active = 0 WHERE work_item_id = ?1",
+            [work_item_id],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET active = 1
+             WHERE id = ?1 AND work_item_id = ?2 AND ephemeral = 1",
+            params![session_id, work_item_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Removes an inactive canonical SIDE row after the SDK session has been
+    /// deleted. Active rows must first be switched away from by the caller.
+    pub(crate) fn delete_ephemeral_side_session(
+        &self,
+        work_item_id: &str,
+        session_id: &str,
+    ) -> Result<bool> {
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let active = tx
+            .query_row(
+                "SELECT active FROM sessions
+                 WHERE id = ?1 AND work_item_id = ?2 AND ephemeral = 1",
+                params![session_id, work_item_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if active == Some(1) {
+            anyhow::bail!("cannot delete active SIDE session {session_id}");
+        }
+        let deleted = tx.execute(
+            "DELETE FROM sessions
+             WHERE id = ?1 AND work_item_id = ?2 AND ephemeral = 1",
+            params![session_id, work_item_id],
+        )? == 1;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     pub(crate) fn active_session(&self, work_item_id: &str) -> Result<Option<SessionRecord>> {
@@ -1992,7 +2204,10 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    use super::{Storage, MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4};
+    use super::{
+        SideSessionRecord, Storage, MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4,
+        MIGRATION_5, MIGRATION_6,
+    };
     use crate::domain::{
         AnchorSide, Annotation, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState,
         EphemeralSessionRecord, PendingChat, Placement, Repo, SessionRecord, Version, VersionKind,
@@ -2017,6 +2232,7 @@ mod tests {
                      'annotations_repo_submitted', 'ask_messages_annotation_seq',
                      'work_items_last_opened', 'chat_outbox_work_item_created',
                      'ephemeral_sessions_work_item_created',
+                     'sessions_work_item_ephemeral',
                      'prune_operations_one_unfinished_per_work_item',
                      'prune_targets_operation_state'
                    )",
@@ -2024,7 +2240,146 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 23);
+        assert_eq!(count, 24);
+        let ephemeral_column: i64 = storage
+            .connection
+            .query_row(
+                r#"SELECT COUNT(*) FROM pragma_table_info('sessions')
+                 WHERE name = 'ephemeral' AND "notnull" = 1 AND dflt_value = '0'"#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ephemeral_column, 1);
+    }
+
+    #[test]
+    fn canonical_side_sessions_round_trip_and_switch_active_ownership() {
+        let storage = Storage::in_memory().unwrap();
+        let item = WorkItem {
+            id: "canonical-side".into(),
+            name: "canonical side".into(),
+            workspace_root: PathBuf::from("/canonical-side"),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            last_opened_at: None,
+        };
+        storage.upsert_work_item(&item).unwrap();
+        storage
+            .activate_session(&SessionRecord {
+                id: "main".into(),
+                work_item_id: item.id.clone(),
+                parent_id: None,
+                active: true,
+                created_at: "1".into(),
+            })
+            .unwrap();
+
+        let side = SideSessionRecord {
+            id: "side".into(),
+            work_item_id: item.id.clone(),
+            parent_id: Some("main".into()),
+            active: false,
+            created_at: "2".into(),
+        };
+        storage.persist_ephemeral_side_session(&side).unwrap();
+        assert_eq!(storage.ephemeral_side_session(&item.id).unwrap(), None);
+        assert_eq!(
+            storage.ephemeral_side_sessions_for_work_item(&item.id).unwrap(),
+            vec![side.clone()]
+        );
+        assert_eq!(
+            storage
+                .connection
+                .query_row(
+                    "SELECT ephemeral FROM sessions WHERE id = 'side'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(storage.active_session(&item.id).unwrap().unwrap().id, "main");
+
+        assert!(storage
+            .activate_ephemeral_side_session(&item.id, &side.id)
+            .unwrap());
+        assert_eq!(
+            storage.ephemeral_side_session(&item.id).unwrap(),
+            Some(SideSessionRecord {
+                active: true,
+                ..side.clone()
+            })
+        );
+        assert_eq!(storage.active_session(&item.id).unwrap().unwrap().id, "side");
+        let active_count: i64 = storage
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE work_item_id = ?1 AND active = 1",
+                [&item.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_count, 1);
+
+        storage
+            .activate_session(&SessionRecord {
+                id: "main".into(),
+                work_item_id: item.id.clone(),
+                parent_id: None,
+                active: true,
+                created_at: "1".into(),
+            })
+            .unwrap();
+        assert!(storage
+            .delete_ephemeral_side_session(&item.id, &side.id)
+            .unwrap());
+        assert!(storage
+            .ephemeral_side_sessions_for_work_item(&item.id)
+            .unwrap()
+            .is_empty());
+        assert!(!storage
+            .activate_ephemeral_side_session(&item.id, &side.id)
+            .unwrap());
+    }
+
+    #[test]
+    fn persisting_active_side_switches_ownership_in_one_transaction() {
+        let storage = Storage::in_memory().unwrap();
+        let item = WorkItem {
+            id: "canonical-side-active".into(),
+            name: "canonical side active".into(),
+            workspace_root: PathBuf::from("/canonical-side-active"),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            last_opened_at: None,
+        };
+        storage.upsert_work_item(&item).unwrap();
+        storage
+            .activate_session(&SessionRecord {
+                id: "main".into(),
+                work_item_id: item.id.clone(),
+                parent_id: None,
+                active: true,
+                created_at: "1".into(),
+            })
+            .unwrap();
+        storage
+            .persist_ephemeral_side_session(&SideSessionRecord {
+                id: "side".into(),
+                work_item_id: item.id.clone(),
+                parent_id: Some("main".into()),
+                active: true,
+                created_at: "2".into(),
+            })
+            .unwrap();
+
+        assert_eq!(storage.active_session(&item.id).unwrap().unwrap().id, "side");
+        assert!(!storage
+            .sessions_for_work_item(&item.id)
+            .unwrap()
+            .iter()
+            .any(|session| session.id == "main" && session.active));
     }
 
     #[test]
@@ -2373,12 +2728,12 @@ mod tests {
         let count: i64 = storage
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 6);
+        assert_eq!(count, 7);
     }
 
     #[test]
@@ -2414,7 +2769,7 @@ mod tests {
         let migrations_applied: i64 = storage
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (5, 6)",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (5, 6, 7)",
                 [],
                 |row| row.get(0),
             )
@@ -2429,8 +2784,77 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migrations_applied, 2);
+        assert_eq!(migrations_applied, 3);
         assert_eq!(tables, 2);
+    }
+
+    #[test]
+    fn schema_six_database_adds_ephemeral_with_safe_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("review.db");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        for (version, sql) in [
+            (1, MIGRATION_1),
+            (2, MIGRATION_2),
+            (3, MIGRATION_3),
+            (4, MIGRATION_4),
+            (5, MIGRATION_5),
+            (6, MIGRATION_6),
+        ] {
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, 'now')",
+                    [version],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO work_items(
+                    id, name, workspace_root, created_at, updated_at
+                 ) VALUES ('legacy', 'legacy', '/legacy', '1', '1')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(
+                    id, work_item_id, parent_id, active, created_at
+                 ) VALUES ('legacy-main', 'legacy', NULL, 1, '1')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let storage = Storage::open(&database).unwrap();
+        let version_count: i64 = storage
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version_count, 1);
+        let legacy_ephemeral: i64 = storage
+            .connection
+            .query_row(
+                "SELECT ephemeral FROM sessions WHERE id = 'legacy-main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_ephemeral, 0);
+        assert_eq!(storage.active_session("legacy").unwrap().unwrap().id, "legacy-main");
     }
 
     #[test]
