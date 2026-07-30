@@ -1149,6 +1149,7 @@ mod tests {
     use crate::copilot::{
         ActivityKind, AgentEvent, AgentLane, ContextTierOption, HistoryEntry, ModelOption,
     };
+    use crate::domain::{AnchorSide, Annotation, AnnotationKind, DeliveryState, Placement};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1301,6 +1302,47 @@ mod tests {
         assert_eq!(harness.mode(), "NORMAL");
         assert!(harness.status().contains("file boundary"));
         assert!(harness.render().unwrap().contains("src/module_12.rs"));
+    }
+
+    #[test]
+    fn annotation_for_a_missing_file_stays_visible_in_the_review_stream() {
+        let mut harness =
+            TuiHarness::from_unified_diff("missing-annotation", workflow_diff(), 84, 22).unwrap();
+        let repo_id = harness.state.work_item.repos[0].record.id.clone();
+        let version_id = harness.state.work_item.repos[0].version.id.clone();
+        harness.state.annotations.push((
+            Annotation {
+                id: "missing-file-note".into(),
+                repo_id,
+                kind: AnnotationKind::Comment,
+                file_path: "src/removed.rs".into(),
+                anchor_snippet: "removed source".into(),
+                anchor_hash: "missing".into(),
+                anchor_start_offset: 0,
+                anchor_line_count: 1,
+                text: Some("retain this historical note".into()),
+                submitted: false,
+                delivery_state: DeliveryState::Draft,
+                created_at: "2026-07-30T00:00:00Z".into(),
+            },
+            Placement {
+                annotation_id: "missing-file-note".into(),
+                version_id,
+                side: AnchorSide::New,
+                line_start: 17,
+                line_end: 17,
+                outdated: true,
+                ambiguous: false,
+            },
+        ));
+
+        harness.key(key(KeyCode::Char(']'))).unwrap();
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        let frame = harness.render().unwrap();
+        assert!(frame.contains("D"));
+        assert!(frame.contains("src/removed.rs"));
+        assert!(frame.contains("!Comment"));
+        assert!(frame.contains("retain this historical note"));
     }
 
     #[test]

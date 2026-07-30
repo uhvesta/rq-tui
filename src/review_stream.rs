@@ -5,6 +5,7 @@
 //! of source columns.  Inline annotation rows are still one-dimensional rows
 //! in both cases, which keeps cursor movement and source anchoring stable.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::diff::{DiffFile, FileStatus, LineKind};
@@ -587,6 +588,10 @@ fn build_rows(files: &[ReviewFile], annotations: &[InlineAnnotation]) -> Vec<Rev
             Some((target, annotation, anchor))
         })
         .collect();
+    let anchored_annotation_ids = insertions
+        .iter()
+        .map(|(_, annotation, _)| annotation.id.clone())
+        .collect::<HashSet<_>>();
     insertions.sort_by(|(left_target, left, _), (right_target, right, _)| {
         left_target
             .cmp(right_target)
@@ -602,6 +607,54 @@ fn build_rows(files: &[ReviewFile], annotations: &[InlineAnnotation]) -> Vec<Rev
             append_annotation_rows(&mut rebuilt, annotation, anchor);
             insertion_index += 1;
         }
+    }
+
+    // A placement whose file vanished from the current diff remains part of
+    // review history. Keep those annotations readable in deterministic
+    // synthetic file sections instead of dropping them from the stream.
+    let mut orphaned = annotations
+        .iter()
+        .filter(|annotation| !anchored_annotation_ids.contains(&annotation.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    orphaned.sort_by(|left, right| {
+        left.repo_id
+            .cmp(&right.repo_id)
+            .then_with(|| left.file_path.cmp(&right.file_path))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut previous_file: Option<(String, PathBuf)> = None;
+    for annotation in orphaned {
+        let file_key = (annotation.repo_id.clone(), annotation.file_path.clone());
+        if previous_file.as_ref() != Some(&file_key) {
+            let path = annotation.file_path.to_string_lossy().into_owned();
+            let repo_name = files
+                .iter()
+                .find(|file| file.repo_id == annotation.repo_id)
+                .map(|file| file.repo_name.clone())
+                .unwrap_or_else(|| annotation.repo_id.clone());
+            rebuilt.push(ReviewRow::FileHeader {
+                key: ReviewRowKey::FileHeader {
+                    repo_id: annotation.repo_id.clone(),
+                    file: path.clone(),
+                },
+                repo_id: annotation.repo_id.clone(),
+                repo_name,
+                path,
+                status: FileStatus::Deleted,
+            });
+            previous_file = Some(file_key);
+        }
+        let anchor = SourceAnchor {
+            repo_id: annotation.repo_id.clone(),
+            file: annotation.file_path.to_string_lossy().into_owned(),
+            hunk: usize::MAX,
+            line: usize::MAX,
+            visible_line: 0,
+            side: annotation.side,
+            source_line: annotation.line_start,
+        };
+        append_annotation_rows(&mut rebuilt, &annotation, &anchor);
     }
     rebuilt
 }
@@ -897,6 +950,40 @@ mod tests {
             4
         );
         assert_eq!(stream.annotation_row("a"), Some(stream.cursor()));
+    }
+
+    #[test]
+    fn annotations_for_missing_files_remain_readable_and_navigable() {
+        let orphan = InlineAnnotation::new(
+            "orphan",
+            "src/removed.rs",
+            SourceSide::New,
+            17,
+            17,
+            "!Comment · src/removed.rs R17",
+            "the source vanished but this review note must remain",
+        );
+        let mut stream = ReviewStream::new(&[file()], &[orphan]);
+
+        assert!(stream.rows().iter().any(|row| {
+            matches!(
+                row,
+                ReviewRow::FileHeader {
+                    path,
+                    status: FileStatus::Deleted,
+                    ..
+                } if path == "src/removed.rs"
+            )
+        }));
+        let orphan_row = stream.annotation_row("orphan").expect("orphan annotation");
+        assert!(matches!(
+            &stream.rows()[orphan_row],
+            ReviewRow::Annotation { block, .. }
+                if block.text == "!Comment · src/removed.rs R17"
+                    && block.anchor.file == "src/removed.rs"
+        ));
+        stream.gg();
+        assert_eq!(stream.jump_annotation(true), Some(orphan_row));
     }
 
     #[test]
