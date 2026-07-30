@@ -5,6 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::highlight::{Highlighter, StyledSegment};
+use crate::markdown::{inline_link, safe_link_destination};
 
 const DEFAULT_WIDTH: usize = 1;
 const TAB_WIDTH: usize = 4;
@@ -101,16 +102,19 @@ pub(crate) fn render_markdown_mapped(
         elided: Vec::new(),
     };
     let mut fence: Option<Fence> = None;
+    let mut table_columns = None;
     let mut source_line_start = 0usize;
+    let source_lines = text.split('\n').collect::<Vec<_>>();
 
     // `split` (rather than `lines`) deliberately retains a final empty item,
     // which makes explicit trailing blank lines visible in the transcript.
-    for source_line in text.split('\n') {
+    for (index, source_line) in source_lines.iter().copied().enumerate() {
         if fence
             .as_ref()
             .is_some_and(|active_fence| is_fence(source_line, active_fence.marker))
         {
             fence = None;
+            table_columns = None;
             mapped.elided.push(SourceRange::new(
                 source_line_start,
                 source_line_start + source_line.len(),
@@ -119,6 +123,7 @@ pub(crate) fn render_markdown_mapped(
             continue;
         }
         if let Some(active_fence) = fence.as_mut() {
+            table_columns = None;
             let expanded = expand_tabs_with_sources(source_line, source_line_start);
             let segments = highlighter
                 .highlight_line(&active_fence.path, active_fence.line_number, &expanded.text)
@@ -132,6 +137,7 @@ pub(crate) fn render_markdown_mapped(
         }
 
         if let Some((marker, info)) = opening_fence(source_line) {
+            table_columns = None;
             fence = Some(Fence {
                 marker,
                 path: synthetic_path(info),
@@ -145,7 +151,29 @@ pub(crate) fn render_markdown_mapped(
             continue;
         }
 
-        render_text_line_mapped(source_line, source_line_start, width, &mut mapped);
+        let separator_columns = table_separator_columns(source_line);
+        let row_columns = table_column_count(source_line);
+        let next_separator_columns = source_lines
+            .get(index + 1)
+            .and_then(|next| table_separator_columns(next));
+        let table_kind = if separator_columns.is_some() && separator_columns == table_columns {
+            Some(TableLineKind::Separator)
+        } else if row_columns.is_some()
+            && (row_columns == table_columns || row_columns == next_separator_columns)
+        {
+            table_columns = row_columns;
+            Some(TableLineKind::Row)
+        } else {
+            table_columns = None;
+            None
+        };
+        render_text_line_mapped(
+            source_line,
+            source_line_start,
+            width,
+            &mut mapped,
+            table_kind,
+        );
         source_line_start = source_line_start.saturating_add(source_line.len() + 1);
     }
 
@@ -170,6 +198,7 @@ fn render_text_line_mapped(
     source_line_start: usize,
     width: usize,
     mapped: &mut MappedMarkdown,
+    table_kind: Option<TableLineKind>,
 ) {
     if source_line.is_empty() {
         mapped.rows.push(MappedRow {
@@ -179,7 +208,12 @@ fn render_text_line_mapped(
         return;
     }
 
-    let mut atoms = markdown_atoms(source_line, source_line_start, &mut mapped.elided);
+    let mut atoms = markdown_atoms(
+        source_line,
+        source_line_start,
+        &mut mapped.elided,
+        table_kind,
+    );
     atoms = coalesce_display_clusters(atoms);
     push_wrapped_atoms(&mut mapped.rows, atoms, width);
 }
@@ -188,10 +222,31 @@ fn markdown_atoms(
     line: &str,
     source_line_start: usize,
     elided: &mut Vec<SourceRange>,
+    table_kind: Option<TableLineKind>,
 ) -> Vec<RenderAtom> {
     let leading = line.len() - line.trim_start_matches(' ').len();
     let (indent, rest) = line.split_at(leading);
     let normal = Style::default().fg(Color::Rgb(210, 210, 210));
+
+    match table_kind {
+        Some(TableLineKind::Separator) => {
+            let mut atoms = direct_atoms_at(indent, source_line_start, 0, normal);
+            atoms.extend(table_separator_atoms(rest, source_line_start + leading));
+            return atoms;
+        }
+        Some(TableLineKind::Row) => {
+            let mut atoms = direct_atoms_at(indent, source_line_start, 0, normal);
+            atoms.extend(table_row_atoms(
+                rest,
+                source_line_start + leading,
+                leading,
+                normal,
+                elided,
+            ));
+            return atoms;
+        }
+        None => {}
+    }
 
     if let Some((level, content)) = heading(rest) {
         let content_offset = line.len().saturating_sub(content.len());
@@ -213,10 +268,10 @@ fn markdown_atoms(
         return atoms;
     }
 
-    if let Some(content) = rest.strip_prefix('>').and_then(strip_optional_space) {
+    if let Some((depth, content)) = quote_content(rest) {
         let content_offset = line.len().saturating_sub(content.len());
         let mut atoms = decoration_atoms(
-            format!("{indent}│ "),
+            format!("{indent}{}", "│ ".repeat(depth)),
             SourceRange::new(source_line_start, source_line_start + content_offset),
             Style::default().fg(Color::DarkGray),
         );
@@ -279,6 +334,140 @@ fn markdown_atoms(
         elided,
     ));
     atoms
+}
+
+fn quote_content(line: &str) -> Option<(usize, &str)> {
+    let mut depth = 0;
+    let mut content = line;
+    while let Some(rest) = content.strip_prefix('>') {
+        depth += 1;
+        content = rest.strip_prefix(' ').unwrap_or(rest);
+    }
+    (depth > 0).then_some((depth, content))
+}
+
+fn table_separator_columns(line: &str) -> Option<usize> {
+    let cells = table_cell_texts(line)?;
+    cells
+        .iter()
+        .all(|cell| {
+            let rule = cell.trim().trim_matches(':');
+            rule.len() >= 3 && rule.bytes().all(|byte| byte == b'-')
+        })
+        .then_some(cells.len())
+}
+
+fn table_column_count(line: &str) -> Option<usize> {
+    table_cell_texts(line).map(|cells| cells.len())
+}
+
+fn table_cell_texts(line: &str) -> Option<Vec<String>> {
+    let mut trimmed = line.trim();
+    if let Some(without_prefix) = trimmed.strip_prefix('|') {
+        trimmed = without_prefix;
+    }
+    if let Some(without_suffix) = trimmed.strip_suffix('|') {
+        trimmed = without_suffix;
+    }
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    for (offset, character) in trimmed.char_indices() {
+        if character == '|' && !escaped_pipe(trimmed, offset) {
+            cells.push(cell.trim().to_owned());
+            cell.clear();
+        } else {
+            cell.push(character);
+        }
+    }
+    cells.push(cell.trim().to_owned());
+    (cells.len() >= 2).then_some(cells)
+}
+
+#[derive(Clone, Copy)]
+enum TableLineKind {
+    Row,
+    Separator,
+}
+
+fn table_separator_atoms(line: &str, source_start: usize) -> Vec<RenderAtom> {
+    let style = Style::default().fg(Color::DarkGray);
+    let mut atoms = Vec::new();
+    for (offset, character) in line.char_indices() {
+        let rendered = match character {
+            '|' => "┼",
+            '-' => "─",
+            ':' => "·",
+            _ => {
+                atoms.extend(direct_atoms_at(
+                    &line[offset..offset + character.len_utf8()],
+                    source_start + offset,
+                    offset,
+                    style,
+                ));
+                continue;
+            }
+        };
+        atoms.extend(decoration_atoms(
+            rendered,
+            SourceRange::new(
+                source_start + offset,
+                source_start + offset + character.len_utf8(),
+            ),
+            style,
+        ));
+    }
+    atoms
+}
+
+fn table_row_atoms(
+    line: &str,
+    source_start: usize,
+    initial_source_column: usize,
+    style: Style,
+    elided: &mut Vec<SourceRange>,
+) -> Vec<RenderAtom> {
+    let mut atoms = Vec::new();
+    let mut segment_start = 0;
+    for (offset, character) in line.char_indices() {
+        if character != '|' || escaped_pipe(line, offset) {
+            continue;
+        }
+        if segment_start < offset {
+            atoms.extend(inline_atoms(
+                &line[segment_start..offset],
+                source_start + segment_start,
+                source_column_at(line, segment_start, initial_source_column),
+                style,
+                elided,
+            ));
+        }
+        atoms.extend(decoration_atoms(
+            "│",
+            SourceRange::new(source_start + offset, source_start + offset + 1),
+            Style::default().fg(Color::Cyan),
+        ));
+        segment_start = offset + 1;
+    }
+    if segment_start < line.len() {
+        atoms.extend(inline_atoms(
+            &line[segment_start..],
+            source_start + segment_start,
+            source_column_at(line, segment_start, initial_source_column),
+            style,
+            elided,
+        ));
+    }
+    atoms
+}
+
+fn escaped_pipe(line: &str, offset: usize) -> bool {
+    line[..offset]
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count()
+        % 2
+        == 1
 }
 
 fn heading(line: &str) -> Option<(usize, &str)> {
@@ -438,6 +627,71 @@ fn inline_atoms(
 
     while cursor < text.len() {
         let rest = &text[cursor..];
+        if let Some(escaped) = escaped_markdown_character(rest) {
+            if plain_start < cursor {
+                atoms.extend(direct_atoms_at(
+                    &text[plain_start..cursor],
+                    source_start + plain_start,
+                    source_column_at(text, plain_start, initial_source_column),
+                    base_style,
+                ));
+            }
+            elided.push(SourceRange::new(
+                source_start + cursor,
+                source_start + cursor + 1,
+            ));
+            let character_start = cursor + 1;
+            atoms.extend(direct_atoms_at(
+                &text[character_start..character_start + escaped.len_utf8()],
+                source_start + character_start,
+                source_column_at(text, character_start, initial_source_column),
+                base_style,
+            ));
+            cursor = character_start + escaped.len_utf8();
+            plain_start = cursor;
+            continue;
+        }
+        if let Some(link) = inline_link(rest) {
+            if plain_start < cursor {
+                atoms.extend(direct_atoms_at(
+                    &text[plain_start..cursor],
+                    source_start + plain_start,
+                    source_column_at(text, plain_start, initial_source_column),
+                    base_style,
+                ));
+            }
+            let label_start = cursor + link.label.start;
+            let label_end = cursor + link.label.end;
+            elided.push(SourceRange::new(
+                source_start + cursor,
+                source_start + label_start,
+            ));
+            elided.push(SourceRange::new(
+                source_start + label_end,
+                source_start + cursor + link.consumed,
+            ));
+            let safe_destination = safe_link_destination(&rest[link.destination.clone()]);
+            let link_color = if safe_destination {
+                Color::LightBlue
+            } else {
+                Color::Yellow
+            };
+            let link_style = base_style.fg(link_color).add_modifier(Modifier::UNDERLINED);
+            atoms.extend(inline_atoms(
+                &text[label_start..label_end],
+                source_start + label_start,
+                source_column_at(text, label_start, initial_source_column),
+                link_style,
+                elided,
+            ));
+            atoms.push(RenderAtom::synthetic(
+                if safe_destination { "↗" } else { "⚠" },
+                Style::default().fg(link_color),
+            ));
+            cursor += link.consumed;
+            plain_start = cursor;
+            continue;
+        }
         let (delimiter, style) = if rest.starts_with("***") {
             (
                 "***",
@@ -496,12 +750,22 @@ fn inline_atoms(
             source_start + content_end,
             source_start + content_end + delimiter.len(),
         ));
-        atoms.extend(direct_atoms_at(
-            &text[content_start..content_end],
-            source_start + content_start,
-            source_column_at(text, content_start, initial_source_column),
-            style,
-        ));
+        if delimiter == "`" {
+            atoms.extend(direct_atoms_at(
+                &text[content_start..content_end],
+                source_start + content_start,
+                source_column_at(text, content_start, initial_source_column),
+                style,
+            ));
+        } else {
+            atoms.extend(inline_atoms(
+                &text[content_start..content_end],
+                source_start + content_start,
+                source_column_at(text, content_start, initial_source_column),
+                style,
+                elided,
+            ));
+        }
         cursor = content_end + delimiter.len();
         plain_start = cursor;
     }
@@ -523,6 +787,30 @@ fn inline_atoms(
         ));
     }
     atoms
+}
+
+fn escaped_markdown_character(text: &str) -> Option<char> {
+    let escaped = text.strip_prefix('\\')?.chars().next()?;
+    matches!(
+        escaped,
+        '\\' | '`'
+            | '*'
+            | '_'
+            | '{'
+            | '}'
+            | '['
+            | ']'
+            | '('
+            | ')'
+            | '#'
+            | '+'
+            | '-'
+            | '.'
+            | '!'
+            | '|'
+            | '>'
+    )
+    .then_some(escaped)
 }
 
 /// Markdown prefix detection historically runs after tab expansion. Quote and
@@ -979,6 +1267,193 @@ mod tests {
         ] {
             assert!(mapped.elided.contains(&delimiter), "missing {delimiter:?}");
         }
+    }
+
+    #[test]
+    fn links_render_a_safe_affordance_and_keep_exact_label_mapping() {
+        let source = "See [**docs**](https://example.invalid/review) now";
+        let mut highlighter = RecordingHighlighter::default();
+        let mapped = render_markdown_mapped(source, 80, &mut highlighter);
+
+        assert_eq!(mapped_text(&mapped), "See docs↗ now");
+        let row = mapped.rows.first().expect("one link row");
+        assert!(row.line.spans[4..8].iter().all(|span| {
+            span.style.add_modifier.contains(Modifier::BOLD)
+                && span.style.add_modifier.contains(Modifier::UNDERLINED)
+        }));
+        let label_start = source.find("docs").unwrap();
+        for offset in label_start..label_start + "docs".len() {
+            assert!(
+                source_ranges(&mapped).contains(&SourceRange::new(offset, offset + 1)),
+                "missing label byte {offset}"
+            );
+        }
+        assert!(mapped.elided.contains(&SourceRange::new(4, 5)));
+        assert!(mapped.elided.contains(&SourceRange::new(
+            label_start + 6,
+            source.find(" now").unwrap()
+        )));
+        assert!(matches!(
+            row.cells
+                .iter()
+                .find(|cell| cell.columns.start == 8)
+                .map(|cell| &cell.source),
+            Some(CellSource::Synthetic)
+        ));
+    }
+
+    #[test]
+    fn malformed_links_remain_literal_text() {
+        let source = "[label]() and [unfinished](https://example.invalid";
+        let mut highlighter = RecordingHighlighter::default();
+        let mapped = render_markdown_mapped(source, 80, &mut highlighter);
+
+        assert_eq!(mapped_text(&mapped), source);
+        assert!(mapped.elided.is_empty());
+    }
+
+    #[test]
+    fn unsafe_links_are_visibly_warned_instead_of_presented_as_safe() {
+        let source = "[run](javascript:alert(1))";
+        let mut highlighter = RecordingHighlighter::default();
+        let mapped = render_markdown_mapped(source, 80, &mut highlighter);
+
+        assert_eq!(mapped_text(&mapped), "run⚠");
+        assert_eq!(
+            mapped
+                .rows
+                .first()
+                .unwrap()
+                .line
+                .spans
+                .last()
+                .unwrap()
+                .style
+                .fg,
+            Some(Color::Yellow)
+        );
+    }
+
+    #[test]
+    fn unicode_links_and_tables_reflow_without_losing_semantic_ownership() {
+        let link = "[文档](https://example.invalid/review)";
+        for width in [2, 3, 10, 80] {
+            let mut highlighter = RecordingHighlighter::default();
+            let mapped = render_markdown_mapped(link, width, &mut highlighter);
+            assert_eq!(
+                mapped
+                    .rows
+                    .iter()
+                    .map(|row| text(&row.line))
+                    .collect::<String>(),
+                "文档↗"
+            );
+            assert!(mapped.rows.iter().all(|row| row.line.width() <= width));
+            let label_start = link.find('文').unwrap();
+            assert!(source_ranges(&mapped).contains(&SourceRange::new(
+                label_start,
+                label_start + '文'.len_utf8()
+            )));
+            assert!(mapped
+                .rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .any(|cell| cell.source == CellSource::Synthetic));
+        }
+
+        let table = "| A | B |\n| --- | --- |\n| 文 | 档 |";
+        let mut highlighter = RecordingHighlighter::default();
+        let mapped = render_markdown_mapped(table, 3, &mut highlighter);
+        assert!(mapped.rows.iter().all(|row| row.line.width() <= 3));
+        for needle in ['A', 'B', '文', '档'] {
+            let start = table.find(needle).unwrap();
+            assert!(source_ranges(&mapped)
+                .iter()
+                .any(|range| range.start <= start && range.end > start));
+        }
+    }
+
+    #[test]
+    fn nested_inline_markup_combines_styles_without_exposing_delimiters() {
+        let mut highlighter = RecordingHighlighter::default();
+        let mapped = render_markdown_mapped("**bold _nested_**", 80, &mut highlighter);
+
+        assert_eq!(mapped_text(&mapped), "bold nested");
+        let row = mapped.rows.first().unwrap();
+        assert!(row.line.spans[..5]
+            .iter()
+            .all(|span| span.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(row.line.spans[5..].iter().all(|span| span
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD)
+            && span.style.add_modifier.contains(Modifier::ITALIC)));
+    }
+
+    #[test]
+    fn tables_and_nested_quotes_render_semantically_without_losing_source_ranges() {
+        let source = "| Name | Result |\n| :--- | ---: |\n| `api` | **safe** |\n| a\\|b | exact |\n> > nested quote";
+        let mut highlighter = RecordingHighlighter::default();
+        let mapped = render_markdown_mapped(source, 80, &mut highlighter);
+        let rendered = mapped_text(&mapped);
+
+        assert!(rendered.contains("│ Name │ Result │"));
+        assert!(rendered.contains("┼ ·─── ┼ ───· ┼"));
+        assert!(rendered.contains("│ api │ safe │"));
+        assert!(rendered.contains("│ a|b │ exact │"));
+        assert!(rendered.contains("│ │ nested quote"));
+        for needle in ["Name", "Result", "api", "safe", "exact", "nested quote"] {
+            let start = source.find(needle).unwrap();
+            assert!(
+                source_ranges(&mapped)
+                    .iter()
+                    .any(|range| range.start <= start && range.end > start),
+                "missing mapping for {needle}"
+            );
+        }
+        let escape = source.find("\\|").unwrap();
+        assert!(mapped
+            .elided
+            .contains(&SourceRange::new(escape, escape + 1)));
+    }
+
+    #[test]
+    fn pipe_prose_without_a_separator_is_not_misclassified_as_a_table() {
+        let source = "| ordinary | pipe prose |";
+        let mut highlighter = RecordingHighlighter::default();
+        let mapped = render_markdown_mapped(source, 80, &mut highlighter);
+
+        assert_eq!(mapped_text(&mapped), source);
+        assert!(mapped
+            .rows
+            .first()
+            .unwrap()
+            .cells
+            .iter()
+            .all(|cell| matches!(cell.source, CellSource::Text(_))));
+    }
+
+    #[test]
+    fn tables_accept_optional_outer_pipes_and_reject_column_mismatches() {
+        assert_eq!(super::table_cell_texts(r"| x\|y | z |").unwrap().len(), 2);
+        assert_eq!(super::table_cell_texts(r"| x\\| y | z |").unwrap().len(), 3);
+
+        let source = "A | B\n--- | ---\n文 | 档";
+        let mut highlighter = RecordingHighlighter::default();
+        let mapped = render_markdown_mapped(source, 80, &mut highlighter);
+        assert_eq!(mapped_text(&mapped), "A │ B\n─── ┼ ───\n文 │ 档");
+
+        let mismatch = "| A | B |\n| --- | --- | --- |\n| one | two |";
+        let mut highlighter = RecordingHighlighter::default();
+        let mapped = render_markdown_mapped(mismatch, 80, &mut highlighter);
+        assert_eq!(mapped_text(&mapped), mismatch);
+
+        let indented = "  | A | B |\n  | --- | --- |\n  | one | two |";
+        let mut highlighter = RecordingHighlighter::default();
+        let mapped = render_markdown_mapped(indented, 80, &mut highlighter);
+        assert!(mapped_text(&mapped).contains("\n  ┼ ─── ┼ ─── ┼\n"));
+        assert!(source_ranges(&mapped).contains(&SourceRange::new(12, 13)));
+        assert!(source_ranges(&mapped).contains(&SourceRange::new(13, 14)));
     }
 
     #[test]

@@ -14,7 +14,7 @@ Evidence abbreviations:
 - `PTY-xx` refers to [`audit/pty-smoke.md`](audit/pty-smoke.md).
 - Other test names identify their Rust module directly.
 
-Current-evidence boundary: the deterministic harness baseline is 195 regular
+Current-evidence boundary: the deterministic harness baseline is 208 regular
 tests passing with 1 authenticated live test ignored by default. The ignored
 stream/resume test was also run explicitly against the installed Copilot CLI
 and passed. PTY-16 through PTY-21 are current compiled-binary evidence; earlier
@@ -198,7 +198,7 @@ matrix so that new evidence is not confused with the earlier PTY run.
 | T-03 | Chat scrolling by rendered rows, including wrapped single messages | Working in the deterministic harness | `WF::chat_scrolls_by_rendered_rows_and_pauses_live_following`; no separate mouse-drag selection automation exists. |
 | T-04 | Sticky multiline composer with wrapping, independent scroll, editing, preserved drafts, and explicit discard | Working in the deterministic harness and compiled PTY | `WF::sticky_chat_composer_wraps_edits_preserves_and_explicitly_discards_drafts`; PTY-21 exercised a 21-row contextual composer and its independent row-range scroll. |
 | T-05 | Cancel draft versus cancel active Copilot turn | Working in the deterministic harness and compiled PTY | Draft preservation/discard and deterministic abort/reusable-session paths pass. PTY-18 stopped an active response while preserving the draft in Insert mode. |
-| T-06 | Markdown semantics in Chat and fenced-code rendering | Working in deterministic frames | `chat_render::*` tests and `WF::markdown_history_and_minimum_terminal_state_have_inspectable_frames`; renderer covers headings, lists, task lists, blockquotes, emphasis, inline code, wrapping, blank lines, and fences. |
+| T-06 | Markdown semantics in Chat and fenced-code rendering | Working in deterministic frames | `chat_render::*`, `markdown::*`, and `WF::markdown_history_and_minimum_terminal_state_have_inspectable_frames`; the source-mapped terminal renderer covers headings, lists, task lists, nested blockquotes, emphasis, inline code, safe link affordances, pipe tables, wrapping, blank lines, and syntax-highlighted fences. Browser output shares safe inline parsing, rejects executable URL schemes, and renders aligned tables. |
 | T-07 | Lazy cached syntax highlighting for diff lines and fenced code | Working in unit tests and deterministic frames | `highlight::tests::recognizes_common_languages`, `highlight::tests::highlights_only_requested_lines_and_reuses_cache`, and `chat_render::tests::highlights_fenced_code_with_a_language_specific_synthetic_path`. |
 | T-08 | Durable Copilot progress, quiet warning, tool/skill visibility, and `:agent-status` timeline | Working in the deterministic harness and compiled PTY | The renderer and overlay expose lane, phase, elapsed time, last event, queue, outbound ID, operation detail, quiet diagnostics, and timeline. Tool, skill, subagent, hook, retry, and error activity are typed and visible. PTY-17 captured active, queued, and immediate-steering progress. |
 | T-09 | `/side` isolated ephemeral conversation and `/main` restoration | Working in deterministic, compiled-PTY, and authenticated paths | `WF::side_conversation_is_visibly_isolated_and_main_transcript_is_restored`; PTY-20 returned from an active SIDE turn promptly, and LIVE-01 exercised real SIDE creation and SDK deletion. |
@@ -211,7 +211,7 @@ matrix so that new evidence is not confused with the earlier PTY run.
 The current checked-in regular-test baseline is:
 
 ```text
-195 regular tests passed; 1 authenticated live Copilot test ignored by default
+208 regular tests passed; 1 authenticated live Copilot test ignored by default
 ```
 
 The regular baseline includes the reducer/effect, storage, rendering, SDK

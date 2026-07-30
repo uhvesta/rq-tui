@@ -817,7 +817,7 @@ pub fn render_ui_scenario(name: &str, width: u16, height: u16) -> Result<String>
             press(&mut harness, crossterm::event::KeyCode::Tab)?;
             harness.inject_agent_event(AgentEvent::HistoryLoaded(vec![HistoryEntry {
                 role: "copilot".into(),
-                text: "# Review result\n\n- **Safe** path\n- `retry` is bounded\n\n```rust\nfn review() -> Result<()> {\n    Ok(())\n}\n```".into(),
+                text: "# Review result\n\n- **Safe** path\n- [Guide](https://example.invalid/review)\n\n| Check | Status |\n| :--- | ---: |\n| `retry` | bounded |\n\n> > Nested context\n\n```rust\nfn review() -> Result<()> {\n    Ok(())\n}\n```".into(),
             }]))?;
         }
         "tiny" => {
@@ -2945,12 +2945,15 @@ mod tests {
         harness
             .inject_agent_event(AgentEvent::HistoryLoaded(vec![HistoryEntry {
                 role: "copilot".into(),
-                text: "# Result\n\n- **safe** item\n\n```rust\nfn main() {}\n```".into(),
+                text: "# Result\n\n- **safe** item\n- [guide](https://example.invalid)\n\n| Check | Status |\n| :--- | ---: |\n| `api` | ready |\n\n> > nested\n\n```rust\nfn main() {}\n```".into(),
             }]))
             .unwrap();
         let markdown = harness.render().unwrap();
         assert!(markdown.contains("# Result"));
         assert!(markdown.contains("• safe item"));
+        assert!(markdown.contains("guide↗"));
+        assert!(markdown.contains("│ Check │ Status │"));
+        assert!(markdown.contains("│ │ nested"));
         assert!(markdown.contains("fn main()"));
         assert!(!markdown.contains("**safe**"));
 

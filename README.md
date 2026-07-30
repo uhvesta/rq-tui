@@ -169,13 +169,16 @@ still rejects shell and write requests.
 ## Markdown and syntax highlighting
 
 Chat messages use terminal Markdown semantics rather than printing raw markup:
-headings, unordered/ordered/task lists, blockquotes, emphasis, inline code,
-blank lines, wrapping, and fenced code blocks are rendered as terminal rows.
+headings, unordered/ordered/task lists, nested blockquotes, emphasis, inline
+code, safe links, pipe tables, blank lines, wrapping, and fenced code blocks
+are rendered as terminal rows. Link labels use a terminal-safe `↗` affordance;
+their URL syntax and synthetic glyph never leak into plain-text selection.
 Fenced code is passed through the same lazy, cached syntax-highlighting
 interface used by diffs. Language fences create a synthetic filename, while
-diff files are detected by path. The deterministic tests cover Rust, Python,
-TypeScript, JavaScript, Go, JSON, YAML, TOML, Markdown, shell, C/C++, Java,
-C#, Ruby, PHP, SQL, HTML, CSS, and Swift.
+diff files are detected by path. Browser preview shares the safe inline parser,
+filters executable URL schemes, and renders aligned tables. The deterministic
+tests cover Rust, Python, TypeScript, JavaScript, Go, JSON, YAML, TOML,
+Markdown, shell, C/C++, Java, C#, Ruby, PHP, SQL, HTML, CSS, and Swift.
 
 ## Persistence and recovery
 

@@ -45,6 +45,7 @@ use crate::domain::{
 use crate::export::{CommentExport, ExportFormat, ReviewArchive};
 use crate::git::Git;
 use crate::highlight::{Highlighter, StyledSegment, SyntectHighlighter};
+use crate::markdown::{escape_html, render_inline_html};
 use crate::remote::{PrReference, RemoteResolver};
 use crate::review_stream::{AnnotationRowPart, ReviewRow};
 use crate::storage::{now, Storage};
@@ -1832,7 +1833,10 @@ fn markdown_to_html(markdown: &str) -> String {
     let mut output = String::new();
     let mut in_code = false;
     let mut in_list = false;
-    for line in markdown.lines() {
+    let lines = markdown.lines().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
         if line.trim_start().starts_with("```") {
             if in_list {
                 output.push_str("</ul>");
@@ -1844,41 +1848,76 @@ fn markdown_to_html(markdown: &str) -> String {
                 "<pre><code>"
             });
             in_code = !in_code;
+            index += 1;
             continue;
         }
-        let escaped = line
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;");
+        if !in_code && index + 1 < lines.len() && table_separator(lines[index + 1]).is_some() {
+            if let (Some(headers), Some(alignments)) =
+                (table_cells(line), table_separator(lines[index + 1]))
+            {
+                if headers.len() == alignments.len() {
+                    if in_list {
+                        output.push_str("</ul>");
+                        in_list = false;
+                    }
+                    output.push_str("<table><thead><tr>");
+                    for (header, alignment) in headers.iter().zip(&alignments) {
+                        output.push_str(&format!(
+                            "<th style=\"text-align:{alignment}\">{}</th>",
+                            render_inline_html(header)
+                        ));
+                    }
+                    output.push_str("</tr></thead><tbody>");
+                    index += 2;
+                    while index < lines.len() {
+                        let Some(cells) = table_cells(lines[index]) else {
+                            break;
+                        };
+                        if cells.len() != headers.len() {
+                            break;
+                        }
+                        output.push_str("<tr>");
+                        for (cell, alignment) in cells.iter().zip(&alignments) {
+                            output.push_str(&format!(
+                                "<td style=\"text-align:{alignment}\">{}</td>",
+                                render_inline_html(cell)
+                            ));
+                        }
+                        output.push_str("</tr>");
+                        index += 1;
+                    }
+                    output.push_str("</tbody></table>");
+                    continue;
+                }
+            }
+        }
         if in_code {
-            output.push_str(&escaped);
+            output.push_str(&escape_html(line));
             output.push('\n');
-        } else if let Some(heading) = escaped.strip_prefix("### ") {
-            output.push_str(&format!("<h3>{heading}</h3>"));
-        } else if let Some(heading) = escaped.strip_prefix("## ") {
-            output.push_str(&format!("<h2>{heading}</h2>"));
-        } else if let Some(heading) = escaped.strip_prefix("# ") {
-            output.push_str(&format!("<h1>{heading}</h1>"));
-        } else if let Some(item) = escaped
-            .strip_prefix("- ")
-            .or_else(|| escaped.strip_prefix("* "))
-        {
+        } else if let Some(heading) = line.strip_prefix("### ") {
+            output.push_str(&format!("<h3>{}</h3>", render_inline_html(heading)));
+        } else if let Some(heading) = line.strip_prefix("## ") {
+            output.push_str(&format!("<h2>{}</h2>", render_inline_html(heading)));
+        } else if let Some(heading) = line.strip_prefix("# ") {
+            output.push_str(&format!("<h1>{}</h1>", render_inline_html(heading)));
+        } else if let Some(item) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
             if !in_list {
                 output.push_str("<ul>");
                 in_list = true;
             }
-            output.push_str(&format!("<li>{item}</li>"));
+            output.push_str(&format!("<li>{}</li>", render_inline_html(item)));
         } else {
             if in_list {
                 output.push_str("</ul>");
                 in_list = false;
             }
-            if escaped.is_empty() {
+            if line.is_empty() {
                 output.push_str("<br>");
             } else {
-                output.push_str(&format!("<p>{escaped}</p>"));
+                output.push_str(&format!("<p>{}</p>", render_inline_html(line)));
             }
         }
+        index += 1;
     }
     if in_code {
         output.push_str("</code></pre>");
@@ -1887,6 +1926,63 @@ fn markdown_to_html(markdown: &str) -> String {
         output.push_str("</ul>");
     }
     output
+}
+
+fn table_cells(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let mut trimmed = trimmed;
+    if let Some(without_prefix) = trimmed.strip_prefix('|') {
+        trimmed = without_prefix;
+    }
+    if let Some(without_suffix) = trimmed.strip_suffix('|') {
+        trimmed = without_suffix;
+    }
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    for (offset, character) in trimmed.char_indices() {
+        if character == '|' && !table_pipe_is_escaped(trimmed, offset) {
+            cells.push(cell.trim().to_owned());
+            cell.clear();
+        } else {
+            cell.push(character);
+        }
+    }
+    cells.push(cell.trim().to_owned());
+    (cells.len() >= 2).then_some(cells)
+}
+
+fn table_pipe_is_escaped(line: &str, offset: usize) -> bool {
+    line[..offset]
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
+fn table_separator(line: &str) -> Option<Vec<&'static str>> {
+    let cells = table_cells(line)?;
+    cells
+        .into_iter()
+        .map(|cell| {
+            let trimmed = cell.trim();
+            let left = trimmed.starts_with(':');
+            let right = trimmed.ends_with(':');
+            let rule = trimmed.trim_matches(':');
+            if rule.len() < 3 || !rule.bytes().all(|byte| byte == b'-') {
+                return None;
+            }
+            Some(match (left, right) {
+                (true, true) => "center",
+                (false, true) => "right",
+                _ => "left",
+            })
+        })
+        .collect()
 }
 
 fn finish_recovery_item(state: &mut AppState, message_id: &str) {
@@ -5232,7 +5328,7 @@ mod tests {
     use super::{
         handle_agent_envelope, handle_agent_event, handle_effect, handle_effect_failure,
         load_ui_preferences, markdown_to_html, open_browser_preview, parse_review_context, render,
-        run_clipboard_candidate,
+        run_clipboard_candidate, table_cells,
     };
     use crate::app::{
         tests_support::state_for_ui, ChatEntry, DiffLayout, Effect, Focus, MarkdownPreview, Screen,
@@ -5857,10 +5953,24 @@ mod tests {
     }
 
     #[test]
-    fn markdown_preview_renders_headings_lists_and_code_safely() {
-        let html = markdown_to_html("# Review\n\n- item\n\n```\n<a>\n```");
-        assert!(html.contains("<h1>Review</h1>"));
-        assert!(html.contains("<li>item</li>"));
+    fn markdown_preview_renders_links_tables_inline_markup_and_code_safely() {
+        assert_eq!(table_cells(r"| x\|y | z |").unwrap().len(), 2);
+        assert_eq!(table_cells(r"| x\\| y | z |").unwrap().len(), 3);
+
+        let html = markdown_to_html(
+            "# **Review**\n\n- [docs](https://example.invalid)\n\n\
+             | Name | Result |\n| :--- | ---: |\n| `api` | <safe> |\n| a\\|b | exact |\n| C:\\temp | ok |\n\n\
+             [bad](javascript:alert(1))\n\n```\n<a>\n```",
+        );
+        assert!(html.contains("<h1><strong>Review</strong></h1>"));
+        assert!(html.contains("<a href=\"https://example.invalid\">docs</a>"));
+        assert!(html.contains("<table>"));
+        assert!(html.contains("<th style=\"text-align:left\">Name</th>"));
+        assert!(html.contains("<td style=\"text-align:right\">&lt;safe&gt;</td>"));
+        assert!(html.contains("<td style=\"text-align:left\">a|b</td>"));
+        assert!(html.contains(r#"<td style="text-align:left">C:\temp</td>"#));
+        assert!(html.contains("class=\"unsafe-link\""));
+        assert!(!html.contains("href=\"javascript:"));
         assert!(html.contains("&lt;a&gt;"));
     }
 }
