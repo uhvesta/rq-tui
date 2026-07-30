@@ -367,8 +367,7 @@ fn run_loop<B: Backend>(
                 .min(std::time::Duration::from_millis(100))
         };
         let terminal_burst = read_terminal_burst(poll_timeout)?;
-        let has_terminal_events = !terminal_burst.events.is_empty();
-        navigation_limiter.begin_burst(terminal_burst_continues, has_terminal_events);
+        navigation_limiter.begin_burst(terminal_burst_continues);
         for terminal_event in terminal_burst.events {
             match terminal_event {
                 Event::Key(key) => {
@@ -453,24 +452,19 @@ fn read_terminal_burst(timeout: std::time::Duration) -> Result<TerminalBurst> {
 #[derive(Default)]
 struct NavigationBurstLimiter {
     counts: Vec<(KeyCode, KeyModifiers, usize)>,
-    held: Option<(KeyCode, KeyModifiers)>,
+    held: Vec<(KeyCode, KeyModifiers)>,
 }
 
 impl NavigationBurstLimiter {
-    fn begin_burst(&mut self, continuation: bool, has_events: bool) {
+    fn begin_burst(&mut self, continuation: bool) {
         if !continuation {
             self.counts.clear();
-        }
-        if !has_events {
-            self.held = None;
         }
     }
 
     fn allow(&mut self, state: &AppState, key: KeyEvent) -> bool {
         if key.kind == KeyEventKind::Release {
-            if self.held == Some((key.code, key.modifiers)) {
-                self.held = None;
-            }
+            self.held.retain(|held| *held != (key.code, key.modifiers));
             self.counts
                 .retain(|(code, modifiers, _)| *code != key.code || *modifiers != key.modifiers);
             return false;
@@ -480,13 +474,13 @@ impl NavigationBurstLimiter {
         }
         let current = (key.code, key.modifiers);
         match key.kind {
-            KeyEventKind::Press => self.held = Some(current),
-            KeyEventKind::Repeat if self.held != Some(current) => {
+            KeyEventKind::Press if !self.held.contains(&current) => self.held.push(current),
+            KeyEventKind::Repeat if !self.held.contains(&current) => {
                 // A repeat without a preceding press is stale input from
                 // before this reducer started observing the stream.
                 return false;
             }
-            KeyEventKind::Repeat | KeyEventKind::Release => {}
+            KeyEventKind::Press | KeyEventKind::Repeat | KeyEventKind::Release => {}
         }
         if let Some((_, _, count)) = self
             .counts
@@ -8401,7 +8395,7 @@ mod tests {
     fn held_navigation_is_bounded_per_ready_terminal_burst() {
         let state = state_for_ui();
         let mut limiter = NavigationBurstLimiter::default();
-        limiter.begin_burst(false, true);
+        limiter.begin_burst(false);
         assert!(limiter.allow(
             &state,
             KeyEvent::new_with_kind(KeyCode::Char('j'), KeyModifiers::NONE, KeyEventKind::Press,)
@@ -8422,7 +8416,7 @@ mod tests {
         // A burst that filled the terminal read buffer can continue in the
         // next loop iteration. Keep the limiter's cap across that continuation
         // instead of resetting it and replaying the stale backlog forever.
-        limiter.begin_burst(true, true);
+        limiter.begin_burst(true);
         assert!((0..100).all(|_| {
             !limiter.allow(
                 &state,
@@ -8445,11 +8439,34 @@ mod tests {
             &state,
             KeyEvent::new_with_kind(KeyCode::Char('j'), KeyModifiers::NONE, KeyEventKind::Repeat,)
         ));
-        limiter.begin_burst(false, false);
+        limiter.begin_burst(false);
         assert!(limiter.allow(
             &state,
             KeyEvent::new_with_kind(KeyCode::Char('j'), KeyModifiers::NONE, KeyEventKind::Press,)
         ));
+        assert!(limiter.allow(
+            &state,
+            KeyEvent::new_with_kind(KeyCode::Char('k'), KeyModifiers::NONE, KeyEventKind::Press,)
+        ));
+        assert!(!limiter.allow(
+            &state,
+            KeyEvent::new_with_kind(
+                KeyCode::Char('k'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )
+        ));
+        assert!(
+            limiter.allow(
+                &state,
+                KeyEvent::new_with_kind(
+                    KeyCode::Char('j'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Repeat,
+                )
+            ),
+            "releasing k must not make a still-held j look stale"
+        );
 
         let mut composing = state_for_ui();
         composing.input_mode = InputMode::Compose;
