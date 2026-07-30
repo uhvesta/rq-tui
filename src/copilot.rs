@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -12,20 +12,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
+use github_copilot_sdk::handler::{
+    AutoModeSwitchHandler, AutoModeSwitchResponse, ElicitationHandler, ExitPlanModeHandler,
+    ExitPlanModeResult, McpAuthHandler, McpAuthRequest, McpAuthResult, PermissionHandler,
+    PermissionResult, UserInputHandler, UserInputResponse,
+};
 use github_copilot_sdk::hooks::{ErrorOccurredOutput, HookEvent, HookOutput, SessionHooks};
-use github_copilot_sdk::rpc::{HistoryCompactRequest, SessionsForkRequest};
+use github_copilot_sdk::rpc::{
+    HistoryCompactRequest, SessionsForkRequest, UIHandlePendingSessionLimitsExhaustedRequest,
+    UISessionLimitsExhaustedResponse, UISessionLimitsExhaustedResponseAction,
+};
 use github_copilot_sdk::session::Session;
 use github_copilot_sdk::subscription::RecvErrorKind;
 use github_copilot_sdk::{
-    CliProgram, Client, ClientOptions, ContextTier, DeliveryMode, MessageOptions,
-    ResumeSessionConfig, SessionConfig, SessionEvent, SessionId, SetModelOptions,
-    SystemMessageConfig,
+    CliProgram, Client, ClientOptions, ContextTier, DeliveryMode, ElicitationResult,
+    ExitPlanModeData, MessageOptions, ResumeSessionConfig, SessionConfig, SessionEvent, SessionId,
+    SetModelOptions, SystemMessageConfig,
 };
 use github_copilot_sdk::{PermissionRequestData, PermissionRequestKind, RequestId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver as AsyncReceiver, Sender as AsyncSender, UnboundedSender};
 use uuid::Uuid;
 
 use crate::config::AppPaths;
@@ -38,6 +45,11 @@ Everything before this boundary is inherited MAIN history and is reference conte
 current task. Answer only the side question below. Do not continue plans or instructions from MAIN. \
 This SIDE conversation is ephemeral and read-only; do not modify files or workspace state.";
 const SDK_CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
+const SDK_INTERACTIVE_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+const PENDING_INTERACTIVE_CONTROL_CAPACITY: usize = 16;
+const PENDING_PROMPT_CAPACITY: usize = 256;
+const PENDING_COMMAND_CAPACITY: usize = 512;
+const PENDING_CONTROL_CAPACITY: usize = 64;
 const SIDE_LEASE_TTL: Duration = Duration::from_secs(30);
 const SIDE_LEASE_HEARTBEAT: Duration = Duration::from_secs(5);
 const SIDE_CLEANUP_RETRY: Duration = Duration::from_secs(30);
@@ -552,7 +564,7 @@ impl AgentEventEnvelope {
 }
 
 pub(crate) struct CopilotBridge {
-    commands: UnboundedSender<AgentCommand>,
+    commands: AsyncSender<AgentCommand>,
     events: Receiver<AgentEventEnvelope>,
     thread: Option<JoinHandle<()>>,
 }
@@ -572,7 +584,7 @@ pub(crate) trait AgentRuntime: AgentSink {
 
 impl CopilotBridge {
     pub(crate) fn start(config: BridgeConfig) -> Self {
-        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (command_tx, command_rx) = tokio::sync::mpsc::channel(PENDING_COMMAND_CAPACITY);
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         // The worker can fail outside its async loop (for example while its
         // runtime is being created). Keep its most recently visible lane so
@@ -612,9 +624,14 @@ impl CopilotBridge {
     }
 
     pub(crate) fn send(&self, command: AgentCommand) -> Result<()> {
-        self.commands
-            .send(command)
-            .map_err(|_| anyhow::anyhow!("Copilot worker has stopped"))
+        self.commands.try_send(command).map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => anyhow::anyhow!(
+                "Copilot command queue is full ({PENDING_COMMAND_CAPACITY}); wait for pending input to drain"
+            ),
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                anyhow::anyhow!("Copilot worker has stopped")
+            }
+        })
     }
 
     pub(crate) fn try_recv(&self) -> Option<AgentEvent> {
@@ -1578,7 +1595,7 @@ impl AgentRuntime for ControlledAgent {
 
 impl Drop for CopilotBridge {
     fn drop(&mut self) {
-        let _ = self.commands.send(AgentCommand::Shutdown);
+        let _ = self.commands.try_send(AgentCommand::Shutdown);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -1749,6 +1766,424 @@ impl EventOutput for EventPublisher {
     }
 }
 
+const PENDING_INTERACTION_CAPACITY: usize = 16;
+const PENDING_INTERACTION_TIMEOUT: Duration = Duration::from_millis(750);
+const SESSION_LIMIT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
+const PENDING_SESSION_LIMIT_CAPACITY: usize = 16;
+const SETTLED_SESSION_LIMIT_CAPACITY: usize = 128;
+
+/// The small set of SDK callbacks which can otherwise leave an agent turn
+/// waiting for a human forever. Keep this enum closed so every new callback
+/// has to choose an explicit safe fallback before it can be wired in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingInteractionKind {
+    Elicitation,
+    UserInput,
+    McpOauth,
+}
+
+impl PendingInteractionKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Elicitation => "elicitation",
+            Self::UserInput => "user input",
+            Self::McpOauth => "MCP OAuth",
+        }
+    }
+
+    fn tool(self) -> &'static str {
+        match self {
+            Self::Elicitation => "elicitation",
+            Self::UserInput => "user_input",
+            Self::McpOauth => "mcp_oauth",
+        }
+    }
+}
+
+struct PendingInteractionState {
+    pending: HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>,
+}
+
+/// A bounded, generic rendezvous for SDK interactions which may eventually be
+/// connected to a TUI prompt. The current non-interactive policy resolves
+/// every request with a safe default after a short deadline, so a Copilot
+/// callback can never pin the SDK event loop or the UI indefinitely.
+#[derive(Clone)]
+struct PendingInteractionBroker {
+    events: EventPublisher,
+    state: Arc<std::sync::Mutex<PendingInteractionState>>,
+    capacity: usize,
+    timeout: Duration,
+}
+
+impl PendingInteractionBroker {
+    fn new(events: EventPublisher) -> Self {
+        Self::with_limits(
+            events,
+            PENDING_INTERACTION_CAPACITY,
+            PENDING_INTERACTION_TIMEOUT,
+        )
+    }
+
+    fn with_limits(events: EventPublisher, capacity: usize, timeout: Duration) -> Self {
+        Self {
+            events,
+            state: Arc::new(std::sync::Mutex::new(PendingInteractionState {
+                pending: HashMap::new(),
+            })),
+            capacity,
+            timeout,
+        }
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, PendingInteractionState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn begin(
+        &self,
+        kind: PendingInteractionKind,
+        request_id: RequestId,
+        detail: Option<String>,
+    ) -> Option<tokio::sync::oneshot::Receiver<serde_json::Value>> {
+        let request_id = request_id.to_string();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let failure = {
+            let mut state = self.lock_state();
+            if state.pending.contains_key(&request_id) {
+                Some(format!("duplicate {} request", kind.label()))
+            } else if state.pending.len() >= self.capacity {
+                Some(format!(
+                    "pending interaction limit reached ({})",
+                    self.capacity
+                ))
+            } else {
+                state.pending.insert(request_id.clone(), sender);
+                None
+            }
+        };
+        if let Some(reason) = failure {
+            self.events.activity(
+                None,
+                AgentActivity {
+                    kind: ActivityKind::Failure,
+                    label: format!("Could not hold Copilot {} request", kind.label()),
+                    tool: Some(kind.tool().into()),
+                    detail: Some(format!(
+                        "{reason} · request={}",
+                        sanitize_event_text(&request_id)
+                    )),
+                },
+            );
+            return None;
+        }
+        self.events.activity(
+            None,
+            AgentActivity {
+                kind: ActivityKind::Other,
+                label: format!(
+                    "Copilot requested {} · this TUI cannot answer it yet and will use a safe fallback",
+                    kind.label()
+                ),
+                tool: Some(kind.tool().into()),
+                detail: Some(format!(
+                    "{} · fallback in {}ms · request={}",
+                    detail
+                        .map(|detail| sanitize_event_text(&detail))
+                        .unwrap_or_else(|| "no request detail".into()),
+                    self.timeout.as_millis(),
+                    sanitize_event_text(&request_id)
+                )),
+            },
+        );
+        Some(receiver)
+    }
+
+    /// Resolve a request without coupling broker tests to an SDK response
+    /// struct. Interactive TUI choices will use this same JSON boundary once
+    /// those prompts are exposed.
+    #[cfg(test)]
+    fn resolve(&self, request_id: &str, response: serde_json::Value) -> bool {
+        let sender = self.lock_state().pending.remove(request_id);
+        sender.is_some_and(|sender| sender.send(response).is_ok())
+    }
+
+    fn remove(&self, request_id: &str) {
+        self.lock_state().pending.remove(request_id);
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.lock_state().pending.len()
+    }
+
+    async fn request<T, Decode>(
+        &self,
+        kind: PendingInteractionKind,
+        request_id: RequestId,
+        detail: Option<String>,
+        safe_default: T,
+        decode: Decode,
+    ) -> T
+    where
+        T: Send,
+        Decode: FnOnce(serde_json::Value) -> Option<T>,
+    {
+        let request_id_text = request_id.to_string();
+        let Some(receiver) = self.begin(kind, request_id, detail) else {
+            return safe_default;
+        };
+        let result = tokio::time::timeout(self.timeout, receiver).await;
+        match result {
+            Ok(Ok(value)) => match decode(value) {
+                Some(response) => {
+                    self.events.activity(
+                        None,
+                        AgentActivity {
+                            kind: ActivityKind::ToolComplete,
+                            label: format!("Copilot {} request resolved", kind.label()),
+                            tool: Some(kind.tool().into()),
+                            detail: Some(format!(
+                                "request={}",
+                                sanitize_event_text(&request_id_text)
+                            )),
+                        },
+                    );
+                    response
+                }
+                None => {
+                    self.remove(&request_id_text);
+                    self.events.activity(
+                        None,
+                        AgentActivity {
+                            kind: ActivityKind::Failure,
+                            label: format!(
+                                "Invalid response for Copilot {} · using safe default",
+                                kind.label()
+                            ),
+                            tool: Some(kind.tool().into()),
+                            detail: Some(format!(
+                                "request={}",
+                                sanitize_event_text(&request_id_text)
+                            )),
+                        },
+                    );
+                    safe_default
+                }
+            },
+            Ok(Err(_)) => {
+                self.remove(&request_id_text);
+                self.events.activity(
+                    None,
+                    AgentActivity {
+                        kind: ActivityKind::Failure,
+                        label: format!(
+                            "Copilot {} response channel closed · using safe default",
+                            kind.label()
+                        ),
+                        tool: Some(kind.tool().into()),
+                        detail: Some(format!("request={}", sanitize_event_text(&request_id_text))),
+                    },
+                );
+                safe_default
+            }
+            Err(_) => {
+                self.remove(&request_id_text);
+                self.events.activity(
+                    None,
+                    AgentActivity {
+                        kind: ActivityKind::Failure,
+                        label: format!(
+                            "No interactive response for Copilot {} · using safe default",
+                            kind.label()
+                        ),
+                        tool: Some(kind.tool().into()),
+                        detail: Some(format!(
+                            "deadline={}ms · request={}",
+                            self.timeout.as_millis(),
+                            sanitize_event_text(&request_id_text)
+                        )),
+                    },
+                );
+                safe_default
+            }
+        }
+    }
+}
+
+struct PendingInteractionHandlers {
+    broker: Arc<PendingInteractionBroker>,
+}
+
+impl PendingInteractionHandlers {
+    fn new(broker: Arc<PendingInteractionBroker>) -> Self {
+        Self { broker }
+    }
+}
+
+#[async_trait]
+impl ElicitationHandler for PendingInteractionHandlers {
+    async fn handle(
+        &self,
+        _session_id: SessionId,
+        request_id: RequestId,
+        request: github_copilot_sdk::ElicitationRequest,
+    ) -> ElicitationResult {
+        self.broker
+            .request(
+                PendingInteractionKind::Elicitation,
+                request_id,
+                Some(request.message),
+                ElicitationResult {
+                    action: "cancel".into(),
+                    content: None,
+                },
+                |value| serde_json::from_value(value).ok(),
+            )
+            .await
+    }
+}
+
+#[async_trait]
+impl UserInputHandler for PendingInteractionHandlers {
+    async fn handle(
+        &self,
+        _session_id: SessionId,
+        question: String,
+        _choices: Option<Vec<String>>,
+        _allow_freeform: Option<bool>,
+    ) -> Option<UserInputResponse> {
+        self.broker
+            .request(
+                PendingInteractionKind::UserInput,
+                RequestId::new(Uuid::new_v4().to_string()),
+                Some(question),
+                None,
+                |value| {
+                    Some(Some(UserInputResponse {
+                        answer: value.get("answer")?.as_str()?.to_owned(),
+                        was_freeform: value
+                            .get("wasFreeform")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(true),
+                    }))
+                },
+            )
+            .await
+    }
+}
+
+#[async_trait]
+impl McpAuthHandler for PendingInteractionHandlers {
+    async fn handle(
+        &self,
+        _session_id: SessionId,
+        request_id: RequestId,
+        request: McpAuthRequest,
+    ) -> McpAuthResult {
+        self.broker
+            .request(
+                PendingInteractionKind::McpOauth,
+                request_id,
+                Some(format!("server={}", request.server_name)),
+                McpAuthResult::Cancelled,
+                decode_mcp_auth_result,
+            )
+            .await
+    }
+}
+
+#[async_trait]
+impl ExitPlanModeHandler for PendingInteractionHandlers {
+    async fn handle(&self, _session_id: SessionId, data: ExitPlanModeData) -> ExitPlanModeResult {
+        let selected_action = data
+            .actions
+            .iter()
+            .find(|action| action.as_str() == "interactive")
+            .cloned();
+        let approved = selected_action.is_some();
+        self.broker.events.activity(
+            None,
+            AgentActivity {
+                kind: if approved {
+                    ActivityKind::ToolComplete
+                } else {
+                    ActivityKind::Failure
+                },
+                label: if approved {
+                    "Copilot plan completed · continuing in read-only interactive mode".into()
+                } else {
+                    "Copilot plan requested an unavailable action · staying in read-only mode"
+                        .into()
+                },
+                tool: Some("exit_plan_mode".into()),
+                detail: Some(format!(
+                    "selected={} · recommended={} · available={}",
+                    selected_action.as_deref().unwrap_or("none"),
+                    sanitize_event_text(&data.recommended_action),
+                    sanitize_event_text(&data.actions.join(","))
+                )),
+            },
+        );
+        ExitPlanModeResult {
+            approved,
+            selected_action,
+            feedback: Some(if approved {
+                "Continue interactively under rq-tui's read-only permission policy".into()
+            } else {
+                "rq-tui only permits the interactive action under its read-only policy".into()
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl AutoModeSwitchHandler for PendingInteractionHandlers {
+    async fn handle(
+        &self,
+        _session_id: SessionId,
+        error_code: Option<String>,
+        retry_after_seconds: Option<f64>,
+    ) -> AutoModeSwitchResponse {
+        self.broker.events.activity(
+            None,
+            AgentActivity {
+                kind: ActivityKind::Failure,
+                label: "Copilot requested an automatic model switch · keeping your selected model"
+                    .into(),
+                tool: Some("auto_mode_switch".into()),
+                detail: Some(format!(
+                    "error={} · retry_after={}s · use :model to choose explicitly",
+                    error_code.as_deref().unwrap_or("unknown"),
+                    retry_after_seconds
+                        .map(|seconds| format!("{seconds:.1}"))
+                        .unwrap_or_else(|| "unknown".into())
+                )),
+            },
+        );
+        AutoModeSwitchResponse::No
+    }
+}
+
+fn decode_mcp_auth_result(value: serde_json::Value) -> Option<McpAuthResult> {
+    if value.get("cancelled").and_then(|value| value.as_bool()) == Some(true)
+        || value.get("action").and_then(|value| value.as_str()) == Some("cancel")
+    {
+        return Some(McpAuthResult::Cancelled);
+    }
+    let access_token = value.get("accessToken")?.as_str()?.to_owned();
+    Some(McpAuthResult::Token {
+        access_token,
+        token_type: value
+            .get("tokenType")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned),
+        expires_in: value.get("expiresIn").and_then(|value| value.as_i64()),
+    })
+}
+
 struct ProgressHooks {
     events: EventPublisher,
 }
@@ -1833,8 +2268,47 @@ fn progress_hooks(events: &EventPublisher) -> Arc<dyn SessionHooks> {
 }
 
 struct SessionSlot {
-    session: Session,
+    session: Arc<Session>,
     subscription: github_copilot_sdk::subscription::EventSubscription,
+}
+
+struct SessionLimitTaskResult {
+    lane: AgentLane,
+    session_id: String,
+    request_key: String,
+    failure: Option<String>,
+}
+
+struct SideCleanupTaskResult {
+    parent_id: String,
+    side_id: String,
+    cleanup_warning: Option<String>,
+}
+
+enum OrphanCleanupTaskResult {
+    Record {
+        session_id: String,
+        cleanup_warning: Option<String>,
+    },
+    Complete {
+        had_warning: bool,
+    },
+}
+
+enum InteractiveTaskResult {
+    Steering {
+        lane: AgentLane,
+        session_id: String,
+        steering_id: String,
+        active_outbound_id: String,
+        result: std::result::Result<String, String>,
+    },
+    Abort {
+        lane: AgentLane,
+        session_id: String,
+        active_outbound_id: String,
+        result: std::result::Result<(), String>,
+    },
 }
 
 struct SideSession {
@@ -2257,6 +2731,69 @@ async fn cleanup_ephemeral_record<B: SideCleanupBackend + Sync>(
             )),
         ),
     }
+}
+
+fn spawn_orphan_cleanup_batch(
+    client: Client,
+    database_path: PathBuf,
+    records: Vec<EphemeralSessionRecord>,
+    results: UnboundedSender<OrphanCleanupTaskResult>,
+) {
+    let runtime = tokio::runtime::Handle::current();
+    std::thread::spawn(move || {
+        runtime.block_on(async move {
+            let mut had_warning = false;
+            match Storage::open(&database_path) {
+                Ok(ledger) => {
+                    for record in records {
+                        let (session_id, cleanup_warning) =
+                            cleanup_ephemeral_record(&client, &ledger, record).await;
+                        had_warning |= cleanup_warning.is_some();
+                        results
+                            .send(OrphanCleanupTaskResult::Record {
+                                session_id,
+                                cleanup_warning,
+                            })
+                            .ok();
+                    }
+                }
+                Err(error) => {
+                    had_warning = true;
+                    results
+                        .send(OrphanCleanupTaskResult::Record {
+                            session_id: "ledger".into(),
+                            cleanup_warning: Some(format!(
+                                "Could not open the SIDE cleanup ledger: {error}; cleanup will retry"
+                            )),
+                        })
+                        .ok();
+                }
+            }
+            results
+                .send(OrphanCleanupTaskResult::Complete { had_warning })
+                .ok();
+        });
+    });
+}
+
+fn schedule_orphan_cleanup(
+    client: &Client,
+    database_path: &Path,
+    records: Vec<EphemeralSessionRecord>,
+    results: &UnboundedSender<OrphanCleanupTaskResult>,
+    in_progress: &mut bool,
+) -> bool {
+    if records.is_empty() || *in_progress {
+        return false;
+    }
+    *in_progress = true;
+    spawn_orphan_cleanup_batch(
+        client.clone(),
+        database_path.to_path_buf(),
+        records,
+        results.clone(),
+    );
+    true
 }
 
 fn copilot_session_state_hint(session_id: &str) -> String {
@@ -2688,7 +3225,7 @@ where
 
 async fn worker(
     config: BridgeConfig,
-    mut commands: UnboundedReceiver<AgentCommand>,
+    mut commands: AsyncReceiver<AgentCommand>,
     raw_events: Sender<AgentEventEnvelope>,
     current_lane: Arc<std::sync::Mutex<AgentLane>>,
 ) -> Result<()> {
@@ -2735,6 +3272,7 @@ async fn worker(
         owner_id.clone(),
         has_side_lease,
     );
+    let main_interactions = Arc::new(PendingInteractionBroker::new(main_events.clone()));
     let cli = find_copilot_cli().context(
         "cannot locate the Copilot CLI; set COPILOT_CLI_PATH or install `copilot` on PATH",
     )?;
@@ -2747,6 +3285,12 @@ async fn worker(
     options
         .env
         .push(("COPILOT_PLUGIN_DIR_ONLY".into(), "true".into()));
+    main_events.activity(
+        None,
+        AgentActivity::other(
+            "Starting Copilot CLI… the TUI remains interactive and prompts will queue until MAIN is ready",
+        ),
+    );
     let client = sdk_call("Copilot client startup", Client::start(options)).await?;
     for operation in ledger.pending_prune_operations()? {
         if operation.work_item_id == config.work_item_id {
@@ -2798,30 +3342,38 @@ async fn worker(
             outcome,
         });
     }
-    let mut orphan_cleanup_results = Vec::new();
-    if has_side_lease {
-        for record in ledger.ephemeral_sessions(&config.work_item_id)? {
-            main_events.activity(
-                None,
-                AgentActivity::other(format!(
-                    "Cleaning interrupted SIDE {}…",
-                    short_session_id(record.side_id.as_deref().unwrap_or(&record.operation_id))
-                )),
-            );
-            orphan_cleanup_results.push(cleanup_ephemeral_record(&client, &ledger, record).await);
-        }
-    }
+    let initial_orphan_cleanup = if has_side_lease {
+        ledger.ephemeral_sessions(&config.work_item_id)?
+    } else {
+        Vec::new()
+    };
     let SessionBoot {
         session,
         resumed,
         mut resume_warning,
-    } = sdk_call(
-        "Copilot session create/resume",
-        create_or_resume_session(&client, &config, &main_events, &ledger),
-    )
-    .await?;
+    } = {
+        main_events.activity(
+            None,
+            AgentActivity::other("Opening the persistent Copilot session… input remains available"),
+        );
+        sdk_call(
+            "Copilot session create/resume",
+            create_or_resume_session(
+                &client,
+                &config,
+                &main_events,
+                &ledger,
+                main_interactions.clone(),
+            ),
+        )
+        .await?
+    };
     let mut resumed_active = None;
     if resumed {
+        main_events.activity(
+            None,
+            AgentActivity::other("Restoring Copilot conversation history… input remains available"),
+        );
         match sdk_call("Copilot history reload", session.get_events()).await {
             Ok(history) => {
                 resumed_active = resumed_active_from_history(&history, session.id());
@@ -2853,13 +3405,7 @@ async fn worker(
             ),
         });
     }
-    for (session_id, cleanup_warning) in orphan_cleanup_results {
-        main_events.emit(AgentEvent::OrphanSideCleanup {
-            session_id,
-            cleanup_warning,
-        });
-    }
-
+    let session = Arc::new(session);
     let mut main = SessionSlot {
         subscription: session.subscribe(),
         session,
@@ -2872,6 +3418,36 @@ async fn worker(
     let mut controls = VecDeque::new();
     let mut active = resumed_active;
     let mut lease_tick = tokio::time::interval(SIDE_LEASE_HEARTBEAT);
+    let (session_limit_result_tx, mut session_limit_result_rx) =
+        tokio::sync::mpsc::unbounded_channel::<SessionLimitTaskResult>();
+    let (interactive_result_tx, mut interactive_result_rx) =
+        tokio::sync::mpsc::unbounded_channel::<InteractiveTaskResult>();
+    let (side_cleanup_result_tx, mut side_cleanup_result_rx) =
+        tokio::sync::mpsc::unbounded_channel::<SideCleanupTaskResult>();
+    let (orphan_cleanup_result_tx, mut orphan_cleanup_result_rx) =
+        tokio::sync::mpsc::unbounded_channel::<OrphanCleanupTaskResult>();
+    let mut pending_session_limits = HashSet::<(String, String)>::new();
+    let mut settled_session_limits = HashSet::<(String, String)>::new();
+    let mut settled_session_limit_order = VecDeque::<(String, String)>::new();
+    let mut pending_steering = HashSet::<String>::new();
+    let mut pending_aborts = HashSet::<String>::new();
+    let mut side_cleanup_in_progress = false;
+    let mut orphan_cleanup_in_progress = !initial_orphan_cleanup.is_empty();
+    if orphan_cleanup_in_progress {
+        main_events.activity(
+            None,
+            AgentActivity::other(format!(
+                "MAIN is ready · cleaning {} interrupted SIDE session(s) in the background…",
+                initial_orphan_cleanup.len()
+            )),
+        );
+        spawn_orphan_cleanup_batch(
+            client.clone(),
+            config.database_path.clone(),
+            initial_orphan_cleanup,
+            orphan_cleanup_result_tx.clone(),
+        );
+    }
     lease_tick.tick().await;
     let mut next_cleanup_retry = Instant::now() + SIDE_CLEANUP_RETRY;
     if let Some(active) = &active {
@@ -2949,9 +3525,29 @@ async fn worker(
                                 None,
                                 AgentActivity::other("A SIDE session is already active; exit it before starting another"),
                             );
+                        } else if side_cleanup_in_progress {
+                            side_requested = false;
+                            if let Some(outbound) = outbound {
+                                main_events.emit(AgentEvent::TurnFailed {
+                                    outbound_id: outbound.id,
+                                    outbound: outbound.kind,
+                                    message: "The previous SIDE session is still being deleted; wait for the SIDE cleanup completion status and retry"
+                                        .into(),
+                                    response_started: false,
+                                });
+                            }
+                            fail_queue(
+                                &mut side_queue,
+                                "The previous SIDE session is still being deleted; this queued prompt was not run",
+                                &main_events,
+                            );
                         } else if !has_side_lease {
                             side_requested = false;
-                            side_queue.clear();
+                            fail_queue(
+                                &mut side_queue,
+                                "SIDE could not start; this queued prompt was not run",
+                                &main_events,
+                            );
                             main_events.lifecycle(LaneEvent::SideFailed {
                                 message: "Cannot start SIDE because another rq-tui process owns SIDE lifecycle cleanup for this Work Item"
                                     .into(),
@@ -2969,7 +3565,11 @@ async fn worker(
                                 lease_guard.set_owned(false);
                                 lease_heartbeat.set_owned(false);
                                 side_requested = false;
-                                side_queue.clear();
+                                fail_queue(
+                                    &mut side_queue,
+                                    "SIDE lifecycle ownership changed; this queued prompt was not run",
+                                    &main_events,
+                                );
                                 main_events.lifecycle(LaneEvent::SideFailed {
                                     message: "SIDE lifecycle ownership changed before fork; MAIN is unchanged and cleanup remains with the current owner"
                                         .into(),
@@ -2990,7 +3590,11 @@ async fn worker(
                             );
                             if let Err(error) = save_ephemeral_record(&ledger, &record) {
                                 side_requested = false;
-                                side_queue.clear();
+                                fail_queue(
+                                    &mut side_queue,
+                                    "SIDE could not be prepared; this queued prompt was not run",
+                                    &main_events,
+                                );
                                 main_events.lifecycle(LaneEvent::SideFailed {
                                     message: format!(
                                         "Could not durably prepare SIDE cleanup; no fork was created: {error}"
@@ -3028,7 +3632,11 @@ async fn worker(
                                         lease_guard.set_owned(false);
                                         lease_heartbeat.set_owned(false);
                                         side_requested = false;
-                                        side_queue.clear();
+                                        fail_queue(
+                                            &mut side_queue,
+                                            "SIDE lifecycle ownership changed; this queued prompt was not run",
+                                            &main_events,
+                                        );
                                         main_events.lifecycle(LaneEvent::SideFailed {
                                             message: "SIDE fork completed after lifecycle ownership changed; it was not activated and the current owner will reconcile it"
                                                 .into(),
@@ -3040,7 +3648,11 @@ async fn worker(
                                     record.updated_at = now();
                                     if let Err(error) = save_ephemeral_record(&ledger, &record) {
                                         side_requested = false;
-                                        side_queue.clear();
+                                        fail_queue(
+                                            &mut side_queue,
+                                            "SIDE cleanup could not be prepared; this queued prompt was not run",
+                                            &main_events,
+                                        );
                                         main_events.lifecycle(LaneEvent::SideFailed {
                                             message: format!(
                                                 "SIDE cleanup ownership changed before the fork id could be bound: {error}. The stale worker will not delete it; the current owner will reconcile the named fork"
@@ -3052,10 +3664,14 @@ async fn worker(
                                         id: side_id.clone(),
                                     };
                                     let side_events = main_events.on_lane(lane.clone());
-                                    let mut resume = resume_config(
+                                    let side_interactions = Arc::new(
+                                        PendingInteractionBroker::new(side_events.clone()),
+                                    );
+                                    let mut resume = resume_config_with_broker(
                                         SessionId::new(side_id.clone()),
                                         &config,
                                         Some(&side_events),
+                                        Some(&side_interactions),
                                     );
                                     resume.suppress_resume_event = Some(true);
                                     match tokio::time::timeout(
@@ -3076,9 +3692,15 @@ async fn worker(
                                                 has_side_lease = false;
                                                 lease_guard.set_owned(false);
                                                 lease_heartbeat.set_owned(false);
-                                                disconnect_session(&session).await.ok();
+                                                tokio::spawn(async move {
+                                                    disconnect_session(&session).await.ok();
+                                                });
                                                 side_requested = false;
-                                                side_queue.clear();
+                                                fail_queue(
+                                                    &mut side_queue,
+                                                    "SIDE ownership changed; this queued prompt was not run",
+                                                    &main_events,
+                                                );
                                                 main_events.lifecycle(LaneEvent::SideFailed {
                                                     message: "SIDE opened after lifecycle ownership changed; it was disconnected without entering the UI and the current owner will clean it"
                                                         .into(),
@@ -3091,9 +3713,15 @@ async fn worker(
                                             if let Err(error) =
                                                 save_ephemeral_record(&ledger, &record)
                                             {
-                                                disconnect_session(&session).await.ok();
+                                                tokio::spawn(async move {
+                                                    disconnect_session(&session).await.ok();
+                                                });
                                                 side_requested = false;
-                                                side_queue.clear();
+                                                fail_queue(
+                                                    &mut side_queue,
+                                                    "SIDE activation failed; this queued prompt was not run",
+                                                    &main_events,
+                                                );
                                                 main_events.lifecycle(LaneEvent::SideFailed {
                                                     message: format!(
                                                         "SIDE was disconnected because activation ownership changed: {error}. The stale worker will not delete it; the current owner retains cleanup responsibility"
@@ -3109,6 +3737,7 @@ async fn worker(
                                                     apply_side_boundary(outbound);
                                                     true
                                                 });
+                                            let session = Arc::new(session);
                                             side = Some(SideSession {
                                                 operation_id,
                                                 id: side_id.clone(),
@@ -3142,37 +3771,61 @@ async fn worker(
                                         }
                                         Ok(Err(error)) => {
                                             side_requested = false;
-                                            side_queue.clear();
-                                            let (_, cleanup_warning) =
-                                                cleanup_ephemeral_record(&client, &ledger, record)
-                                                    .await;
+                                            fail_queue(
+                                                &mut side_queue,
+                                                "SIDE fork failed; this queued prompt was not run",
+                                                &main_events,
+                                            );
+                                            record.state = "cleanup_pending".into();
+                                            record.last_error = Some(error.to_string());
+                                            record.updated_at = now();
+                                            save_ephemeral_record(&ledger, &record).ok();
+                                            let scheduled = schedule_orphan_cleanup(
+                                                &client,
+                                                &config.database_path,
+                                                vec![record],
+                                                &orphan_cleanup_result_tx,
+                                                &mut orphan_cleanup_in_progress,
+                                            );
                                             main_events.lifecycle(LaneEvent::SideFailed {
-                                                message: cleanup_warning.map_or_else(
-                                                    || format!(
-                                                        "SIDE fork could not be opened and was deleted: {error}"
-                                                    ),
-                                                    |cleanup| format!(
-                                                        "SIDE fork could not be opened: {error}. {cleanup}"
-                                                    ),
+                                                message: format!(
+                                                    "SIDE fork could not be opened: {error}. Cleanup {}",
+                                                    if scheduled {
+                                                        "is continuing in the background"
+                                                    } else {
+                                                        "was durably queued for the next cleanup pass"
+                                                    }
                                                 ),
                                             })
                                         }
                                         Err(_) => {
                                             side_requested = false;
-                                            side_queue.clear();
-                                            let (_, cleanup_warning) =
-                                                cleanup_ephemeral_record(&client, &ledger, record)
-                                                    .await;
+                                            fail_queue(
+                                                &mut side_queue,
+                                                "SIDE fork timed out; this queued prompt was not run",
+                                                &main_events,
+                                            );
+                                            record.state = "cleanup_pending".into();
+                                            record.last_error =
+                                                Some("SIDE resume timed out".into());
+                                            record.updated_at = now();
+                                            save_ephemeral_record(&ledger, &record).ok();
+                                            let scheduled = schedule_orphan_cleanup(
+                                                &client,
+                                                &config.database_path,
+                                                vec![record],
+                                                &orphan_cleanup_result_tx,
+                                                &mut orphan_cleanup_in_progress,
+                                            );
                                             main_events.lifecycle(LaneEvent::SideFailed {
-                                                message: cleanup_warning.map_or_else(
-                                                    || format!(
-                                                        "SIDE fork {side_id} opening exceeded {} seconds; the fork was deleted",
-                                                        SDK_CONTROL_TIMEOUT.as_secs()
-                                                    ),
-                                                    |cleanup| format!(
-                                                        "SIDE fork {side_id} opening exceeded {} seconds. {cleanup}",
-                                                        SDK_CONTROL_TIMEOUT.as_secs()
-                                                    ),
+                                                message: format!(
+                                                    "SIDE fork {side_id} opening exceeded {} seconds. Cleanup {}",
+                                                    SDK_CONTROL_TIMEOUT.as_secs(),
+                                                    if scheduled {
+                                                        "is continuing in the background"
+                                                    } else {
+                                                        "was durably queued for the next cleanup pass"
+                                                    }
                                                 ),
                                             })
                                         }
@@ -3180,47 +3833,64 @@ async fn worker(
                                 }
                                 Ok(Err(error)) => {
                                     side_requested = false;
-                                    side_queue.clear();
+                                    fail_queue(
+                                        &mut side_queue,
+                                        "SIDE fork failed; this queued prompt was not run",
+                                        &main_events,
+                                    );
                                     record.state = "cleanup_pending".into();
                                     record.last_error = Some(format!(
                                         "Fork RPC returned an error before confirming whether SIDE was created: {error}"
                                     ));
                                     record.updated_at = now();
                                     save_ephemeral_record(&ledger, &record)?;
-                                    let (_, cleanup_warning) =
-                                        cleanup_ephemeral_record(&client, &ledger, record).await;
+                                    let scheduled = schedule_orphan_cleanup(
+                                        &client,
+                                        &config.database_path,
+                                        vec![record],
+                                        &orphan_cleanup_result_tx,
+                                        &mut orphan_cleanup_in_progress,
+                                    );
                                     main_events.lifecycle(LaneEvent::SideFailed {
-                                        message: cleanup_warning.map_or_else(
-                                            || format!(
-                                                "SIDE fork returned an error and the named fork was deleted: {error}"
-                                            ),
-                                            |cleanup| format!(
-                                                "Could not confirm SIDE creation: {error}. {cleanup}"
-                                            ),
+                                        message: format!(
+                                            "Could not confirm SIDE creation: {error}. Cleanup {}",
+                                            if scheduled {
+                                                "is continuing in the background"
+                                            } else {
+                                                "was durably queued for the next cleanup pass"
+                                            }
                                         ),
                                     })
                                 }
                                 Err(_) => {
                                     side_requested = false;
-                                    side_queue.clear();
+                                    fail_queue(
+                                        &mut side_queue,
+                                        "SIDE fork timed out; this queued prompt was not run",
+                                        &main_events,
+                                    );
                                     record.state = "cleanup_pending".into();
                                     record.last_error = Some(
                                         "Fork RPC timed out before returning a SIDE id".into(),
                                     );
                                     record.updated_at = now();
                                     save_ephemeral_record(&ledger, &record)?;
-                                    let (_, cleanup_warning) =
-                                        cleanup_ephemeral_record(&client, &ledger, record).await;
+                                    let scheduled = schedule_orphan_cleanup(
+                                        &client,
+                                        &config.database_path,
+                                        vec![record],
+                                        &orphan_cleanup_result_tx,
+                                        &mut orphan_cleanup_in_progress,
+                                    );
                                     main_events.lifecycle(LaneEvent::SideFailed {
-                                        message: cleanup_warning.map_or_else(
-                                            || format!(
-                                                "SIDE creation exceeded {} seconds; no fork remained after reconciliation",
-                                                SDK_CONTROL_TIMEOUT.as_secs()
-                                            ),
-                                            |cleanup| format!(
-                                                "SIDE creation exceeded {} seconds. {cleanup}",
-                                                SDK_CONTROL_TIMEOUT.as_secs()
-                                            ),
+                                        message: format!(
+                                            "SIDE creation exceeded {} seconds. Cleanup {}",
+                                            SDK_CONTROL_TIMEOUT.as_secs(),
+                                            if scheduled {
+                                                "is continuing in the background"
+                                            } else {
+                                                "was durably queued for the next cleanup pass"
+                                            }
                                         ),
                                     })
                                 }
@@ -3257,28 +3927,69 @@ async fn worker(
                                         "Could not durably mark SIDE cleanup as pending: {error}"
                                     )
                                 });
-                            disconnect_session(&side_session.slot.session).await.ok();
-                            let (_, delete_warning) =
-                                cleanup_ephemeral_record(&client, &ledger, cleanup_record).await;
-                            let cleanup_warning = match (prepare_warning, delete_warning) {
-                                (Some(prepare), Some(delete)) => {
-                                    Some(format!("{prepare}. {delete}"))
-                                }
-                                (Some(warning), None) | (None, Some(warning)) => Some(warning),
-                                (None, None) => None,
-                            };
-                            side_events.lifecycle(LaneEvent::SideExited {
-                                parent_id: side_session.parent_id,
-                                side_id,
-                                cleanup_warning,
-                            });
-                            side_queue.clear();
+                            fail_queue(
+                                &mut side_queue,
+                                "SIDE exited; this queued prompt was cancelled",
+                                &side_events,
+                            );
                             side_requested = false;
+                            side_cleanup_in_progress = true;
                             active_lane = AgentLane::Main;
                             set_current_lane(&current_lane, active_lane.clone());
+                            side_events.activity(
+                                None,
+                                AgentActivity::other(
+                                    "Returned to MAIN; SIDE disconnect and deletion continue in the background…",
+                                ),
+                            );
+                            let parent_id = side_session.parent_id;
+                            let session = side_session.slot.session;
+                            let cleanup_client = client.clone();
+                            let cleanup_database_path = config.database_path.clone();
+                            let result_tx = side_cleanup_result_tx.clone();
+                            let runtime = tokio::runtime::Handle::current();
+                            std::thread::spawn(move || {
+                                runtime.block_on(async move {
+                                    let mut warnings = Vec::new();
+                                    if let Some(warning) = prepare_warning {
+                                        warnings.push(warning);
+                                    }
+                                    if let Err(error) = disconnect_session(&session).await {
+                                        warnings.push(format!("SIDE disconnect failed: {error}"));
+                                    }
+                                    match Storage::open(&cleanup_database_path) {
+                                        Ok(cleanup_ledger) => {
+                                            let (_, delete_warning) = cleanup_ephemeral_record(
+                                                &cleanup_client,
+                                                &cleanup_ledger,
+                                                cleanup_record,
+                                            )
+                                            .await;
+                                            if let Some(warning) = delete_warning {
+                                                warnings.push(warning);
+                                            }
+                                        }
+                                        Err(error) => warnings.push(format!(
+                                            "Could not reopen the SIDE cleanup ledger: {error}; the durable cleanup record will be retried at startup"
+                                        )),
+                                    }
+                                    result_tx
+                                        .send(SideCleanupTaskResult {
+                                            parent_id,
+                                            side_id,
+                                            cleanup_warning: (!warnings.is_empty())
+                                                .then(|| warnings.join(". ")),
+                                        })
+                                        .ok();
+                                });
+                            });
                         } else {
                             side_requested = false;
-                            side_queue.clear();
+                            fail_queue(
+                                &mut side_queue,
+                                "No SIDE session was active; this queued prompt was cancelled",
+                                &main_events,
+                            );
                             main_events
                                 .activity(None, AgentActivity::other("No SIDE session is active"));
                         }
@@ -3427,10 +4138,11 @@ async fn worker(
                                     );
                                     continue;
                                 }
-                                let mut resume = resume_config(
+                                let mut resume = resume_config_with_broker(
                                     SessionId::new(new_id.clone()),
                                     &config,
                                     Some(&main_events),
+                                    Some(&main_interactions),
                                 );
                                 resume.suppress_resume_event = Some(true);
                                 match sdk_call(
@@ -3475,6 +4187,7 @@ async fn worker(
                                             );
                                         } else {
                                             disconnect_session(&main.session).await.ok();
+                                            let session = Arc::new(session);
                                             main = SessionSlot {
                                                 subscription: session.subscribe(),
                                                 session,
@@ -3566,23 +4279,44 @@ async fn worker(
                             let lane = AgentLane::Side {
                                 id: side_session.id.clone(),
                             };
-                            abort_session(&side_session.slot.session).await.ok();
-                            disconnect_session(&side_session.slot.session).await.ok();
+                            let side_events = main_events.on_lane(lane.clone());
                             let message = "SIDE closed because this process lost its lifecycle lease; its durable cleanup record was retained for the current owner";
                             fail_active(
                                 &mut active,
                                 message.into(),
-                                &main_events.on_lane(lane.clone()),
+                                &side_events,
                             );
                             fail_queue(
                                 &mut side_queue,
                                 message,
-                                &main_events.on_lane(lane.clone()),
+                                &side_events,
                             );
-                            main_events.on_lane(lane).lifecycle(LaneEvent::SideExited {
-                                parent_id: side_session.parent_id,
-                                side_id: side_session.id,
+                            side_events.lifecycle(LaneEvent::SideExited {
+                                parent_id: side_session.parent_id.clone(),
+                                side_id: side_session.id.clone(),
                                 cleanup_warning: Some(message.into()),
+                            });
+                            side_events.activity(
+                                None,
+                                AgentActivity::other(
+                                    "Returned to MAIN; closing the lease-lost SIDE session in the background…",
+                                ),
+                            );
+                            let session = side_session.slot.session;
+                            tokio::spawn(async move {
+                                abort_session(&session).await.ok();
+                                let activity = match disconnect_session(&session).await {
+                                    Ok(()) => AgentActivity::other(
+                                        "Lease-lost SIDE session disconnected",
+                                    ),
+                                    Err(error) => AgentActivity {
+                                        kind: ActivityKind::Failure,
+                                        label: "Lease-lost SIDE disconnect did not finish".into(),
+                                        tool: Some("session_disconnect".into()),
+                                        detail: Some(error.to_string()),
+                                    },
+                                };
+                                side_events.activity(None, activity);
                             });
                             active_lane = AgentLane::Main;
                             set_current_lane(&current_lane, active_lane.clone());
@@ -3598,6 +4332,7 @@ async fn worker(
                         && active.is_none()
                         && main_queue.is_empty()
                         && side.is_none()
+                        && !orphan_cleanup_in_progress
                     {
                         next_cleanup_retry = Instant::now() + SIDE_CLEANUP_RETRY;
                         let pending_cleanup = ledger
@@ -3606,21 +4341,20 @@ async fn worker(
                             .filter(|record| retryable_cleanup_state(&record.state))
                             .collect::<Vec<_>>();
                         if !pending_cleanup.is_empty() {
+                            orphan_cleanup_in_progress = true;
                             main_events.activity(
                                 None,
                                 AgentActivity::other(format!(
-                                    "Retrying {} interrupted SIDE cleanup operation(s)…",
+                                    "Retrying {} interrupted SIDE cleanup operation(s) in the background…",
                                     pending_cleanup.len()
                                 )),
                             );
-                        }
-                        for record in pending_cleanup {
-                            let (session_id, cleanup_warning) =
-                                cleanup_ephemeral_record(&client, &ledger, record).await;
-                            main_events.emit(AgentEvent::OrphanSideCleanup {
-                                session_id,
-                                cleanup_warning,
-                            });
+                            spawn_orphan_cleanup_batch(
+                                client.clone(),
+                                config.database_path.clone(),
+                                pending_cleanup,
+                                orphan_cleanup_result_tx.clone(),
+                            );
                         }
                     }
                 } else {
@@ -3644,25 +4378,25 @@ async fn worker(
                         main_events.activity(
                             None,
                             AgentActivity::other(
-                                "SIDE lifecycle lease acquired · reconciling interrupted sessions…",
+                                "SIDE lifecycle lease acquired · reconciling interrupted sessions in the background…",
                             ),
                         );
-                        let mut cleanup_had_warning = false;
-                        for record in ledger.ephemeral_sessions(&config.work_item_id)? {
-                            let (session_id, cleanup_warning) =
-                                cleanup_ephemeral_record(&client, &ledger, record).await;
-                            cleanup_had_warning |= cleanup_warning.is_some();
-                            main_events.emit(AgentEvent::OrphanSideCleanup {
-                                session_id,
-                                cleanup_warning,
-                            });
-                        }
-                        if !cleanup_had_warning {
+                        let pending_cleanup =
+                            ledger.ephemeral_sessions(&config.work_item_id)?;
+                        if pending_cleanup.is_empty() {
                             main_events.activity(
                                 None,
                                 AgentActivity::other(
                                     "SIDE lifecycle ready · /side is available",
                                 ),
+                            );
+                        } else if !orphan_cleanup_in_progress {
+                            orphan_cleanup_in_progress = true;
+                            spawn_orphan_cleanup_batch(
+                                client.clone(),
+                                config.database_path.clone(),
+                                pending_cleanup,
+                                orphan_cleanup_result_tx.clone(),
                             );
                         }
                     }
@@ -3686,6 +4420,17 @@ async fn worker(
                         }
                     }
                     AgentCommand::Send(outbound) => {
+                        if main_queue.len() >= PENDING_PROMPT_CAPACITY {
+                            main_events.emit(AgentEvent::TurnFailed {
+                                outbound_id: outbound.id,
+                                outbound: outbound.kind,
+                                message: format!(
+                                    "MAIN queue is full ({PENDING_PROMPT_CAPACITY} prompts); wait for queued work to drain"
+                                ),
+                                response_started: false,
+                            });
+                            continue;
+                        }
                         let position = queue_position(
                             &main_queue,
                             &active,
@@ -3705,6 +4450,17 @@ async fn worker(
                             } else {
                                 &mut side_queue
                             };
+                            if queue.len() >= PENDING_PROMPT_CAPACITY {
+                                events.emit(AgentEvent::TurnFailed {
+                                    outbound_id: steering_id,
+                                    outbound: outbound.kind,
+                                    message: format!(
+                                        "queue is full ({PENDING_PROMPT_CAPACITY} prompts)"
+                                    ),
+                                    response_started: false,
+                                });
+                                continue;
+                            }
                             let position = queue_position(queue, &active, &active_lane, &active_lane);
                             queue.push_back(outbound);
                             events.emit(AgentEvent::Queued {
@@ -3712,41 +4468,57 @@ async fn worker(
                                 position,
                             });
                         } else {
-                            let slot = if let Some(side) =
-                                side.as_mut().filter(|_| active_lane != AgentLane::Main)
+                            let session = if let Some(side) =
+                                side.as_ref().filter(|_| active_lane != AgentLane::Main)
                             {
-                                &mut side.slot
+                                Arc::clone(&side.slot.session)
                             } else {
-                                &mut main
+                                Arc::clone(&main.session)
                             };
                             let outbound_id =
-                                active.as_ref().map(|turn| turn.outbound.id.clone());
-                            match sdk_call(
-                                "Copilot immediate steering",
-                                slot.session.send(
+                                active.as_ref().map(|turn| turn.outbound.id.clone())
+                                    .expect("active steering has an outbound id");
+                            if pending_steering.len() >= PENDING_INTERACTIVE_CONTROL_CAPACITY {
+                                events.emit(AgentEvent::SteeringFailed {
+                                    steering_id,
+                                    active_outbound_id: outbound_id,
+                                    message: format!(
+                                        "already sending {} steering updates; wait for an acknowledgement or queue this prompt",
+                                        PENDING_INTERACTIVE_CONTROL_CAPACITY
+                                    ),
+                                });
+                                continue;
+                            }
+                            events.activity(
+                                Some(outbound_id.clone()),
+                                AgentActivity::other(
+                                    "Sending steering update to the active Copilot turn…",
+                                ),
+                            );
+                            pending_steering.insert(steering_id.clone());
+                            let session_id = session.id().to_string();
+                            let lane = active_lane.clone();
+                            let result_tx = interactive_result_tx.clone();
+                            tokio::spawn(async move {
+                                let result = sdk_interactive_call(
+                                    "Copilot immediate steering",
+                                    session.send(
                                     MessageOptions::new(outbound.text.clone())
                                         .with_mode(DeliveryMode::Immediate),
-                                ),
-                            )
-                            .await
-                            {
-                                Ok(message_id) => {
-                                    if let Some(active) = active.as_mut() {
-                                        register_sdk_message_root(active, message_id);
-                                    }
-                                    events.emit(AgentEvent::SteeringAccepted {
+                                    ),
+                                )
+                                .await
+                                .map_err(|error| error.to_string());
+                                result_tx
+                                    .send(InteractiveTaskResult::Steering {
+                                        lane,
+                                        session_id,
                                         steering_id,
-                                        active_outbound_id: outbound_id
-                                            .expect("active steering has an outbound id"),
-                                    });
-                                }
-                                Err(error) => events.emit(AgentEvent::SteeringFailed {
-                                    steering_id,
-                                    active_outbound_id: outbound_id
-                                        .expect("active steering has an outbound id"),
-                                    message: error.to_string(),
-                                }),
-                            }
+                                        active_outbound_id: outbound_id,
+                                        result,
+                                    })
+                                    .ok();
+                            });
                         }
                     }
                     AgentCommand::CancelQueued(outbound_id) => {
@@ -3846,6 +4618,18 @@ async fn worker(
                         }
                     }
                     AgentCommand::SendSide(mut outbound) => {
+                        if side_queue.len() >= PENDING_PROMPT_CAPACITY {
+                            let lane = side_lane(side.as_ref()).unwrap_or(AgentLane::Main);
+                            main_events.on_lane(lane).emit(AgentEvent::TurnFailed {
+                                outbound_id: outbound.id,
+                                outbound: outbound.kind,
+                                message: format!(
+                                    "SIDE queue is full ({PENDING_PROMPT_CAPACITY} prompts); wait for queued work to drain"
+                                ),
+                                response_started: false,
+                            });
+                            continue;
+                        }
                         if let Some(side_session) = side.as_mut() {
                             if !side_session.boundary_sent {
                                 apply_side_boundary(&mut outbound);
@@ -3882,16 +4666,20 @@ async fn worker(
                             controls.retain(|control| {
                                 !matches!(control, AgentCommand::StartSide { .. })
                             });
-                            side_queue.clear();
+                            fail_queue(
+                                &mut side_queue,
+                                "SIDE creation was cancelled; this queued prompt was not run",
+                                &main_events,
+                            );
                             side_requested = false;
                             main_events.lifecycle(LaneEvent::SideCancelled);
                         } else {
-                            if active.is_some() && active_lane != AgentLane::Main {
-                                if let Some(side_session) = side.as_mut() {
-                                    abort_session(&side_session.slot.session).await.ok();
-                                }
+                            if !controls
+                                .iter()
+                                .any(|control| matches!(control, AgentCommand::ExitSide))
+                            {
+                                controls.push_front(AgentCommand::ExitSide);
                             }
-                            controls.push_front(AgentCommand::ExitSide);
                             main_events.on_lane(active_lane.clone()).activity(
                                 active.as_ref().map(|turn| turn.outbound.id.clone()),
                                 AgentActivity::other(
@@ -3901,23 +4689,44 @@ async fn worker(
                         }
                     }
                     AgentCommand::Abort => {
-                        if active.is_some() {
-                            let slot = if let Some(side) = side.as_mut().filter(|_| active_lane != AgentLane::Main) {
-                                &mut side.slot
+                        if let Some(active_outbound_id) =
+                            active.as_ref().map(|turn| turn.outbound.id.clone())
+                        {
+                            main_events.on_lane(active_lane.clone()).activity(
+                                Some(active_outbound_id.clone()),
+                                AgentActivity::other("Stopping the current response…"),
+                            );
+                            let session = if let Some(side) =
+                                side.as_ref().filter(|_| active_lane != AgentLane::Main)
+                            {
+                                Arc::clone(&side.slot.session)
                             } else {
-                                &mut main
+                                Arc::clone(&main.session)
                             };
-                            match abort_session(&slot.session).await {
-                                Ok(()) => {
-                                    main_events.on_lane(active_lane.clone()).activity(
-                                        active.as_ref().map(|turn| turn.outbound.id.clone()),
-                                        AgentActivity::other("Stopping the current response…"),
-                                    );
-                                }
-                                Err(error) => {
-                                    let events = main_events.on_lane(active_lane.clone());
-                                    fail_active(&mut active, error.to_string(), &events);
-                                }
+                            let session_id = session.id().to_string();
+                            if pending_aborts.insert(session_id.clone()) {
+                                let lane = active_lane.clone();
+                                let result_tx = interactive_result_tx.clone();
+                                tokio::spawn(async move {
+                                    let result = abort_session(&session)
+                                        .await
+                                        .map_err(|error| error.to_string());
+                                    result_tx
+                                        .send(InteractiveTaskResult::Abort {
+                                            lane,
+                                            session_id,
+                                            active_outbound_id,
+                                            result,
+                                        })
+                                        .ok();
+                                });
+                            } else {
+                                main_events.on_lane(active_lane.clone()).activity(
+                                    Some(active_outbound_id),
+                                    AgentActivity::other(
+                                        "Stop is already in progress; the worker remains responsive",
+                                    ),
+                                );
                             }
                         } else {
                             main_events
@@ -3925,9 +4734,28 @@ async fn worker(
                                 .emit(AgentEvent::StopSettledAlreadyIdle);
                         }
                     }
-                    AgentCommand::StartSide { .. } => {
+                    AgentCommand::StartSide { outbound } => {
+                        if controls.len() >= PENDING_CONTROL_CAPACITY {
+                            side_requested = false;
+                            if let Some(outbound) = outbound {
+                                main_events.emit(AgentEvent::TurnFailed {
+                                    outbound_id: outbound.id,
+                                    outbound: outbound.kind,
+                                    message: format!(
+                                        "deferred control queue is full ({PENDING_CONTROL_CAPACITY}); SIDE was not scheduled"
+                                    ),
+                                    response_started: false,
+                                });
+                            }
+                            main_events.lifecycle(LaneEvent::SideFailed {
+                                message: format!(
+                                    "Deferred control queue is full ({PENDING_CONTROL_CAPACITY}); wait for pending controls to finish"
+                                ),
+                            });
+                            continue;
+                        }
                         side_requested = true;
-                        controls.push_back(command);
+                        controls.push_back(AgentCommand::StartSide { outbound });
                         main_events.on_lane(active_lane.clone()).activity(
                             active.as_ref().map(|turn| turn.outbound.id.clone()),
                             AgentActivity::other(
@@ -3936,38 +4764,58 @@ async fn worker(
                         );
                     }
                     AgentCommand::ExitSide => {
-                        if active.is_some() && active_lane != AgentLane::Main {
-                            if let Some(side_session) = side.as_mut() {
-                                match abort_session(&side_session.slot.session).await {
-                                    Ok(()) => {
-                                        main_events.on_lane(active_lane.clone()).activity(
-                                            active
-                                                .as_ref()
-                                                .map(|turn| turn.outbound.id.clone()),
-                                            AgentActivity::other(
-                                                "Stopping the SIDE response before returning to MAIN…",
-                                            ),
-                                        );
-                                    }
-                                    Err(error) => {
-                                        let events =
-                                            main_events.on_lane(active_lane.clone());
-                                        fail_active(
-                                            &mut active,
-                                            format!(
-                                                "Could not stop SIDE before returning to MAIN: {error}"
-                                            ),
-                                            &events,
-                                        );
-                                    }
+                        if let Some(active_outbound_id) = active
+                            .as_ref()
+                            .filter(|_| active_lane != AgentLane::Main)
+                            .map(|turn| turn.outbound.id.clone())
+                        {
+                            if let Some(side_session) = side.as_ref() {
+                                let session = Arc::clone(&side_session.slot.session);
+                                let session_id = session.id().to_string();
+                                if pending_aborts.insert(session_id.clone()) {
+                                    main_events.on_lane(active_lane.clone()).activity(
+                                        Some(active_outbound_id.clone()),
+                                        AgentActivity::other(
+                                            "Stopping the SIDE response before returning to MAIN…",
+                                        ),
+                                    );
+                                    let lane = active_lane.clone();
+                                    let result_tx = interactive_result_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result = abort_session(&session)
+                                            .await
+                                            .map_err(|error| error.to_string());
+                                        result_tx
+                                            .send(InteractiveTaskResult::Abort {
+                                                lane,
+                                                session_id,
+                                                active_outbound_id,
+                                                result,
+                                            })
+                                            .ok();
+                                    });
                                 }
                             }
-                            controls.push_front(AgentCommand::ExitSide);
-                        } else {
+                            if !controls
+                                .iter()
+                                .any(|control| matches!(control, AgentCommand::ExitSide))
+                            {
+                                controls.push_front(AgentCommand::ExitSide);
+                            }
+                        } else if !controls
+                            .iter()
+                            .any(|control| matches!(control, AgentCommand::ExitSide))
+                        {
                             controls.push_front(AgentCommand::ExitSide);
                         }
                     }
                     AgentCommand::PruneSessions { .. } => {
+                        if controls.len() >= PENDING_CONTROL_CAPACITY {
+                            main_events.emit(AgentEvent::Error(format!(
+                                "Deferred control queue is full ({PENDING_CONTROL_CAPACITY}); prune was not scheduled"
+                            )));
+                            continue;
+                        }
                         controls.push_back(command);
                         main_events.activity(
                             active.as_ref().map(|turn| turn.outbound.id.clone()),
@@ -3989,6 +4837,14 @@ async fn worker(
                             }
                             _ => unreachable!(),
                         };
+                        if controls.len() >= PENDING_CONTROL_CAPACITY {
+                            main_events.on_lane(active_lane.clone()).emit(AgentEvent::Error(
+                                format!(
+                                    "Deferred control queue is full ({PENDING_CONTROL_CAPACITY}); {label} was rejected"
+                                ),
+                            ));
+                            continue;
+                        }
                         controls.push_back(command);
                         main_events.on_lane(active_lane.clone()).activity(
                             active.as_ref().map(|turn| turn.outbound.id.clone()),
@@ -3996,14 +4852,12 @@ async fn worker(
                         );
                     }
                     AgentCommand::Shutdown => {
-                        if active.is_some() {
-                            let slot = if let Some(side) = side.as_mut().filter(|_| active_lane != AgentLane::Main) {
-                                &mut side.slot
-                            } else {
-                                &mut main
-                            };
-                            abort_session(&slot.session).await.ok();
-                        }
+                        main_events.on_lane(active_lane.clone()).activity(
+                            active.as_ref().map(|turn| turn.outbound.id.clone()),
+                            AgentActivity::other(
+                                "Shutting down Copilot session cleanup in the background…",
+                            ),
+                        );
                         break;
                     },
                 }
@@ -4018,6 +4872,94 @@ async fn worker(
                 match incoming {
                     Ok(event) => {
                         let events = main_events.on_lane(active_lane.clone());
+                        if event.event_type == "session_limits_exhausted.requested" {
+                            let session = if active_lane == AgentLane::Main {
+                                Arc::clone(&main.session)
+                            } else if let Some(side_session) = side.as_ref() {
+                                Arc::clone(&side_session.slot.session)
+                            } else {
+                                Arc::clone(&main.session)
+                            };
+                            let session_id = session.id().to_string();
+                            let request_key = event
+                                .data
+                                .get("requestId")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("<missing-request-id>")
+                                .to_owned();
+                            let limit_key = (session_id.clone(), request_key.clone());
+                            if pending_session_limits.contains(&limit_key)
+                                || settled_session_limits.contains(&limit_key)
+                            {
+                                events.activity(
+                                    active.as_ref().map(|turn| turn.outbound.id.clone()),
+                                    AgentActivity {
+                                        kind: ActivityKind::Other,
+                                        label: "Ignored duplicate Copilot session-limit request"
+                                            .into(),
+                                        tool: Some("session_limits".into()),
+                                        detail: Some(format!("request={request_key}")),
+                                    },
+                                );
+                                handle_session_event(event, &mut active, &events);
+                                continue;
+                            }
+                            if pending_session_limits.len() >= PENDING_SESSION_LIMIT_CAPACITY {
+                                let message = format!(
+                                    "Copilot sent more than {} concurrent session-limit requests; disconnecting immediately so no SDK request remains waiting. Restart rq-tui to resume the persisted session",
+                                    PENDING_SESSION_LIMIT_CAPACITY
+                                );
+                                events.activity(
+                                    active.as_ref().map(|turn| turn.outbound.id.clone()),
+                                    AgentActivity {
+                                        kind: ActivityKind::Failure,
+                                        label: "Too many concurrent Copilot session-limit requests · disconnecting safely"
+                                            .into(),
+                                        tool: Some("session_limits".into()),
+                                        detail: Some(format!("request={request_key}")),
+                                    },
+                                );
+                                fail_active(&mut active, message.clone(), &events);
+                                fail_queue(&mut main_queue, &message, &main_events);
+                                if let Some(side_session) = &side {
+                                    fail_queue(
+                                        &mut side_queue,
+                                        &message,
+                                        &main_events.on_lane(AgentLane::Side {
+                                            id: side_session.id.clone(),
+                                        }),
+                                    );
+                                } else {
+                                    fail_queue(&mut side_queue, &message, &events);
+                                }
+                                events.emit(AgentEvent::Error(message));
+                                break;
+                            }
+                            pending_session_limits.insert(limit_key);
+                            let limit_event = event.clone();
+                            let limit_events = events.clone();
+                            let lane = active_lane.clone();
+                            let result_tx = session_limit_result_tx.clone();
+                            tokio::spawn(async move {
+                                let settled = handle_session_limits_request(
+                                    &limit_event,
+                                    &session,
+                                    &limit_events,
+                                )
+                                .await;
+                                result_tx
+                                    .send(SessionLimitTaskResult {
+                                        lane,
+                                        session_id,
+                                        request_key,
+                                        failure: (!settled).then(|| {
+                                            "Copilot session-limit request could not be settled safely; restart rq-tui to resume the persisted session"
+                                                .into()
+                                        }),
+                                    })
+                                    .ok();
+                            });
+                        }
                         handle_session_event(event, &mut active, &events);
                     }
                     Err(error) => {
@@ -4075,6 +5017,202 @@ async fn worker(
                     }
                 }
             }
+            Some(result) = orphan_cleanup_result_rx.recv() => {
+                match result {
+                    OrphanCleanupTaskResult::Record {
+                        session_id,
+                        cleanup_warning,
+                    } => main_events.emit(AgentEvent::OrphanSideCleanup {
+                        session_id,
+                        cleanup_warning,
+                    }),
+                    OrphanCleanupTaskResult::Complete { had_warning } => {
+                        orphan_cleanup_in_progress = false;
+                        if !had_warning {
+                            main_events.activity(
+                                None,
+                                AgentActivity::other(
+                                    "Interrupted SIDE cleanup complete · /side is available",
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            Some(result) = side_cleanup_result_rx.recv() => {
+                side_cleanup_in_progress = false;
+                main_events
+                    .on_lane(AgentLane::Side {
+                        id: result.side_id.clone(),
+                    })
+                    .lifecycle(LaneEvent::SideExited {
+                        parent_id: result.parent_id,
+                        side_id: result.side_id,
+                        cleanup_warning: result.cleanup_warning,
+                    });
+            }
+            Some(result) = interactive_result_rx.recv() => {
+                match result {
+                    InteractiveTaskResult::Steering {
+                        lane,
+                        session_id,
+                        steering_id,
+                        active_outbound_id,
+                        result,
+                    } => {
+                        pending_steering.remove(&steering_id);
+                        let events = main_events.on_lane(lane.clone());
+                        let origin_session_id = match &lane {
+                            AgentLane::Main => Some(main.session.id().to_string()),
+                            AgentLane::Side { id } => side
+                                .as_ref()
+                                .filter(|side| &side.id == id)
+                                .map(|side| side.slot.session.id().to_string()),
+                        };
+                        let still_active = active
+                            .as_ref()
+                            .is_some_and(|turn| turn.outbound.id == active_outbound_id)
+                            && active_lane == lane;
+                        if origin_session_id.as_deref() != Some(&session_id) || !still_active {
+                            events.emit(AgentEvent::SteeringFailed {
+                                steering_id,
+                                active_outbound_id,
+                                message: "the original Copilot turn settled or changed before the steering acknowledgement arrived"
+                                    .into(),
+                            });
+                            continue;
+                        }
+                        match result {
+                            Ok(message_id) => {
+                                if let Some(active) = active.as_mut() {
+                                    register_sdk_message_root(active, message_id);
+                                }
+                                events.emit(AgentEvent::SteeringAccepted {
+                                    steering_id,
+                                    active_outbound_id,
+                                });
+                            }
+                            Err(message) => events.emit(AgentEvent::SteeringFailed {
+                                steering_id,
+                                active_outbound_id,
+                                message,
+                            }),
+                        }
+                    }
+                    InteractiveTaskResult::Abort {
+                        lane,
+                        session_id,
+                        active_outbound_id,
+                        result,
+                    } => {
+                        pending_aborts.remove(&session_id);
+                        let events = main_events.on_lane(lane.clone());
+                        let origin_session_id = match &lane {
+                            AgentLane::Main => Some(main.session.id().to_string()),
+                            AgentLane::Side { id } => side
+                                .as_ref()
+                                .filter(|side| &side.id == id)
+                                .map(|side| side.slot.session.id().to_string()),
+                        };
+                        if origin_session_id.as_deref() != Some(&session_id) {
+                            events.activity(
+                                active.as_ref().map(|turn| turn.outbound.id.clone()),
+                                AgentActivity::other(
+                                    "Ignored a stale stop acknowledgement from a closed Copilot session",
+                                ),
+                            );
+                            continue;
+                        }
+                        let still_active = active
+                            .as_ref()
+                            .is_some_and(|turn| turn.outbound.id == active_outbound_id)
+                            && active_lane == lane;
+                        match result {
+                            Err(message) if still_active => {
+                                fail_active(&mut active, message, &events);
+                            }
+                            Err(message) => {
+                                events.activity(
+                                    None,
+                                    AgentActivity::other(format!(
+                                        "Copilot stop failed after the turn had already settled: {message}"
+                                    )),
+                                );
+                            }
+                            Ok(()) if still_active => {
+                                if let Some(active) = active.take() {
+                                    if !active.response_started {
+                                        events.emit(AgentEvent::ResponseStarted {
+                                            outbound_id: active.outbound.id.clone(),
+                                            outbound: active.outbound.kind,
+                                            first_delta: String::new(),
+                                        });
+                                    }
+                                    events.emit(AgentEvent::ResponseComplete {
+                                        outbound_id: active.outbound.id,
+                                        aborted: true,
+                                    });
+                                }
+                            }
+                            Ok(()) => {}
+                        }
+                    }
+                }
+            }
+            Some(result) = session_limit_result_rx.recv() => {
+                let limit_key = (result.session_id.clone(), result.request_key.clone());
+                pending_session_limits.remove(&limit_key);
+                if settled_session_limits.insert(limit_key.clone()) {
+                    settled_session_limit_order.push_back(limit_key);
+                }
+                while settled_session_limit_order.len() > SETTLED_SESSION_LIMIT_CAPACITY {
+                    if let Some(expired) = settled_session_limit_order.pop_front() {
+                        settled_session_limits.remove(&expired);
+                    }
+                }
+                let origin_session_id = match &result.lane {
+                    AgentLane::Main => Some(main.session.id().to_string()),
+                    AgentLane::Side { id } => side
+                        .as_ref()
+                        .filter(|side| &side.id == id)
+                        .map(|side| side.slot.session.id().to_string()),
+                };
+                let Some(message) = result.failure else {
+                    continue;
+                };
+                let origin_events = main_events.on_lane(result.lane.clone());
+                if origin_session_id.as_deref() != Some(&result.session_id) {
+                    origin_events.activity(
+                        None,
+                        AgentActivity {
+                            kind: ActivityKind::Other,
+                            label: "Ignored stale session-limit failure from a closed session".into(),
+                            tool: Some("session_limits".into()),
+                            detail: Some(format!(
+                                "session={} · request={}",
+                                result.session_id, result.request_key
+                            )),
+                        },
+                    );
+                    continue;
+                }
+                let current_events = main_events.on_lane(active_lane.clone());
+                fail_active(&mut active, message.clone(), &current_events);
+                fail_queue(&mut main_queue, &message, &main_events);
+                if let Some(side_session) = &side {
+                    fail_queue(
+                        &mut side_queue,
+                        &message,
+                        &main_events.on_lane(AgentLane::Side {
+                            id: side_session.id.clone(),
+                        }),
+                    );
+                } else {
+                    fail_queue(&mut side_queue, &message, &current_events);
+                }
+                origin_events.emit(AgentEvent::Error(message));
+                break;
+            }
         }
     }
 
@@ -4106,7 +5244,7 @@ async fn worker(
 }
 
 async fn abort_session(session: &Session) -> Result<()> {
-    sdk_call("Copilot abort", session.abort()).await
+    sdk_interactive_call("Copilot abort", session.abort()).await
 }
 
 async fn disconnect_session(session: &Session) -> Result<()> {
@@ -4132,6 +5270,22 @@ where
             format!(
                 "{operation} exceeded {} seconds",
                 SDK_CONTROL_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(Into::into)
+}
+
+async fn sdk_interactive_call<T, E, F>(operation: &str, future: F) -> Result<T>
+where
+    F: Future<Output = std::result::Result<T, E>>,
+    E: Into<anyhow::Error>,
+{
+    tokio::time::timeout(SDK_INTERACTIVE_CONTROL_TIMEOUT, future)
+        .await
+        .with_context(|| {
+            format!(
+                "{operation} exceeded {} seconds",
+                SDK_INTERACTIVE_CONTROL_TIMEOUT.as_secs()
             )
         })?
         .map_err(Into::into)
@@ -4212,6 +5366,8 @@ fn is_observability_event(event_type: &str) -> bool {
             | "session.shutdown"
             | "session.compaction_start"
             | "session.compaction_complete"
+            | "session_limits_exhausted.requested"
+            | "session_limits_exhausted.completed"
             | "assistant.turn_start"
             | "assistant.streaming_delta"
             | "assistant.turn_end"
@@ -4999,7 +6155,9 @@ fn handle_session_event(
                 active,
                 AgentActivity {
                     kind: ActivityKind::Other,
-                    label: "Copilot is waiting for your input".into(),
+                    label:
+                        "Copilot requested user input · rq-tui will return no input after its safe fallback"
+                            .into(),
                     tool: Some("user_input".into()),
                     detail: event_detail(&event.data, &["question", "requestId", "request_id"]),
                 },
@@ -5011,7 +6169,7 @@ fn handle_session_event(
                 active,
                 AgentActivity {
                     kind: ActivityKind::ToolComplete,
-                    label: "User input received".into(),
+                    label: "Copilot user-input request completed".into(),
                     tool: Some("user_input".into()),
                     detail: event_detail(&event.data, &["requestId", "request_id"]),
                 },
@@ -5023,7 +6181,9 @@ fn handle_session_event(
                 active,
                 AgentActivity {
                     kind: ActivityKind::Other,
-                    label: "Copilot is waiting for confirmation".into(),
+                    label:
+                        "Copilot requested confirmation · rq-tui will cancel after its safe fallback"
+                            .into(),
                     tool: Some("elicitation".into()),
                     detail: event_detail(
                         &event.data,
@@ -5038,7 +6198,7 @@ fn handle_session_event(
                 active,
                 AgentActivity {
                     kind: ActivityKind::ToolComplete,
-                    label: "User confirmation received".into(),
+                    label: "Copilot confirmation request completed".into(),
                     tool: Some("elicitation".into()),
                     detail: event_detail(&event.data, &["action", "requestId", "request_id"]),
                 },
@@ -5503,13 +6663,15 @@ async fn create_or_resume_session(
     config: &BridgeConfig,
     events: &EventPublisher,
     ledger: &Storage,
+    interactions: Arc<PendingInteractionBroker>,
 ) -> Result<SessionBoot> {
     if let Some(id) = &config.existing_session_id {
         match client
-            .resume_session(resume_config(
+            .resume_session(resume_config_with_broker(
                 SessionId::new(id.clone()),
                 config,
                 Some(events),
+                Some(&interactions),
             ))
             .await
         {
@@ -5521,7 +6683,8 @@ async fn create_or_resume_session(
                 });
             }
             Err(error) => {
-                let session = create_tracked_session(client, config, events, ledger).await?;
+                let session =
+                    create_tracked_session(client, config, events, ledger, interactions).await?;
                 return Ok(SessionBoot {
                     session,
                     resumed: false,
@@ -5533,7 +6696,7 @@ async fn create_or_resume_session(
         }
     }
     Ok(SessionBoot {
-        session: create_tracked_session(client, config, events, ledger).await?,
+        session: create_tracked_session(client, config, events, ledger, interactions).await?,
         resumed: false,
         resume_warning: None,
     })
@@ -5544,6 +6707,7 @@ async fn create_tracked_session(
     config: &BridgeConfig,
     events: &EventPublisher,
     ledger: &Storage,
+    interactions: Arc<PendingInteractionBroker>,
 ) -> Result<Session> {
     let session_id = Uuid::new_v4().to_string();
     // Persist the client-selected ID before asking the SDK to create it. A
@@ -5558,7 +6722,8 @@ async fn create_tracked_session(
     })?;
     let session = client
         .create_session(
-            create_config(config, Some(events)).with_session_id(SessionId::new(session_id.clone())),
+            create_config_with_broker(config, Some(events), Some(&interactions))
+                .with_session_id(SessionId::new(session_id.clone())),
         )
         .await?;
     if session.id().as_str() != session_id {
@@ -5577,7 +6742,16 @@ async fn create_tracked_session(
     Ok(session)
 }
 
+#[cfg(test)]
 fn create_config(config: &BridgeConfig, events: Option<&EventPublisher>) -> SessionConfig {
+    create_config_with_broker(config, events, None)
+}
+
+fn create_config_with_broker(
+    config: &BridgeConfig,
+    events: Option<&EventPublisher>,
+    interactions: Option<&Arc<PendingInteractionBroker>>,
+) -> SessionConfig {
     let mut session = SessionConfig::default()
         .with_model(config.model.clone())
         .with_streaming(true)
@@ -5595,13 +6769,32 @@ fn create_config(config: &BridgeConfig, events: Option<&EventPublisher>) -> Sess
     if let Some(events) = events {
         session = session.with_hooks(progress_hooks(events));
     }
+    if let Some(interactions) = interactions {
+        let handlers = Arc::new(PendingInteractionHandlers::new(interactions.clone()));
+        session = session
+            .with_auto_mode_switch_handler(handlers.clone())
+            .with_elicitation_handler(handlers.clone())
+            .with_exit_plan_mode_handler(handlers.clone())
+            .with_mcp_auth_handler(handlers.clone())
+            .with_user_input_handler(handlers);
+    }
     session
 }
 
+#[cfg(test)]
 fn resume_config(
     id: SessionId,
     config: &BridgeConfig,
     events: Option<&EventPublisher>,
+) -> ResumeSessionConfig {
+    resume_config_with_broker(id, config, events, None)
+}
+
+fn resume_config_with_broker(
+    id: SessionId,
+    config: &BridgeConfig,
+    events: Option<&EventPublisher>,
+    interactions: Option<&Arc<PendingInteractionBroker>>,
 ) -> ResumeSessionConfig {
     let mut session = ResumeSessionConfig::new(id)
         // A bridge restart must hand pending SDK work back to the resumed
@@ -5623,7 +6816,163 @@ fn resume_config(
     if let Some(events) = events {
         session = session.with_hooks(progress_hooks(events));
     }
+    if let Some(interactions) = interactions {
+        let handlers = Arc::new(PendingInteractionHandlers::new(interactions.clone()));
+        session = session
+            .with_auto_mode_switch_handler(handlers.clone())
+            .with_elicitation_handler(handlers.clone())
+            .with_exit_plan_mode_handler(handlers.clone())
+            .with_mcp_auth_handler(handlers.clone())
+            .with_user_input_handler(handlers);
+    }
     session
+}
+
+async fn handle_session_limits_request(
+    event: &SessionEvent,
+    session: &Session,
+    events: &impl EventOutput,
+) -> bool {
+    let request_id = event
+        .data
+        .get("requestId")
+        .and_then(serde_json::Value::as_str)
+        .map(RequestId::new);
+    let requested = serde_json::from_value::<
+        github_copilot_sdk::session_events::SessionLimitsExhaustedRequestedData,
+    >(event.data.clone());
+    let request_id = match (requested.as_ref(), request_id) {
+        (Ok(requested), _) => requested.request_id.clone(),
+        (Err(error), Some(request_id)) => {
+            send_activity(
+                &None,
+                AgentActivity {
+                    kind: ActivityKind::Failure,
+                    label: "Malformed Copilot session-limit request · cancelling by request id"
+                        .into(),
+                    tool: Some("session_limits".into()),
+                    detail: Some(sanitize_event_text(&error.to_string())),
+                },
+                events,
+            );
+            request_id
+        }
+        (Err(error), None) => {
+            send_activity(
+                &None,
+                AgentActivity {
+                    kind: ActivityKind::Failure,
+                    label: "Malformed Copilot session-limit request has no id · the SDK cannot be answered"
+                        .into(),
+                    tool: Some("session_limits".into()),
+                    detail: Some(sanitize_event_text(&error.to_string())),
+                },
+                events,
+            );
+            return false;
+        }
+    };
+    let detail = requested
+        .as_ref()
+        .map(|requested| {
+            format!(
+                "used={:.2} credits · max={:.2} credits",
+                requested.used_ai_credits, requested.max_ai_credits
+            )
+        })
+        .unwrap_or_else(|_| "credit details unavailable".into());
+    send_activity(
+        &None,
+        AgentActivity {
+            kind: ActivityKind::Other,
+            label: "Copilot session limit reached · cancelling this turn immediately".into(),
+            tool: Some("session_limits".into()),
+            detail: Some(format!(
+                "{detail} · interactive credit changes are not available in rq-tui yet"
+            )),
+        },
+        events,
+    );
+    let response = UISessionLimitsExhaustedResponse {
+        action: UISessionLimitsExhaustedResponseAction::Cancel,
+        additional_ai_credits: None,
+        max_ai_credits: None,
+    };
+    let params = UIHandlePendingSessionLimitsExhaustedRequest {
+        request_id,
+        response,
+    };
+    match tokio::time::timeout(
+        SESSION_LIMIT_RESPONSE_TIMEOUT,
+        session
+            .rpc()
+            .ui()
+            .handle_pending_session_limits_exhausted(params),
+    )
+    .await
+    {
+        Ok(Ok(result)) if result.success => {
+            send_activity(
+                &None,
+                AgentActivity {
+                    kind: ActivityKind::ToolComplete,
+                    label: "Copilot session-limit cancellation accepted".into(),
+                    tool: Some("session_limits".into()),
+                    detail: Some("The worker can continue processing queued commands".into()),
+                },
+                events,
+            );
+            true
+        }
+        Ok(Ok(_)) => {
+            send_activity(
+                &None,
+                AgentActivity {
+                    kind: ActivityKind::Failure,
+                    label:
+                        "Copilot session-limit response was not accepted · stopping the worker safely"
+                            .into(),
+                    tool: Some("session_limits".into()),
+                    detail: Some(
+                        "request was already resolved, expired, or unknown; restart rq-tui to resume"
+                            .into(),
+                    ),
+                },
+                events,
+            );
+            false
+        }
+        Ok(Err(error)) => {
+            send_activity(
+                &None,
+                AgentActivity {
+                    kind: ActivityKind::Failure,
+                    label: "Could not resolve Copilot session limit · stopping the worker safely"
+                        .into(),
+                    tool: Some("session_limits".into()),
+                    detail: Some(sanitize_event_text(&error.to_string())),
+                },
+                events,
+            );
+            false
+        }
+        Err(_) => {
+            send_activity(
+                &None,
+                AgentActivity {
+                    kind: ActivityKind::Failure,
+                    label: "Copilot session-limit cancellation timed out after 1s".into(),
+                    tool: Some("session_limits".into()),
+                    detail: Some(
+                        "The worker will disconnect instead of appearing stuck; restart rq-tui to resume"
+                            .into(),
+                    ),
+                },
+                events,
+            );
+            false
+        }
+    }
 }
 
 fn system_message(work_item_id: &str) -> SystemMessageConfig {
@@ -5710,7 +7059,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use anyhow::Result;
-    use github_copilot_sdk::handler::PermissionHandler;
+    use github_copilot_sdk::handler::{
+        AutoModeSwitchHandler, AutoModeSwitchResponse, ExitPlanModeHandler, PermissionHandler,
+    };
     use github_copilot_sdk::hooks::{
         HookContext, HookEvent, PostToolUseFailureInput, PreToolUseInput, SessionHooks,
     };
@@ -5719,13 +7070,15 @@ mod tests {
     };
 
     use super::{
-        cleanup_ephemeral_record, create_config, delete_journaled_remote_sessions,
-        durable_export_choice, enqueue_message, envelope_outbound_id, execute_prune_operation,
-        handle_session_event, history_entries, model_option, now, register_sdk_message_root,
-        resume_config, resumed_active_from_history, retryable_cleanup_state, ActiveOutbound,
-        ActivityKind, AgentCommand, AgentEvent, AgentLane, AgentRuntime, AgentSink, BridgeConfig,
+        cleanup_ephemeral_record, create_config, create_config_with_broker,
+        delete_journaled_remote_sessions, durable_export_choice, enqueue_message,
+        envelope_outbound_id, execute_prune_operation, handle_session_event, history_entries,
+        model_option, now, register_sdk_message_root, resume_config, resume_config_with_broker,
+        resumed_active_from_history, retryable_cleanup_state, ActiveOutbound, ActivityKind,
+        AgentCommand, AgentEvent, AgentLane, AgentRuntime, AgentSink, BridgeConfig,
         ControlledAgent, CopilotBridge, EventPublisher, HistoryEntry, LaneEvent, Outbound,
-        OutboundKind, ProgressHooks, PruneExecution, ReadOnlyPermissionHandler, SideCleanupBackend,
+        OutboundKind, PendingInteractionBroker, PendingInteractionHandlers, PendingInteractionKind,
+        ProgressHooks, PruneExecution, ReadOnlyPermissionHandler, SideCleanupBackend,
         WorkItemProcessLock,
     };
     use crate::config::AppPaths;
@@ -6371,6 +7724,25 @@ mod tests {
             resume_config(SessionId::new("previous"), &config, None).plugin_directories,
             Some(vec![PathBuf::from("plugins")])
         );
+
+        let (sender, _receiver) = mpsc::channel();
+        let broker = Arc::new(PendingInteractionBroker::new(EventPublisher::new(
+            sender,
+            AgentLane::Main,
+        )));
+        let created = create_config_with_broker(&config, None, Some(&broker));
+        let resumed =
+            resume_config_with_broker(SessionId::new("previous"), &config, None, Some(&broker));
+        assert!(created.elicitation_handler.is_some());
+        assert!(created.mcp_auth_handler.is_some());
+        assert!(created.user_input_handler.is_some());
+        assert!(created.exit_plan_mode_handler.is_some());
+        assert!(created.auto_mode_switch_handler.is_some());
+        assert!(resumed.elicitation_handler.is_some());
+        assert!(resumed.mcp_auth_handler.is_some());
+        assert!(resumed.user_input_handler.is_some());
+        assert!(resumed.exit_plan_mode_handler.is_some());
+        assert!(resumed.auto_mode_switch_handler.is_some());
     }
 
     #[tokio::test]
@@ -6418,6 +7790,127 @@ mod tests {
             )
             .await;
         assert!(format!("{result:?}").contains("Reject"));
+    }
+
+    #[tokio::test]
+    async fn pending_interaction_broker_resolves_and_cleans_up() {
+        let (sender, _receiver) = mpsc::channel();
+        let broker = PendingInteractionBroker::with_limits(
+            EventPublisher::new(sender, AgentLane::Main),
+            2,
+            Duration::from_secs(1),
+        );
+        let request_broker = broker.clone();
+        let request = tokio::spawn(async move {
+            request_broker
+                .request(
+                    PendingInteractionKind::UserInput,
+                    RequestId::new("answer-request"),
+                    Some("Pick one".into()),
+                    "fallback".to_owned(),
+                    |value| value.as_str().map(str::to_owned),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(broker.pending_len(), 1);
+        assert!(broker.resolve(
+            "answer-request",
+            serde_json::Value::String("selected".into())
+        ));
+        assert_eq!(request.await.unwrap(), "selected");
+        assert_eq!(broker.pending_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_interaction_broker_times_out_to_a_safe_default() {
+        let (sender, _receiver) = mpsc::channel();
+        let broker = PendingInteractionBroker::with_limits(
+            EventPublisher::new(sender, AgentLane::Main),
+            1,
+            Duration::from_millis(1),
+        );
+        let response = broker
+            .request(
+                PendingInteractionKind::Elicitation,
+                RequestId::new("timeout-request"),
+                None,
+                "cancel".to_owned(),
+                |value| value.as_str().map(str::to_owned),
+            )
+            .await;
+        assert_eq!(response, "cancel");
+        assert_eq!(broker.pending_len(), 0);
+    }
+
+    #[test]
+    fn pending_interaction_broker_enforces_its_capacity() {
+        let (sender, _receiver) = mpsc::channel();
+        let broker = PendingInteractionBroker::with_limits(
+            EventPublisher::new(sender, AgentLane::Main),
+            1,
+            Duration::from_secs(1),
+        );
+        let first = broker.begin(
+            PendingInteractionKind::McpOauth,
+            RequestId::new("first"),
+            None,
+        );
+        let second = broker.begin(
+            PendingInteractionKind::McpOauth,
+            RequestId::new("second"),
+            None,
+        );
+        assert!(first.is_some());
+        assert!(second.is_none());
+        assert_eq!(broker.pending_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn noninteractive_plan_and_auto_model_handlers_are_safe_and_explicit() {
+        let (sender, _receiver) = mpsc::channel();
+        let handlers =
+            PendingInteractionHandlers::new(Arc::new(PendingInteractionBroker::with_limits(
+                EventPublisher::new(sender, AgentLane::Main),
+                1,
+                Duration::from_millis(1),
+            )));
+        let plan = ExitPlanModeHandler::handle(
+            &handlers,
+            SessionId::new("session"),
+            github_copilot_sdk::ExitPlanModeData {
+                summary: "review plan".into(),
+                plan_content: None,
+                actions: vec!["autopilot".into(), "interactive".into()],
+                recommended_action: "autopilot".into(),
+            },
+        )
+        .await;
+        assert!(plan.approved);
+        assert_eq!(plan.selected_action.as_deref(), Some("interactive"));
+        let unavailable_plan = ExitPlanModeHandler::handle(
+            &handlers,
+            SessionId::new("session"),
+            github_copilot_sdk::ExitPlanModeData {
+                summary: "autonomous plan".into(),
+                plan_content: None,
+                actions: vec!["autopilot".into()],
+                recommended_action: "autopilot".into(),
+            },
+        )
+        .await;
+        assert!(!unavailable_plan.approved);
+        assert_eq!(unavailable_plan.selected_action, None);
+        assert_eq!(
+            AutoModeSwitchHandler::handle(
+                &handlers,
+                SessionId::new("session"),
+                Some("rate_limit".into()),
+                Some(30.0),
+            )
+            .await,
+            AutoModeSwitchResponse::No
+        );
     }
 
     #[tokio::test]
@@ -6541,12 +8034,12 @@ mod tests {
                     "requestId": "input-1",
                     "question": "Which environment should I use?"
                 }),
-                "waiting for your input",
+                "will return no input",
             ),
             (
                 "user_input.completed",
                 serde_json::json!({"requestId": "input-1"}),
-                "User input received",
+                "user-input request completed",
             ),
             (
                 "elicitation.requested",
@@ -6555,12 +8048,12 @@ mod tests {
                     "message": "Confirm the remote session",
                     "mode": "form"
                 }),
-                "waiting for confirmation",
+                "will cancel after",
             ),
             (
                 "elicitation.completed",
                 serde_json::json!({"requestId": "elicit-1", "action": "accept"}),
-                "User confirmation received",
+                "confirmation request completed",
             ),
             (
                 "tool.user_requested",
