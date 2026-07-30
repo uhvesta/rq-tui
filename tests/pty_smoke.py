@@ -28,6 +28,12 @@ ANSI_RE = re.compile(
 OSC52_RE = re.compile(rb"\x1b\]52;c;([A-Za-z0-9+/=]*)\x07")
 CHAT_ROWS_RE = re.compile(r"rows (\d+)-(\d+)/(\d+)")
 
+# A semantic deadline for the compiled PTY regression below. This is not a
+# sleep: once the initial frame is visible, a large navigation burst must
+# acknowledge a new input mode within this bound.
+NAVIGATION_BURST = b"j" * 2048 + b"k" * 2048
+BURST_RESPONSE_TIMEOUT = 2.0
+
 
 def git(repo: Path, *args: str) -> None:
     subprocess.run(
@@ -348,11 +354,17 @@ class Child:
         raise AssertionError(self.failure(f"timed out waiting for {marker!r}"))
 
     def wait_for_since(self, marker: str, offset: int, timeout: float = 8.0) -> None:
-        deadline = time.monotonic() + timeout
+        self.wait_for_since_within(marker, offset, timeout)
+
+    def wait_for_since_within(
+        self, marker: str, offset: int, timeout: float = 8.0
+    ) -> float:
+        started = time.monotonic()
+        deadline = started + timeout
         while time.monotonic() < deadline:
             self.read(0.1)
             if marker in terminal_text(bytes(self.output[offset:])):
-                return
+                return time.monotonic() - started
             status = self.poll()
             if status is not None:
                 raise AssertionError(self.failure(f"process exited {status} before {marker!r}"))
@@ -515,6 +527,7 @@ def main() -> int:
         # here starves Crossterm input for many seconds.
         repo = make_fixture(root, extra_changed_lines=12_000)
         child = Child(binary, repo, app_root)
+        burst_latency = 0.0
         try:
             child.resize(100, 24)
             child.wait_for(
@@ -525,6 +538,29 @@ def main() -> int:
             child.wait_for("COPILOT MAIN", timeout=8)
             if child.poll() is not None:
                 raise AssertionError(child.failure("TUI exited during entry"))
+
+            # PTY-29: a held j/k burst must not leave the user waiting behind
+            # thousands of queued navigation events. The trailing ':' is an
+            # unambiguous, actionable acknowledgement: it proves the input
+            # loop reached a new mode after the burst, not merely that the
+            # terminal kept repainting the old review screen.
+            before_burst = len(child.output)
+            child.send(NAVIGATION_BURST + b":")
+            burst_latency = child.wait_for_since_within(
+                "COMMAND MODE ACTIVE", before_burst, BURST_RESPONSE_TIMEOUT
+            )
+            child.send(b"\x1b")
+            child.wait_for_since("NORMAL", before_burst, timeout=4)
+
+            # PTY-30: the spec-required Ctrl-W focus chord must acknowledge
+            # its pending state and then move between the file tree and diff.
+            before_focus = len(child.output)
+            child.send(b"\x17")
+            child.wait_for_since("CTRL-W", before_focus, timeout=4)
+            child.send(b"h")
+            child.wait_for_since("Focus: files", before_focus, timeout=4)
+            child.send(b"\x17l")
+            child.wait_for_since("Focus: diff", before_focus, timeout=4)
 
             # Resize the real terminal and require a post-resize redraw. The
             # ioctl is deliberately performed on the PTY master, so this also
@@ -797,7 +833,7 @@ def main() -> int:
 
     print(
         "PTY_SMOKE_OK: entry resize prune-progress chat-composer "
-        "command-mode clean-exit no-panic"
+        f"held-key-burst={burst_latency:.3f}s ctrl-w clean-exit no-panic"
     )
     return 0
 
