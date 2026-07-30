@@ -729,6 +729,8 @@ impl ControlledAgent {
         let state = Arc::clone(&agent.state);
         let flood_startup = env::var_os("RQ_TUI_CONTROLLED_STARTUP_FLOOD").as_deref()
             == Some(std::ffi::OsStr::new("1"));
+        let resumed_session =
+            env::var_os("RQ_TUI_CONTROLLED_RESUMED").as_deref() == Some(std::ffi::OsStr::new("1"));
         std::thread::spawn(move || {
             let storage = match Storage::open(&config.database_path) {
                 Ok(storage) => storage,
@@ -874,7 +876,7 @@ impl ControlledAgent {
                     AgentLane::Main,
                     AgentEvent::SessionReady {
                         session_id: format!("controlled-{}", config.work_item_id),
-                        resumed: false,
+                        resumed: resumed_session,
                         resume_warning: None,
                     },
                 ),

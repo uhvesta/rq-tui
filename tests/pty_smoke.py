@@ -572,7 +572,10 @@ def main() -> int:
             binary,
             repo,
             app_root,
-            {"RQ_TUI_CONTROLLED_STARTUP_FLOOD": "1"},
+            {
+                "RQ_TUI_CONTROLLED_STARTUP_FLOOD": "1",
+                "RQ_TUI_CONTROLLED_RESUMED": "1",
+            },
         )
         burst_latency = 0.0
         try:
@@ -615,6 +618,7 @@ def main() -> int:
             child.wait_for_screen("IMMEDIATE_INPUT", timeout=2)
             child.send(b"\x03")
             child.wait_for_screen_state(("NORMAL",), ("INSERT",), timeout=4)
+            child.wait_for_screen("session resumed", timeout=4)
 
             # PTY-30: the spec-required Ctrl-W focus chord must acknowledge
             # its pending state and then move between the file tree and diff.
