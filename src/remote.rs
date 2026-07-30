@@ -141,6 +141,7 @@ impl<R: ProcessRunner> RemoteResolver<R> {
         if references.is_empty() {
             bail!("at least one PR is required");
         }
+        let references = canonical_references(references);
         let metadata = references
             .iter()
             .map(|reference| self.metadata(reference).map(|meta| (reference, meta)))
@@ -193,7 +194,7 @@ impl<R: ProcessRunner> RemoteResolver<R> {
         });
         for repo in &repos {
             ensure_link(
-                &session_root.join(&repo.record.name),
+                &session_root.join(remote_session_link_name(repo)),
                 repo.version.worktree_path.as_ref(),
             )?;
         }
@@ -278,7 +279,7 @@ impl<R: ProcessRunner> RemoteResolver<R> {
                 .map(|version| version.version_num + 1)
                 .unwrap_or(1);
             let id = format!("{repo_id}:v{version_num}");
-            let worktree = cache.join("worktrees").join(format!("v{version_num}"));
+            let worktree = remote_worktree_path(&cache, &repo_id, version_num);
             self.add_worktree(&bare, &worktree, &head_sha)?;
             let version = Version {
                 id,
@@ -444,6 +445,29 @@ impl<R: ProcessRunner> RemoteResolver<R> {
     }
 }
 
+fn canonical_references(references: &[PrReference]) -> Vec<PrReference> {
+    let mut references = references.to_vec();
+    references.sort_by_key(PrReference::canonical_url);
+    references.dedup_by(|left, right| left.canonical_url() == right.canonical_url());
+    references
+}
+
+fn remote_session_link_name(repo: &ReviewRepo) -> String {
+    repo.record
+        .remote_pr_url
+        .as_deref()
+        .and_then(|url| PrReference::parse(url).ok())
+        .map(|reference| format!("{}--{}", reference.owner, reference.repo))
+        .unwrap_or_else(|| repo.record.name.clone())
+}
+
+fn remote_worktree_path(cache: &Path, repo_id: &str, version_num: i64) -> PathBuf {
+    cache
+        .join("worktrees")
+        .join(repo_id)
+        .join(format!("v{version_num}"))
+}
+
 fn write_remote_metadata(root: &Path, metadata: &[PrMetadata]) -> Result<()> {
     let directory = root.join(".rq-tui").join("metadata");
     fs::create_dir_all(&directory)?;
@@ -500,7 +524,14 @@ fn ensure_link(link: &Path, target: Option<&PathBuf>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::PrReference;
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        canonical_references, remote_session_link_name, remote_worktree_path, PrReference,
+    };
+    use crate::diff::DiffSet;
+    use crate::domain::{BaseBranchSource, Repo, Version, VersionKind};
+    use crate::work_item::ReviewRepo;
 
     #[test]
     fn parses_supported_pr_reference_forms() {
@@ -522,5 +553,59 @@ mod tests {
     fn rejects_incomplete_pr_references() {
         assert!(PrReference::parse("api#42").is_err());
         assert!(PrReference::parse("acme/api").is_err());
+    }
+
+    #[test]
+    fn canonical_pr_sets_are_order_independent_and_deduplicated() {
+        let first = PrReference::parse("other/api#7").unwrap();
+        let second = PrReference::parse("acme/api#42").unwrap();
+        let ordered = canonical_references(&[first.clone(), second.clone(), first]);
+
+        assert_eq!(
+            ordered,
+            vec![second, PrReference::parse("other/api#7").unwrap()]
+        );
+    }
+
+    #[test]
+    fn same_named_remote_repositories_get_distinct_session_links() {
+        let repo = |id: &str, url: &str| ReviewRepo {
+            record: Repo {
+                id: id.into(),
+                work_item_id: "work".into(),
+                name: "api".into(),
+                path: PathBuf::from(format!("/{id}/repo.git")),
+                remote_pr_url: Some(url.into()),
+                pr_meta_json: None,
+                base_branch: Some("main".into()),
+                base_branch_source: BaseBranchSource::Auto,
+                last_activity_at: None,
+            },
+            version: Version {
+                id: format!("{id}:v1"),
+                repo_id: id.into(),
+                version_num: 1,
+                kind: VersionKind::Remote,
+                created_at: "1".into(),
+                head_sha: "head".into(),
+                worktree_path: Some(PathBuf::from(format!("/{id}/v1"))),
+                last_opened_at: Some("1".into()),
+            },
+            diff: DiffSet::default(),
+        };
+        let acme = repo("acme", "https://github.com/acme/api/pull/42");
+        let other = repo("other", "https://github.com/other/api/pull/7");
+
+        assert_eq!(remote_session_link_name(&acme), "acme--api");
+        assert_eq!(remote_session_link_name(&other), "other--api");
+    }
+
+    #[test]
+    fn remote_worktrees_are_scoped_to_the_owning_repo_record() {
+        let cache = Path::new("/cache/acme_api_42");
+        assert_ne!(
+            remote_worktree_path(cache, "work-a-repo", 1),
+            remote_worktree_path(cache, "work-b-repo", 1)
+        );
     }
 }
