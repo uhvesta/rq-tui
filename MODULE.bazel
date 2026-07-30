@@ -4,6 +4,7 @@ module(
 )
 
 bazel_dep(name = "rules_rust", version = "0.72.0")
+bazel_dep(name = "rules_shell", version = "0.6.1")
 
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 

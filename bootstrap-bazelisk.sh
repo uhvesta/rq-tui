@@ -1,12 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 BAZELISK_VERSION="v1.29.0"
 REPOSITORY_URL="https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+tools_dir="${repo_root}/.tools"
 install_dir="${repo_root}/.tools/bin"
 install_path="${install_dir}/bazelisk"
+link_path="${install_dir}/bazel"
+lock_dir="${install_dir}/.bootstrap-bazelisk.lock"
+temporary_path=""
+lock_acquired=false
+
+cleanup() {
+  if [[ -n "${temporary_path}" ]]; then
+    rm -f -- "${temporary_path}"
+  fi
+  if [[ "${lock_acquired}" == true ]]; then
+    rmdir "${lock_dir}" 2>/dev/null || true
+  fi
+}
+
+trap cleanup EXIT
 
 case "$(uname -s)" in
   Darwin) bazelisk_os="darwin" ;;
@@ -47,22 +64,61 @@ sha256_file() {
 
 download() {
   if command -v curl >/dev/null 2>&1; then
-    curl --fail --location --retry 3 --output "$2" "$1"
+    curl \
+      --fail \
+      --location \
+      --proto '=https' \
+      --tlsv1.2 \
+      --connect-timeout 15 \
+      --max-time 300 \
+      --retry 3 \
+      --output "$2" \
+      "$1"
   elif command -v wget >/dev/null 2>&1; then
-    wget --tries=3 --output-document="$2" "$1"
+    wget \
+      --https-only \
+      --timeout=15 \
+      --read-timeout=30 \
+      --tries=3 \
+      --output-document="$2" \
+      "$1"
   else
     echo "curl or wget is required to download Bazelisk." >&2
     return 1
   fi
 }
 
+for directory in "${tools_dir}" "${install_dir}"; do
+  if [[ -L "${directory}" ]]; then
+    echo "Refusing to install through symlinked directory: ${directory}" >&2
+    exit 1
+  fi
+done
+
 mkdir -p "${install_dir}"
-if [[ -x "${install_path}" ]] && [[ "$(sha256_file "${install_path}")" == "${expected_sha256}" ]]; then
+chmod 0700 "${tools_dir}" "${install_dir}"
+
+if ! mkdir "${lock_dir}" 2>/dev/null; then
+  echo "Another Bazelisk bootstrap is already running (${lock_dir})." >&2
+  exit 1
+fi
+lock_acquired=true
+
+if [[ -L "${install_path}" ]]; then
+  echo "Refusing to replace symlinked Bazelisk path: ${install_path}" >&2
+  exit 1
+fi
+if [[ -e "${install_path}" ]] && [[ ! -f "${install_path}" ]]; then
+  echo "Refusing to replace non-file Bazelisk path: ${install_path}" >&2
+  exit 1
+fi
+
+if [[ -f "${install_path}" ]] \
+  && [[ -x "${install_path}" ]] \
+  && [[ "$(sha256_file "${install_path}")" == "${expected_sha256}" ]]; then
   echo "Bazelisk ${BAZELISK_VERSION} is already installed at ${install_path}"
 else
-  temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/rq-tui-bazelisk.XXXXXX")"
-  trap 'rm -rf "${temporary_dir}"' EXIT
-  temporary_path="${temporary_dir}/${asset}"
+  temporary_path="$(mktemp "${install_dir}/.bazelisk.XXXXXX")"
   download "${REPOSITORY_URL}/${asset}" "${temporary_path}"
   actual_sha256="$(sha256_file "${temporary_path}")"
   if [[ "${actual_sha256}" != "${expected_sha256}" ]]; then
@@ -72,14 +128,23 @@ else
   fi
   chmod 0755 "${temporary_path}"
   mv "${temporary_path}" "${install_path}"
+  temporary_path=""
+  if [[ ! -f "${install_path}" ]] || [[ -L "${install_path}" ]] || [[ ! -x "${install_path}" ]]; then
+    echo "Bazelisk installation did not produce a regular executable: ${install_path}" >&2
+    exit 1
+  fi
   echo "Installed Bazelisk ${BAZELISK_VERSION} at ${install_path}"
 fi
 
-ln -sfn bazelisk "${install_dir}/bazel"
+if [[ -e "${link_path}" ]] && [[ ! -L "${link_path}" ]]; then
+  echo "Refusing to replace non-symlink Bazel path: ${link_path}" >&2
+  exit 1
+fi
+ln -sfn bazelisk "${link_path}"
 
 echo
 echo "Bootstrap complete. For this shell, run:"
 echo "  export PATH=\"${install_dir}:\$PATH\""
 echo
 echo "Then use Bazel normally; .bazelversion pins the repository's Bazel release:"
-echo "  bazel test //... --lockfile_mode=error"
+echo "  bazel test //..."

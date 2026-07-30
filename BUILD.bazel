@@ -1,3 +1,5 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
 filegroup(
     name = "migrations",
     srcs = glob(["migrations/*.sql"]),
@@ -16,9 +18,16 @@ alias(
     visibility = ["//visibility:private"],
 )
 
+sh_test(
+    name = "bootstrap_bazelisk_test",
+    srcs = ["tests/bootstrap_bazelisk_test.sh"],
+    data = ["bootstrap-bazelisk.sh"],
+)
+
 test_suite(
     name = "rq_tui_tests",
     tests = [
+        ":bootstrap_bazelisk_test",
         "//src:clippy_test",
         "//src:rq_tui_tests",
         "//src:rustfmt_test",
