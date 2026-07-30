@@ -1,6 +1,6 @@
 # Chat interaction and review integration specification
 
-Status: proposed requirements  
+Status: superseded by [`spec-v2-consolidated.md`](spec-v2-consolidated.md)
 Date: 2026-07-30
 
 This document records the interaction requirements raised after the original

@@ -55,6 +55,54 @@ for remote PR metadata; git plumbing (clone/worktree/write-tree) for all
 checkout and snapshot mechanics. Build/test gate is Bazel (Bzlmod), macOS/
 Linux only.
 
+**Prefer existing ratatui-ecosystem widgets over bespoke ones.** Before
+hand-rolling a widget, check the [`tui-widgets`](https://crates.io/crates/tui-widgets)
+family and the broader ratatui ecosystem for something that already does
+the job — this build has repeatedly reinvented things (wrapped-text editing
+with cursor tracking for composers, §7.5; scrollable viewports with a
+follow/pause model, §7.4; markdown rendering, §3.11 below) that community
+widgets likely already solve, tested, with fewer edge cases than a
+from-scratch implementation. Concretely worth evaluating first: a
+maintained textarea/editor widget for the Chat and inline Ask/Comment
+composers (wrapped-row cursor movement, multi-line editing — §7.5) instead
+of the bespoke wrapped-line cursor math this codebase has carried since v1;
+a scrollview widget for any pane that needs viewport+scrollbar+follow
+semantics; and a markdown-rendering widget for §3.11's inline preview.
+Adopt a widget wholesale where it fits; fall back to bespoke only where the
+inline-block/no-rail interaction model (§3.4) genuinely has no off-the-shelf
+equivalent — don't rewrite something a maintained crate already gets right.
+
+### 1.1 Crate layout: a Cargo workspace, not one crate
+
+**Decision:** this build starts as a Cargo workspace with several member
+crates instead of one monolithic crate. The goal is twofold: force a real
+API boundary between layers (so e.g. the reducer can't reach into rendering
+internals, or storage into UI state, by accident), and make the highest-
+value logic — the modal reducer — unit-testable with zero TUI/IO
+dependencies at all, not just via the headless `TestBackend` harness
+(§7.9) which still pulls in all of ratatui.
+
+Proposed member crates (names indicative, not final):
+
+| Crate | Contents | Depends on | Why split out |
+|---|---|---|---|
+| `rq-tui-domain` | Work Item / Repo / Version / Annotation / Placement types (§8), diff parsing (unified-diff → hunks/lines) | — | Pure data + pure parsing, zero I/O. The shared vocabulary every other crate imports; changing it is a deliberate, visible event. |
+| `rq-tui-git` | Worktree/clone/snapshot plumbing (`git stash create` / `write-tree` trick, §2.3), rename detection for re-anchoring (§2.4) | `rq-tui-domain` | Isolates every `git` subprocess call behind one API; lets higher layers be tested against a fake instead of a real repo. |
+| `rq-tui-storage` | SQLite schema, migrations, queries (§8) | `rq-tui-domain` | The persistence boundary — swappable/mockable independent of everything else. |
+| `rq-tui-remote` | `gh` PR fetch/resolve, cache-dir layout (§2.2) | `rq-tui-domain`, `rq-tui-git` | Network/subprocess-heavy; isolating it keeps the reducer and storage tests free of any dependency on `gh` being installed or authenticated. |
+| `rq-tui-copilot` | Copilot SDK session management, the `AgentSink`/`AgentEvent` abstraction, MAIN/SIDE/fork session topology (§2.6) | `rq-tui-domain` | The agent boundary — already partway there via the `AgentSink` trait; a real crate boundary makes the fake-agent-backed tests (§7.9) enforced by the compiler, not just by convention. |
+| `rq-tui-app` | The modal reducer: `AppState`, `handle_key`, `Effect` (§4) | `rq-tui-domain` | **The highest-value split.** This is pure `(state, key) -> (state, effects)` logic with no ratatui, no SQLite, no subprocess calls — it should be unit-testable by feeding key sequences and asserting on emitted `Effect`s and resulting state, at workspace-build speed, with no `TestBackend` or temp SQLite file required for logic-only tests. |
+| `rq-tui-ui` | ratatui rendering (§3, §7), syntax highlighting, markdown rendering (§3.11) | `rq-tui-app`, `rq-tui-domain` | Presentation-only; consumes `AppState` read-only and never mutates it directly, enforced by the crate boundary instead of by convention. |
+| `rq-tui` (bin) | CLI parsing, wiring the above together, `main` | all of the above | Thin — if this crate has meaningful logic in it, something leaked out of its proper layer. |
+
+This directly serves §7.9's acceptance standard ("a deterministic end-to-end
+test... not only emitted effects") by giving the reducer a test tier
+*below* end-to-end: pure unit tests in `rq-tui-app` with no I/O at all,
+sitting underneath the existing headless-harness integration tests, sitting
+underneath the PTY-driven compiled-binary tests. Each tier catches what the
+one below it can't (a bad reducer branch; a rendering bug the reducer
+can't see; a real-terminal escape-sequence surprise the harness can't see).
+
 ---
 
 ## 2. Core Concepts
@@ -205,10 +253,11 @@ prefix, each fork accumulates its own suffix, quota is per-session-turn, and
 forking creates a "which session do new asks target" problem for zero UX
 benefit.)
 
-*(Changed from v2: the original's split-view rail (old §3.2) and its
-alternate "unified view has inline fold blocks instead" carve-out (old §3.3)
-are gone. There is exactly one treatment, always: inline blocks in a single
-unified diff stream. See §3 and the "diff layout" decision below.)*
+*(Changed from v2: the original's split-view rail (old §3.2) is gone —
+there is exactly one annotation treatment, always: the inline block. What's
+new is that this treatment, previously exclusive to unified view (old
+§3.3's "inline fold blocks" carve-out), now applies to split view too —
+split itself is not removed, only its rail. See §3.2/§3.3.)*
 
 ### 2.6 Sessions: MAIN, SIDE, and Forking
 
@@ -287,40 +336,63 @@ $ rq-tui review --pr github.com/acme/api-server#482
   >
 ```
 
-### 3.2 Diff layout decision: unified only, no rail — ever
+### 3.2 Diff layout: split and unified both stay — only the rail is gone
 
-**Decision:** the split (old|new side-by-side) diff layout from the
-original spec is **removed entirely**. Review Mode has exactly one diff
-layout: a single continuous, scrollable stream of unified `+`/`-` content
-with a line-number gutter, matching the owner's reference screenshot.
-`:diff split` / `:diff unified` are removed from Command Mode accordingly
-(§5); `:diff expand` (context expansion) remains.
+**Decision:** both diff layouts from the original spec are **kept** —
+split (old|new side-by-side) and unified (single `+`/`-` stream) remain
+togglable via `:diff split` / `:diff unified` (§5), same as v1. What
+changes is orthogonal to layout: **there is no annotation rail in either
+layout, ever.** Comments and asks always render as the inline block
+described in §3.4, injected directly beneath their anchor row(s) — in
+unified that's one row below the single anchor line; in split it's one
+full-width row below the aligned old/new pair, breaking out of the
+two-column grid for just that block (§3.3). `:diff expand` (context
+expansion) is unaffected by any of this.
 
-**Reasoning:** the owner's screenshot is unambiguous ground truth — one
-scrolling `+`/`-` stream, not two columns — and it is the same view the
-inline comment/ask box is anchored into. Keeping split as a togglable
-secondary layout would resurrect exactly the "which column do things live
-in" ambiguity the owner is explicitly eliminating: split view's natural
-partner was the old third-column rail, and there is no rail anymore. A
-single layout also makes "`j`/`k` moves through everything, including
-open blocks, as one linear scroll" (§3.4) trivially well-defined — there is
-only ever one stream to scroll. The owner's phrase "I want the diff view to
-look like it does right now but I want to change some things" is read as:
-keep the overall dark-theme visual language (colors, gutters, hunk headers,
-full-row backgrounds for added/removed lines) — change the *structure*
-(remove the rail, make comments/asks inline) — which is exactly what the
-screenshot depicts.
+**Reasoning:** the owner's screenshot shows unified with an inline comment
+box, which is the concrete reference for *how inline blocks look and
+behave* — but the owner was explicit that removing split entirely was the
+wrong read of "I want the diff view to look like it does right now": split
+is still wanted as an available layout, only the old rail-based annotation
+UI is unwanted. So the fix here is narrower than the first draft of this
+document assumed: kill the rail, keep both layouts. `j`/`k` moving through
+inline block rows "as one linear scroll" (§3.4) works identically in both
+layouts — a block's rows are just more rows in whichever stream you're
+currently in.
 
-### 3.3 Review Mode — Files pane + unified diff stream
-The left pane is the file tree (toggle with `t`, §4). The right pane is one
-continuous scroll: every changed file's header, hunk header(s), and lines,
-back to back, no visual gap between files. Added lines carry a full-row
-green background wash; removed lines a full-row red wash (not just a glyph).
-The line-number gutter shows the number appropriate to that row's side —
-new-file numbers for context/added rows, old-file numbers for removed rows
-(this is what "side" means throughout: §2.4, §8). The currently selected row
-gets a solid highlighted full-row background and a `❯` chevron in the
-gutter — the one selection convention used everywhere in this UI.
+*(Changed from the first draft of this consolidated doc: an earlier pass
+removed split entirely, reasoning that split's only remaining reason to
+exist was pairing with the rail. The owner corrected this — split has value
+independent of the rail (seeing old and new code side by side) and stays.
+Default layout is unified, matching the reference screenshot; `:diff
+split` switches to split at any time and keeps working exactly as in v1.)*
+
+### 3.3 Review Mode — Files pane + diff (unified default, split available)
+The left pane is the file tree (toggle with `t`, §4). The right pane holds
+the diff in whichever layout is active (§3.2):
+
+- **Unified** (default): one continuous scroll — every changed file's
+  header, hunk header(s), and lines, back to back, no visual gap between
+  files. Added lines carry a full-row green background wash; removed lines
+  a full-row red wash (not just a glyph). The line-number gutter shows the
+  number appropriate to that row's side — new-file numbers for
+  context/added rows, old-file numbers for removed rows (this is what
+  "side" means throughout: §2.4, §8).
+- **Split** (`:diff split`): old and new render in two columns as in v1,
+  each with its own gutter. There is exactly one cursor, not one per
+  column: `j`/`k` (and every other vertical movement — `C-u`/`C-d`,
+  `gg`/`G`, block traversal) advances both columns in lockstep by paired
+  row, the same single-cursor model as unified, just displayed across two
+  columns. This is what makes the "one linear scroll, `j`/`k` goes through
+  everything including open blocks" principle (§3.4) hold in split too —
+  there's still only one thing to scroll, it's just drawn twice per row.
+  Inline blocks (§3.4) render as one continuous stream conceptually — a
+  block spans the full width beneath its anchor row, underneath both
+  columns, rather than living inside either one.
+
+Either way, the currently selected row gets a solid highlighted full-row
+background and a `❯` chevron in the gutter — the one selection convention
+used everywhere in this UI.
 
 ```
 ┌─ new-auth ───────────────────────────────────────────────────────── [Review] Chat: ● ─┐
@@ -356,6 +428,27 @@ added), filename, then right-aligned `+added  -removed`. The selected file
 is shown in the accent color with the `❯` chevron. Repo groups (multi-repo
 Work Items) are ordered per §2.1, each with a compact relative-activity
 timestamp; `h`/`l` on a group row collapses/expands it, same as v2.
+
+Same content in split (`:diff split`) — the inline block still spans full
+width beneath the anchor row, breaking out of the two-column grid:
+
+```
+┌─ new-auth ───────────────────────────────────────────────────────── [Review] Chat: ● ─┐
+│ Files (2)    │- old                              │+ new                              split │
+├───────────────┼──────────────────────────────────┴──────────────────────────────────────────┤
+│❯ A README.md  │  84  fn validate(tok: &str) {      84  fn validate(tok: &str) {               │
+│               │  85    let claims = decode(tok);   85    let claims = decode(tok);            │
+│               │  86    if claims.exp < now() {      86    if claims.exp < now() {              │
+│               │❯ 87      return Err(Expired)      ❯ 87      return Err(Expired)                │
+│               │       ╭──────────────────────────────────────────────────────────╮            │
+│               │       │ Ask · session.rs R87                                       │            │
+│               │       │ ❯ why does this not log before returning?▏                 │            │
+│               │       ╰──────────────────────────────────────────────────────────╯            │
+│               │  88  }                              88  }                                     │
+├───────────────┴──────────────────────────────────────────────────────────────────────────────┤
+│ INSERT  ask · session.rs R87   Enter submit  Esc cancel                                        │
+└──────────────────────────────────────────────────────────────────────────────────────────────┘
+```
 
 ### 3.4 Inline block: Comment vs Ask, and "go up and down around it"
 
@@ -424,7 +517,6 @@ layout reference.
 
 ```
 ┌─ new-auth — Chat (MAIN) ───────────────────────────────────── model: gpt-5 ▾   [Chat] Review: ● ─┐
-│ Focus: files → diff → conversation                                                                 │
 │  💬 you  (session.rs:89-94)                                                                        │
 │  why 15min not 1h?                                                                                 │
 │                                                                                                     │
@@ -446,10 +538,12 @@ layout reference.
 └─────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The breadcrumb line (`Focus: files → diff → conversation`) is always
-present (§4.2). Chat mode is a full-panel transcript — it replaces Review's
-screen when active (toggled with `Tab`/`gc`/`gr`), it is not a docked
-sidebar; MAIN/SIDE tabs and the durable activity line live inside it (§7).
+The `Focus: files → diff` breadcrumb (§4.2) is a Review-only affordance —
+Chat mode is a full-panel transcript with a single focus target (the
+transcript itself), so it has no breadcrumb of its own. Chat replaces
+Review's screen entirely when active (toggled with `Tab`/`gc`/`gr`, §4.3);
+it is not a docked sidebar and not reachable via `Ctrl-w`. MAIN/SIDE state
+and the durable activity line live inside it (§7).
 
 ### 3.6 Command Palette (`:`, autocomplete)
 ```
@@ -465,20 +559,22 @@ sidebar; MAIN/SIDE tabs and the durable activity line live inside it (§7).
 ┌─ Settings ──────────────────────────────────────────────────────────────────────────────────────┐
 │  Model              gpt-5 · reasoning: medium · context: 128k     ▸ staged picker (§7.7)          │
 │  Ask tool scope     read/search only (fixed for `a`)                                              │
+│  Diff layout        unified (default)          ▸ split available anytime via :diff split (§3.2)  │
 │  Base branch        auto-detect (per-repo)     ▸ override globally or per-repo                   │
 │  Cache dir          ~/.cache/rq-tui/prs                                                           │
 │  gh auth            ✓ authenticated as octocat                                                    │
 │  Keybindings        vim (default)              ▸ view/edit                                        │
 │  Diff context       6 lines (o expand step: 10)                                                   │
 │  File tree default  open                       ▸ open/closed on launch (`t` toggles at runtime)   │
-│  Markdown preview   browser (system default)   ▸ change                                           │
+│  Markdown preview   inline (default)           ▸ inline / browser fallback (§3.11)                │
 │  Skills dir         ./ .rq-tui/skills, ~/.rq-tui/skills                                            │
 │  Storage            SQLite (WAL) — ~/.local/share/rq-tui/rq-tui.db                                 │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ j/k select  Enter edit  q back                                                                    │
 └─────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
-There is no "diff layout" setting — unified is the only layout (§3.2).
+"Diff layout" sets the *default* on launch; `:diff split` / `:diff unified`
+switch it at any time within a review without touching this setting.
 
 ### 3.8 Version History Picker
 Counts come straight from per-version placement rows, so they're exact.
@@ -537,6 +633,39 @@ version has been reviewed — no prompt, they never appear here.
   prune summary prints the session storage path so it can be removed
   manually.
 
+### 3.11 Markdown preview: inline by default, with real scrolling
+
+**Changed from v2:** the original spec's `gm` always shelled out to an
+external browser. That remains available, but the *default* is an inline
+overlay rendered directly in the TUI — no context switch to a browser tab
+for the common case of previewing a README, a comment body, or an ask
+thread.
+
+- `gm` (§4.4 for full referent table) opens a full-height overlay panel
+  with the target's Markdown rendered semantically (headings, lists, fenced
+  code with syntax highlighting, tables, links shown as `text (url)` or
+  similar terminal-safe form) — the same rendering quality already
+  required for Chat's transcript (§7.2's Markdown-aware selection implies
+  the renderer already exists; this reuses it).
+- The overlay is independently, fully scrollable: `j`/`k` line-by-line,
+  `C-u`/`C-d` half-page, `C-f`/`C-b` full-page, `gg`/`G` top/bottom — same
+  muscle memory as every other pane (§9), not a one-shot static render.
+  Content wider than the overlay wraps; content taller than the overlay
+  scrolls, with a `lines X-Y/Z` indicator when it doesn't all fit (same
+  idiom as the inline-block scroll indicator, §3.4).
+- `q` or `Esc` closes the overlay and returns focus exactly where it was
+  (diff cursor position, chat cursor position, or composer draft, per the
+  referent that opened it).
+- The **browser fallback** (`:settings` → Markdown preview → browser, or a
+  one-key toggle from inside the overlay) remains for cases where the
+  inline render is insufficient — very large documents, or content the
+  terminal genuinely can't represent (complex tables, embedded images).
+  Settings' "Markdown preview" row (§3.7) becomes `inline (default) /
+  browser` instead of always `browser`.
+- Implementation should evaluate an existing ratatui-ecosystem Markdown
+  widget before writing a bespoke renderer (§1) — the requirement is the
+  behavior above, not a specific implementation.
+
 ---
 
 ## 4. Modal Model & Keybindings
@@ -589,48 +718,60 @@ auto-follow) → `i` to type a reply.
 ### 4.2 Focus and pending-key visibility
 
 At every instant the user must be able to answer both "where is focus?" and
-"is the app waiting for another key?" This applies globally, not just in
-Chat:
+"is the app waiting for another key?" This applies within Review; Chat is a
+separate full-screen mode with its own focus model (§7), not a window you
+`Ctrl-w` into (§4.3):
 
-- Every focusable pane (file tree, diff, chat) has a visibly distinct
-  focused border and title.
-- The status area always shows a breadcrumb, e.g.
-  `Focus: files → diff → conversation`.
+- Both Review windows (file tree, diff) have a visibly distinct focused
+  border and title.
+- The status area always shows a breadcrumb while in Review, e.g.
+  `Focus: files → diff`.
 - Starting a `Ctrl-W` chord immediately shows
   `CTRL-W · h/j/k/l or arrows · Esc cancel` in the status area.
 - `Ctrl-W h/j/k/l` and `Ctrl-W` plus arrow keys behave identically.
 - An incomplete chord times out (1.5s of no second key) and visibly reports
   that it was cancelled, returning to whatever mode/pane was active.
-- A direction with no destination reports it, e.g. `No window below` — it
-  never silently clears the visible cursor or no-ops invisibly.
+- A direction with no destination reports it, e.g. `No window to the
+  right` — it never silently clears the visible cursor or no-ops
+  invisibly. Since Review has only two windows, `Ctrl-w j`/`Ctrl-w k` (no
+  vertical neighbor) and the far side of `h`/`l` always report a dead end;
+  this is expected, not a bug.
 - Focus movement always places a visible cursor or selected row in the
-  destination pane.
-- Resizing, closing an overlay, or switching Review/Chat never leaves focus
-  pointing at a hidden pane.
+  destination window.
+- Resizing or closing an overlay never leaves focus pointing at a hidden
+  window.
 
-### 4.3 Window navigation: `Ctrl-w h/j/k/l`, uniform, three windows
+### 4.3 Window navigation: `Ctrl-w h/j/k/l`, two windows — Chat is not one of them
 
-**Decision:** with the annotation rail gone, the focusable window set is
-exactly three: **file tree**, **diff**, **chat**. There is no pane-specific
-special-casing — inline ask/comment blocks are *content inside the diff
-pane* (§3.4), not separate focusable windows, consistent with "you go up
-and down around it."
+**Decision:** the `Ctrl-w`-navigable window set inside Review is exactly
+**two**: **file tree** and **diff**. Inline ask/comment blocks are
+*content inside the diff window* (§3.4), never separate focusable windows,
+consistent with "you go up and down around it."
 
-The three windows are arranged conceptually left-to-right — `file tree |
-diff | chat` (chat is normally a full-panel mode, not a simultaneous split,
-but it is still the rightmost stop in the window ring so `Ctrl-w l`/`Ctrl-w
-h` reach it uniformly):
+**Chat is deliberately not part of this ring.** It's a separate,
+full-screen mode you reach with `Tab` / `gc` / `gr` (§3.5, §7.1) — the
+owner was explicit: "for chat I want a separate screen all together that
+takes up everything," not a third `Ctrl-w` pane living alongside a
+shrunken Review. So there is no `Ctrl-w`-to-Chat path in either direction;
+`Tab`/`gc`/`gr` is the only door.
 
-| From | `Ctrl-w l` | `Ctrl-w h` | `Ctrl-w j` / `Ctrl-w k` |
-|---|---|---|---|
-| file tree | → diff | *(no window to the left — reports `No window to the left`)* | *(no vertical neighbor — reports `No window below`/`No window above`)* |
-| diff | → chat (switches into Chat mode, equivalent to `Tab`/`gc`) | → file tree (opens it if closed) | *(no vertical neighbor)* |
-| chat | *(no window to the right)* | → diff (switches back into Review, equivalent to `Tab`/`gr`) | *(no vertical neighbor)* |
+| From | `Ctrl-w l` | `Ctrl-w h` |
+|---|---|---|
+| file tree | → diff | *(no window to the left — reports `No window to the left`)* |
+| diff | *(no window to the right — reports `No window to the right`; use `Tab`/`gc` to reach Chat)* | → file tree (opens it if closed) |
 
-`t` toggles the file tree pane open/closed (§4.4) — this is the new primary
-binding for that action. *(Changed from v2: this supersedes the original
-spec's `-` / `,e` bindings, which are retired to avoid two bindings for one
-action.)*
+`t` toggles the file tree window open/closed (§4.4) — this is the new
+primary binding for that action. *(Changed from v2: this supersedes the
+original spec's `-` / `,e` bindings, which are retired to avoid two
+bindings for one action.)*
+
+*(Changed from the first draft of this consolidated doc: an earlier pass
+put Chat into the `Ctrl-w` ring as a third window, reasoning that
+"universal Ctrl-w for all windows" implied including it. The owner
+corrected this — Chat should stay a distinct full-screen destination
+reached only via `Tab`/`gc`/`gr`, exactly as in the original v2 spec;
+"universal Ctrl-w" describes uniform behavior *among Review's windows*,
+not that every screen in the app is a Ctrl-w-reachable pane.)*
 
 ### 4.4 Keybindings (summary)
 
@@ -647,7 +788,7 @@ NORMAL-mode commands.
 | `C-f` / `C-b` | Any pane | Full-page scroll |
 | `o` / `O` | Diff pane, cursor on a fold line | Expand 10 more context lines / expand the whole gap |
 | `gg` / `G` | Focused pane | Jump to top/bottom (chat: oldest/latest, `G` resumes auto-follow) |
-| `Ctrl-w h/j/k/l` | Global | Move focus among file tree ⇄ diff ⇄ chat (§4.3); shows chord prompt, times out, reports dead-end directions (§4.2) |
+| `Ctrl-w h/j/k/l` | Review | Move focus between file tree ⇄ diff (§4.3); shows chord prompt, times out, reports dead-end directions (§4.2). Chat is reached via `Tab`/`gc`/`gr`, not `Ctrl-w` |
 | `t` | Review | Toggle file tree pane open/closed |
 | `i` | NORMAL, input context (chat composer, ask thread, comment, editor field) | Enter INSERT mode |
 | `Esc` | INSERT / VISUAL / search | Back to NORMAL (also cancels selection / closes search bar) |
@@ -673,6 +814,7 @@ NORMAL-mode commands.
 
 | Command | Effect |
 |---|---|
+| `:diff split` / `:diff unified` | Switch diff layout (§3.2); default on launch is unified, set in Settings |
 | `:diff expand` | Expand full context for current file |
 | `:model` | Open the staged model picker (model → reasoning → context tier → extra options, §7.7) |
 | `:fork` | Fork the active session into a new persistent branch and make it active (§2.6) |
@@ -696,9 +838,6 @@ with `/`, intercepted by the harness before send (never forwarded to the
 model) — the same idiom Claude Code/Codex/Copilot CLI use for their own
 slash commands. The `:` palette form and the `/` composer form are
 equivalent; use whichever your fingers are already on.
-
-*(Changed from v2: `:diff split` / `:diff unified` are removed — unified is
-the only layout, §3.2.)*
 
 ---
 
@@ -1088,11 +1227,14 @@ only the latest text.
 ## 9. Keybindings, Search & Navigation (pane-scoped, keyboard-only)
 
 No mouse dependency. Two orthogonal axes drive everything: the **mode**
-(NORMAL / INSERT / VISUAL, §4.1) says what keys mean; the **focused window**
-(file tree, diff, or chat — §4.3) says what they act on. All tables in this
-section describe NORMAL-mode behavior unless noted — search, scroll, and
-yank resolve relative to whatever you're currently looking at, the same way
-vim splits work.
+(NORMAL / INSERT / VISUAL, §4.1) says what keys mean; **where you are**
+says what they act on — the focused window within Review (file tree or
+diff, §4.3), or the Chat transcript when that full-screen mode is active
+(§7). All tables in this section describe NORMAL-mode behavior unless
+noted — search, scroll, and yank resolve relative to whatever you're
+currently looking at, the same way vim splits work. The Chat column below
+describes Chat-mode movement for completeness even though Chat isn't a
+`Ctrl-w`-reachable window (§4.3).
 
 **Within-pane movement (scoped to whichever window has focus)**
 | Key | Diff pane | Chat pane | File tree |
@@ -1143,8 +1285,8 @@ disturb your position in the diff, and switching focus back to the diff
 resumes where you left off.
 
 **Markdown preview (`gm`) — what it previews**
-`gm` always previews *the thing under the cursor*, opened in the external
-browser (per Settings):
+`gm` always previews *the thing under the cursor*, in a scrollable inline
+overlay by default (browser fallback available, §3.11):
 | Context | Referent |
 |---|---|
 | Diff pane, cursor in code | The current file, if it's a markdown file (otherwise no-op with a hint) |
@@ -1298,8 +1440,11 @@ that reason.
   Snapshots (§2.3) bound the damage — annotations are always recoverable
   against their snapshot — but live re-anchor cadence is still undecided.
 - Precise diff algorithm/library choice for multi-repo unified views.
-- Markdown preview implementation: local static server + browser open, vs.
-  shelling to an existing tool.
+- Which ratatui-ecosystem widget (if any) to adopt for the inline Markdown
+  overlay (§3.11) and for composer text editing (§1) — needs a short
+  evaluation pass against `tui-widgets` and similar before committing.
+  Browser-fallback launch mechanism (system `open`/`xdg-open` vs. a local
+  static server) is a smaller, secondary decision.
 - Whether `settings` stores the global default base branch as a single row
   (e.g. `key='base_branch.default'`) or needs a small dedicated table if
   per-language/per-org defaults are wanted later.
