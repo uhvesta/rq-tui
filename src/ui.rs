@@ -1345,6 +1345,12 @@ pub(crate) fn handle_effect(
                 state.status = "Snapshots are only available for local working trees".into();
             } else {
                 let snapshot = create_snapshot(storage, &Git::default(), &repo.record)?;
+                load_version_choices(state, storage)?;
+                state.version_index = state
+                    .versions
+                    .iter()
+                    .position(|choice| choice.version.id == snapshot.id)
+                    .unwrap_or(0);
                 state.status = format!("Pinned snapshot s{}", snapshot.version_num);
             }
         }
@@ -6779,8 +6785,10 @@ fn plain_segments(text: &str) -> Vec<StyledSegment> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::Mutex;
 
     use anyhow::Result;
@@ -6805,10 +6813,14 @@ mod tests {
         LaneEvent, ModelSelection, OutboundKind, PruneSessionOutcome,
     };
     use crate::diff::{DiffLine, LineKind};
-    use crate::domain::{PendingChat, WorkItem};
+    use crate::domain::{
+        AnchorSide, Annotation, AnnotationKind, DeliveryState, PendingChat, Placement, Version,
+        VersionKind, WorkItem,
+    };
     use crate::highlight::{Highlighter, PlainHighlighter, StyledSegment};
     use crate::review_stream::{ReviewRow, ReviewRowKey};
     use crate::storage::{now, Storage};
+    use tempfile::tempdir;
 
     #[derive(Default)]
     struct FakeAgent {
@@ -6865,6 +6877,16 @@ mod tests {
         }
     }
 
+    fn git(path: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
     #[test]
     fn review_screen_renders_deterministically_without_a_real_terminal() {
         let backend = TestBackend::new(100, 24);
@@ -6884,6 +6906,137 @@ mod tests {
         assert!(content.contains("demo — Review"));
         assert!(content.contains("unified"));
         assert!(content.contains("a ask"));
+    }
+
+    #[test]
+    fn snapshot_command_refreshes_version_history_with_counts_and_selection() {
+        let temp = tempdir().unwrap();
+        git(temp.path(), &["init", "-b", "main"]);
+        git(temp.path(), &["config", "user.email", "test@example.com"]);
+        git(temp.path(), &["config", "user.name", "Test"]);
+        fs::write(temp.path().join("a.rs"), "one\n").unwrap();
+        git(temp.path(), &["add", "a.rs"]);
+        git(temp.path(), &["commit", "-m", "initial"]);
+        fs::write(temp.path().join("a.rs"), "two\n").unwrap();
+
+        let storage = Storage::in_memory().unwrap();
+        let agent = FakeAgent::default();
+        let mut state = state_for_ui();
+        state.work_item.repos[0].record.path = temp.path().to_owned();
+        state.work_item.repos[0].version.id = "r:working-tree".into();
+        storage.upsert_work_item(&state.work_item.item).unwrap();
+        storage
+            .upsert_repo(&state.work_item.repos[0].record)
+            .unwrap();
+        storage
+            .upsert_version(&state.work_item.repos[0].version)
+            .unwrap();
+        storage
+            .upsert_version(&Version {
+                id: "remote-v1".into(),
+                repo_id: "r".into(),
+                version_num: 1,
+                kind: VersionKind::Remote,
+                created_at: "2000-01-01T00:00:00Z".into(),
+                head_sha: "remote".into(),
+                worktree_path: None,
+                last_opened_at: None,
+            })
+            .unwrap();
+        for (id, kind) in [
+            ("ask", AnnotationKind::Ask),
+            ("comment", AnnotationKind::Comment),
+        ] {
+            storage
+                .add_annotation(
+                    &Annotation {
+                        id: id.into(),
+                        repo_id: "r".into(),
+                        kind,
+                        file_path: PathBuf::from("a.rs"),
+                        anchor_snippet: "two".into(),
+                        anchor_hash: id.into(),
+                        anchor_start_offset: 0,
+                        anchor_line_count: 1,
+                        text: Some(id.into()),
+                        submitted: false,
+                        delivery_state: DeliveryState::Draft,
+                        created_at: now(),
+                    },
+                    &Placement {
+                        annotation_id: id.into(),
+                        version_id: "r:working-tree".into(),
+                        side: AnchorSide::New,
+                        line_start: 1,
+                        line_end: 1,
+                        outdated: false,
+                        ambiguous: false,
+                    },
+                )
+                .unwrap();
+        }
+
+        let effects = state.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        assert!(effects.is_empty());
+        for character in "snapshot".chars() {
+            assert!(state
+                .handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .is_empty());
+        }
+        let effects = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(effects.len(), 1);
+        handle_effect(
+            &mut state,
+            &storage,
+            &paths(),
+            &agent,
+            effects.into_iter().next().unwrap(),
+        )
+        .unwrap();
+
+        let snapshot = state
+            .versions
+            .iter()
+            .find(|choice| choice.version.kind == VersionKind::Snapshot)
+            .unwrap();
+        assert_eq!(state.versions.len(), 3);
+        assert_eq!(snapshot.version.version_num, 1);
+        assert_eq!((snapshot.asks, snapshot.comments), (1, 1));
+        assert_eq!(
+            state.versions[state.version_index].version.id, snapshot.version.id,
+            "the freshly pinned row must be selected when opening history"
+        );
+
+        assert!(state
+            .handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE))
+            .is_empty());
+        for character in "versions".chars() {
+            assert!(state
+                .handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .is_empty());
+        }
+        assert!(state
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .is_empty());
+        assert_eq!(state.screen, Screen::Versions);
+
+        let backend = TestBackend::new(120, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut highlighter = PlainHighlighter;
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("s1"));
+        assert!(rendered.contains("1 asks · 1 comments"));
+        assert!(rendered.contains("v0"));
+        assert!(rendered.contains("v1"));
     }
 
     #[test]
