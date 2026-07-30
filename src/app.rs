@@ -548,6 +548,7 @@ pub(crate) struct AppState {
     pub(crate) compose_target: Option<ComposeTarget>,
     pub(crate) input_return_mode: InputMode,
     pub(crate) status: String,
+    pub(crate) quit_guard: Option<String>,
     pub(crate) annotations: Vec<(Annotation, Placement)>,
     pub(crate) ask_threads: HashMap<String, Vec<AskMessage>>,
     pub(crate) collapsed_annotations: HashSet<String>,
@@ -646,6 +647,7 @@ impl AppState {
             compose_target: None,
             input_return_mode: InputMode::Normal,
             status: String::new(),
+            quit_guard: None,
             annotations: Vec::new(),
             ask_threads: HashMap::new(),
             collapsed_annotations: HashSet::new(),
@@ -714,6 +716,9 @@ impl AppState {
     }
 
     pub(crate) fn tick(&mut self, now: Instant) {
+        if self.quit_guard.is_some() && !self.has_unsubmitted_work() && self.compose.is_empty() {
+            self.quit_guard = None;
+        }
         if !self.pending_prefix.is_empty()
             && self.pending_prefix_started.is_some_and(|started| {
                 now.saturating_duration_since(started) >= Self::CTRL_W_TIMEOUT
@@ -1323,6 +1328,10 @@ impl AppState {
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         self.tick(Instant::now());
+        if key.code == KeyCode::Esc && self.quit_guard.take().is_some() {
+            self.status = "Quit warning dismissed · work remains open".into();
+            return Vec::new();
+        }
         match self.input_mode {
             InputMode::Command => return self.handle_command_key(key),
             InputMode::Search => return self.handle_search_key(key),

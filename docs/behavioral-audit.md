@@ -14,7 +14,7 @@ Evidence abbreviations:
 - `PTY-xx` refers to [`audit/pty-smoke.md`](audit/pty-smoke.md).
 - Other test names identify their Rust module directly.
 
-Current-evidence boundary: 259 tests are discovered: 258 regular tests pass
+Current-evidence boundary: 262 tests are discovered: 261 regular tests pass
 and 1 authenticated live test is ignored by default. The ignored
 stream/resume test was also run explicitly against the installed Copilot CLI
 and passed. PTY-16 through PTY-26 are current compiled-binary evidence; earlier
@@ -50,6 +50,7 @@ PTY references remain useful historical records.
 | P1 | Delivered annotation corrections were sent without durable recovery metadata. | Migration 6 records outbox kind and MAIN/SIDE lane; corrections are persisted before delivery and require explicit resend/discard after restart. `WF::delivered_annotation_correction_requires_explicit_recovery_after_restart`. |
 | P1 | The 40×9 contextual composer lost its rectangle or clipped the insertion cursor, and compact file/version lists could hide the selected row. | Compact editors now retain top/body/bottom borders with an independently scrolled content viewport; file and version lists window around their selection. The exact-minimum composer, file-tree, and version-history tests cover these states. |
 | P1 | Bracketed multiline paste was dropped or submitted only its first line; generic Vim prefixes could remain invisibly armed; queue editing looked like a new prompt. | Bracketed paste is enabled and inserted atomically with visible multiline feedback; every prefix is labelled, cancellable, and timed; queue replacement uses a yellow `EDIT QUEUED <id>` contract. PTY-26 and the corresponding deterministic paste/prefix/queue tests pass. |
+| P2 | Long source rows were silently clipped, blocked-quit warnings could be overwritten by SDK progress, and cancellation before the first response delta left no transcript marker. | Both diff layouts place a styled `…` in the final visible cell of clipped rows; quit guards render from dedicated state until dismissed/forced; early abort marks the submitted turn as cancelled. The long-line, quit-guard, and early-cancel deterministic workflows cover these cases. |
 
 ## Requirement traceability
 
@@ -217,7 +218,7 @@ matrix so that new evidence is not confused with the earlier PTY run.
 The current checked-in regular-test baseline is:
 
 ```text
-259 total tests; 258 passed; 1 authenticated live Copilot test ignored by default
+262 total tests; 261 passed; 1 authenticated live Copilot test ignored by default
 ```
 
 The regular baseline includes the reducer/effect, storage, rendering, SDK

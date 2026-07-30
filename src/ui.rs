@@ -398,9 +398,13 @@ pub(crate) fn handle_effect(
     match effect {
         Effect::Quit { force } => {
             if force || (!state.has_unsubmitted_work() && state.compose.is_empty()) {
+                state.quit_guard = None;
                 state.should_quit = true;
             } else {
-                state.status = "Unsubmitted comments/asks exist; use :q! to force quit".into();
+                let warning =
+                    "QUIT BLOCKED · unsubmitted work exists · :q! force · Esc dismiss".to_owned();
+                state.status = warning.clone();
+                state.quit_guard = Some(warning);
             }
         }
         Effect::CreateAnnotation {
@@ -2998,12 +3002,23 @@ pub(crate) fn handle_agent_event(
                     "Context draft ready; edit or accept it".into()
                 };
             }
+            let mut response_marked = false;
             if let Some(message) = state.chat.iter_mut().find(|message| {
                 message.streaming && message.outbound_id.as_deref() == Some(outbound_id.as_str())
             }) {
                 message.streaming = false;
                 if aborted {
                     message.error = Some("stopped".into());
+                }
+                response_marked = true;
+            }
+            if aborted && !response_marked {
+                if let Some(message) =
+                    state.chat.iter_mut().rev().find(|message| {
+                        message.outbound_id.as_deref() == Some(outbound_id.as_str())
+                    })
+                {
+                    message.error = Some("cancelled before response start".into());
                 }
             }
             if !context_completed && completed_visible_turn {
@@ -4521,17 +4536,23 @@ fn render_split(
                     LineKind::Context => (Some(&source), Some(&source)),
                     LineKind::Meta => (None, None),
                 };
-                let old = split_line(
-                    old,
-                    Some(std::path::Path::new(file)),
-                    selected && old.is_some(),
-                    highlighter,
+                let old = truncate_styled_line(
+                    split_line(
+                        old,
+                        Some(std::path::Path::new(file)),
+                        selected && old.is_some(),
+                        highlighter,
+                    ),
+                    body_columns[0].width.saturating_sub(1) as usize,
                 );
-                let new = split_line(
-                    new,
-                    Some(std::path::Path::new(file)),
-                    selected && new.is_some(),
-                    highlighter,
+                let new = truncate_styled_line(
+                    split_line(
+                        new,
+                        Some(std::path::Path::new(file)),
+                        selected && new.is_some(),
+                        highlighter,
+                    ),
+                    body_columns[1].width as usize,
                 );
                 rendered_rows.push((index, old, new, None));
                 let _ = line;
@@ -4831,6 +4852,7 @@ fn review_row_lines(
                 (false, LineKind::Deletion) => Style::default().bg(Color::Rgb(56, 25, 29)),
                 _ => Style::default(),
             });
+            rendered = truncate_styled_line(rendered, width);
             let padding = width.saturating_sub(rendered.width());
             if padding > 0 {
                 rendered.spans.push(Span::raw(" ".repeat(padding)));
@@ -4933,6 +4955,45 @@ fn fit_terminal_text(text: &str, width: usize) -> String {
     result
 }
 
+fn truncate_styled_line(mut line: Line<'static>, width: usize) -> Line<'static> {
+    if line.width() <= width {
+        return line;
+    }
+    if width == 0 {
+        line.spans.clear();
+        return line;
+    }
+
+    let available = width.saturating_sub(1);
+    let mut used = 0usize;
+    let mut spans = Vec::new();
+    'outer: for span in line.spans {
+        let mut text = String::new();
+        for (_, grapheme) in grapheme_indices(span.content.as_ref()) {
+            let grapheme_width = cell_width(grapheme);
+            if used.saturating_add(grapheme_width) > available {
+                if !text.is_empty() {
+                    spans.push(Span::styled(text, span.style));
+                }
+                break 'outer;
+            }
+            text.push_str(grapheme);
+            used = used.saturating_add(grapheme_width);
+        }
+        if !text.is_empty() {
+            spans.push(Span::styled(text, span.style));
+        }
+    }
+    spans.push(Span::styled(
+        "…",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ));
+    line.spans = spans;
+    line
+}
+
 fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let mode = match state.input_mode {
         InputMode::Normal => "NORMAL",
@@ -4941,7 +5002,9 @@ fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
         InputMode::Search => "SEARCH",
         InputMode::Compose => "INSERT",
     };
-    let content = if !state.pending_prefix.is_empty() {
+    let content = if let Some(warning) = state.quit_guard.as_ref() {
+        warning.clone()
+    } else if !state.pending_prefix.is_empty() {
         state.status.clone()
     } else {
         match state.input_mode {
@@ -5608,7 +5671,9 @@ fn render_chat_composer(frame: &mut ratatui::Frame, state: &mut AppState, area: 
             )
         }
         InputMode::Normal => {
-            let title = if state.status.is_empty() {
+            let title = if let Some(warning) = state.quit_guard.as_ref() {
+                format!(" {warning} ")
+            } else if state.status.is_empty() {
                 " NORMAL · i edit · j/k scroll · G latest · Tab review · Ctrl-C stop ".to_owned()
             } else if area.width < 60 {
                 format!(" NORMAL · {} ", state.status)

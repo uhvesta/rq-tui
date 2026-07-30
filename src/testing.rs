@@ -2114,6 +2114,85 @@ mod tests {
     }
 
     #[test]
+    fn long_diff_lines_show_a_clipping_marker_in_both_layouts() {
+        let diff = "diff --git a/src/long.rs b/src/long.rs\n\
+                    index 1111111..2222222 100644\n\
+                    --- a/src/long.rs\n\
+                    +++ b/src/long.rs\n\
+                    @@ -1 +1 @@\n\
+                    -let value = \"short\";\n\
+                    +let value = \"this source line is intentionally much wider than either review pane and its hidden tail is END\";\n";
+        let mut harness = TuiHarness::from_unified_diff("clipped", diff, 80, 14).unwrap();
+        harness.key(key(KeyCode::Char('t'))).unwrap();
+
+        let unified = harness.render().unwrap();
+        assert!(unified.contains("let value"));
+        assert!(unified.contains('…'));
+        assert!(!unified.contains("END"));
+
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "diff split");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        let split = harness.render().unwrap();
+        assert!(split.contains("let value"));
+        assert!(split.contains('…'));
+        assert!(!split.contains("END"));
+    }
+
+    #[test]
+    fn quit_guard_survives_async_agent_progress_until_dismissed() {
+        let mut harness =
+            TuiHarness::from_unified_diff("quit-guard", workflow_diff(), 80, 18).unwrap();
+        harness.key(key(KeyCode::Char('c'))).unwrap();
+        type_text(&mut harness, "unsubmitted local comment");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "q");
+        harness.key(key(KeyCode::Enter)).unwrap();
+
+        assert!(harness.state.quit_guard.is_some());
+        harness
+            .inject_agent_event(AgentEvent::Activity {
+                outbound_id: None,
+                label: "background SDK progress that changes ordinary status".into(),
+            })
+            .unwrap();
+        let frame = harness.render().unwrap();
+        assert!(frame.contains("QUIT BLOCKED"));
+        assert!(!harness.state.should_quit);
+
+        harness.key(key(KeyCode::Esc)).unwrap();
+        assert!(harness.state.quit_guard.is_none());
+        assert!(harness.status().contains("warning dismissed"));
+    }
+
+    #[test]
+    fn cancellation_before_response_start_leaves_a_transcript_marker() {
+        let mut harness =
+            TuiHarness::from_unified_diff("early-cancel", workflow_diff(), 80, 18).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "cancel this before any response");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        let outbound_id = harness.state.chat[0].outbound_id.clone().unwrap();
+
+        harness
+            .inject_agent_event(AgentEvent::ResponseComplete {
+                outbound_id,
+                aborted: true,
+            })
+            .unwrap();
+
+        let frame = harness.render().unwrap();
+        assert!(frame.contains("cancel this before any response"));
+        assert!(frame.contains("response cancelled"));
+        assert!(harness.state.chat[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("cancelled before")));
+    }
+
+    #[test]
     fn visual_search_extends_the_fixed_anchor_and_chat_visual_yanks_messages() {
         let mut review = TuiHarness::from_unified_diff("search", workflow_diff(), 100, 24).unwrap();
         review.key(key(KeyCode::Char('v'))).unwrap();
