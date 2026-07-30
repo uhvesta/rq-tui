@@ -94,6 +94,7 @@ pub(crate) struct PrMetadata {
     pub(crate) url: String,
     pub(crate) state: String,
     pub(crate) merged_at: Option<String>,
+    pub(crate) updated_at: String,
     pub(crate) base_ref_name: String,
     pub(crate) head_ref_oid: String,
 }
@@ -138,7 +139,7 @@ impl<R: ProcessRunner> RemoteResolver<R> {
             "view",
             &reference.gh_selector(),
             "--json",
-            "number,title,body,url,state,mergedAt,baseRefName,headRefOid",
+            "number,title,body,url,state,mergedAt,updatedAt,baseRefName,headRefOid",
         ]))?;
         ensure_success("gh pr view", &output)?;
         serde_json::from_slice(&output.stdout).context("invalid PR metadata from gh")
@@ -186,6 +187,9 @@ impl<R: ProcessRunner> RemoteResolver<R> {
             last_opened_at: Some(timestamp),
         };
         storage.upsert_work_item(&item)?;
+        let mut provisional = existing.is_none().then(|| {
+            ProvisionalRemoteWorkItem::new(storage, item.id.clone(), session_root.clone())
+        });
         fs::create_dir_all(&session_root)?;
 
         let metadata_for_context = metadata
@@ -224,6 +228,9 @@ impl<R: ProcessRunner> RemoteResolver<R> {
                 attached_to_session: false,
                 delivery_state: DeliveryState::Draft,
             })?;
+        }
+        if let Some(provisional) = &mut provisional {
+            provisional.commit();
         }
         Ok(ResolvedWorkItem {
             item,
@@ -275,7 +282,7 @@ impl<R: ProcessRunner> RemoteResolver<R> {
             pr_meta_json: Some(serde_json::to_string(&metadata)?),
             base_branch: Some(metadata.base_ref_name.clone()),
             base_branch_source: BaseBranchSource::Auto,
-            last_activity_at: Some(now()),
+            last_activity_at: Some(metadata.updated_at.clone()),
         };
         storage.upsert_repo(&record)?;
 
@@ -457,6 +464,38 @@ impl<R: ProcessRunner> RemoteResolver<R> {
     }
 }
 
+struct ProvisionalRemoteWorkItem<'a> {
+    storage: &'a Storage,
+    id: String,
+    session_root: PathBuf,
+    committed: bool,
+}
+
+impl<'a> ProvisionalRemoteWorkItem<'a> {
+    fn new(storage: &'a Storage, id: String, session_root: PathBuf) -> Self {
+        Self {
+            storage,
+            id,
+            session_root,
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ProvisionalRemoteWorkItem<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        self.storage.delete_work_item(&self.id).ok();
+        fs::remove_dir_all(&self.session_root).ok();
+    }
+}
+
 fn canonical_references(references: &[PrReference]) -> Vec<PrReference> {
     let mut references = references.to_vec();
     references.sort_by_key(PrReference::canonical_url);
@@ -539,11 +578,14 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        canonical_references, remote_session_link_name, remote_worktree_path, PrReference,
+        canonical_references, remote_session_link_name, remote_worktree_path, PrMetadata,
+        PrReference, ProvisionalRemoteWorkItem,
     };
     use crate::diff::DiffSet;
-    use crate::domain::{BaseBranchSource, Repo, Version, VersionKind};
+    use crate::domain::{BaseBranchSource, Repo, Version, VersionKind, WorkItem};
+    use crate::storage::Storage;
     use crate::work_item::ReviewRepo;
+    use tempfile::tempdir;
 
     #[test]
     fn parses_supported_pr_reference_forms() {
@@ -565,6 +607,52 @@ mod tests {
     fn rejects_incomplete_pr_references() {
         assert!(PrReference::parse("api#42").is_err());
         assert!(PrReference::parse("acme/api").is_err());
+    }
+
+    #[test]
+    fn github_updated_at_is_preserved_for_remote_activity_ordering() {
+        let metadata: PrMetadata = serde_json::from_str(
+            r#"{
+                "number": 42,
+                "title": "Fix ordering",
+                "body": "",
+                "url": "https://github.com/acme/api/pull/42",
+                "state": "OPEN",
+                "mergedAt": null,
+                "updatedAt": "2026-07-29T10:11:12Z",
+                "baseRefName": "main",
+                "headRefOid": "abc123"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(metadata.updated_at, "2026-07-29T10:11:12Z");
+    }
+
+    #[test]
+    fn failed_new_remote_resolution_removes_its_provisional_history() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::open(&temp.path().join("review.db")).unwrap();
+        let session_root = temp.path().join("session");
+        std::fs::create_dir_all(&session_root).unwrap();
+        let item = WorkItem {
+            id: "provisional".into(),
+            name: "provisional".into(),
+            workspace_root: session_root.clone(),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            last_opened_at: Some("now".into()),
+        };
+        storage.upsert_work_item(&item).unwrap();
+
+        drop(ProvisionalRemoteWorkItem::new(
+            &storage,
+            item.id.clone(),
+            session_root.clone(),
+        ));
+
+        assert!(storage.work_item_by_id(&item.id).unwrap().is_none());
+        assert!(!session_root.exists());
     }
 
     #[test]
