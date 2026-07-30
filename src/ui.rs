@@ -407,12 +407,16 @@ fn run_loop<B: Backend>(
                 .saturating_duration_since(std::time::Instant::now())
                 .min(std::time::Duration::from_millis(100))
         };
-        let terminal_burst = read_terminal_burst(if terminal_backlog.is_empty() {
-            poll_timeout
-        } else {
-            std::time::Duration::ZERO
-        })?;
+        let terminal_burst = read_terminal_burst(
+            if terminal_backlog.is_empty() {
+                poll_timeout
+            } else {
+                std::time::Duration::ZERO
+            },
+            MAX_TERMINAL_EVENT_SLICE,
+        )?;
         navigation_limiter.begin_burst(terminal_burst_continues);
+        let terminal_drain_elapsed = terminal_burst.drain_elapsed;
         terminal_backlog.extend(terminal_burst.events);
         let terminal_slice_started = std::time::Instant::now();
         let mut actionable_events = 0;
@@ -464,7 +468,8 @@ fn run_loop<B: Backend>(
                 }
             }
             if actionable_events >= MAX_ACTIONABLE_TERMINAL_EVENTS_PER_FRAME
-                || terminal_slice_started.elapsed() >= MAX_TERMINAL_EVENT_SLICE
+                || terminal_drain_elapsed.saturating_add(terminal_slice_started.elapsed())
+                    >= MAX_TERMINAL_EVENT_SLICE
             {
                 break;
             }
@@ -871,9 +876,8 @@ const MAX_AGENT_EVENTS_PER_FRAME: usize = 256;
 const MAX_AGENT_EVENT_SLICE: std::time::Duration = std::time::Duration::from_millis(8);
 const MAX_ACTIONABLE_TERMINAL_EVENTS_PER_FRAME: usize = 256;
 const MAX_TERMINAL_EVENT_SLICE: std::time::Duration = std::time::Duration::from_millis(8);
-// Read the entire common auto-repeat backlog in one pass so the navigation
-// limiter below can discard stale repeats and reach a trailing actionable key
-// without forcing an expensive Review redraw between chunks.
+// Drain a large common auto-repeat backlog when cheap, while bounding both the
+// event count and time spent before application-level input processing.
 const MAX_TERMINAL_BURST: usize = 4_096;
 // Legacy terminal input does not distinguish a deliberately repeated motion
 // from keyboard auto-repeat. Keep enough events for normal Vim-style motion
@@ -883,23 +887,35 @@ const MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST: usize = 32;
 struct TerminalBurst {
     events: Vec<Event>,
     saturated: bool,
+    drain_elapsed: std::time::Duration,
 }
 
-fn read_terminal_burst(timeout: std::time::Duration) -> Result<TerminalBurst> {
+fn read_terminal_burst(
+    timeout: std::time::Duration,
+    drain_budget: std::time::Duration,
+) -> Result<TerminalBurst> {
     if !event::poll(timeout)? {
         return Ok(TerminalBurst {
             events: Vec::new(),
             saturated: false,
+            drain_elapsed: std::time::Duration::ZERO,
         });
     }
+    let drain_started = std::time::Instant::now();
     let mut events = Vec::with_capacity(16);
     events.push(event::read()?);
-    while events.len() < MAX_TERMINAL_BURST && event::poll(std::time::Duration::ZERO)? {
+    while events.len() < MAX_TERMINAL_BURST
+        && drain_started.elapsed() < drain_budget
+        && event::poll(std::time::Duration::ZERO)?
+    {
         events.push(event::read()?);
     }
+    let drain_elapsed = drain_started.elapsed();
     Ok(TerminalBurst {
-        saturated: events.len() == MAX_TERMINAL_BURST,
+        // Preserve held-key limiting across either kind of drain boundary.
+        saturated: events.len() == MAX_TERMINAL_BURST || drain_elapsed >= drain_budget,
         events,
+        drain_elapsed,
     })
 }
 
@@ -3526,10 +3542,10 @@ fn handle_agent_event_with_persistence(
                 .chain(state.main_chat.iter().flatten())
                 .find(|message| message.outbound_id.as_deref() == Some(replacement_id.as_str()))
                 .map(|message| message.text.clone());
-            if storage
+            if let Some(original) = storage
                 .pending_chats(&state.work_item.item.id)?
-                .iter()
-                .any(|chat| chat.id == outbound_id)
+                .into_iter()
+                .find(|chat| chat.id == outbound_id)
             {
                 storage.replace_queued_chat(
                     &outbound_id,
@@ -3537,8 +3553,8 @@ fn handle_agent_event_with_persistence(
                         id: replacement_id.clone(),
                         work_item_id: state.work_item.item.id.clone(),
                         text: replacement_text.unwrap_or_default(),
-                        kind: "chat".into(),
-                        lane: "main".into(),
+                        kind: original.kind,
+                        lane: original.lane,
                         created_at: now(),
                     },
                 )?;
@@ -9941,6 +9957,51 @@ mod tests {
             AskResponseUpdate::Delta { message_id, text }
                 if message_id == "assistant-a" && text == "event"
         ));
+    }
+
+    #[test]
+    fn queued_side_replacement_preserves_durable_lane_and_kind() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+        storage.upsert_work_item(&state.work_item.item).unwrap();
+        storage
+            .enqueue_chat(&PendingChat {
+                id: "side-original".into(),
+                work_item_id: state.work_item.item.id.clone(),
+                text: "original correction".into(),
+                kind: "correction".into(),
+                lane: "side".into(),
+                created_at: now(),
+            })
+            .unwrap();
+        state.pending_outbound_ids.insert("side-original".into());
+        state.side_outbound_ids.insert("side-original".into());
+        state.chat.push(ChatEntry {
+            id: "replacement-entry".into(),
+            role: "you".into(),
+            text: "replacement correction".into(),
+            streaming: false,
+            annotation_id: None,
+            outbound_id: Some("side-replacement".into()),
+            error: None,
+        });
+
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::QueueReplaced {
+                outbound_id: "side-original".into(),
+                replacement_id: "side-replacement".into(),
+                position: 0,
+            },
+        )
+        .unwrap();
+
+        let pending = storage.pending_chats(&state.work_item.item.id).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "side-replacement");
+        assert_eq!(pending[0].kind, "correction");
+        assert_eq!(pending[0].lane, "side");
     }
 
     #[test]
