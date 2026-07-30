@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -12,8 +13,11 @@ use crate::diff::parse_unified;
 use crate::domain::{
     BaseBranchSource, DeliveryState, Repo, ReviewContext, Version, VersionKind, WorkItem,
 };
+use crate::process_control::output_with_timeout;
 use crate::storage::{now, Storage};
 use crate::work_item::{ResolvedWorkItem, ReviewRepo};
+
+const NETWORK_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PrReference {
@@ -103,7 +107,15 @@ pub(crate) struct SystemProcessRunner;
 
 impl ProcessRunner for SystemProcessRunner {
     fn output(&self, command: &mut Command) -> Result<Output> {
-        command.output().context("failed to execute process")
+        let operation = std::iter::once(command.get_program().to_string_lossy().into_owned())
+            .chain(
+                command
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned()),
+            )
+            .collect::<Vec<_>>()
+            .join(" ");
+        output_with_timeout(command, &operation, NETWORK_COMMAND_TIMEOUT)
     }
 }
 

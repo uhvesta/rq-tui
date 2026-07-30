@@ -15,6 +15,7 @@ pub(crate) mod export;
 pub(crate) mod git;
 pub(crate) mod highlight;
 pub(crate) mod markdown;
+pub(crate) mod process_control;
 pub(crate) mod prune;
 pub(crate) mod remote;
 pub(crate) mod review_stream;

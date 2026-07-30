@@ -2,12 +2,16 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use walkdir::{DirEntry, WalkDir};
+
+use crate::process_control::output_with_timeout;
+
+const LOCAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalRepoState {
@@ -28,10 +32,15 @@ pub(crate) struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
     fn output(&self, program: &OsStr, args: &[OsString]) -> Result<Output> {
-        Command::new(program)
-            .args(args)
-            .output()
-            .with_context(|| format!("failed to run {}", program.to_string_lossy()))
+        let operation = std::iter::once(program.to_string_lossy().into_owned())
+            .chain(args.iter().map(|arg| arg.to_string_lossy().into_owned()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        output_with_timeout(
+            Command::new(program).args(args),
+            &operation,
+            LOCAL_COMMAND_TIMEOUT,
+        )
     }
 }
 
