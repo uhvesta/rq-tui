@@ -990,10 +990,12 @@ impl AppState {
         &self,
         rows: &[ReviewRow],
         width: usize,
+        composer_visible_rows: usize,
     ) -> Arc<ReviewDisplayLayout> {
         let width = width.max(1);
+        let composer_visible_rows = composer_visible_rows.max(1);
         if let Some(layout) = self.review_layout_cache.borrow().as_ref() {
-            if layout.matches(self.review_stream_revision, width) {
+            if layout.matches(self.review_stream_revision, width, composer_visible_rows) {
                 return Arc::clone(layout);
             }
         }
@@ -1001,6 +1003,7 @@ impl AppState {
             self.review_stream_revision,
             rows,
             width,
+            composer_visible_rows,
         ));
         *self.review_layout_cache.borrow_mut() = Some(Arc::clone(&layout));
         #[cfg(test)]

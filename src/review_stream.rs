@@ -319,16 +319,23 @@ pub(crate) struct ReviewDisplayLayout {
     rows: Vec<ReviewDisplayRow>,
     total_height: usize,
     composer_cursor: Option<usize>,
+    composer_visible_rows: usize,
 }
 
 impl ReviewDisplayLayout {
-    pub(crate) fn for_rows(semantic_revision: u64, rows: &[ReviewRow], width: usize) -> Self {
+    pub(crate) fn for_rows(
+        semantic_revision: u64,
+        rows: &[ReviewRow],
+        width: usize,
+        composer_visible_rows: usize,
+    ) -> Self {
         let width = width.max(1);
+        let composer_visible_rows = composer_visible_rows.max(1);
         let mut layout_rows = Vec::with_capacity(rows.len());
         let mut composer_cursor = None;
         let mut start = 0usize;
         for (semantic_row, row) in rows.iter().enumerate() {
-            let (height, cursor_line) = review_row_geometry(row, width);
+            let (height, cursor_line) = review_row_geometry(row, width, composer_visible_rows);
             let height = height.max(1);
             layout_rows.push(ReviewDisplayRow {
                 semantic_row,
@@ -346,11 +353,19 @@ impl ReviewDisplayLayout {
             rows: layout_rows,
             total_height: start,
             composer_cursor,
+            composer_visible_rows,
         }
     }
 
-    pub(crate) fn matches(&self, semantic_revision: u64, width: usize) -> bool {
-        self.semantic_revision == semantic_revision && self.width == width.max(1)
+    pub(crate) fn matches(
+        &self,
+        semantic_revision: u64,
+        width: usize,
+        composer_visible_rows: usize,
+    ) -> bool {
+        self.semantic_revision == semantic_revision
+            && self.width == width.max(1)
+            && self.composer_visible_rows == composer_visible_rows.max(1)
     }
 
     pub(crate) fn rows(&self) -> &[ReviewDisplayRow] {
@@ -375,7 +390,11 @@ impl ReviewDisplayLayout {
     }
 }
 
-fn review_row_geometry(row: &ReviewRow, width: usize) -> (usize, Option<usize>) {
+fn review_row_geometry(
+    row: &ReviewRow,
+    width: usize,
+    composer_visible_rows: usize,
+) -> (usize, Option<usize>) {
     let ReviewRow::Annotation { block, .. } = row else {
         return (1, None);
     };
@@ -391,7 +410,15 @@ fn review_row_geometry(row: &ReviewRow, width: usize) -> (usize, Option<usize>) 
         || matches!(block.part, AnnotationRowPart::Prompt))
     .then_some(cursor_line)
     .flatten();
-    (height, cursor)
+    let Some(cursor) = cursor else {
+        return (height, None);
+    };
+    let visible_rows = composer_visible_rows.max(1).min(height);
+    let scroll = cursor
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(height.saturating_sub(visible_rows));
+    (visible_rows, Some(cursor.saturating_sub(scroll)))
 }
 
 /// Matches the editor's terminal-cell wrapping: tabs occupy one cell and

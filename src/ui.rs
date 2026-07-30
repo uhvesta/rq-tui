@@ -4991,7 +4991,12 @@ fn render_unified(
     state.compose_wrap_width = body.width.saturating_sub(4).max(1) as usize;
     state.set_review_content_width(body.width.saturating_sub(9) as usize);
     sync_active_follow_up_cursor(state, stream.rows());
-    let layout = state.review_display_layout(stream.rows(), body.width.max(1) as usize);
+    let composer_visible_rows = inline_composer_visible_rows(frame.area().height, body.height);
+    let layout = state.review_display_layout(
+        stream.rows(),
+        body.width.max(1) as usize,
+        composer_visible_rows,
+    );
     clamp_review_display_scroll(state, &layout, body.height.max(1) as usize);
     let viewport_end = state.review_scroll.saturating_add(body.height as usize);
     let search = (!state.search.is_empty()).then_some(state.search.as_str());
@@ -5013,6 +5018,7 @@ fn render_unified(
                 state.review_horizontal_scroll,
                 highlighter,
                 search,
+                composer_visible_rows,
             )
             .into_iter()
             .skip(skip)
@@ -5085,7 +5091,12 @@ fn render_split(
     );
     sync_active_follow_up_cursor(state, stream.rows());
     let selection_side = state.review_selection_side();
-    let layout = state.review_display_layout(stream.rows(), body.width.max(1) as usize);
+    let composer_visible_rows = inline_composer_visible_rows(frame.area().height, body.height);
+    let layout = state.review_display_layout(
+        stream.rows(),
+        body.width.max(1) as usize,
+        composer_visible_rows,
+    );
     clamp_review_display_scroll(state, &layout, body.height.max(1) as usize);
     let viewport_end = state.review_scroll.saturating_add(body.height as usize);
     let search = (!state.search.is_empty()).then_some(state.search.as_str());
@@ -5160,6 +5171,7 @@ fn render_split(
                     state.review_horizontal_scroll,
                     highlighter,
                     search,
+                    composer_visible_rows,
                 )
                 .into_iter()
                 .skip(skip)
@@ -5195,6 +5207,14 @@ fn render_split(
         frame.render_widget(Clear, line_area);
         frame.render_widget(Paragraph::new(line), line_area);
     }
+}
+
+fn inline_composer_visible_rows(terminal_height: u16, viewport_height: u16) -> usize {
+    usize::from(
+        (terminal_height / 3)
+            .clamp(1, 12)
+            .min(viewport_height.saturating_sub(3).max(1)),
+    )
 }
 
 /// Keep the semantic cursor attached to the prompt row when streamed Ask
@@ -5380,7 +5400,15 @@ fn review_row_lines(
     horizontal_scroll: usize,
     highlighter: &mut dyn Highlighter,
 ) -> Vec<Line<'static>> {
-    review_row_lines_with_search(row, selection, width, horizontal_scroll, highlighter, None)
+    review_row_lines_with_search(
+        row,
+        selection,
+        width,
+        horizontal_scroll,
+        highlighter,
+        None,
+        usize::MAX,
+    )
 }
 
 fn review_row_lines_with_search(
@@ -5390,6 +5418,7 @@ fn review_row_lines_with_search(
     horizontal_scroll: usize,
     highlighter: &mut dyn Highlighter,
     search: Option<&str>,
+    composer_visible_rows: usize,
 ) -> Vec<Line<'static>> {
     let selected = selection.is_some();
     let selected_style = matches!(selection, Some(ReviewRowSelection::Whole))
@@ -5498,14 +5527,14 @@ fn review_row_lines_with_search(
                 }
                 AnnotationRowPart::Body { .. } => {
                     let wrapped = wrapped_editor_lines(&block.text, block.text.len(), available).0;
-                    wrapped
+                    visible_inline_composer_lines(wrapped, composer_visible_rows)
                         .into_iter()
                         .map(|line| bordered_body(&line, width))
                         .collect()
                 }
                 AnnotationRowPart::Prompt => {
                     let wrapped = wrapped_editor_lines(&block.text, block.text.len(), available).0;
-                    wrapped
+                    visible_inline_composer_lines(wrapped, composer_visible_rows)
                         .into_iter()
                         .map(|line| bordered_body(&line, width))
                         .collect()
@@ -5524,6 +5553,18 @@ fn review_row_lines_with_search(
                 .collect()
         }
     }
+}
+
+fn visible_inline_composer_lines(lines: Vec<String>, composer_visible_rows: usize) -> Vec<String> {
+    let Some(cursor_row) = lines.iter().position(|line| line.contains('▏')) else {
+        return lines;
+    };
+    let visible_rows = composer_visible_rows.max(1).min(lines.len());
+    let scroll = cursor_row
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(lines.len().saturating_sub(visible_rows));
+    lines.into_iter().skip(scroll).take(visible_rows).collect()
 }
 
 fn styled_full_row(
