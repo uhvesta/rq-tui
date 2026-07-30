@@ -471,6 +471,11 @@ def main() -> int:
         setup = Child(binary, old_repo, app_root)
         try:
             setup.resize(80, 18)
+            setup.wait_for(
+                "Inspecting local repositories and computing diffs", timeout=8
+            )
+            setup.wait_for("Ctrl-C cancels", timeout=8)
+            setup.wait_for("entering TUI", timeout=8)
             setup.wait_for("Review", timeout=8)
             setup.wait_for("COPILOT MAIN", timeout=8)
             setup.send(b"\t")
@@ -499,6 +504,10 @@ def main() -> int:
         child = Child(binary, repo, app_root)
         try:
             child.resize(100, 24)
+            child.wait_for(
+                "Inspecting local repositories and computing diffs", timeout=8
+            )
+            child.wait_for("entering TUI", timeout=8)
             child.wait_for("Review", timeout=8)
             child.wait_for("COPILOT MAIN", timeout=8)
             if child.poll() is not None:

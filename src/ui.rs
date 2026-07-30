@@ -123,7 +123,13 @@ fn persist_model_preferences(
     Ok(())
 }
 
-pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> Result<()> {
+pub(crate) fn run(
+    mut state: AppState,
+    storage: &Storage,
+    paths: &AppPaths,
+    mut startup: crate::cli::StartupProgress,
+) -> Result<()> {
+    startup.stage("Loading review history and preferences");
     for repo in &state.work_item.repos {
         state
             .annotations
@@ -196,6 +202,7 @@ pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> R
         let plugins = root.join(".rq-tui").join("plugins");
         plugins.is_dir().then_some(plugins)
     }));
+    startup.stage("Starting Copilot session");
     let bridge = start_agent(BridgeConfig {
         work_item_id: state.work_item.item.id.clone(),
         session_root: state.work_item.session_root.clone(),
@@ -208,6 +215,7 @@ pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> R
         skill_directories,
         plugin_directories,
     });
+    startup.finish();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     if let Err(error) = execute!(

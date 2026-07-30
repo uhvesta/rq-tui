@@ -1,6 +1,9 @@
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{ArgGroup, Args, Parser, Subcommand};
@@ -84,16 +87,21 @@ pub(crate) struct ReviewArgs {
 
 pub(crate) fn run_review(args: ReviewArgs, paths: AppPaths) -> Result<()> {
     require_interactive_terminal(io_is_interactive())?;
+    let mut progress = StartupProgress::begin("Opening review storage");
     let storage = Storage::open(&paths.database)?;
     let workspace = args.path.as_deref().map(resolve_invocation_path);
     let resolved = match (args.path.as_deref(), args.prs.is_empty()) {
-        (Some(_), true) => resolve_local(
-            workspace.as_deref().expect("path was present"),
-            args.base.as_deref(),
-            &paths,
-            &storage,
-        )?,
+        (Some(_), true) => {
+            progress.stage("Inspecting local repositories and computing diffs");
+            resolve_local(
+                workspace.as_deref().expect("path was present"),
+                args.base.as_deref(),
+                &paths,
+                &storage,
+            )?
+        }
         (None, false) => {
+            progress.stage("Fetching pull-request metadata and revisions");
             let references = args
                 .prs
                 .iter()
@@ -102,12 +110,14 @@ pub(crate) fn run_review(args: ReviewArgs, paths: AppPaths) -> Result<()> {
             RemoteResolver::default().resolve(&references, &paths, &storage)?
         }
         (Some(_), false) => {
+            progress.stage("Inspecting local repositories and computing diffs");
             let local = resolve_local(
                 workspace.as_deref().expect("path was present"),
                 args.base.as_deref(),
                 &paths,
                 &storage,
             )?;
+            progress.stage("Fetching pull-request metadata and revisions");
             let references = args
                 .prs
                 .iter()
@@ -118,7 +128,85 @@ pub(crate) fn run_review(args: ReviewArgs, paths: AppPaths) -> Result<()> {
         }
         (None, true) => unreachable!("clap requires a target"),
     };
-    crate::ui::run(AppState::new(resolved), &storage, &paths)
+    crate::ui::run(AppState::new(resolved), &storage, &paths, progress)
+}
+
+enum StartupSignal {
+    Stage(String),
+    Stop,
+}
+
+pub(crate) struct StartupProgress {
+    started: Instant,
+    sender: Sender<StartupSignal>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl StartupProgress {
+    const HEARTBEAT: Duration = Duration::from_secs(2);
+
+    fn begin(stage: &str) -> Self {
+        let started = Instant::now();
+        let (sender, receiver) = mpsc::channel();
+        let mut current_stage = stage.to_owned();
+        eprintln!("{}", startup_message(&current_stage, Duration::ZERO));
+        let worker = std::thread::spawn(move || loop {
+            match receiver.recv_timeout(Self::HEARTBEAT) {
+                Ok(StartupSignal::Stage(stage)) => current_stage = stage,
+                Ok(StartupSignal::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    eprintln!("{}", startup_message(&current_stage, started.elapsed()));
+                }
+            }
+        });
+        Self {
+            started,
+            sender,
+            worker: Some(worker),
+        }
+    }
+
+    pub(crate) fn stage(&mut self, stage: &str) {
+        eprintln!("{}", startup_message(stage, self.started.elapsed()));
+        let _ = self.sender.send(StartupSignal::Stage(stage.to_owned()));
+    }
+
+    pub(crate) fn finish(mut self) {
+        self.stop();
+        eprintln!(
+            "rq-tui · review ready in {} · entering TUI",
+            format_elapsed(self.started.elapsed())
+        );
+    }
+
+    fn stop(&mut self) {
+        let _ = self.sender.send(StartupSignal::Stop);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for StartupProgress {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn startup_message(stage: &str, elapsed: Duration) -> String {
+    format!(
+        "rq-tui · {stage} · {} elapsed · Ctrl-C cancels",
+        format_elapsed(elapsed)
+    )
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    }
 }
 
 fn io_is_interactive() -> bool {
@@ -203,9 +291,11 @@ fn command_version(program: &str, args: &[&str]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use clap::Parser;
 
-    use super::{require_interactive_terminal, Cli, Command};
+    use super::{format_elapsed, require_interactive_terminal, startup_message, Cli, Command};
 
     #[test]
     fn incomplete_review_is_rejected_before_tui_startup() {
@@ -236,5 +326,18 @@ mod tests {
     fn mixed_local_and_remote_review_is_accepted() {
         let cli = Cli::try_parse_from(["rq-tui", "review", ".", "--pr", "acme/api#42"]).unwrap();
         assert!(matches!(cli.command, Command::Review(_)));
+    }
+
+    #[test]
+    fn startup_progress_names_the_stage_elapsed_time_and_escape_hatch() {
+        assert_eq!(format_elapsed(Duration::from_secs(7)), "7s");
+        assert_eq!(format_elapsed(Duration::from_secs(125)), "2m 05s");
+        assert_eq!(
+            startup_message(
+                "Inspecting local repositories and computing diffs",
+                Duration::from_secs(3)
+            ),
+            "rq-tui · Inspecting local repositories and computing diffs · 3s elapsed · Ctrl-C cancels"
+        );
     }
 }
