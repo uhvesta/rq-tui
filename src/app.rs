@@ -1,5 +1,9 @@
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::cmp;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -10,14 +14,15 @@ use crate::chat_selection::{
     Movement,
 };
 use crate::context_editor::{ContextEditorState, ContextField};
-use crate::copilot::{ModelOption, ModelSelection, PruneSessionOutcome};
+use crate::copilot::{HistoryEntry, ModelOption, ModelSelection, PruneSessionOutcome};
 use crate::diff::{DiffFile, DiffSet, LineKind};
 use crate::domain::{
     AnchorSide, Annotation, AnnotationKind, AskMessage, DeliveryState, PendingChat, Placement,
     ReviewContext, Version,
 };
 use crate::review_stream::{
-    InlineAnnotation, ReviewFile, ReviewRow, ReviewStream, SourceSide, StreamMovement,
+    InlineAnnotation, ReviewDisplayLayout, ReviewFile, ReviewRow, ReviewStream, SourceSide,
+    StreamMovement,
 };
 use crate::terminal_text::{
     cell_width, floor_grapheme_boundary, grapheme_indices, next_grapheme_boundary,
@@ -26,6 +31,15 @@ use crate::terminal_text::{
 use crate::work_item::ResolvedWorkItem;
 
 pub(crate) const INLINE_COMPOSER_ID: &str = "zzzzzzzz-inline-composer";
+
+/// Cached immutable semantic data for Review.  Cursor/scroll belong to
+/// `AppState`, which keeps the stream safe to share across navigation and
+/// paints.
+#[derive(Clone, Debug, Default)]
+struct ReviewStreamCache {
+    revision: u64,
+    stream: Option<Arc<ReviewStream>>,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Screen {
@@ -659,6 +673,15 @@ pub(crate) struct AppState {
     pub(crate) review_visual_preferred_column: usize,
     pub(crate) review_horizontal_scroll: usize,
     pub(crate) review_content_width: usize,
+    review_stream_revision: u64,
+    review_stream_cache: RefCell<ReviewStreamCache>,
+    /// Width-dependent display geometry is invalidated alongside the semantic
+    /// stream and additionally keyed by width.
+    review_layout_cache: RefCell<Option<Arc<ReviewDisplayLayout>>>,
+    #[cfg(test)]
+    review_stream_builds: Cell<usize>,
+    #[cfg(test)]
+    review_layout_builds: Cell<usize>,
     /// Width-specific renderer index. Cursor and selection endpoints remain
     /// source based, therefore survive a layout rebuild.
     pub(crate) chat_layout: Option<ChatLayout>,
@@ -694,6 +717,8 @@ pub(crate) struct AppState {
     pub(crate) chat_total_rows: usize,
     pub(crate) chat_viewport_rows: usize,
     pub(crate) chat_autofollow: bool,
+    history_restore_accepting: bool,
+    history_restore_len: usize,
     pub(crate) preview_markdown: Option<String>,
     pub(crate) preview_scroll: usize,
     pub(crate) preview_total_rows: usize,
@@ -768,6 +793,13 @@ impl AppState {
             review_visual_preferred_column: 0,
             review_horizontal_scroll: 0,
             review_content_width: 1,
+            review_stream_revision: 1,
+            review_stream_cache: RefCell::default(),
+            review_layout_cache: RefCell::default(),
+            #[cfg(test)]
+            review_stream_builds: Cell::new(0),
+            #[cfg(test)]
+            review_layout_builds: Cell::new(0),
             chat_layout: None,
             chat_navigation: None,
             chat_selection: None,
@@ -800,6 +832,8 @@ impl AppState {
             chat_total_rows: 0,
             chat_viewport_rows: 0,
             chat_autofollow: true,
+            history_restore_accepting: false,
+            history_restore_len: 0,
             preview_markdown: None,
             preview_scroll: 0,
             preview_total_rows: 0,
@@ -889,7 +923,55 @@ impl AppState {
             .unwrap_or(0)
     }
 
-    pub(crate) fn review_stream(&self) -> ReviewStream {
+    /// Mark all Review-derived data stale after an annotation, streamed Ask,
+    /// draft, fold, or diff mutation.  This intentionally does not fire for
+    /// cursor/scroll navigation.
+    pub(crate) fn invalidate_review_cache(&mut self) {
+        self.review_stream_revision = self.review_stream_revision.wrapping_add(1).max(1);
+        self.review_stream_cache.borrow_mut().stream = None;
+        self.review_layout_cache.borrow_mut().take();
+    }
+
+    pub(crate) fn review_display_layout(
+        &self,
+        rows: &[ReviewRow],
+        width: usize,
+    ) -> Arc<ReviewDisplayLayout> {
+        let width = width.max(1);
+        if let Some(layout) = self.review_layout_cache.borrow().as_ref() {
+            if layout.matches(self.review_stream_revision, width) {
+                return Arc::clone(layout);
+            }
+        }
+        let layout = Arc::new(ReviewDisplayLayout::for_rows(
+            self.review_stream_revision,
+            rows,
+            width,
+        ));
+        *self.review_layout_cache.borrow_mut() = Some(Arc::clone(&layout));
+        #[cfg(test)]
+        self.review_layout_builds
+            .set(self.review_layout_builds.get().saturating_add(1));
+        layout
+    }
+
+    #[cfg(test)]
+    pub(crate) fn review_cache_build_counts(&self) -> (usize, usize) {
+        (
+            self.review_stream_builds.get(),
+            self.review_layout_builds.get(),
+        )
+    }
+
+    pub(crate) fn review_stream(&self) -> Arc<ReviewStream> {
+        {
+            let cache = self.review_stream_cache.borrow();
+            if cache.revision == self.review_stream_revision {
+                if let Some(stream) = &cache.stream {
+                    return Arc::clone(stream);
+                }
+            }
+        }
         let files = self
             .work_item
             .repos
@@ -989,7 +1071,48 @@ impl AppState {
         if let Some(composer) = self.inline_composer_annotation() {
             annotations.push(composer);
         }
-        ReviewStream::for_files(&files, &annotations)
+        let stream = Arc::new(ReviewStream::for_files(&files, &annotations));
+        let mut cache = self.review_stream_cache.borrow_mut();
+        cache.revision = self.review_stream_revision;
+        cache.stream = Some(Arc::clone(&stream));
+        #[cfg(test)]
+        self.review_stream_builds
+            .set(self.review_stream_builds.get().saturating_add(1));
+        stream
+    }
+
+    /// Apply one bounded chunk of resumed SDK history. A non-empty local
+    /// transcript wins over remote history, matching the previous one-shot
+    /// restore behavior; accepted chunks continue until SessionReady.
+    pub(crate) fn append_resumed_history(&mut self, history: Vec<HistoryEntry>) {
+        if !self.history_restore_accepting {
+            if !self.chat.is_empty() {
+                return;
+            }
+            self.history_restore_accepting = true;
+            self.history_restore_len = 0;
+        }
+        let restored = history
+            .into_iter()
+            .map(|entry| ChatEntry {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: entry.role,
+                text: entry.text,
+                streaming: false,
+                annotation_id: None,
+                outbound_id: None,
+                error: None,
+            })
+            .collect::<Vec<_>>();
+        let restored_count = restored.len();
+        let insertion = self.history_restore_len.min(self.chat.len());
+        self.chat.splice(insertion..insertion, restored);
+        self.history_restore_len = self.history_restore_len.saturating_add(restored_count);
+    }
+
+    pub(crate) fn finish_history_restore(&mut self) {
+        self.history_restore_accepting = false;
+        self.history_restore_len = 0;
     }
 
     fn inline_composer_annotation(&self) -> Option<InlineAnnotation> {
@@ -1070,6 +1193,10 @@ impl AppState {
     }
 
     fn focus_inline_composer(&mut self) {
+        // The compose target, cursor marker, or fold state has just changed.
+        // Rebuild before locating the prompt instead of searching the previous
+        // semantic snapshot and leaving focus on the source row.
+        self.invalidate_review_cache();
         self.review_cursor = self
             .review_stream()
             .rows()
@@ -1098,12 +1225,13 @@ impl AppState {
     fn move_review_stream(&mut self, movement: StreamMovement) {
         let origin = (self.repo_index, self.file_index);
         let was_visual = self.input_mode == InputMode::Visual;
-        let mut stream = self.review_stream();
-        stream.set_cursor(self.review_cursor);
-        let previous_cursor = stream.cursor();
-        stream.move_by(movement, self.viewport_height.max(1));
-        self.review_cursor = stream.cursor();
-        let row = stream.current().cloned();
+        let stream = self.review_stream();
+        let previous_cursor = self
+            .review_cursor
+            .min(stream.rows().len().saturating_sub(1));
+        self.review_cursor =
+            stream.moved_cursor(previous_cursor, movement, self.viewport_height.max(1));
+        let row = stream.rows().get(self.review_cursor).cloned();
         if let Some(row) = row.as_ref() {
             self.sync_source_from_review_row(row);
         }
@@ -1573,9 +1701,11 @@ impl AppState {
     }
 
     fn enter_review_visual(&mut self, mode: ReviewSelectionMode) -> bool {
-        let mut stream = self.review_stream();
-        stream.set_cursor(self.review_cursor);
-        if !matches!(stream.current(), Some(ReviewRow::Source { .. })) {
+        let stream = self.review_stream();
+        if !matches!(
+            stream.rows().get(self.review_cursor),
+            Some(ReviewRow::Source { .. })
+        ) {
             self.status =
                 "Visual selection starts on source rows, not headers or annotation blocks".into();
             return false;
@@ -1780,10 +1910,30 @@ impl AppState {
         match self.input_mode {
             InputMode::Command => return self.handle_command_key(key),
             InputMode::Search => return self.handle_search_key(key),
-            InputMode::Compose => return self.handle_compose_key(key),
+            InputMode::Compose => {
+                let was_inline_compose = self.inline_review_compose_active();
+                let effects = self.handle_compose_key(key);
+                if was_inline_compose || self.inline_review_compose_active() {
+                    self.invalidate_review_cache();
+                }
+                return effects;
+            }
             InputMode::Normal | InputMode::Visual => {}
         }
         self.handle_normal_key(key)
+    }
+
+    fn inline_review_compose_active(&self) -> bool {
+        self.input_mode == InputMode::Compose
+            && matches!(
+                self.compose_target,
+                Some(
+                    ComposeTarget::Annotation(_)
+                        | ComposeTarget::FollowUp(_)
+                        | ComposeTarget::EditAnnotation(_)
+                        | ComposeTarget::EditAskMessage { .. }
+                )
+            )
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -2130,6 +2280,7 @@ impl AppState {
                 ) {
                     self.input_mode = InputMode::Compose;
                     self.compose_cursor = self.compose_cursor.min(self.compose.len());
+                    self.invalidate_review_cache();
                     self.status = "INSERT · resumed preserved inline draft".into();
                 } else if let Some((kind, annotation_id, text)) =
                     self.annotation_under_cursor().map(|(annotation, _)| {
@@ -2821,6 +2972,7 @@ impl AppState {
                     if !self.collapsed_annotations.remove(&annotation_id) {
                         self.collapsed_annotations.insert(annotation_id.clone());
                     }
+                    self.invalidate_review_cache();
                     self.review_cursor = self
                         .review_stream()
                         .rows()
@@ -3493,6 +3645,9 @@ impl AppState {
                     normalized.len(),
                     if lines == 1 { "" } else { "s" }
                 );
+                if self.inline_review_compose_active() {
+                    self.invalidate_review_cache();
+                }
             }
             InputMode::Command => {
                 self.command
@@ -3755,9 +3910,11 @@ impl AppState {
             self.status = "Cannot annotate a binary or empty file".into();
             return;
         }
-        let mut stream = self.review_stream();
-        stream.set_cursor(self.review_cursor);
-        if !matches!(stream.current(), Some(ReviewRow::Source { .. })) {
+        let stream = self.review_stream();
+        if !matches!(
+            stream.rows().get(self.review_cursor),
+            Some(ReviewRow::Source { .. })
+        ) {
             self.status =
                 "Cannot annotate fold and metadata rows, file headers, or hunk headers".into();
             return;
@@ -4368,9 +4525,9 @@ impl AppState {
 
     fn annotation_under_cursor(&self) -> Option<&(Annotation, Placement)> {
         if self.screen == Screen::Review && self.input_mode == InputMode::Normal {
-            let mut stream = self.review_stream();
-            stream.set_cursor(self.review_cursor);
-            if let Some(ReviewRow::Annotation { block, .. }) = stream.current() {
+            let stream = self.review_stream();
+            if let Some(ReviewRow::Annotation { block, .. }) = stream.rows().get(self.review_cursor)
+            {
                 return self
                     .annotations
                     .iter()
@@ -4501,10 +4658,11 @@ impl AppState {
     fn jump_annotation(&mut self, forward: bool) {
         let origin = (self.repo_index, self.file_index);
         let was_visual = self.input_mode == InputMode::Visual;
-        let mut stream = self.review_stream();
-        stream.set_cursor(self.review_cursor);
-        let previous_cursor = stream.cursor();
-        let target = stream.jump_annotation(forward);
+        let stream = self.review_stream();
+        let previous_cursor = self
+            .review_cursor
+            .min(stream.rows().len().saturating_sub(1));
+        let target = stream.annotation_after(previous_cursor, forward);
         let Some(target) = target else {
             self.status = "No annotations".into();
             return;
@@ -4513,7 +4671,7 @@ impl AppState {
         if target == previous_cursor {
             self.status = "Already at the only annotation".into();
         }
-        if let Some(row) = stream.current() {
+        if let Some(row) = stream.rows().get(target) {
             self.sync_source_from_review_row(row);
         }
         if was_visual && origin != (self.repo_index, self.file_index) {

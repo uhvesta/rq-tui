@@ -342,6 +342,27 @@ impl TuiHarness {
         )
     }
 
+    /// Replace an in-flight response with an SDK snapshot, exercising the
+    /// same cache invalidation path used after reconnect/resume resyncs.
+    pub fn replace_response_snapshot(&mut self, text: &str) -> Result<()> {
+        let (outbound, lane) = self
+            .active_stream
+            .as_ref()
+            .context("no fake-agent response is streaming")?;
+        handle_agent_envelope(
+            &mut self.state,
+            &self.storage,
+            AgentEventEnvelope {
+                lane: lane.clone(),
+                event: LaneEvent::Agent(AgentEvent::ResponseSnapshot {
+                    outbound_id: outbound.id.clone(),
+                    text: text.to_owned(),
+                }),
+                activity: None,
+            },
+        )
+    }
+
     pub fn complete_response(&mut self, aborted: bool) -> Result<()> {
         let (outbound, lane) = self
             .active_stream
@@ -1369,6 +1390,7 @@ mod tests {
     use crate::copilot::{
         ActivityKind, AgentEvent, AgentLane, ContextTierOption, HistoryEntry, ModelOption,
     };
+    use crate::diff::LineKind;
     use crate::domain::{
         AnchorSide, Annotation, AnnotationKind, DeliveryState, Placement, ReviewContext, Version,
         VersionKind,
@@ -1624,6 +1646,7 @@ mod tests {
                 ambiguous: false,
             },
         ));
+        harness.state.invalidate_review_cache();
 
         harness.key(key(KeyCode::Char(']'))).unwrap();
         harness.key(key(KeyCode::Char('a'))).unwrap();
@@ -2795,6 +2818,7 @@ mod tests {
         streamed.delivery_state = DeliveryState::Sent;
         streamed.ts = "2026-01-01T00:00:00Z".into();
         thread.push(streamed);
+        ask.state.invalidate_review_cache();
         ask.render().unwrap();
         assert!(ask.state.review_cursor > prompt_before);
         let active_frame = ask.render().unwrap();
@@ -2821,8 +2845,115 @@ mod tests {
         type_text(&mut harness, "question");
         harness.key(key(KeyCode::Enter)).unwrap();
         harness.state.side_active = true;
+        harness.state.invalidate_review_cache();
         let frame = harness.render().unwrap();
         assert!(frame.contains("follow-up unavailable · /main"));
+    }
+
+    #[test]
+    fn review_caches_reuse_navigation_and_invalidate_every_semantic_mutation() {
+        let mut harness =
+            TuiHarness::from_unified_diff("review-cache", workflow_diff(), 96, 24).unwrap();
+
+        harness.render().unwrap();
+        let initial = harness.state.review_cache_build_counts();
+        harness.render().unwrap();
+        harness.key(key(KeyCode::Char('j'))).unwrap();
+        harness.render().unwrap();
+        assert_eq!(harness.state.review_cache_build_counts(), initial);
+
+        harness.resize(72, 24);
+        harness.render().unwrap();
+        let resized = harness.state.review_cache_build_counts();
+        assert_eq!(resized.0, initial.0, "resize keeps semantic rows");
+        assert_eq!(resized.1, initial.1 + 1, "resize rebuilds geometry once");
+
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        assert!(matches!(
+            harness
+                .state
+                .review_stream()
+                .rows()
+                .get(harness.state.review_cursor),
+            Some(crate::review_stream::ReviewRow::Annotation { block, .. })
+                if block.annotation_id == crate::app::INLINE_COMPOSER_ID
+        ));
+        type_text(&mut harness, "draft");
+        harness.render().unwrap();
+        let draft = harness.state.review_cache_build_counts();
+        assert_eq!(
+            draft.0,
+            resized.0 + 2,
+            "composer focus and its edited draft each rebuild once"
+        );
+        assert_eq!(draft.1, resized.1 + 1);
+
+        harness.key(key(KeyCode::Left)).unwrap();
+        harness.render().unwrap();
+        let cursor_edit = harness.state.review_cache_build_counts();
+        assert_eq!(cursor_edit.0, draft.0 + 1, "cursor marker is semantic");
+
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.render().unwrap();
+        let created = harness.state.review_cache_build_counts();
+        assert_eq!(created.0, cursor_edit.0 + 1, "annotation CRUD invalidates");
+
+        harness.start_next_response("first").unwrap();
+        harness.render().unwrap();
+        let started = harness.state.review_cache_build_counts();
+        harness.push_response_delta(" delta").unwrap();
+        harness.render().unwrap();
+        let delta = harness.state.review_cache_build_counts();
+        assert_eq!(delta.0, started.0 + 1, "Ask delta invalidates");
+        harness.replace_response_snapshot("snapshot text").unwrap();
+        harness.render().unwrap();
+        let snapshot = harness.state.review_cache_build_counts();
+        assert_eq!(snapshot.0, delta.0 + 1, "Ask snapshot invalidates");
+        harness.complete_response(false).unwrap();
+        harness.render().unwrap();
+        let completed = harness.state.review_cache_build_counts();
+        assert_eq!(completed.0, snapshot.0 + 1, "Ask completion invalidates");
+
+        harness.key(key(KeyCode::Char('z'))).unwrap();
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        harness.render().unwrap();
+        let folded = harness.state.review_cache_build_counts();
+        assert_eq!(folded.0, completed.0 + 1, "fold invalidates");
+
+        harness.state.work_item.repos[0].diff.files[0].hunks[0]
+            .lines
+            .push(crate::diff::DiffLine {
+                kind: LineKind::Addition,
+                old_line: None,
+                new_line: Some(999),
+                content: "snapshot replacement".into(),
+            });
+        harness.state.invalidate_review_cache();
+        harness.render().unwrap();
+        let refreshed = harness.state.review_cache_build_counts();
+        assert_eq!(refreshed.0, folded.0 + 1, "diff replacement invalidates");
+        assert_eq!(refreshed.1, folded.1 + 1);
+    }
+
+    #[test]
+    fn ordinary_background_chat_streaming_does_not_invalidate_review_caches() {
+        let mut harness =
+            TuiHarness::from_unified_diff("review-cache-chat", workflow_diff(), 96, 24).unwrap();
+        harness.render().unwrap();
+        let initial = harness.state.review_cache_build_counts();
+
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "background question");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.start_next_response("first").unwrap();
+        harness.push_response_delta(" delta").unwrap();
+        harness.replace_response_snapshot("snapshot").unwrap();
+        harness.complete_response(false).unwrap();
+
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.render().unwrap();
+        assert_eq!(harness.state.review_cache_build_counts(), initial);
     }
 
     #[test]

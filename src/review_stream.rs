@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::diff::{DiffFile, FileStatus, LineKind};
+use crate::terminal_text::{cell_width, grapheme_indices};
 
 /// Which side of a source file a line anchor refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -287,6 +288,138 @@ pub(crate) struct ReviewStream {
     cursor: usize,
 }
 
+/// One semantic row's position in a width-specific terminal layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReviewDisplayRow {
+    semantic_row: usize,
+    start: usize,
+    height: usize,
+}
+
+impl ReviewDisplayRow {
+    pub(crate) fn semantic_row(self) -> usize {
+        self.semantic_row
+    }
+
+    pub(crate) fn start(self) -> usize {
+        self.start
+    }
+
+    pub(crate) fn height(self) -> usize {
+        self.height
+    }
+}
+
+/// Compact, width-specific Review geometry. There is exactly one entry per
+/// semantic row; wrapped terminal rows are represented by a start and height.
+#[derive(Clone, Debug)]
+pub(crate) struct ReviewDisplayLayout {
+    semantic_revision: u64,
+    width: usize,
+    rows: Vec<ReviewDisplayRow>,
+    total_height: usize,
+    composer_cursor: Option<usize>,
+}
+
+impl ReviewDisplayLayout {
+    pub(crate) fn for_rows(semantic_revision: u64, rows: &[ReviewRow], width: usize) -> Self {
+        let width = width.max(1);
+        let mut layout_rows = Vec::with_capacity(rows.len());
+        let mut composer_cursor = None;
+        let mut start = 0usize;
+        for (semantic_row, row) in rows.iter().enumerate() {
+            let (height, cursor_line) = review_row_geometry(row, width);
+            let height = height.max(1);
+            layout_rows.push(ReviewDisplayRow {
+                semantic_row,
+                start,
+                height,
+            });
+            if let Some(cursor_line) = cursor_line {
+                composer_cursor = Some(start.saturating_add(cursor_line));
+            }
+            start = start.saturating_add(height);
+        }
+        Self {
+            semantic_revision,
+            width,
+            rows: layout_rows,
+            total_height: start,
+            composer_cursor,
+        }
+    }
+
+    pub(crate) fn matches(&self, semantic_revision: u64, width: usize) -> bool {
+        self.semantic_revision == semantic_revision && self.width == width.max(1)
+    }
+
+    pub(crate) fn rows(&self) -> &[ReviewDisplayRow] {
+        &self.rows
+    }
+
+    pub(crate) fn row(&self, semantic_row: usize) -> Option<ReviewDisplayRow> {
+        self.rows.get(semantic_row).copied()
+    }
+
+    pub(crate) fn total_height(&self) -> usize {
+        self.total_height
+    }
+
+    pub(crate) fn composer_cursor(&self) -> Option<usize> {
+        self.composer_cursor
+    }
+
+    pub(crate) fn viewport_start(&self, scroll: usize) -> usize {
+        self.rows
+            .partition_point(|display| display.start.saturating_add(display.height) <= scroll)
+    }
+}
+
+fn review_row_geometry(row: &ReviewRow, width: usize) -> (usize, Option<usize>) {
+    let ReviewRow::Annotation { block, .. } = row else {
+        return (1, None);
+    };
+    let available = width.saturating_sub(4).max(1);
+    if !matches!(
+        block.part,
+        AnnotationRowPart::Body { .. } | AnnotationRowPart::Prompt
+    ) {
+        return (1, None);
+    }
+    let (height, cursor_line) = wrapped_text_geometry(&block.text, available);
+    let cursor = (block.annotation_id == "zzzzzzzz-inline-composer"
+        || matches!(block.part, AnnotationRowPart::Prompt))
+    .then_some(cursor_line)
+    .flatten();
+    (height, cursor)
+}
+
+/// Matches the editor's terminal-cell wrapping: tabs occupy one cell and
+/// grapheme clusters are never split.
+fn wrapped_text_geometry(text: &str, width: usize) -> (usize, Option<usize>) {
+    let width = width.max(1);
+    let mut row = 0usize;
+    let mut column = 0usize;
+    let mut cursor_line = None;
+    for (_, grapheme) in grapheme_indices(text) {
+        if grapheme == "\n" {
+            row = row.saturating_add(1);
+            column = 0;
+            continue;
+        }
+        let grapheme_width = cell_width(if grapheme == "\t" { " " } else { grapheme });
+        if column > 0 && column.saturating_add(grapheme_width) > width {
+            row = row.saturating_add(1);
+            column = 0;
+        }
+        if grapheme == "▏" {
+            cursor_line = Some(row);
+        }
+        column = column.saturating_add(grapheme_width);
+    }
+    (row.saturating_add(1), cursor_line)
+}
+
 impl ReviewStream {
     #[cfg(test)]
     pub(crate) fn new(files: &[DiffFile], annotations: &[InlineAnnotation]) -> Self {
@@ -318,12 +451,66 @@ impl ReviewStream {
         self.rows.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn cursor(&self) -> usize {
         self.cursor
     }
 
+    #[cfg(test)]
     pub(crate) fn current(&self) -> Option<&ReviewRow> {
         self.rows.get(self.cursor)
+    }
+
+    /// Return the cursor resulting from `movement` without mutating this
+    /// immutable semantic snapshot.  The TUI owns its cursor separately, so
+    /// this lets navigation share one cached stream instead of cloning all
+    /// review rows for every key press.
+    pub(crate) fn moved_cursor(
+        &self,
+        cursor: usize,
+        movement: StreamMovement,
+        viewport_rows: usize,
+    ) -> usize {
+        if self.rows.is_empty() {
+            return 0;
+        }
+        let cursor = cursor.min(self.rows.len() - 1);
+        let half = (viewport_rows / 2).max(1);
+        let page = viewport_rows.max(1);
+        match movement {
+            StreamMovement::Up => cursor.saturating_sub(1),
+            StreamMovement::Down => (cursor + 1).min(self.rows.len() - 1),
+            StreamMovement::HalfPageUp => cursor.saturating_sub(half),
+            StreamMovement::HalfPageDown => (cursor + half).min(self.rows.len() - 1),
+            StreamMovement::PageUp => cursor.saturating_sub(page),
+            StreamMovement::PageDown => (cursor + page).min(self.rows.len() - 1),
+            StreamMovement::First => 0,
+            StreamMovement::Last => self.rows.len() - 1,
+        }
+    }
+
+    /// Find the next annotation header relative to the TUI-owned cursor.
+    pub(crate) fn annotation_after(&self, cursor: usize, forward: bool) -> Option<usize> {
+        let cursor = cursor.min(self.rows.len().saturating_sub(1));
+        let mut headers = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| row.is_annotation_header().then_some(index));
+        if forward {
+            headers
+                .find(|index| *index > cursor)
+                .or_else(|| self.rows.iter().position(ReviewRow::is_annotation_header))
+        } else {
+            self.rows
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, row)| {
+                    (index < cursor && row.is_annotation_header()).then_some(index)
+                })
+                .or_else(|| self.rows.iter().rposition(ReviewRow::is_annotation_header))
+        }
     }
 
     #[cfg(test)]
@@ -331,10 +518,12 @@ impl ReviewStream {
         self.current().map(ReviewRow::key)
     }
 
+    #[cfg(test)]
     pub(crate) fn set_cursor(&mut self, row: usize) {
         self.cursor = row.min(self.rows.len().saturating_sub(1));
     }
 
+    #[cfg(test)]
     pub(crate) fn move_by(&mut self, movement: StreamMovement, viewport_rows: usize) {
         if self.rows.is_empty() {
             self.cursor = 0;
@@ -381,6 +570,7 @@ impl ReviewStream {
         self.move_by(StreamMovement::Last, 1);
     }
 
+    #[cfg(test)]
     pub(crate) fn jump_annotation(&mut self, forward: bool) -> Option<usize> {
         let candidates: Vec<usize> = self
             .rows

@@ -27,7 +27,7 @@ use crate::annotations::{
 use crate::app::{
     command_matches, AgentPhase, AppState, ChatEntry, ComposeTarget, DiffLayout, Effect, Focus,
     InputMode, MarkdownPreview, ModelPickerStage, PendingPrune, PruneChoice, ReadyPrune,
-    ReviewRowSelection, Screen, VersionChoice, INLINE_COMPOSER_ID,
+    ReviewRowSelection, Screen, VersionChoice,
 };
 use crate::chat_render::{render_markdown_mapped, CellSource, MappedMarkdown, MappedRow};
 use crate::chat_selection::{
@@ -50,7 +50,7 @@ use crate::git::Git;
 use crate::highlight::{Highlighter, StyledSegment, SyntectHighlighter};
 use crate::markdown::{escape_html, render_inline_html};
 use crate::remote::{PrReference, RemoteResolver};
-use crate::review_stream::{AnnotationRowPart, ReviewRow};
+use crate::review_stream::{AnnotationRowPart, ReviewDisplayLayout, ReviewRow};
 use crate::storage::{now, Storage};
 use crate::terminal_text::{cell_width, floor_grapheme_boundary, grapheme_indices};
 use crate::work_item::{combine_resolved, resolve_local};
@@ -144,6 +144,7 @@ pub(crate) fn run(
             );
         }
     }
+    state.invalidate_review_cache();
     if let Some(context) = storage.context_for_work_item(&state.work_item.item.id)? {
         state.context_editor = crate::context_editor::ContextEditorState::new(context);
     } else if state
@@ -661,6 +662,7 @@ pub(crate) fn handle_effect(
                     }
                 }
             };
+            state.invalidate_review_cache();
             let stream = state.review_stream();
             if let Some((header, anchor)) =
                 stream
@@ -818,6 +820,7 @@ pub(crate) fn handle_effect(
                 });
                 bridge.send(AgentCommand::StartSide { outbound })?;
                 state.side_starting = true;
+                state.invalidate_review_cache();
                 follow_chat(state);
                 state.agent_progress.record(
                     AgentPhase::Queued,
@@ -917,6 +920,7 @@ pub(crate) fn handle_effect(
                         "Ask follow-up saved as pending after agent delivery failed".into()
                     }
                 };
+                state.invalidate_review_cache();
             }
         }
         Effect::EditAnnotation {
@@ -948,6 +952,7 @@ pub(crate) fn handle_effect(
             } else {
                 state.status = "Annotation updated".into();
             }
+            state.invalidate_review_cache();
         }
         Effect::EditAskMessage {
             annotation_id,
@@ -981,6 +986,7 @@ pub(crate) fn handle_effect(
             } else {
                 "Queued ask edited; correction will follow it".into()
             };
+            state.invalidate_review_cache();
         }
         Effect::RepinAnnotation {
             annotation_id,
@@ -1012,6 +1018,7 @@ pub(crate) fn handle_effect(
             storage.update_annotation_anchor(annotation)?;
             storage.upsert_placement(placement)?;
             state.status = "Annotation anchor re-pinned".into();
+            state.invalidate_review_cache();
         }
         Effect::DeleteAnnotation(annotation_id) => {
             let mut pending_ids = state
@@ -1057,6 +1064,7 @@ pub(crate) fn handle_effect(
                 .retain(|(current, _)| current.id != annotation_id);
             state.ask_threads.remove(&annotation_id);
             state.deleted_annotation = Some((annotation, placements, ask_messages));
+            state.invalidate_review_cache();
             let review_rows = state.review_stream().rows().len();
             state.review_cursor = state.review_cursor.min(review_rows.saturating_sub(1));
             state.review_scroll = state.review_scroll.min(review_rows.saturating_sub(1));
@@ -1089,6 +1097,7 @@ pub(crate) fn handle_effect(
                             .insert(annotation.id.clone(), ask_messages);
                     }
                     state.status = "Annotation restored".into();
+                    state.invalidate_review_cache();
                 }
             } else {
                 state.status = "Nothing to undo".into();
@@ -1591,6 +1600,7 @@ pub(crate) fn handle_effect(
 
 pub(crate) fn handle_effect_failure(state: &mut AppState, effect: &Effect, error: &anyhow::Error) {
     state.status = format!("Action failed: {error:#}");
+    let mut restored_inline_composer = false;
     match effect {
         Effect::CreateAnnotation {
             kind,
@@ -1609,6 +1619,7 @@ pub(crate) fn handle_effect_failure(state: &mut AppState, effect: &Effect, error
             state.compose_target = Some(ComposeTarget::Annotation(*kind));
             state.compose = text.clone();
             state.compose_cursor = state.compose.len();
+            restored_inline_composer = true;
         }
         Effect::FollowUpAsk {
             annotation_id,
@@ -1619,6 +1630,7 @@ pub(crate) fn handle_effect_failure(state: &mut AppState, effect: &Effect, error
             state.compose_target = Some(ComposeTarget::FollowUp(annotation_id.clone()));
             state.compose = text.clone();
             state.compose_cursor = state.compose.len();
+            restored_inline_composer = true;
         }
         Effect::EditAnnotation {
             annotation_id,
@@ -1629,6 +1641,22 @@ pub(crate) fn handle_effect_failure(state: &mut AppState, effect: &Effect, error
             state.compose_target = Some(ComposeTarget::EditAnnotation(annotation_id.clone()));
             state.compose = text.clone();
             state.compose_cursor = state.compose.len();
+            restored_inline_composer = true;
+        }
+        Effect::EditAskMessage {
+            annotation_id,
+            message_id,
+            text,
+        } => {
+            state.input_return_mode = InputMode::Normal;
+            state.input_mode = InputMode::Compose;
+            state.compose_target = Some(ComposeTarget::EditAskMessage {
+                annotation_id: annotation_id.clone(),
+                message_id: message_id.clone(),
+            });
+            state.compose = text.clone();
+            state.compose_cursor = state.compose.len();
+            restored_inline_composer = true;
         }
         Effect::SendChat(text) => {
             state.screen = Screen::Chat;
@@ -1688,6 +1716,7 @@ pub(crate) fn handle_effect_failure(state: &mut AppState, effect: &Effect, error
                 }
             }
             state.side_starting = false;
+            state.invalidate_review_cache();
             // Consume the MAIN viewport snapshot captured before StartSide.
             // Otherwise a failed fork can restore stale navigation during an
             // unrelated later semantic-layout reset.
@@ -1721,6 +1750,9 @@ pub(crate) fn handle_effect_failure(state: &mut AppState, effect: &Effect, error
             );
         }
         _ => {}
+    }
+    if restored_inline_composer {
+        state.invalidate_review_cache();
     }
 }
 
@@ -1809,6 +1841,7 @@ fn open_version(
             storage.ask_messages_for_annotation(&annotation.id)?,
         );
     }
+    state.invalidate_review_cache();
     state.review_scroll = 0;
     state.sync_review_cursor_to_current_file();
     storage.mark_version_opened(version_id)?;
@@ -1874,6 +1907,7 @@ fn expand_context(state: &mut AppState, storage: &Storage, all: bool) -> Result<
         .find(|file| file.display_path == current_path)
         .context("current file disappeared from expanded diff")?;
     state.work_item.repos[state.repo_index].diff.files[state.file_index] = expanded;
+    state.invalidate_review_cache();
     state.cursor = state
         .cursor
         .min(state.current_line_count().saturating_sub(1));
@@ -2453,6 +2487,7 @@ fn refresh_work_item(state: &mut AppState, storage: &Storage, paths: &AppPaths) 
             );
         }
     }
+    state.invalidate_review_cache();
     state.review_scroll = 0;
     state.sync_review_cursor_to_current_file();
     load_version_choices(state, storage)?;
@@ -2519,6 +2554,7 @@ pub(crate) fn handle_agent_envelope(
             state.chat.append(&mut state.pending_side_entries);
             state.side_starting = false;
             state.side_active = true;
+            state.invalidate_review_cache();
             state.side_session_id = Some(side_id.clone());
             state.chat_scroll = 0;
             state.chat_autofollow = true;
@@ -2597,6 +2633,7 @@ pub(crate) fn handle_agent_envelope(
             }
             state.side_starting = false;
             state.side_active = false;
+            state.invalidate_review_cache();
             state.reset_chat_semantics();
             state.agent_progress.queue_depth = 0;
             state.agent_progress.record(
@@ -2614,6 +2651,7 @@ pub(crate) fn handle_agent_envelope(
             state.pending_side_entries.clear();
             state.side_starting = false;
             state.side_active = false;
+            state.invalidate_review_cache();
             state.reset_chat_semantics();
             state.agent_progress.queue_depth = 0;
             state.agent_progress.record(
@@ -2756,6 +2794,7 @@ fn restore_main_surface(state: &mut AppState) {
     state.pending_side_entries.clear();
     state.side_starting = false;
     state.side_active = false;
+    state.invalidate_review_cache();
     state.side_session_id = None;
     for id in state.side_outbound_ids.drain() {
         state.pending_outbound_ids.remove(&id);
@@ -2795,6 +2834,7 @@ pub(crate) fn handle_agent_event(
             resumed,
             resume_warning,
         } => {
+            state.finish_history_restore();
             storage.activate_session(&SessionRecord {
                 id: session_id,
                 work_item_id: state.work_item.item.id.clone(),
@@ -2825,19 +2865,9 @@ pub(crate) fn handle_agent_event(
             };
         }
         AgentEvent::HistoryLoaded(history) => {
-            if state.chat.is_empty() {
-                state.chat = history
-                    .into_iter()
-                    .map(|entry| ChatEntry {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        role: entry.role,
-                        text: entry.text,
-                        streaming: false,
-                        annotation_id: None,
-                        outbound_id: None,
-                        error: None,
-                    })
-                    .collect();
+            let previous_len = state.chat.len();
+            state.append_resumed_history(history);
+            if state.chat.len() != previous_len {
                 follow_chat(state);
             }
         }
@@ -3071,6 +3101,10 @@ pub(crate) fn handle_agent_event(
             outbound,
             first_delta,
         } => {
+            let changes_review = matches!(
+                &outbound,
+                OutboundKind::Ask { .. } | OutboundKind::CommentBatch { .. }
+            );
             let first_delta_len = first_delta.len();
             let annotation_id = match &outbound {
                 OutboundKind::Ask {
@@ -3180,6 +3214,9 @@ pub(crate) fn handle_agent_event(
                 Some(outbound_id.clone()),
             );
             state.status = "Copilot is responding…".into();
+            if changes_review {
+                state.invalidate_review_cache();
+            }
         }
         AgentEvent::ResponseDelta { outbound_id, delta } => {
             state.agent_progress.record(
@@ -3198,11 +3235,13 @@ pub(crate) fn handle_agent_event(
             {
                 state.context_editor.apply_generation_partial(&outbound_id);
             }
+            let mut changes_review = false;
             if let Some(message) = state.chat.iter_mut().find(|message| {
                 message.streaming && message.outbound_id.as_deref() == Some(outbound_id.as_str())
             }) {
                 message.text.push_str(&delta);
                 if let Some(annotation_id) = &message.annotation_id {
+                    changes_review = true;
                     storage.update_latest_ask_response(annotation_id, &message.text)?;
                     if let Some(response) =
                         state.ask_threads.get_mut(annotation_id).and_then(|thread| {
@@ -3217,6 +3256,9 @@ pub(crate) fn handle_agent_event(
                 }
             }
             follow_chat(state);
+            if changes_review {
+                state.invalidate_review_cache();
+            }
         }
         AgentEvent::ResponseSnapshot { outbound_id, text } => {
             state.agent_progress.record(
@@ -3229,11 +3271,13 @@ pub(crate) fn handle_agent_event(
                 state.context_editor.raw_generation_stream = text.clone();
                 state.context_editor.apply_generation_partial(&outbound_id);
             }
+            let mut changes_review = false;
             if let Some(message) = state.chat.iter_mut().find(|message| {
                 message.streaming && message.outbound_id.as_deref() == Some(outbound_id.as_str())
             }) {
                 message.text = text;
                 if let Some(annotation_id) = &message.annotation_id {
+                    changes_review = true;
                     storage.update_latest_ask_response(annotation_id, &message.text)?;
                     if let Some(response) =
                         state.ask_threads.get_mut(annotation_id).and_then(|thread| {
@@ -3248,6 +3292,9 @@ pub(crate) fn handle_agent_event(
                 }
             }
             follow_chat(state);
+            if changes_review {
+                state.invalidate_review_cache();
+            }
         }
         AgentEvent::ResponseComplete {
             outbound_id,
@@ -3274,9 +3321,11 @@ pub(crate) fn handle_agent_event(
                 };
             }
             let mut response_marked = false;
+            let mut changes_review = false;
             if let Some(message) = state.chat.iter_mut().find(|message| {
                 message.streaming && message.outbound_id.as_deref() == Some(outbound_id.as_str())
             }) {
+                changes_review = message.annotation_id.is_some();
                 message.streaming = false;
                 if aborted {
                     message.error = Some("stopped".into());
@@ -3311,6 +3360,9 @@ pub(crate) fn handle_agent_event(
                     format!("Outbound {} reached SDK idle", short_id(&outbound_id)),
                     None,
                 );
+            }
+            if changes_review {
+                state.invalidate_review_cache();
             }
         }
         AgentEvent::StopSettledAlreadyIdle => {
@@ -3359,6 +3411,10 @@ pub(crate) fn handle_agent_event(
                 chat.streaming = false;
                 chat.error = Some(message.clone());
             }
+            let changes_review = matches!(
+                &outbound,
+                OutboundKind::Ask { .. } | OutboundKind::CommentBatch { .. }
+            );
             match outbound {
                 OutboundKind::Ask { annotation_id, .. } => {
                     if let Some((annotation, _)) = state
@@ -3391,6 +3447,9 @@ pub(crate) fn handle_agent_event(
             } else {
                 format!("Copilot turn failed: {message}")
             };
+            if changes_review {
+                state.invalidate_review_cache();
+            }
         }
         AgentEvent::Activity { outbound_id, label } => {
             state.agent_activity = label.clone();
@@ -4809,30 +4868,24 @@ fn render_unified(
     state.set_review_content_width(body.width.saturating_sub(9) as usize);
     let stream = state.review_stream();
     sync_active_follow_up_cursor(state, stream.rows());
-    let (layout, semantic_rows, composer_cursor) =
-        review_display_layout(stream.rows(), body.width.max(1) as usize);
-    clamp_review_display_scroll(
-        state,
-        &semantic_rows,
-        body.height.max(1) as usize,
-        composer_cursor,
-    );
+    let layout = state.review_display_layout(stream.rows(), body.width.max(1) as usize);
+    clamp_review_display_scroll(state, &layout, body.height.max(1) as usize);
     let viewport_end = state.review_scroll.saturating_add(body.height as usize);
     let search = (!state.search.is_empty()).then_some(state.search.as_str());
     let mut lines = Vec::with_capacity(body.height as usize);
-    for display in layout.iter().filter(|display| {
-        display.start < viewport_end
-            && display.start.saturating_add(display.height) > state.review_scroll
-    }) {
-        let row = &stream.rows()[display.semantic_row];
-        let skip = state.review_scroll.saturating_sub(display.start);
+    for display in layout.rows()[layout.viewport_start(state.review_scroll)..]
+        .iter()
+        .take_while(|display| display.start() < viewport_end)
+    {
+        let row = &stream.rows()[display.semantic_row()];
+        let skip = state.review_scroll.saturating_sub(display.start());
         let take = viewport_end
-            .saturating_sub(display.start.max(state.review_scroll))
-            .min(display.height.saturating_sub(skip));
+            .saturating_sub(display.start().max(state.review_scroll))
+            .min(display.height().saturating_sub(skip));
         lines.extend(
             review_row_lines_with_search(
                 row,
-                review_row_selection(state, row, display.semantic_row),
+                review_row_selection(state, row, display.semantic_row()),
                 body.width.max(1) as usize,
                 state.review_horizontal_scroll,
                 highlighter,
@@ -4898,28 +4951,22 @@ fn render_split(
     let stream = state.review_stream();
     sync_active_follow_up_cursor(state, stream.rows());
     let selection_side = state.review_selection_side();
-    let (layout, semantic_rows, composer_cursor) =
-        review_display_layout(stream.rows(), body.width.max(1) as usize);
-    clamp_review_display_scroll(
-        state,
-        &semantic_rows,
-        body.height.max(1) as usize,
-        composer_cursor,
-    );
+    let layout = state.review_display_layout(stream.rows(), body.width.max(1) as usize);
+    clamp_review_display_scroll(state, &layout, body.height.max(1) as usize);
     let viewport_end = state.review_scroll.saturating_add(body.height as usize);
     let search = (!state.search.is_empty()).then_some(state.search.as_str());
     let mut rendered_rows = Vec::new();
-    for display in layout.iter().filter(|display| {
-        display.start < viewport_end
-            && display.start.saturating_add(display.height) > state.review_scroll
-    }) {
-        let index = display.semantic_row;
+    for display in layout.rows()[layout.viewport_start(state.review_scroll)..]
+        .iter()
+        .take_while(|display| display.start() < viewport_end)
+    {
+        let index = display.semantic_row();
         let row = &stream.rows()[index];
         let selection = review_row_selection(state, row, index);
-        let skip = state.review_scroll.saturating_sub(display.start);
+        let skip = state.review_scroll.saturating_sub(display.start());
         let take = viewport_end
-            .saturating_sub(display.start.max(state.review_scroll))
-            .min(display.height.saturating_sub(skip));
+            .saturating_sub(display.start().max(state.review_scroll))
+            .min(display.height().saturating_sub(skip));
         match row {
             ReviewRow::Source {
                 file,
@@ -5016,38 +5063,6 @@ fn render_split(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ReviewDisplayRow {
-    semantic_row: usize,
-    start: usize,
-    height: usize,
-}
-
-fn review_display_layout(
-    rows: &[ReviewRow],
-    width: usize,
-) -> (Vec<ReviewDisplayRow>, Vec<usize>, Option<usize>) {
-    let mut layout = Vec::with_capacity(rows.len());
-    let mut semantic_rows = Vec::with_capacity(rows.len());
-    let mut composer_cursor = None;
-    let mut start = 0usize;
-    for (semantic_row, row) in rows.iter().enumerate() {
-        let (height, cursor_line) = review_row_geometry(row, width);
-        let height = height.max(1);
-        layout.push(ReviewDisplayRow {
-            semantic_row,
-            start,
-            height,
-        });
-        semantic_rows.extend(std::iter::repeat_n(semantic_row, height));
-        if let Some(cursor_line) = cursor_line {
-            composer_cursor = Some(start.saturating_add(cursor_line));
-        }
-        start = start.saturating_add(height);
-    }
-    (layout, semantic_rows, composer_cursor)
-}
-
 /// Keep the semantic cursor attached to the prompt row when streamed Ask
 /// messages insert body rows above it.  The row index is intentionally
 /// refreshed from the stable annotation ID on every render.
@@ -5070,46 +5085,25 @@ fn sync_active_follow_up_cursor(state: &mut AppState, rows: &[ReviewRow]) {
     }
 }
 
-fn review_row_geometry(row: &ReviewRow, width: usize) -> (usize, Option<usize>) {
-    let ReviewRow::Annotation { block, .. } = row else {
-        return (1, None);
-    };
-    let available = width.saturating_sub(4).max(1);
-    if !matches!(
-        block.part,
-        AnnotationRowPart::Body { .. } | AnnotationRowPart::Prompt
-    ) {
-        return (1, None);
-    }
-    let lines = wrapped_editor_lines(&block.text, block.text.len(), available).0;
-    let cursor = (block.annotation_id == INLINE_COMPOSER_ID
-        || matches!(block.part, AnnotationRowPart::Prompt))
-    .then(|| lines.iter().position(|line| line.contains('▏')))
-    .flatten();
-    (lines.len().max(1), cursor)
-}
-
 fn clamp_review_display_scroll(
     state: &mut AppState,
-    semantic_rows: &[usize],
+    layout: &ReviewDisplayLayout,
     viewport: usize,
-    composer_cursor: Option<usize>,
 ) {
-    if let Some(cursor) = composer_cursor {
+    if let Some(cursor) = layout.composer_cursor() {
         if cursor < state.review_scroll {
             state.review_scroll = cursor;
         } else if cursor >= state.review_scroll.saturating_add(viewport) {
             state.review_scroll = cursor.saturating_add(1).saturating_sub(viewport);
         }
     }
-    if composer_cursor.is_none() {
-        let selected_start = semantic_rows
-            .iter()
-            .position(|row| *row == state.review_cursor);
-        let selected_end = semantic_rows
-            .iter()
-            .rposition(|row| *row == state.review_cursor);
-        if let (Some(start), Some(end)) = (selected_start, selected_end) {
+    if layout.composer_cursor().is_none() {
+        if let Some(display) = layout.row(state.review_cursor) {
+            let start = display.start();
+            let end = display
+                .start()
+                .saturating_add(display.height())
+                .saturating_sub(1);
             if start < state.review_scroll {
                 state.review_scroll = start;
             } else if end >= state.review_scroll.saturating_add(viewport) {
@@ -5119,7 +5113,7 @@ fn clamp_review_display_scroll(
     }
     state.review_scroll = state
         .review_scroll
-        .min(semantic_rows.len().saturating_sub(viewport));
+        .min(layout.total_height().saturating_sub(viewport));
 }
 
 fn render_compact_inline_composer(
@@ -8641,6 +8635,42 @@ mod tests {
             ]),
         )
         .unwrap();
+        state.chat.push(ChatEntry {
+            id: "local-during-restore".into(),
+            role: "you".into(),
+            text: "Typed while history was loading".into(),
+            streaming: false,
+            annotation_id: None,
+            outbound_id: Some("local".into()),
+            error: None,
+        });
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::HistoryLoaded(vec![HistoryEntry {
+                role: "you".into(),
+                text: "Later restored question".into(),
+            }]),
+        )
+        .unwrap();
+        assert_eq!(state.chat.len(), 4, "bounded history chunks append");
+        assert_eq!(state.chat[2].text, "Later restored question");
+        assert_eq!(state.chat[3].id, "local-during-restore");
+        state.finish_history_restore();
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::HistoryLoaded(vec![HistoryEntry {
+                role: "copilot".into(),
+                text: "late duplicate history".into(),
+            }]),
+        )
+        .unwrap();
+        assert_eq!(
+            state.chat.len(),
+            4,
+            "history after SessionReady cannot overwrite local chat"
+        );
         state.pending_outbound_ids.insert("outbound".into());
         handle_agent_event(
             &mut state,
@@ -8671,9 +8701,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(state.chat.len(), 3);
-        assert_eq!(state.chat[2].text, "New answer");
-        assert!(!state.chat[2].streaming);
+        assert_eq!(state.chat.len(), 5);
+        assert_eq!(state.chat[4].text, "New answer");
+        assert!(!state.chat[4].streaming);
         assert!(state.pending_outbound_ids.is_empty());
     }
 

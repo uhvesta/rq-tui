@@ -41,6 +41,7 @@ const SDK_CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 const SIDE_LEASE_TTL: Duration = Duration::from_secs(30);
 const SIDE_LEASE_HEARTBEAT: Duration = Duration::from_secs(5);
 const SIDE_CLEANUP_RETRY: Duration = Duration::from_secs(30);
+const HISTORY_EVENT_CHUNK_SIZE: usize = 128;
 
 fn apply_side_boundary(outbound: &mut Outbound) {
     outbound.text = format!("{SIDE_BOUNDARY}\n\nSide question:\n{}", outbound.text);
@@ -731,6 +732,11 @@ impl ControlledAgent {
             == Some(std::ffi::OsStr::new("1"));
         let resumed_session =
             env::var_os("RQ_TUI_CONTROLLED_RESUMED").as_deref() == Some(std::ffi::OsStr::new("1"));
+        let resumed_history_entries = env::var("RQ_TUI_CONTROLLED_RESUMED_HISTORY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_default()
+            .min(100_000);
         std::thread::spawn(move || {
             let storage = match Storage::open(&config.database_path) {
                 Ok(storage) => storage,
@@ -868,6 +874,30 @@ impl ControlledAgent {
                         ),
                     );
                 }
+            }
+            for start in (0..resumed_history_entries).step_by(HISTORY_EVENT_CHUNK_SIZE) {
+                let end = start
+                    .saturating_add(HISTORY_EVENT_CHUNK_SIZE)
+                    .min(resumed_history_entries);
+                let history = (start..end)
+                    .map(|index| HistoryEntry {
+                        role: if index % 2 == 0 {
+                            "user".into()
+                        } else {
+                            "assistant".into()
+                        },
+                        text: format!(
+                            "Controlled resumed history message {index}\n\n\
+                             - bounded history restore\n\
+                             - keyboard input remains actionable"
+                        ),
+                    })
+                    .collect();
+                Self::schedule_shared(
+                    &state,
+                    Duration::ZERO,
+                    AgentEventEnvelope::agent(AgentLane::Main, AgentEvent::HistoryLoaded(history)),
+                );
             }
             Self::schedule_shared(
                 &state,
@@ -2795,7 +2825,10 @@ async fn worker(
         match sdk_call("Copilot history reload", session.get_events()).await {
             Ok(history) => {
                 resumed_active = resumed_active_from_history(&history, session.id());
-                main_events.emit(AgentEvent::HistoryLoaded(history_entries(&history)));
+                let history = history_entries(&history);
+                for chunk in history.chunks(HISTORY_EVENT_CHUNK_SIZE) {
+                    main_events.emit(AgentEvent::HistoryLoaded(chunk.to_vec()));
+                }
             }
             Err(error) => {
                 let warning = format!(

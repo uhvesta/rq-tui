@@ -33,6 +33,7 @@ CHAT_ROWS_RE = re.compile(r"rows (\d+)-(\d+)/(\d+)")
 # acknowledge a new input mode within this bound.
 NAVIGATION_BURST = b"j" * 2048 + b"k" * 2048
 BURST_RESPONSE_TIMEOUT = 2.0
+ENTRY_RESPONSE_TIMEOUT = 4.0
 
 
 def git(repo: Path, *args: str) -> None:
@@ -568,6 +569,62 @@ def main() -> int:
         # Rendering must syntax-highlight only the viewport; a full-diff pass
         # here starves Crossterm input for many seconds.
         repo = make_fixture(root, extra_changed_lines=12_000)
+        entry_latency = 0.0
+        resumed_input_latency = 0.0
+        entry_started = time.monotonic()
+        resume_probe = Child(
+            binary,
+            repo,
+            app_root,
+            {
+                "RQ_TUI_CONTROLLED_STARTUP_FLOOD": "1",
+                "RQ_TUI_CONTROLLED_RESUMED": "1",
+                "RQ_TUI_CONTROLLED_RESUMED_HISTORY": "1024",
+            },
+        )
+        try:
+            resume_probe.resize(100, 24)
+            resume_probe.wait_for(
+                "Inspecting local repositories and computing diffs", timeout=8
+            )
+            resume_probe.wait_for("entering TUI", timeout=8)
+            resume_probe.wait_for("Review", timeout=8)
+            entry_latency = time.monotonic() - entry_started
+            if entry_latency > ENTRY_RESPONSE_TIMEOUT:
+                raise AssertionError(
+                    resume_probe.failure(
+                        f"first Review frame took {entry_latency:.3f}s "
+                        f"(budget {ENTRY_RESPONSE_TIMEOUT:.3f}s)"
+                    )
+                )
+            resume_probe.wait_for("COPILOT MAIN", timeout=8)
+            if resume_probe.poll() is not None:
+                raise AssertionError(
+                    resume_probe.failure("TUI exited during resumed entry")
+                )
+
+            # PTY-32: production resume history is delivered in bounded chunks.
+            # Command mode must remain actionable while 1,000+ restored messages
+            # and the startup activity flood are still being applied.
+            resume_probe.send(b":")
+            resumed_input_latency = resume_probe.wait_for_screen_within(
+                "COMMAND MODE · Command palette", BURST_RESPONSE_TIMEOUT
+            )
+            resume_probe.send(b"\x1b")
+            resume_probe.wait_for_screen_state(
+                ("NORMAL",),
+                ("COMMAND MODE · Command palette",),
+                timeout=4,
+            )
+            resume_probe.wait_for_screen("session resumed", timeout=4)
+            resume_probe.send(b":q\r")
+            if resume_probe.wait_for_exit(timeout=8) != 0:
+                raise AssertionError(
+                    resume_probe.failure("resumed history probe did not exit cleanly")
+                )
+        finally:
+            resume_probe.close()
+
         child = Child(
             binary,
             repo,
@@ -900,6 +957,8 @@ def main() -> int:
 
     print(
         "PTY_SMOKE_OK: entry resize prune-progress chat-composer "
+        f"first-frame={entry_latency:.3f}s "
+        f"resumed-input={resumed_input_latency:.3f}s "
         f"held-key-burst={burst_latency:.3f}s ctrl-w clean-exit no-panic"
     )
     return 0
