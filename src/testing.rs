@@ -2482,7 +2482,13 @@ mod tests {
         assert!(frame.contains('▏'), "{frame}");
         assert!(frame.contains("↑/↓ scroll"), "{frame}");
         assert!(frame.contains('╰'), "{frame}");
-        assert!(frame.contains("INSERT"), "{frame}");
+        assert!(frame.contains("Review · files → diff"), "{frame}");
+        assert!(
+            frame.contains("INSERT · Enter send · Esc keep · ^C discard"),
+            "{frame}"
+        );
+        assert!(frame.contains("COPILOT MAIN CONNECTING"), "{frame}");
+        assert!(frame.contains("event 0ms ago"), "{frame}");
     }
 
     #[test]

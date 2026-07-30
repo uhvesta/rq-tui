@@ -4746,19 +4746,31 @@ fn render_header(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
         crate::app::Focus::Chat => "chat",
         crate::app::Focus::InlineAsk => "files → diff → inline ask",
     };
-    let title = format!(
-        " {} — Review  │  Focus: {}  │  {} > {}  │  {}/{} files{} ",
-        state.work_item.item.name,
-        focus,
-        repo,
-        file,
-        state.file_index.saturating_add(1),
-        state
-            .current_diff()
-            .map(|diff| diff.files.len())
-            .unwrap_or(0),
-        context_title,
-    );
+    let file_count = state
+        .current_diff()
+        .map(|diff| diff.files.len())
+        .unwrap_or(0);
+    let title = if area.width < 60 {
+        fit_terminal_text(
+            &format!(
+                " Review · {focus} · {}/{} · {file} ",
+                state.file_index.saturating_add(1),
+                file_count,
+            ),
+            area.width as usize,
+        )
+    } else {
+        format!(
+            " {} — Review  │  Focus: {}  │  {} > {}  │  {}/{} files{} ",
+            state.work_item.item.name,
+            focus,
+            repo,
+            file,
+            state.file_index.saturating_add(1),
+            file_count,
+            context_title,
+        )
+    };
     frame.render_widget(
         Paragraph::new(title).block(Block::default().borders(Borders::BOTTOM)),
         area,
@@ -5755,6 +5767,7 @@ fn paint_content_columns(
 }
 
 fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    let compact = area.width < 60;
     let mode = match state.input_mode {
         InputMode::Normal => "NORMAL",
         InputMode::Visual => "VISUAL",
@@ -5781,7 +5794,12 @@ fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 )
             ) =>
         {
-            "INSERT  Enter/Ctrl-S submit · Shift-Enter newline · Esc keep · Ctrl-C discard".into()
+            if compact {
+                "INSERT · Enter send · Esc keep · ^C discard".into()
+            } else {
+                "INSERT  Enter/Ctrl-S submit · Shift-Enter newline · Esc keep · Ctrl-C discard"
+                    .into()
+            }
         }
         InputMode::Compose => format!(
             "{mode}  {}  (Enter/Ctrl-S submit · Shift-Enter newline · Esc cancel)",
@@ -5823,11 +5841,15 @@ fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 )
             }
         }
+        _ if state.status.is_empty() && compact => {
+            format!("{mode} · j/k move · a ask · : command")
+        }
         _ if state.status.is_empty() => {
             format!(
                 "{mode}  j/k move · h/l file · t files · v select · a ask · c comment · Tab chat · : command"
             )
         }
+        _ if compact => format!("{mode} · {}", state.status),
         _ => format!(
             "{mode} · {} · j/k move · h/l file · t files · v select · a ask · c comment · Tab chat · : command",
             state.status
@@ -5836,18 +5858,27 @@ fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     };
     let progress = &state.agent_progress;
     let lane = visible_lane(state);
-    let liveness = format!(
-        "COPILOT {lane} {} {} · last SDK event {} ago · {} · :agent-status",
-        progress.phase.label(),
-        format_duration(progress.elapsed()),
-        format_duration(progress.last_event_age()),
-        progress.summary,
-    );
+    let liveness = if compact {
+        format!(
+            "COPILOT {lane} {} {} · event {} ago",
+            progress.phase.label(),
+            format_duration(progress.elapsed()),
+            format_duration(progress.last_event_age()),
+        )
+    } else {
+        format!(
+            "COPILOT {lane} {} {} · last SDK event {} ago · {} · :agent-status",
+            progress.phase.label(),
+            format_duration(progress.elapsed()),
+            format_duration(progress.last_event_age()),
+            progress.summary,
+        )
+    };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::raw(content),
+            Line::raw(fit_terminal_text(&content, area.width as usize)),
             Line::styled(
-                liveness,
+                fit_terminal_text(&liveness, area.width as usize),
                 Style::default().fg(if progress.phase.is_active() {
                     Color::Cyan
                 } else {
