@@ -341,6 +341,9 @@ impl ChatSelection {
                 }
             }
         }
+        if self.mode == ChatSelectionMode::Line && !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
         output
     }
 
@@ -1476,7 +1479,7 @@ mod tests {
                     include_speaker_labels: false
                 }
             ),
-            "hello"
+            "hello\n"
         );
     }
 

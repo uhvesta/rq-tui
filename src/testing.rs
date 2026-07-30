@@ -1064,6 +1064,26 @@ pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Re
         "compose_scroll: {}\n",
         harness.state.compose_scroll
     ));
+    output.push_str(&format!("review_scroll: {}\n", harness.state.review_scroll));
+    output.push_str(&format!(
+        "review_cursor: {} · composer_cursor_rows: {:?}\n",
+        harness.state.review_cursor,
+        harness
+            .state
+            .review_stream()
+            .rows()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| match row {
+                crate::review_stream::ReviewRow::Annotation { block, .. }
+                    if block.text.contains('▏') =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    ));
     output.push_str(&format!("chat_scroll: {}\n", harness.chat_scroll()));
     output.push_str(&format!("last_yank: {:?}\n", harness.last_yank()));
     output.push_str(&format!("effects: {:?}\n", harness.captured_effects()));
@@ -1127,6 +1147,121 @@ mod tests {
         let frame = harness.render().unwrap();
         assert!(frame.contains("fixture — Review"));
         assert!(frame.contains("new"));
+    }
+
+    #[test]
+    fn review_navigation_is_one_cross_file_semantic_stream() {
+        let output = super::run_ui_script(
+            "manyfiles",
+            100,
+            28,
+            "key j\nkey j\nkey j\nkey j\nkey j\nsnapshot crossed\n",
+        )
+        .unwrap();
+        assert!(output.contains("repo > src/module_1.rs"));
+        assert!(output.contains("repo > src/module_2.rs  │  2/12 files"));
+        assert!(output.contains("M repo > src/module_3.rs"));
+    }
+
+    #[test]
+    fn inline_blocks_are_bordered_navigable_foldable_stream_rows() {
+        let mut harness = TuiHarness::from_unified_diff("inline", workflow_diff(), 72, 20).unwrap();
+        harness.key(key(KeyCode::Char('c'))).unwrap();
+        type_text(
+            &mut harness,
+            "a deliberately long comment that wraps inside its border without overflowing",
+        );
+        harness.key(key(KeyCode::Enter)).unwrap();
+        let saved = harness.render().unwrap();
+        assert!(saved.contains("╭─ Comment · src/lib.rs R10"));
+        assert!(saved.contains("╰────────────────"));
+
+        harness.key(key(KeyCode::Char('j'))).unwrap();
+        assert!(harness.render().unwrap().contains("╭─ ❯ Comment"));
+        harness.key(key(KeyCode::Char('j'))).unwrap();
+        harness.key(key(KeyCode::Char('z'))).unwrap();
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        let collapsed = harness.render().unwrap();
+        assert!(collapsed.contains("▸ Comment · src/lib.rs R10"));
+        assert!(!collapsed.contains("deliberately long comment"));
+    }
+
+    #[test]
+    fn i_on_an_ask_block_starts_a_new_follow_up_instead_of_editing_history() {
+        let mut harness =
+            TuiHarness::from_unified_diff("follow-up", workflow_diff(), 90, 22).unwrap();
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        type_text(&mut harness, "original question");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.stream_next_response(&["first answer"]).unwrap();
+        harness.key(key(KeyCode::Char(']'))).unwrap();
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        assert_eq!(harness.mode(), "INSERT");
+        assert!(harness.compose_text().is_empty());
+        type_text(&mut harness, "new follow up");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        assert!(harness
+            .captured_effects()
+            .iter()
+            .any(|effect| effect.contains("FollowUpAsk") && effect.contains("new follow up")));
+        assert!(!harness
+            .captured_effects()
+            .iter()
+            .any(|effect| effect.contains("EditAskMessage")));
+    }
+
+    #[test]
+    fn normal_mode_gm_previews_and_restores_a_preserved_inline_draft() {
+        let mut harness =
+            TuiHarness::from_unified_diff("draft-preview", workflow_diff(), 82, 21).unwrap();
+        harness.key(key(KeyCode::Char('c'))).unwrap();
+        type_text(&mut harness, "# Draft\n\npreview **this**");
+        harness.key(key(KeyCode::Esc)).unwrap();
+        assert_eq!(harness.mode(), "NORMAL");
+        assert_eq!(harness.compose_text(), "# Draft\n\npreview **this**");
+        harness.key(key(KeyCode::Char('g'))).unwrap();
+        harness.key(key(KeyCode::Char('m'))).unwrap();
+        let preview = harness.render().unwrap();
+        assert!(preview.contains("Markdown preview"));
+        assert!(preview.contains("Draft"));
+        harness.key(key(KeyCode::Esc)).unwrap();
+        assert_eq!(harness.mode(), "NORMAL");
+        assert_eq!(harness.compose_text(), "# Draft\n\npreview **this**");
+    }
+
+    #[test]
+    fn queued_chat_prompts_can_be_edited_before_delivery() {
+        let mut harness =
+            TuiHarness::from_unified_diff("queue-edit", workflow_diff(), 84, 22).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "active prompt");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.start_next_response("working").unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "queued original");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "queue");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.key(key(KeyCode::Down)).unwrap();
+        harness.key(key(KeyCode::Char('e'))).unwrap();
+        assert_eq!(harness.mode(), "INSERT");
+        assert_eq!(harness.compose_text(), "queued original");
+        harness
+            .key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
+        type_text(&mut harness, "queued replacement");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        assert!(harness
+            .captured_effects()
+            .iter()
+            .any(|effect| effect.contains("CancelQueued")));
+        assert!(harness
+            .captured_effects()
+            .iter()
+            .any(|effect| effect.contains("SendChat(\"queued replacement\")")));
     }
 
     #[test]
@@ -1198,7 +1333,7 @@ mod tests {
         harness.key(key(KeyCode::Char('j'))).unwrap();
         harness.key(key(KeyCode::Char('j'))).unwrap();
         assert_eq!(harness.mode(), "VISUAL");
-        assert!(harness.selected_cell_count().unwrap() > 0);
+        assert!(harness.selected_cell_count().unwrap() > 220);
         harness.key(key(KeyCode::Char('a'))).unwrap();
         assert!(harness.render().unwrap().contains("new lines 10-12"));
         type_text(&mut harness, "Explain this range");
@@ -1391,14 +1526,14 @@ mod tests {
         harness.key(key(KeyCode::Char('v'))).unwrap();
         harness.key(key(KeyCode::Char('j'))).unwrap();
         let split_selected = harness.selected_cell_count().unwrap();
-        assert!(split_selected > 0);
+        assert!(split_selected > 110);
 
         harness.key(key(KeyCode::Char(':'))).unwrap();
         type_text(&mut harness, "diff unified");
         harness.key(key(KeyCode::Enter)).unwrap();
         harness.key(key(KeyCode::Char('v'))).unwrap();
         harness.key(key(KeyCode::Char('j'))).unwrap();
-        assert!(harness.selected_cell_count().unwrap() > 0);
+        assert!(harness.selected_cell_count().unwrap() > 110);
 
         harness.key(key(KeyCode::Esc)).unwrap();
         harness.key(key(KeyCode::Char('l'))).unwrap();
@@ -1503,7 +1638,7 @@ mod tests {
         assert!(harness.render().unwrap().contains("VISUAL LINE"));
         assert!(harness.selected_cell_count().unwrap() > 2);
         harness.key(key(KeyCode::Char('y'))).unwrap();
-        assert_eq!(harness.last_yank(), Some("## café 👩\u{200d}💻"));
+        assert_eq!(harness.last_yank(), Some("## café 👩\u{200d}💻\n"));
 
         harness
             .key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL))
@@ -1876,8 +2011,9 @@ mod tests {
         assert!(frame.contains("Ask"));
         assert!(frame.contains("lines "));
         assert!(frame.contains("↑/↓ scroll"));
-        assert!(frame.contains("internal vertic"));
-        assert!(frame.contains("al viewport"));
+        assert!(frame.contains("cursor visible"));
+        assert!(frame.contains("vertical viewport."));
+        assert!(frame.contains('▏'));
         assert!(frame.contains("Enter submit"));
     }
 
@@ -2156,9 +2292,9 @@ mod tests {
         assert!(markdown.contains("fn main()"));
         assert!(!markdown.contains("**safe**"));
 
-        harness.resize(20, 5);
+        harness.resize(33, 9);
         let tiny = harness.render().unwrap();
         assert!(tiny.contains("needs at"));
-        assert!(tiny.contains("32×8"));
+        assert!(tiny.contains("40×9"));
     }
 }

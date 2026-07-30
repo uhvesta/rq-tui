@@ -10,8 +10,15 @@ use crate::chat_selection::{
 };
 use crate::copilot::{ModelOption, ModelSelection};
 use crate::diff::{DiffFile, DiffSet, LineKind};
-use crate::domain::{AnchorSide, Annotation, AnnotationKind, AskMessage, Placement, Version};
+use crate::domain::{
+    AnchorSide, Annotation, AnnotationKind, AskMessage, DeliveryState, Placement, Version,
+};
+use crate::review_stream::{
+    InlineAnnotation, ReviewFile, ReviewRow, ReviewStream, SourceSide, StreamMovement,
+};
 use crate::work_item::ResolvedWorkItem;
+
+const INLINE_COMPOSER_ID: &str = "zzzzzzzz-inline-composer";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Screen {
@@ -153,6 +160,7 @@ pub(crate) enum ComposeTarget {
         annotation_id: String,
         message_id: String,
     },
+    EditQueued(String),
     Chat,
     Context,
     SettingBase,
@@ -435,6 +443,10 @@ pub(crate) struct AppState {
     pub(crate) file_index: usize,
     pub(crate) cursor: usize,
     pub(crate) scroll: usize,
+    /// Cursor and viewport in the one continuous semantic Review stream.
+    /// `cursor` remains the source-row index used for annotations/visual mode.
+    pub(crate) review_cursor: usize,
+    pub(crate) review_scroll: usize,
     pub(crate) visual_anchor: Option<usize>,
     /// Width-specific renderer index. Cursor and selection endpoints remain
     /// source based, therefore survive a layout rebuild.
@@ -511,7 +523,7 @@ impl AppState {
     const CTRL_W_TIMEOUT: Duration = Duration::from_millis(1_500);
 
     pub(crate) fn new(work_item: ResolvedWorkItem) -> Self {
-        Self {
+        let mut state = Self {
             work_item,
             screen: Screen::Review,
             previous_screen: Screen::Review,
@@ -523,6 +535,8 @@ impl AppState {
             file_index: 0,
             cursor: 0,
             scroll: 0,
+            review_cursor: 0,
+            review_scroll: 0,
             visual_anchor: None,
             chat_layout: None,
             chat_navigation: None,
@@ -590,7 +604,9 @@ impl AppState {
             settings_index: 0,
             should_quit: false,
             viewport_height: 20,
-        }
+        };
+        state.sync_review_cursor_to_current_file();
+        state
     }
 
     pub(crate) fn current_diff(&self) -> Option<&DiffSet> {
@@ -626,6 +642,332 @@ impl AppState {
         self.current_file()
             .map(|file| file.visible_lines().count())
             .unwrap_or(0)
+    }
+
+    pub(crate) fn review_stream(&self) -> ReviewStream {
+        let files = self
+            .work_item
+            .repos
+            .iter()
+            .flat_map(|repo| {
+                repo.diff.files.iter().cloned().map(|file| {
+                    ReviewFile::new(repo.record.id.clone(), repo.record.name.clone(), file)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut annotations = self
+            .annotations
+            .iter()
+            .map(|(annotation, placement)| {
+                let marker = if placement.outdated {
+                    "!"
+                } else if placement.ambiguous {
+                    "≈"
+                } else {
+                    ""
+                };
+                let kind = match annotation.kind {
+                    AnnotationKind::Ask => "Ask",
+                    AnnotationKind::Comment => "Comment",
+                };
+                let side = match placement.side {
+                    AnchorSide::Old => ("L", SourceSide::Old),
+                    AnchorSide::New => ("R", SourceSide::New),
+                };
+                let body = match annotation.kind {
+                    AnnotationKind::Comment => {
+                        format!("❯ {}", annotation.text.as_deref().unwrap_or_default())
+                    }
+                    AnnotationKind::Ask => self
+                        .ask_threads
+                        .get(&annotation.id)
+                        .map(|thread| {
+                            thread
+                                .iter()
+                                .map(|message| {
+                                    let speaker = if message.role == "assistant" {
+                                        "🤖"
+                                    } else {
+                                        "❯"
+                                    };
+                                    let waiting =
+                                        if message.delivery_state == DeliveryState::Pending {
+                                            " · queued"
+                                        } else {
+                                            ""
+                                        };
+                                    format!("{speaker} {}{waiting}", message.text)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .filter(|thread| !thread.is_empty())
+                        .unwrap_or_else(|| "⏺ Ask queued · waiting for Copilot".into()),
+                };
+                let mut inline = InlineAnnotation::new(
+                    annotation.id.clone(),
+                    annotation.file_path.clone(),
+                    side.1,
+                    placement.line_start.max(0) as usize,
+                    placement.line_end.max(placement.line_start).max(0) as usize,
+                    format!(
+                        "{marker}{kind} · {} {}{}",
+                        annotation.file_path.display(),
+                        side.0,
+                        placement.line_start
+                    ),
+                    body,
+                )
+                .in_repo(annotation.repo_id.clone());
+                inline.collapsed = self.collapsed_annotations.contains(&annotation.id);
+                inline
+            })
+            .collect::<Vec<_>>();
+        if let Some(composer) = self.inline_composer_annotation() {
+            annotations.push(composer);
+        }
+        ReviewStream::for_files(&files, &annotations)
+    }
+
+    fn inline_composer_annotation(&self) -> Option<InlineAnnotation> {
+        let target = self.compose_target.as_ref()?;
+        let (repo_id, file_path, side, line_start, line_end, title) = match target {
+            ComposeTarget::Annotation(kind) => {
+                let repo = self.work_item.repos.get(self.repo_index)?;
+                let file = self.current_file()?;
+                let selection = self.diff_selection();
+                let anchor = anchor_from_diff(file, selection.start_row, selection.end_row).ok()?;
+                (
+                    repo.record.id.clone(),
+                    file.display_path.clone(),
+                    match anchor.side {
+                        AnchorSide::Old => SourceSide::Old,
+                        AnchorSide::New => SourceSide::New,
+                    },
+                    anchor.line_start,
+                    anchor.line_end,
+                    match kind {
+                        AnnotationKind::Ask => "Ask · draft",
+                        AnnotationKind::Comment => "Comment · draft",
+                    }
+                    .to_owned(),
+                )
+            }
+            ComposeTarget::FollowUp(id) => {
+                let (annotation, placement) = self
+                    .annotations
+                    .iter()
+                    .find(|(annotation, _)| &annotation.id == id)?;
+                (
+                    annotation.repo_id.clone(),
+                    annotation.file_path.clone(),
+                    match placement.side {
+                        AnchorSide::Old => SourceSide::Old,
+                        AnchorSide::New => SourceSide::New,
+                    },
+                    placement.line_start.max(0) as usize,
+                    placement.line_end.max(placement.line_start).max(0) as usize,
+                    "Ask follow-up · draft".into(),
+                )
+            }
+            ComposeTarget::EditAnnotation(id)
+            | ComposeTarget::EditAskMessage {
+                annotation_id: id, ..
+            } => {
+                let (annotation, placement) = self
+                    .annotations
+                    .iter()
+                    .find(|(annotation, _)| &annotation.id == id)?;
+                (
+                    annotation.repo_id.clone(),
+                    annotation.file_path.clone(),
+                    match placement.side {
+                        AnchorSide::Old => SourceSide::Old,
+                        AnchorSide::New => SourceSide::New,
+                    },
+                    placement.line_start.max(0) as usize,
+                    placement.line_end.max(placement.line_start).max(0) as usize,
+                    "Edit inline annotation".into(),
+                )
+            }
+            ComposeTarget::EditQueued(_)
+            | ComposeTarget::Chat
+            | ComposeTarget::Context
+            | ComposeTarget::SettingBase
+            | ComposeTarget::SettingExpandStep => return None,
+        };
+        let mut draft = self.compose.clone();
+        if self.input_mode == InputMode::Compose {
+            let mut cursor = self.compose_cursor.min(draft.len());
+            while cursor > 0 && !draft.is_char_boundary(cursor) {
+                cursor -= 1;
+            }
+            draft.insert(cursor, '▏');
+        }
+        Some(
+            InlineAnnotation::new(
+                INLINE_COMPOSER_ID,
+                file_path,
+                side,
+                line_start,
+                line_end,
+                format!(
+                    "{title} · {} lines {line_start}-{line_end}",
+                    match side {
+                        SourceSide::Old => "old",
+                        SourceSide::New => "new",
+                    }
+                ),
+                format!("↳ Enter submit · Esc keep · Ctrl-C discard · ↑/↓ scroll\n❯ {draft}"),
+            )
+            .in_repo(repo_id),
+        )
+    }
+
+    fn focus_inline_composer(&mut self) {
+        self.review_cursor = self
+            .review_stream()
+            .rows()
+            .iter()
+            .rposition(|row| {
+                matches!(
+                    row,
+                    ReviewRow::Annotation { block, .. }
+                        if block.annotation_id == INLINE_COMPOSER_ID
+                            && matches!(
+                                block.part,
+                                crate::review_stream::AnnotationRowPart::Body { .. }
+                            )
+                )
+            })
+            .unwrap_or(self.review_cursor);
+    }
+
+    fn move_review_stream(&mut self, movement: StreamMovement) {
+        let mut stream = self.review_stream();
+        stream.set_cursor(self.review_cursor);
+        stream.move_by(movement, self.viewport_height.max(1));
+        self.review_cursor = stream.cursor();
+        let row = stream.current().cloned();
+        if let Some(row) = row.as_ref() {
+            self.sync_source_from_review_row(row);
+        }
+    }
+
+    fn sync_source_from_review_row(&mut self, row: &ReviewRow) {
+        if let Some(anchor) = row.source_anchor() {
+            self.set_current_review_location(&anchor.repo_id, &anchor.file, anchor.visible_line);
+            return;
+        }
+        match row {
+            ReviewRow::FileHeader { repo_id, path, .. } => {
+                self.set_current_review_location(repo_id, path, 0)
+            }
+            ReviewRow::HunkHeader {
+                repo_id,
+                file,
+                hunk,
+                ..
+            }
+            | ReviewRow::Fold {
+                repo_id,
+                file,
+                hunk,
+                ..
+            } => {
+                let visible =
+                    self.work_item
+                        .repos
+                        .iter()
+                        .find(|repo| repo.record.id == *repo_id)
+                        .and_then(|repo| {
+                            repo.diff.files.iter().find(|candidate| {
+                                candidate.path().to_string_lossy() == file.as_str()
+                            })
+                        })
+                        .map(|file| {
+                            file.hunks
+                                .iter()
+                                .take(*hunk)
+                                .map(|hunk| hunk.lines.len())
+                                .sum()
+                        })
+                        .unwrap_or(0);
+                self.set_current_review_location(repo_id, file, visible);
+            }
+            ReviewRow::Source { .. } | ReviewRow::Annotation { .. } => {}
+        }
+    }
+
+    fn set_current_review_location(&mut self, repo_id: &str, file: &str, visible_line: usize) {
+        let Some((repo_index, repo)) = self
+            .work_item
+            .repos
+            .iter()
+            .enumerate()
+            .find(|(_, repo)| repo.record.id == repo_id)
+        else {
+            return;
+        };
+        let Some(file_index) = repo
+            .diff
+            .files
+            .iter()
+            .position(|candidate| candidate.path().to_string_lossy() == file)
+        else {
+            return;
+        };
+        self.repo_index = repo_index;
+        self.file_index = file_index;
+        self.cursor = visible_line.min(
+            repo.diff.files[file_index]
+                .visible_lines()
+                .count()
+                .saturating_sub(1),
+        );
+    }
+
+    fn sync_review_cursor_to_current_file(&mut self) {
+        let repo_id = self
+            .work_item
+            .repos
+            .get(self.repo_index)
+            .map(|repo| repo.record.id.clone());
+        let file = self
+            .current_file()
+            .map(|file| file.path().to_string_lossy().into_owned());
+        let (Some(repo_id), Some(file)) = (repo_id, file) else {
+            self.review_cursor = 0;
+            self.review_scroll = 0;
+            return;
+        };
+        let stream = self.review_stream();
+        self.review_cursor = stream
+            .rows()
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    ReviewRow::Source {
+                        repo_id: row_repo,
+                        file: path,
+                        ..
+                    } if row_repo == &repo_id && path == &file
+                )
+            })
+            .or_else(|| {
+                stream.rows().iter().position(|row| {
+                    matches!(
+                        row,
+                        ReviewRow::FileHeader {
+                            repo_id: row_repo,
+                            path,
+                            ..
+                        } if row_repo == &repo_id && path == &file
+                    )
+                })
+            })
+            .unwrap_or(0);
     }
 
     pub(crate) fn selection(&self) -> (usize, usize) {
@@ -896,6 +1238,38 @@ impl AppState {
                         vec![Effect::CancelQueued(outbound_id)]
                     }
                 }
+                KeyCode::Char('e') => {
+                    let Some((outbound_id, active)) =
+                        self.queue_entry_ids().get(self.scroll).cloned()
+                    else {
+                        self.status = "No queued prompt is selected".into();
+                        return Vec::new();
+                    };
+                    if active {
+                        self.status =
+                            "The active prompt cannot be edited · use :steer or stop it first"
+                                .into();
+                        return Vec::new();
+                    }
+                    let text = self
+                        .chat
+                        .iter()
+                        .chain(self.pending_side_entries.iter())
+                        .find(|entry| entry.outbound_id.as_deref() == Some(outbound_id.as_str()))
+                        .map(|entry| entry.text.clone())
+                        .unwrap_or_default();
+                    self.screen = Screen::Chat;
+                    self.focus = Focus::Chat;
+                    self.input_return_mode = InputMode::Normal;
+                    self.input_mode = InputMode::Compose;
+                    self.compose_target = Some(ComposeTarget::EditQueued(outbound_id));
+                    self.compose = text;
+                    self.compose_cursor = self.compose.len();
+                    self.compose_scroll = 0;
+                    self.status =
+                        "INSERT · editing queued prompt · Enter replaces it atomically".into();
+                    Vec::new()
+                }
                 _ => Vec::new(),
             };
         }
@@ -1010,11 +1384,62 @@ impl AppState {
                 self.start_composing(AnnotationKind::Comment);
             }
             KeyCode::Char('i')
+                if self.screen == Screen::Review && self.input_mode == InputMode::Normal =>
+            {
+                if matches!(
+                    self.compose_target,
+                    Some(
+                        ComposeTarget::Annotation(_)
+                            | ComposeTarget::FollowUp(_)
+                            | ComposeTarget::EditAnnotation(_)
+                            | ComposeTarget::EditAskMessage { .. }
+                    )
+                ) {
+                    self.input_mode = InputMode::Compose;
+                    self.compose_cursor = self.compose_cursor.min(self.compose.len());
+                    self.status = "INSERT · resumed preserved inline draft".into();
+                } else if let Some((kind, annotation_id, text)) =
+                    self.annotation_under_cursor().map(|(annotation, _)| {
+                        (
+                            annotation.kind,
+                            annotation.id.clone(),
+                            annotation.text.clone().unwrap_or_default(),
+                        )
+                    })
+                {
+                    self.input_return_mode = InputMode::Normal;
+                    self.input_mode = InputMode::Compose;
+                    self.compose_cursor = 0;
+                    self.compose_scroll = 0;
+                    self.compose.clear();
+                    match kind {
+                        AnnotationKind::Ask => {
+                            self.collapsed_annotations.remove(&annotation_id);
+                            self.compose_target = Some(ComposeTarget::FollowUp(annotation_id));
+                            self.focus = Focus::InlineAsk;
+                            self.status = "INSERT · typing a new Ask follow-up".into();
+                        }
+                        AnnotationKind::Comment => {
+                            self.compose = text;
+                            self.compose_cursor = self.compose.len();
+                            self.compose_target =
+                                Some(ComposeTarget::EditAnnotation(annotation_id));
+                            self.status = "INSERT · editing the inline comment".into();
+                        }
+                    }
+                    self.focus_inline_composer();
+                } else {
+                    self.status = "Move onto an inline annotation prompt before pressing i".into();
+                }
+            }
+            KeyCode::Char('i')
                 if self.screen == Screen::Chat && self.input_mode == InputMode::Normal =>
             {
                 self.input_return_mode = InputMode::Normal;
                 self.input_mode = InputMode::Compose;
-                self.compose_target = Some(ComposeTarget::Chat);
+                if !matches!(self.compose_target, Some(ComposeTarget::EditQueued(_))) {
+                    self.compose_target = Some(ComposeTarget::Chat);
+                }
                 self.compose_cursor = self.compose.len();
             }
             KeyCode::Enter if self.focus == Focus::FilePicker => {
@@ -1035,6 +1460,7 @@ impl AppState {
                         self.compose.clear();
                         self.compose_cursor = 0;
                         self.focus = Focus::InlineAsk;
+                        self.focus_inline_composer();
                     }
                 }
             }
@@ -1064,6 +1490,7 @@ impl AppState {
                         self.compose_target = Some(ComposeTarget::EditAnnotation(annotation_id));
                         self.compose = text;
                         self.compose_cursor = self.compose.len();
+                        self.focus_inline_composer();
                     } else {
                         self.input_return_mode = InputMode::Normal;
                         self.input_mode = InputMode::Compose;
@@ -1083,6 +1510,7 @@ impl AppState {
                             self.compose.clear();
                             self.compose_cursor = 0;
                         }
+                        self.focus_inline_composer();
                     }
                 }
             }
@@ -1137,6 +1565,20 @@ impl AppState {
             }
             KeyCode::PageUp if self.focus == Focus::Chat => {
                 self.move_chat_semantic(Movement::PageUp(self.viewport_height.max(1)));
+            }
+            KeyCode::PageDown
+                if self.screen == Screen::Review
+                    && matches!(self.focus, Focus::Diff | Focus::InlineAsk)
+                    && self.input_mode == InputMode::Normal =>
+            {
+                self.move_review_stream(StreamMovement::PageDown);
+            }
+            KeyCode::PageUp
+                if self.screen == Screen::Review
+                    && matches!(self.focus, Focus::Diff | Focus::InlineAsk)
+                    && self.input_mode == InputMode::Normal =>
+            {
+                self.move_review_stream(StreamMovement::PageUp);
             }
             KeyCode::PageDown => self.move_down(self.viewport_height),
             KeyCode::PageUp => self.move_up(self.viewport_height),
@@ -1571,8 +2013,24 @@ impl AppState {
                     .map(|(annotation, _)| annotation.id.clone())
                 {
                     if !self.collapsed_annotations.remove(&annotation_id) {
-                        self.collapsed_annotations.insert(annotation_id);
+                        self.collapsed_annotations.insert(annotation_id.clone());
                     }
+                    self.review_cursor = self
+                        .review_stream()
+                        .rows()
+                        .iter()
+                        .position(|row| {
+                            matches!(
+                                row,
+                                ReviewRow::Annotation { block, .. }
+                                    if block.annotation_id == annotation_id
+                                        && matches!(
+                                            block.part,
+                                            crate::review_stream::AnnotationRowPart::Header { .. }
+                                        )
+                            )
+                        })
+                        .unwrap_or(self.review_cursor);
                     self.status = "Toggled annotation fold".into();
                 }
             }
@@ -1732,6 +2190,34 @@ impl AppState {
                 self.status =
                     "Nothing is running · Esc cancels a draft, :agent-status inspects Copilot"
                         .into();
+            }
+            KeyCode::Char('d')
+                if self.screen == Screen::Review
+                    && matches!(self.focus, Focus::Diff | Focus::InlineAsk)
+                    && self.input_mode == InputMode::Normal =>
+            {
+                self.move_review_stream(StreamMovement::HalfPageDown);
+            }
+            KeyCode::Char('u')
+                if self.screen == Screen::Review
+                    && matches!(self.focus, Focus::Diff | Focus::InlineAsk)
+                    && self.input_mode == InputMode::Normal =>
+            {
+                self.move_review_stream(StreamMovement::HalfPageUp);
+            }
+            KeyCode::Char('f')
+                if self.screen == Screen::Review
+                    && matches!(self.focus, Focus::Diff | Focus::InlineAsk)
+                    && self.input_mode == InputMode::Normal =>
+            {
+                self.move_review_stream(StreamMovement::PageDown);
+            }
+            KeyCode::Char('b')
+                if self.screen == Screen::Review
+                    && matches!(self.focus, Focus::Diff | Focus::InlineAsk)
+                    && self.input_mode == InputMode::Normal =>
+            {
+                self.move_review_stream(StreamMovement::PageUp);
             }
             KeyCode::Char('d') => self.move_down(half),
             KeyCode::Char('u') => self.move_up(half),
@@ -1946,11 +2432,24 @@ impl AppState {
         match key.code {
             KeyCode::Esc => {
                 self.input_mode = self.input_return_mode;
-                if self.compose_target == Some(ComposeTarget::Chat) {
+                let preserve = matches!(
+                    self.compose_target,
+                    Some(ComposeTarget::Chat | ComposeTarget::EditQueued(_))
+                ) || (self.input_return_mode == InputMode::Normal
+                    && matches!(
+                        self.compose_target,
+                        Some(
+                            ComposeTarget::Annotation(_)
+                                | ComposeTarget::FollowUp(_)
+                                | ComposeTarget::EditAnnotation(_)
+                                | ComposeTarget::EditAskMessage { .. }
+                        )
+                    ));
+                if preserve {
                     self.status = if self.compose.is_empty() {
-                        "Chat composer left in NORMAL mode".into()
+                        "Composer left in NORMAL mode".into()
                     } else {
-                        "Draft kept · press i to resume editing or Ctrl-C to discard".into()
+                        "Draft kept · i resumes · gm previews · Ctrl-C discards".into()
                     };
                 } else {
                     self.compose.clear();
@@ -2058,6 +2557,9 @@ impl AppState {
                 message_id,
                 text,
             }],
+            ComposeTarget::EditQueued(outbound_id) => {
+                vec![Effect::CancelQueued(outbound_id), Effect::SendChat(text)]
+            }
             ComposeTarget::Chat => {
                 let trimmed = text.trim();
                 if trimmed == "/side" {
@@ -2221,6 +2723,15 @@ impl AppState {
             self.status = "Cannot annotate a binary or empty file".into();
             return;
         }
+        if self.input_mode == InputMode::Normal {
+            let mut stream = self.review_stream();
+            stream.set_cursor(self.review_cursor);
+            if !matches!(stream.current(), Some(ReviewRow::Source { .. })) {
+                self.status =
+                    "Cannot annotate fold and metadata rows, file headers, or hunk headers".into();
+                return;
+            }
+        }
         let Some(file) = self.current_file() else {
             self.status = "Cannot annotate a binary or empty file".into();
             return;
@@ -2236,6 +2747,7 @@ impl AppState {
         self.compose.clear();
         self.compose_cursor = 0;
         self.compose_scroll = 0;
+        self.focus_inline_composer();
     }
 
     fn insert_compose(&mut self, text: &str) {
@@ -2366,6 +2878,13 @@ impl AppState {
                     }
                 }
             }
+            Focus::Diff | Focus::InlineAsk
+                if self.screen == Screen::Review && self.input_mode == InputMode::Normal =>
+            {
+                for _ in 0..amount {
+                    self.move_review_stream(StreamMovement::Down);
+                }
+            }
             _ => {
                 let last = self.current_line_count().saturating_sub(1);
                 self.cursor = cmp::min(last, self.cursor.saturating_add(amount));
@@ -2389,6 +2908,13 @@ impl AppState {
                     for _ in 1..amount {
                         self.move_chat_semantic(Movement::Up);
                     }
+                }
+            }
+            Focus::Diff | Focus::InlineAsk
+                if self.screen == Screen::Review && self.input_mode == InputMode::Normal =>
+            {
+                for _ in 0..amount {
+                    self.move_review_stream(StreamMovement::Up);
                 }
             }
             _ => {
@@ -2450,6 +2976,7 @@ impl AppState {
         self.cursor = 0;
         self.scroll = 0;
         self.clear_visual_selection();
+        self.sync_review_cursor_to_current_file();
     }
 
     fn clear_visual_selection(&mut self) {
@@ -2468,8 +2995,7 @@ impl AppState {
                 self.chat_scroll = 0;
             }
         } else {
-            self.cursor = 0;
-            self.scroll = 0;
+            self.move_review_stream(StreamMovement::First);
         }
     }
 
@@ -2485,8 +3011,7 @@ impl AppState {
                 self.chat_scroll = self.chat_total_rows.saturating_sub(self.chat_viewport_rows);
             }
         } else {
-            self.cursor = self.current_line_count().saturating_sub(1);
-            self.ensure_cursor_visible();
+            self.move_review_stream(StreamMovement::Last);
         }
     }
 
@@ -2615,6 +3140,16 @@ impl AppState {
     }
 
     fn annotation_under_cursor(&self) -> Option<&(Annotation, Placement)> {
+        if self.screen == Screen::Review && self.input_mode == InputMode::Normal {
+            let mut stream = self.review_stream();
+            stream.set_cursor(self.review_cursor);
+            if let Some(ReviewRow::Annotation { block, .. }) = stream.current() {
+                return self
+                    .annotations
+                    .iter()
+                    .find(|(annotation, _)| annotation.id == block.annotation_id);
+            }
+        }
         let repo = self.work_item.repos.get(self.repo_index)?;
         let file = self.current_file()?;
         self.annotations.iter().find(|(annotation, placement)| {
@@ -2701,51 +3236,18 @@ impl AppState {
         context
     }
 
-    fn annotation_positions(&self) -> Vec<(usize, usize, usize)> {
-        let mut positions = Vec::new();
-        for (repo_index, repo) in self.work_item.repos.iter().enumerate() {
-            for (file_index, file) in repo.diff.files.iter().enumerate() {
-                for (_, placement) in self.annotations.iter().filter(|(annotation, _)| {
-                    annotation.repo_id == repo.record.id
-                        && annotation.file_path == file.display_path
-                }) {
-                    if let Some(cursor) = file.visible_lines().position(|line| {
-                        placement_line(line, Some(placement.side)).map(|number| number as i64)
-                            == Some(placement.line_start)
-                    }) {
-                        positions.push((repo_index, file_index, cursor));
-                    }
-                }
-            }
-        }
-        positions.sort_unstable();
-        positions.dedup();
-        positions
-    }
-
     fn jump_annotation(&mut self, forward: bool) {
-        let positions = self.annotation_positions();
-        if positions.is_empty() {
+        let mut stream = self.review_stream();
+        stream.set_cursor(self.review_cursor);
+        let target = stream.jump_annotation(forward);
+        let Some(target) = target else {
             self.status = "No annotations".into();
             return;
-        }
-        let current = (self.repo_index, self.file_index, self.cursor);
-        let target = if forward {
-            positions
-                .iter()
-                .copied()
-                .find(|position| *position > current)
-                .unwrap_or(positions[0])
-        } else {
-            positions
-                .iter()
-                .rev()
-                .copied()
-                .find(|position| *position < current)
-                .unwrap_or(*positions.last().expect("not empty"))
         };
-        (self.repo_index, self.file_index, self.cursor) = target;
-        self.ensure_cursor_visible();
+        self.review_cursor = target;
+        if let Some(row) = stream.current() {
+            self.sync_source_from_review_row(row);
+        }
     }
 
     fn yank_current(&mut self) -> Vec<Effect> {
@@ -2836,7 +3338,20 @@ fn editor_cursor_positions(text: &str, width: usize) -> Vec<(usize, usize, usize
 }
 
 fn terminal_cell_width(character: char) -> usize {
-    if character.is_control() {
+    if character.is_control()
+        || matches!(
+            character as u32,
+            0x0300..=0x036f
+                | 0x1ab0..=0x1aff
+                | 0x1dc0..=0x1dff
+                | 0x20d0..=0x20ff
+                | 0xfe00..=0xfe0f
+                | 0xfe20..=0xfe2f
+                | 0x1f3fb..=0x1f3ff
+                | 0xe0100..=0xe01ef
+                | 0x200d
+        )
+    {
         0
     } else if matches!(
         character as u32,
@@ -3008,6 +3523,22 @@ mod tests {
         assert!(upper < app.compose.len());
         app.handle_key(key(KeyCode::Down));
         assert!(app.compose_cursor > upper);
+    }
+
+    #[test]
+    fn composer_combining_marks_do_not_consume_terminal_columns() {
+        let positions = super::editor_cursor_positions("e\u{301}x", 1);
+        assert_eq!(
+            positions
+                .iter()
+                .find(|(byte, _, _)| *byte == "e\u{301}".len())
+                .map(|(_, row, column)| (*row, *column)),
+            Some((1, 0))
+        );
+        assert_eq!(
+            positions.last().map(|(_, row, column)| (*row, *column)),
+            Some((1, 1))
+        );
     }
 
     #[test]

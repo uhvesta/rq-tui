@@ -39,13 +39,14 @@ use crate::copilot::{
 };
 use crate::diff::{DiffLine, LineKind};
 use crate::domain::{
-    AnchorSide, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState, Placement,
-    ReviewContext, SessionRecord,
+    AnnotationKind, AskMessage, BaseBranchSource, DeliveryState, Placement, ReviewContext,
+    SessionRecord,
 };
 use crate::export::{CommentExport, ExportFormat, ReviewArchive};
 use crate::git::Git;
 use crate::highlight::{Highlighter, StyledSegment, SyntectHighlighter};
 use crate::remote::{PrReference, RemoteResolver};
+use crate::review_stream::{AnnotationRowPart, ReviewRow};
 use crate::storage::{now, Storage};
 use crate::work_item::{combine_resolved, resolve_local};
 
@@ -333,6 +334,7 @@ pub(crate) fn handle_effect(
                 .as_ref()
                 .map(|snapshot| format!(" · pinned s{}", snapshot.version_num))
                 .unwrap_or_default();
+            let created_annotation_id = created.annotation.id.clone();
             state
                 .annotations
                 .push((created.annotation.clone(), current_placement));
@@ -388,6 +390,16 @@ pub(crate) fn handle_effect(
                     }
                 }
             };
+            if let Some(header) = state.review_stream().rows().iter().position(|row| {
+                matches!(
+                    row,
+                    ReviewRow::Annotation { block, .. }
+                        if block.annotation_id == created_annotation_id
+                            && matches!(block.part, AnnotationRowPart::Header { .. })
+                )
+            }) {
+                state.review_cursor = header.saturating_sub(1);
+            }
         }
         Effect::SendChat(text) => {
             if !text.trim().is_empty() {
@@ -1473,7 +1485,7 @@ fn copy_with_native_clipboard(text: &str) -> Result<&'static str> {
 }
 
 fn markdown_preview_source(state: &AppState) -> Result<String> {
-    let markdown = if state.input_mode == InputMode::Compose {
+    let markdown = if state.compose_target.is_some() && !state.compose.is_empty() {
         state.compose.clone()
     } else if state.screen == Screen::Chat {
         state
@@ -2433,12 +2445,12 @@ pub(crate) fn render(
     state: &mut AppState,
     highlighter: &mut dyn Highlighter,
 ) {
-    if frame.area().width <= 32 || frame.area().height <= 8 {
+    if frame.area().width < 40 || frame.area().height < 9 {
         let area = frame.area();
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(format!(
-                "needs at least 33×9\n32×8 is too small\ncurrent: {}×{}\n:q still exits safely",
+                "needs at least 40×9\ncurrent: {}×{}\nresize to continue\n:q still exits safely",
                 area.width, area.height
             ))
             .block(
@@ -2932,17 +2944,6 @@ fn render_review(
         DiffLayout::Unified => render_unified(frame, state, body[1], highlighter),
         DiffLayout::Split => render_split(frame, state, body[1], highlighter),
     }
-    if matches!(
-        state.compose_target,
-        Some(
-            ComposeTarget::Annotation(_)
-                | ComposeTarget::FollowUp(_)
-                | ComposeTarget::EditAnnotation(_)
-                | ComposeTarget::EditAskMessage { .. }
-        )
-    ) {
-        render_contextual_composer(frame, state, body[1]);
-    }
     render_status(frame, state, vertical[2]);
 }
 
@@ -3074,32 +3075,70 @@ fn fuzzy_match(haystack: &str, needle: &str) -> bool {
 
 fn render_unified(
     frame: &mut ratatui::Frame,
-    state: &AppState,
+    state: &mut AppState,
     area: Rect,
     highlighter: &mut dyn Highlighter,
 ) {
-    let lines = visible_diff_lines(state, highlighter, area.height as usize);
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
     let focused = state.focus == crate::app::Focus::Diff;
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(
-                Block::default()
-                    .title(if focused { "▶ unified" } else { "unified" })
-                    .title_style(Style::default().fg(if focused {
-                        Color::Cyan
-                    } else {
-                        Color::DarkGray
-                    }))
-                    .borders(Borders::NONE),
-            )
-            .wrap(Wrap { trim: false }),
-        area,
+        Paragraph::new(if focused { "▶ unified" } else { "unified" }).style(
+            Style::default()
+                .fg(if focused {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Rect::new(area.x, area.y, area.width, 1),
     );
+    if area.height == 1 {
+        return;
+    }
+    let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+    state.viewport_height = body.height.max(1) as usize;
+    state.compose_wrap_width = body.width.saturating_sub(4).max(1) as usize;
+    let stream = state.review_stream();
+    let rendered = stream
+        .rows()
+        .iter()
+        .enumerate()
+        .flat_map(|(index, row)| {
+            review_row_lines(
+                row,
+                review_row_selected(state, row, index),
+                body.width.max(1) as usize,
+                highlighter,
+            )
+            .into_iter()
+            .map(move |line| (index, line))
+        })
+        .collect::<Vec<_>>();
+    let semantic_rows = rendered.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+    let composer_cursor = rendered
+        .iter()
+        .position(|(_, line)| line_has_composer_cursor(line));
+    clamp_review_display_scroll(
+        state,
+        &semantic_rows,
+        body.height.max(1) as usize,
+        composer_cursor,
+    );
+    let lines = rendered
+        .into_iter()
+        .skip(state.review_scroll)
+        .map(|(_, line)| line)
+        .take(body.height as usize)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(Text::from(lines)), body);
 }
 
 fn render_split(
     frame: &mut ratatui::Frame,
-    state: &AppState,
+    state: &mut AppState,
     area: Rect,
     highlighter: &mut dyn Highlighter,
 ) {
@@ -3135,116 +3174,84 @@ fn render_split(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(body);
-    let rows = split_rows(state);
-    let start = state.scroll.min(rows.len());
-    let current_repo_id = state
-        .work_item
-        .repos
-        .get(state.repo_index)
-        .map(|repo| repo.record.id.as_str())
-        .unwrap_or_default();
-    let current_file = state.current_file();
-    let path = current_file.map(|file| file.path());
-    let mut old_lines = Vec::new();
-    let mut new_lines = Vec::new();
-    let mut inline_blocks = Vec::new();
-    for (index, old, new) in rows.into_iter().skip(start) {
-        if old_lines.len() >= body.height as usize {
-            break;
-        }
-        old_lines.push(split_line(
-            old.as_ref(),
-            path,
-            old.is_some() && diff_row_selected(state, index),
-            highlighter,
-        ));
-        new_lines.push(split_line(
-            new.as_ref(),
-            path,
-            new.is_some() && diff_row_selected(state, index),
-            highlighter,
-        ));
-
-        let Some(source_line) = old.as_ref().or(new.as_ref()) else {
-            continue;
-        };
-        for (annotation, placement) in &state.annotations {
-            let belongs_here = current_file.is_some_and(|file| {
-                annotation.repo_id == current_repo_id
-                    && annotation.file_path == file.display_path
-                    && placement_line(source_line, placement.side)
-                        .is_some_and(|line| placement.line_start == line as i64)
-            });
-            if !belongs_here || old_lines.len() >= body.height as usize {
-                continue;
+    state.viewport_height = body.height.max(1) as usize;
+    state.compose_wrap_width = body.width.saturating_sub(4).max(1) as usize;
+    let stream = state.review_stream();
+    let mut rendered_rows = Vec::new();
+    for (index, row) in stream.rows().iter().enumerate() {
+        let selected = review_row_selected(state, row, index);
+        match row {
+            ReviewRow::Source {
+                file,
+                line,
+                kind,
+                old_line,
+                new_line,
+                content,
+                ..
+            } => {
+                let source = DiffLine {
+                    kind: *kind,
+                    old_line: *old_line,
+                    new_line: *new_line,
+                    content: content.clone(),
+                };
+                let (old, new) = match kind {
+                    LineKind::Deletion => (Some(&source), None),
+                    LineKind::Addition => (None, Some(&source)),
+                    LineKind::Context => (Some(&source), Some(&source)),
+                    LineKind::Meta => (None, None),
+                };
+                let old = split_line(
+                    old,
+                    Some(std::path::Path::new(file)),
+                    selected && old.is_some(),
+                    highlighter,
+                );
+                let new = split_line(
+                    new,
+                    Some(std::path::Path::new(file)),
+                    selected && new.is_some(),
+                    highlighter,
+                );
+                rendered_rows.push((index, old, new, None));
+                let _ = line;
             }
-            let marker = if placement.outdated {
-                "!"
-            } else if placement.ambiguous {
-                "≈"
-            } else {
-                ""
-            };
-            let kind = match annotation.kind {
-                AnnotationKind::Ask => "Ask",
-                AnnotationKind::Comment => "Comment",
-            };
-            let side = match placement.side {
-                AnchorSide::Old => "L",
-                AnchorSide::New => "R",
-            };
-            let title = format!(
-                " {marker}{kind} · {} {side}{} ",
-                annotation.file_path.display(),
-                placement.line_start
-            );
-            let body_text = if state.collapsed_annotations.contains(&annotation.id) {
-                match annotation.kind {
-                    AnnotationKind::Ask => "▸ Ask thread collapsed".into(),
-                    AnnotationKind::Comment => format!(
-                        "▸ {}",
-                        annotation.text.as_deref().unwrap_or("Comment collapsed")
-                    ),
+            _ => {
+                for line in review_row_lines(row, selected, body.width as usize, highlighter) {
+                    rendered_rows.push((index, Line::from(""), Line::from(""), Some(line)));
                 }
-            } else {
-                match annotation.kind {
-                    AnnotationKind::Comment => {
-                        format!("❯ {}", annotation.text.as_deref().unwrap_or_default())
-                    }
-                    AnnotationKind::Ask => state
-                        .ask_threads
-                        .get(&annotation.id)
-                        .map(|thread| {
-                            thread
-                                .iter()
-                                .map(|message| {
-                                    let speaker = if message.role == "assistant" {
-                                        "🤖"
-                                    } else {
-                                        "❯"
-                                    };
-                                    format!("{speaker} {}", message.text)
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        })
-                        .filter(|thread| !thread.is_empty())
-                        .unwrap_or_else(|| "⏺ Ask queued · waiting for Copilot".into()),
-                }
-            };
-            let inner_width = body.width.saturating_sub(4).max(1) as usize;
-            let block_lines = wrapped_editor_lines(&body_text, body_text.len(), inner_width).0;
-            let block_height = (block_lines.len() + 2)
-                .min(body.height as usize - old_lines.len())
-                .max(1);
-            let offset = old_lines.len();
-            old_lines.extend((0..block_height).map(|_| Line::from("")));
-            new_lines.extend((0..block_height).map(|_| Line::from("")));
-            inline_blocks.push((offset, block_height, title, block_lines));
+            }
         }
     }
-    old_lines.truncate(body.height as usize);
-    new_lines.truncate(body.height as usize);
+    let semantic_rows = rendered_rows
+        .iter()
+        .map(|(index, _, _, _)| *index)
+        .collect::<Vec<_>>();
+    let composer_cursor = rendered_rows.iter().position(|(_, old, new, full)| {
+        full.as_ref().is_some_and(line_has_composer_cursor)
+            || line_has_composer_cursor(old)
+            || line_has_composer_cursor(new)
+    });
+    clamp_review_display_scroll(
+        state,
+        &semantic_rows,
+        body.height.max(1) as usize,
+        composer_cursor,
+    );
+    let visible = rendered_rows
+        .into_iter()
+        .skip(state.review_scroll)
+        .take(body.height as usize)
+        .collect::<Vec<_>>();
+    let old_lines = visible
+        .iter()
+        .map(|(_, old, _, _)| old.clone())
+        .collect::<Vec<_>>();
+    let new_lines = visible
+        .iter()
+        .map(|(_, _, new, _)| new.clone())
+        .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(old_lines).block(
             Block::default()
@@ -3254,31 +3261,258 @@ fn render_split(
         body_columns[0],
     );
     frame.render_widget(Paragraph::new(new_lines), body_columns[1]);
-    for (offset, height, title, lines) in inline_blocks {
-        let block_area = Rect::new(
-            body.x,
-            body.y + offset as u16,
-            body.width,
-            height.min(body.height as usize - offset) as u16,
-        );
-        frame.render_widget(Clear, block_area);
-        frame.render_widget(
-            Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<_>>())
-                .block(
-                    Block::default()
-                        .title(title)
-                        .title_style(
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                        .border_style(Style::default().fg(Color::Cyan))
-                        .borders(Borders::ALL),
-                )
-                .wrap(Wrap { trim: false }),
-            block_area,
-        );
+    for (offset, (_, _, _, line)) in visible.into_iter().enumerate() {
+        let Some(line) = line else {
+            continue;
+        };
+        let line_area = Rect::new(body.x, body.y + offset as u16, body.width, 1);
+        frame.render_widget(Clear, line_area);
+        frame.render_widget(Paragraph::new(line), line_area);
     }
+}
+
+fn clamp_review_display_scroll(
+    state: &mut AppState,
+    semantic_rows: &[usize],
+    viewport: usize,
+    composer_cursor: Option<usize>,
+) {
+    if let Some(cursor) = composer_cursor {
+        if cursor < state.review_scroll {
+            state.review_scroll = cursor;
+        } else if cursor >= state.review_scroll.saturating_add(viewport) {
+            state.review_scroll = cursor.saturating_add(1).saturating_sub(viewport);
+        }
+    }
+    if composer_cursor.is_none() {
+        let selected_start = semantic_rows
+            .iter()
+            .position(|row| *row == state.review_cursor);
+        let selected_end = semantic_rows
+            .iter()
+            .rposition(|row| *row == state.review_cursor);
+        if let (Some(start), Some(end)) = (selected_start, selected_end) {
+            if start < state.review_scroll {
+                state.review_scroll = start;
+            } else if end >= state.review_scroll.saturating_add(viewport) {
+                state.review_scroll = end.saturating_add(1).saturating_sub(viewport);
+            }
+        }
+    }
+    state.review_scroll = state
+        .review_scroll
+        .min(semantic_rows.len().saturating_sub(viewport));
+}
+
+fn line_has_composer_cursor(line: &Line<'_>) -> bool {
+    line.spans
+        .iter()
+        .any(|span| span.content.as_ref().contains('▏'))
+}
+
+fn review_row_selected(state: &AppState, row: &ReviewRow, index: usize) -> bool {
+    if state.input_mode != InputMode::Visual {
+        return index == state.review_cursor;
+    }
+    let ReviewRow::Source {
+        repo_id,
+        file,
+        old_anchor,
+        new_anchor,
+        ..
+    } = row
+    else {
+        return false;
+    };
+    let Some(current_repo) = state.work_item.repos.get(state.repo_index) else {
+        return false;
+    };
+    let Some(current_file) = state.current_file() else {
+        return false;
+    };
+    if repo_id != &current_repo.record.id
+        || file.as_str() != current_file.path().to_string_lossy().as_ref()
+    {
+        return false;
+    }
+    let visible_line = new_anchor
+        .as_ref()
+        .or(old_anchor.as_ref())
+        .map(|anchor| anchor.visible_line);
+    let (start, end) = state.selection();
+    visible_line.is_some_and(|line| (start..=end).contains(&line))
+}
+
+fn review_row_lines(
+    row: &ReviewRow,
+    selected: bool,
+    width: usize,
+    highlighter: &mut dyn Highlighter,
+) -> Vec<Line<'static>> {
+    let selected_style = selected.then_some(Style::default().bg(Color::Rgb(40, 50, 65)));
+    match row {
+        ReviewRow::FileHeader {
+            repo_name,
+            path,
+            status,
+            ..
+        } => {
+            let badge = match status {
+                crate::diff::FileStatus::Added => "A",
+                crate::diff::FileStatus::Modified => "M",
+                crate::diff::FileStatus::Deleted => "D",
+                crate::diff::FileStatus::Renamed => "R",
+            };
+            vec![styled_full_row(
+                format!(
+                    "{} {badge} {repo_name} > {path}",
+                    if selected { "❯" } else { " " }
+                ),
+                width,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+                selected_style,
+            )]
+        }
+        ReviewRow::HunkHeader { text, .. } => vec![styled_full_row(
+            format!("{} {text}", if selected { "❯" } else { " " }),
+            width,
+            Style::default().fg(Color::Blue),
+            selected_style,
+        )],
+        ReviewRow::Fold {
+            hidden_lines, text, ..
+        } => vec![styled_full_row(
+            format!(
+                "{} ··· {} unchanged lines ···  {}",
+                if selected { "❯" } else { " " },
+                hidden_lines,
+                text
+            ),
+            width,
+            Style::default().fg(Color::Blue),
+            selected_style,
+        )],
+        ReviewRow::Source {
+            file,
+            line,
+            kind,
+            old_line,
+            new_line,
+            content,
+            ..
+        } => {
+            let source = DiffLine {
+                kind: *kind,
+                old_line: *old_line,
+                new_line: *new_line,
+                content: content.clone(),
+            };
+            let mut rendered = unified_line(
+                std::path::Path::new(file),
+                &source,
+                *line,
+                selected,
+                highlighter,
+            );
+            rendered = rendered.style(match (selected, kind) {
+                (true, _) => Style::default().bg(Color::Rgb(40, 50, 65)),
+                (false, LineKind::Addition) => Style::default().bg(Color::Rgb(18, 48, 31)),
+                (false, LineKind::Deletion) => Style::default().bg(Color::Rgb(56, 25, 29)),
+                _ => Style::default(),
+            });
+            let padding = width.saturating_sub(rendered.width());
+            if padding > 0 {
+                rendered.spans.push(Span::raw(" ".repeat(padding)));
+            }
+            vec![rendered]
+        }
+        ReviewRow::Annotation { block, .. } => {
+            let accent = Style::default().fg(Color::Cyan);
+            let available = width.saturating_sub(4).max(1);
+            let strings = match block.part {
+                AnnotationRowPart::Header { collapsed } => {
+                    let marker = if selected { "❯ " } else { "" };
+                    let indicator = if collapsed { "▸ " } else { "" };
+                    vec![bordered_top(
+                        &format!("{marker}{indicator}{}", block.text),
+                        width,
+                    )]
+                }
+                AnnotationRowPart::Body { .. } => {
+                    let wrapped = wrapped_editor_lines(&block.text, block.text.len(), available).0;
+                    wrapped
+                        .into_iter()
+                        .map(|line| bordered_body(&line, width))
+                        .collect()
+                }
+                AnnotationRowPart::Footer => vec![bordered_bottom(width)],
+            };
+            strings
+                .into_iter()
+                .map(|text| {
+                    let mut line = Line::styled(text, accent);
+                    if let Some(style) = selected_style {
+                        line = line.style(style);
+                    }
+                    line
+                })
+                .collect()
+        }
+    }
+}
+
+fn styled_full_row(
+    text: String,
+    width: usize,
+    style: Style,
+    selected: Option<Style>,
+) -> Line<'static> {
+    let mut line = Line::styled(fit_terminal_text(&text, width), style);
+    if let Some(selected) = selected {
+        line = line.style(selected);
+    }
+    line
+}
+
+fn bordered_top(title: &str, width: usize) -> String {
+    if width < 2 {
+        return fit_terminal_text(title, width);
+    }
+    let inner = width.saturating_sub(2);
+    let label = fit_terminal_text(&format!("─ {title} "), inner);
+    format!("╭{label}╮")
+}
+
+fn bordered_body(text: &str, width: usize) -> String {
+    if width < 2 {
+        return fit_terminal_text(text, width);
+    }
+    format!("│{}│", fit_terminal_text(&format!(" {text}"), width - 2))
+}
+
+fn bordered_bottom(width: usize) -> String {
+    match width {
+        0 => String::new(),
+        1 => "╰".into(),
+        _ => format!("╰{}╯", "─".repeat(width - 2)),
+    }
+}
+
+fn fit_terminal_text(text: &str, width: usize) -> String {
+    let mut result = String::new();
+    let mut used = 0usize;
+    for character in text.chars() {
+        let cell_width = terminal_char_width(character);
+        if used.saturating_add(cell_width) > width {
+            break;
+        }
+        result.push(character);
+        used = used.saturating_add(cell_width);
+    }
+    result.push_str(&" ".repeat(width.saturating_sub(used)));
+    result
 }
 
 fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
@@ -3303,7 +3537,7 @@ fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 )
             ) =>
         {
-            "INSERT  Enter/Ctrl-S submit · Shift-Enter newline · Esc cancel".into()
+            "INSERT  Enter/Ctrl-S submit · Shift-Enter newline · Esc keep · Ctrl-C discard".into()
         }
         InputMode::Compose => format!(
             "{mode}  {}  (Enter/Ctrl-S submit · Shift-Enter newline · Esc cancel)",
@@ -3456,107 +3690,6 @@ fn render_command_palette(frame: &mut ratatui::Frame, state: &mut AppState) {
         ),
         palette,
     );
-}
-
-fn render_contextual_composer(frame: &mut ratatui::Frame, state: &mut AppState, body: Rect) {
-    if body.width < 20 || body.height < 4 {
-        return;
-    }
-    let base_title = match &state.compose_target {
-        Some(ComposeTarget::Annotation(AnnotationKind::Ask)) => " Ask ",
-        Some(ComposeTarget::Annotation(AnnotationKind::Comment)) => " Comment ",
-        Some(ComposeTarget::FollowUp(_)) => " Ask follow-up ",
-        Some(ComposeTarget::EditAnnotation(_) | ComposeTarget::EditAskMessage { .. }) => " Edit ",
-        _ => return,
-    };
-    let width = if body.width < 60 {
-        body.width
-    } else {
-        body.width.saturating_sub(4).clamp(20, 120)
-    };
-    let inner_width = width.saturating_sub(2).max(1) as usize;
-    state.compose_wrap_width = inner_width;
-    let (lines, cursor_row, cursor_col) =
-        wrapped_editor_lines(&state.compose, state.compose_cursor, inner_width);
-    let desired_height = lines.len().saturating_add(3) as u16;
-    let height_cap = body.height.saturating_mul(2).saturating_div(3).max(4);
-    let height = desired_height.clamp(4, height_cap.min(body.height));
-    let visible_rows = height.saturating_sub(3).max(1) as usize;
-    if cursor_row < state.compose_scroll {
-        state.compose_scroll = cursor_row;
-    } else if cursor_row >= state.compose_scroll.saturating_add(visible_rows) {
-        state.compose_scroll = cursor_row.saturating_add(1).saturating_sub(visible_rows);
-    }
-    let max_scroll = lines.len().saturating_sub(visible_rows);
-    state.compose_scroll = state.compose_scroll.min(max_scroll);
-    let title = if lines.len() > visible_rows {
-        format!(
-            "{base_title}· lines {}-{}/{} · ↑/↓ scroll ",
-            state.compose_scroll + 1,
-            (state.compose_scroll + visible_rows).min(lines.len()),
-            lines.len()
-        )
-    } else {
-        base_title.to_owned()
-    };
-    let cursor_y = state.cursor.saturating_sub(state.scroll) as u16;
-    let preferred_y = body.y.saturating_add(cursor_y).saturating_add(1);
-    let max_y = body.bottom().saturating_sub(height);
-    let composer = Rect::new(
-        body.x + (body.width.saturating_sub(width)) / 2,
-        preferred_y.min(max_y),
-        width,
-        height,
-    );
-    let range = state
-        .current_file()
-        .and_then(|file| {
-            let selection = state.diff_selection();
-            anchor_from_diff(file, selection.start_row, selection.end_row).ok()
-        })
-        .map(|anchor| {
-            format!(
-                "{:?} lines {}-{}",
-                anchor.side, anchor.line_start, anchor.line_end
-            )
-            .to_lowercase()
-        })
-        .unwrap_or_else(|| "selected code".into());
-    frame.render_widget(Clear, composer);
-    let block = Block::default().title(title).borders(Borders::ALL);
-    let inner = block.inner(composer);
-    frame.render_widget(block, composer);
-    let rows = lines
-        .iter()
-        .skip(state.compose_scroll)
-        .take(visible_rows)
-        .cloned()
-        .map(Line::raw)
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(rows),
-        Rect::new(inner.x, inner.y, inner.width, visible_rows as u16),
-    );
-    frame.render_widget(
-        Paragraph::new(format!("↳ {range} · Enter submit · Esc keep draft"))
-            .style(Style::default().fg(Color::DarkGray)),
-        Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
-    );
-    if state.input_mode == InputMode::Compose
-        && cursor_row >= state.compose_scroll
-        && cursor_row < state.compose_scroll.saturating_add(visible_rows)
-    {
-        frame.set_cursor_position((
-            inner
-                .x
-                .saturating_add((cursor_col as u16).min(inner.width.saturating_sub(1))),
-            inner.y.saturating_add(
-                cursor_row
-                    .saturating_sub(state.compose_scroll)
-                    .min(visible_rows.saturating_sub(1)) as u16,
-            ),
-        ));
-    }
 }
 
 fn render_chat(
@@ -4012,7 +4145,20 @@ fn wrapped_editor_lines(text: &str, cursor: usize, width: usize) -> (Vec<String>
 }
 
 fn terminal_char_width(character: char) -> usize {
-    if character.is_control() {
+    if character.is_control()
+        || matches!(
+            character as u32,
+            0x0300..=0x036f
+                | 0x1ab0..=0x1aff
+                | 0x1dc0..=0x1dff
+                | 0x20d0..=0x20ff
+                | 0xfe00..=0xfe0f
+                | 0xfe20..=0xfe2f
+                | 0x1f3fb..=0x1f3ff
+                | 0xe0100..=0xe01ef
+                | 0x200d
+        )
+    {
         0
     } else if matches!(
         character as u32,
@@ -4267,7 +4413,7 @@ fn render_queue(frame: &mut ratatui::Frame, state: &AppState) {
     let area = frame.area();
     frame.render_widget(
         Paragraph::new(
-            "j/k select · d cancel selected queued prompt · s stop active · q/Esc return",
+            "j/k select · e edit selected queued prompt · d cancel selected queued prompt · s stop active · q/Esc return",
         )
         .style(Style::default().fg(Color::DarkGray)),
         Rect::new(
@@ -4308,104 +4454,6 @@ fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
-fn visible_diff_lines(
-    state: &AppState,
-    highlighter: &mut dyn Highlighter,
-    height: usize,
-) -> Vec<Line<'static>> {
-    let Some(file) = state.current_file() else {
-        return vec![Line::from("No changed files")];
-    };
-    let current_repo_id = state
-        .work_item
-        .repos
-        .get(state.repo_index)
-        .map(|repo| repo.record.id.as_str())
-        .unwrap_or_default();
-    file.visible_lines()
-        .enumerate()
-        .skip(state.scroll)
-        .take(height)
-        .flat_map(|(index, line)| {
-            let selected = diff_row_selected(state, index);
-            let mut rendered = vec![unified_line(
-                file.path(),
-                line,
-                index,
-                selected,
-                highlighter,
-            )];
-            for (annotation, placement) in &state.annotations {
-                if annotation.repo_id == current_repo_id
-                    && annotation.file_path == file.display_path
-                    && placement_line(line, placement.side)
-                        .is_some_and(|display_line| placement.line_start == display_line as i64)
-                {
-                    let marker = if placement.outdated {
-                        "!"
-                    } else if placement.ambiguous {
-                        "≈"
-                    } else {
-                        "↳"
-                    };
-                    let kind = match annotation.kind {
-                        AnnotationKind::Ask => "ask",
-                        AnnotationKind::Comment => "comment",
-                    };
-                    let collapsed = state.collapsed_annotations.contains(&annotation.id);
-                    rendered.push(Line::styled(
-                        format!(
-                            "        {marker} [{kind}] {}",
-                            if collapsed { "[collapsed]" } else { "" }
-                        ),
-                        Style::default().fg(Color::Cyan),
-                    ));
-                    if !collapsed {
-                        match annotation.kind {
-                            AnnotationKind::Comment => rendered.push(Line::styled(
-                                format!(
-                                    "          you: {}",
-                                    annotation.text.as_deref().unwrap_or_default()
-                                ),
-                                Style::default().fg(Color::Green),
-                            )),
-                            AnnotationKind::Ask => {
-                                if let Some(thread) = state.ask_threads.get(&annotation.id) {
-                                    rendered.extend(thread.iter().map(|message| {
-                                        let speaker = if message.role == "assistant" {
-                                            "copilot"
-                                        } else {
-                                            "you"
-                                        };
-                                        let waiting =
-                                            if message.delivery_state == DeliveryState::Pending {
-                                                " ⠋"
-                                            } else {
-                                                ""
-                                            };
-                                        Line::styled(
-                                            format!(
-                                                "          {speaker}{waiting}: {}",
-                                                message.text.replace('\n', " ")
-                                            ),
-                                            Style::default().fg(if message.role == "assistant" {
-                                                Color::Cyan
-                                            } else {
-                                                Color::Green
-                                            }),
-                                        )
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            rendered
-        })
-        .collect()
-}
-
 fn unified_line(
     path: &std::path::Path,
     line: &DiffLine,
@@ -4439,37 +4487,6 @@ fn unified_line(
         result = result.style(Style::default().bg(Color::Rgb(40, 50, 65)));
     }
     result
-}
-
-fn split_rows(state: &AppState) -> Vec<(usize, Option<DiffLine>, Option<DiffLine>)> {
-    let Some(file) = state.current_file() else {
-        return Vec::new();
-    };
-    file.visible_lines()
-        .cloned()
-        .enumerate()
-        .map(|(index, line)| match line.kind {
-            LineKind::Deletion => (index, Some(line), None),
-            LineKind::Addition => (index, None, Some(line)),
-            LineKind::Context | LineKind::Meta => (index, Some(line.clone()), Some(line)),
-        })
-        .collect()
-}
-
-fn diff_row_selected(state: &AppState, index: usize) -> bool {
-    if state.input_mode == InputMode::Visual || state.compose_target.is_some() {
-        let (start, end) = state.selection();
-        start <= index && index <= end
-    } else {
-        index == state.cursor
-    }
-}
-
-fn placement_line(line: &DiffLine, side: AnchorSide) -> Option<usize> {
-    match side {
-        AnchorSide::Old => line.old_line,
-        AnchorSide::New => line.new_line,
-    }
 }
 
 fn split_line(
