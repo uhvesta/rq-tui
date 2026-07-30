@@ -46,7 +46,7 @@ pub(crate) fn inline_link(text: &str) -> Option<InlineLink> {
     })
 }
 
-pub(crate) fn render_inline_html(text: &str) -> String {
+pub fn render_inline_html(text: &str) -> String {
     render_inline_html_inner(text, 0)
 }
 
@@ -129,7 +129,7 @@ fn render_inline_html_inner(text: &str, depth: usize) -> String {
     output
 }
 
-pub(crate) fn escape_html(text: &str) -> String {
+pub fn escape_html(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     for character in text.chars() {
         push_escaped_char(&mut output, character);

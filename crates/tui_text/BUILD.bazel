@@ -1,0 +1,52 @@
+load("@rules_rust//rust:defs.bzl", "rust_clippy_test", "rust_library", "rust_test", "rustfmt_test")
+load("@crates//:defs.bzl", "crate_deps")
+
+TUI_TEXT_DEPS = crate_deps(
+    [
+        "anyhow",
+        "lru",
+        "ratatui",
+        "syntect",
+        "two-face",
+        "unicode-segmentation",
+        "unicode-width",
+    ],
+    package_name = "crates/tui_text",
+)
+
+rust_library(
+    name = "tui_text_lib",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "rq_tui_text",
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    deps = TUI_TEXT_DEPS,
+    visibility = ["//src:__pkg__"],
+)
+
+rust_test(
+    name = "tui_text_tests",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    deps = TUI_TEXT_DEPS,
+    visibility = ["//visibility:private"],
+)
+
+rust_clippy_test(
+    name = "clippy_test",
+    targets = [":tui_text_lib", ":tui_text_tests"],
+    visibility = ["//visibility:private"],
+)
+
+rustfmt_test(
+    name = "rustfmt_test",
+    targets = [":tui_text_lib", ":tui_text_tests"],
+    visibility = ["//visibility:private"],
+)
+
+test_suite(
+    name = "tui_text_test_suite",
+    tests = [":tui_text_tests", ":clippy_test", ":rustfmt_test"],
+    visibility = ["//:__pkg__"],
+)

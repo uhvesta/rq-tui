@@ -7,15 +7,15 @@
 use unicode_segmentation::{GraphemeIndices, UnicodeSegmentation};
 use unicode_width::UnicodeWidthStr;
 
-pub(crate) fn grapheme_indices(text: &str) -> GraphemeIndices<'_> {
+pub fn grapheme_indices(text: &str) -> GraphemeIndices<'_> {
     text.grapheme_indices(true)
 }
 
-pub(crate) fn cell_width(text: &str) -> usize {
+pub fn cell_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
-pub(crate) fn floor_grapheme_boundary(text: &str, cursor: usize) -> usize {
+pub fn floor_grapheme_boundary(text: &str, cursor: usize) -> usize {
     let cursor = cursor.min(text.len());
     if cursor == text.len() {
         return cursor;
@@ -26,7 +26,7 @@ pub(crate) fn floor_grapheme_boundary(text: &str, cursor: usize) -> usize {
         .unwrap_or(0)
 }
 
-pub(crate) fn previous_grapheme_boundary(text: &str, cursor: usize) -> usize {
+pub fn previous_grapheme_boundary(text: &str, cursor: usize) -> usize {
     let cursor = floor_grapheme_boundary(text, cursor);
     text[..cursor]
         .grapheme_indices(true)
@@ -35,7 +35,7 @@ pub(crate) fn previous_grapheme_boundary(text: &str, cursor: usize) -> usize {
         .unwrap_or(0)
 }
 
-pub(crate) fn next_grapheme_boundary(text: &str, cursor: usize) -> usize {
+pub fn next_grapheme_boundary(text: &str, cursor: usize) -> usize {
     let cursor = floor_grapheme_boundary(text, cursor);
     text[cursor..]
         .grapheme_indices(true)

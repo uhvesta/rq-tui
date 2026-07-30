@@ -2,8 +2,8 @@
 pub(crate) mod agent_state;
 pub(crate) mod annotations;
 pub(crate) mod app;
-pub(crate) mod chat_render;
-pub(crate) mod chat_selection;
+pub(crate) use rq_tui_text::chat_render;
+pub(crate) use rq_tui_text::chat_selection;
 pub(crate) mod cli;
 pub(crate) mod config;
 #[allow(dead_code)] // Bounded model slice; UI/storage integration follows separately.
@@ -13,14 +13,14 @@ pub(crate) mod diff;
 pub(crate) mod domain;
 pub(crate) mod export;
 pub(crate) mod git;
-pub(crate) mod highlight;
-pub(crate) mod markdown;
+pub(crate) use rq_tui_text::highlight;
+pub(crate) use rq_tui_text::markdown;
 pub(crate) mod process_control;
 pub(crate) mod prune;
 pub(crate) mod remote;
 pub(crate) mod review_stream;
 pub(crate) mod storage;
-pub(crate) mod terminal_text;
+pub(crate) use rq_tui_text::terminal_text;
 #[doc(hidden)]
 pub mod testing;
 pub(crate) mod ui;

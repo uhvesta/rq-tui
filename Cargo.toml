@@ -5,7 +5,7 @@ edition = "2021"
 
 [workspace]
 resolver = "2"
-members = ["crates/app", "crates/domain", "crates/storage"]
+members = ["crates/app", "crates/domain", "crates/storage", "crates/tui_text"]
 
 [dependencies]
 anyhow = "1"
@@ -16,22 +16,18 @@ clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"
 dirs = "6"
 github-copilot-sdk = { version = "1.0.8", default-features = false }
-lru = "0.16"
 rq-tui-domain = { path = "crates/domain" }
 rq-tui-app = { path = "crates/app" }
 rq-tui-storage = { path = "crates/storage" }
+rq-tui-text = { path = "crates/tui_text" }
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 signal-hook = "0.3"
 similar = "2"
-syntect = "5"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
-two-face = "0.5"
-unicode-segmentation = "1"
-unicode-width = "0.2"
 uuid = { version = "1", features = ["serde", "v4"] }
 walkdir = "2"
 

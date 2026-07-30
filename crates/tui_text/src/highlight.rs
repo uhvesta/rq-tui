@@ -11,14 +11,14 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StyledSegment {
-    pub(crate) text: String,
-    pub(crate) foreground: (u8, u8, u8),
-    pub(crate) bold: bool,
-    pub(crate) italic: bool,
+pub struct StyledSegment {
+    pub text: String,
+    pub foreground: (u8, u8, u8),
+    pub bold: bool,
+    pub italic: bool,
 }
 
-pub(crate) trait Highlighter {
+pub trait Highlighter {
     fn highlight_line(
         &mut self,
         path: &Path,
@@ -34,14 +34,14 @@ struct CacheKey {
     content_hash: u64,
 }
 
-pub(crate) struct SyntectHighlighter {
+pub struct SyntectHighlighter {
     syntaxes: SyntaxSet,
     theme: Theme,
     cache: LruCache<CacheKey, Vec<StyledSegment>>,
 }
 
 impl SyntectHighlighter {
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Self {
         let syntaxes = two_face::syntax::extra_newlines();
         let themes = ThemeSet::load_defaults();
         let theme = themes
@@ -59,7 +59,7 @@ impl SyntectHighlighter {
     }
 
     #[cfg(test)]
-    pub(crate) fn syntax_name_for_path(&self, path: &Path) -> &str {
+    pub fn syntax_name_for_path(&self, path: &Path) -> &str {
         self.syntaxes
             .find_syntax_for_file(path)
             .ok()
@@ -120,7 +120,7 @@ impl Highlighter for SyntectHighlighter {
 }
 
 #[derive(Default)]
-pub(crate) struct PlainHighlighter;
+pub struct PlainHighlighter;
 
 impl Highlighter for PlainHighlighter {
     fn highlight_line(

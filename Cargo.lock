@@ -1619,23 +1619,19 @@ dependencies = [
  "crossterm",
  "dirs 6.0.0",
  "github-copilot-sdk",
- "lru 0.16.4",
  "pretty_assertions",
  "ratatui",
  "rq-tui-app",
  "rq-tui-domain",
  "rq-tui-storage",
+ "rq-tui-text",
  "serde",
  "serde_json",
  "sha2",
  "signal-hook",
  "similar",
- "syntect",
  "tempfile",
  "tokio",
- "two-face",
- "unicode-segmentation",
- "unicode-width 0.2.0",
  "uuid",
  "walkdir",
 ]
@@ -1661,6 +1657,19 @@ dependencies = [
  "rq-tui-domain",
  "rusqlite",
  "tempfile",
+]
+
+[[package]]
+name = "rq-tui-text"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lru 0.16.4",
+ "ratatui",
+ "syntect",
+ "two-face",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

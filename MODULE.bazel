@@ -16,6 +16,7 @@ crate.from_cargo(
         "//crates/app:Cargo.toml",
         "//crates/domain:Cargo.toml",
         "//crates/storage:Cargo.toml",
+        "//crates/tui_text:Cargo.toml",
     ],
 )
 

@@ -15,9 +15,9 @@ const TAB_WIDTH: usize = 4;
 /// Display rows are deliberately ephemeral because they change on resize;
 /// callers should retain source ranges when they need to preserve a selection.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SourceRange {
-    pub(crate) start: usize,
-    pub(crate) end: usize,
+pub struct SourceRange {
+    pub start: usize,
+    pub end: usize,
 }
 
 impl SourceRange {
@@ -33,7 +33,7 @@ impl SourceRange {
 /// Why a terminal cell was rendered. Decorations have a source range even
 /// when the displayed glyph was normalized (for example, `-` becomes `•`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum CellSource {
+pub enum CellSource {
     Text(SourceRange),
     Decoration(SourceRange),
     Synthetic,
@@ -43,19 +43,19 @@ pub(crate) enum CellSource {
 /// A double-width glyph occupies a two-cell interval that maps to one source
 /// range, so a pointer hit on either cell resolves to the same text.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MappedCell {
-    pub(crate) columns: Range<usize>,
-    pub(crate) source: CellSource,
+pub struct MappedCell {
+    pub columns: Range<usize>,
+    pub source: CellSource,
 }
 
 /// One terminal row plus semantic cell mappings.
 #[derive(Clone, Debug)]
-pub(crate) struct MappedRow {
-    pub(crate) line: Line<'static>,
+pub struct MappedRow {
+    pub line: Line<'static>,
     /// Consumed by the future chat hit-testing/selection layer. `render_markdown`
     /// intentionally projects only `line` to preserve its existing API.
     #[allow(dead_code)]
-    pub(crate) cells: Vec<MappedCell>,
+    pub cells: Vec<MappedCell>,
 }
 
 /// Complete layout-oriented Markdown rendering result.
@@ -65,9 +65,9 @@ pub(crate) struct MappedRow {
 /// these ranges to widen a semantic selection while a plain-text mode ignores
 /// them.
 #[derive(Clone, Debug)]
-pub(crate) struct MappedMarkdown {
-    pub(crate) rows: Vec<MappedRow>,
-    pub(crate) elided: Vec<SourceRange>,
+pub struct MappedMarkdown {
+    pub rows: Vec<MappedRow>,
+    pub elided: Vec<SourceRange>,
 }
 
 /// Render a chat message into terminal rows.
@@ -77,7 +77,7 @@ pub(crate) struct MappedMarkdown {
 /// row rather than by message. Fenced code is handed to the application's
 /// existing syntax highlighter one source line at a time.
 #[cfg(test)]
-pub(crate) fn render_markdown(
+pub fn render_markdown(
     text: &str,
     width: usize,
     highlighter: &mut dyn Highlighter,
@@ -91,7 +91,7 @@ pub(crate) fn render_markdown(
 
 /// Render Markdown into terminal rows while preserving a mapping from each
 /// visible cell to stable source bytes in `text`.
-pub(crate) fn render_markdown_mapped(
+pub fn render_markdown_mapped(
     text: &str,
     width: usize,
     highlighter: &mut dyn Highlighter,

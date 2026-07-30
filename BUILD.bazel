@@ -45,6 +45,7 @@ test_suite(
     tests = [
         "//crates/app:app_test_suite",
         "//crates/storage:storage_test_suite",
+        "//crates/tui_text:tui_text_test_suite",
         ":bootstrap_bazelisk_test",
         ":non_tty_cli_test",
         ":pty_smoke_test",

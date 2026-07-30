@@ -934,7 +934,7 @@ impl ChatLayout {
         }
     }
 
-    pub(crate) fn point_for_column(&self, row: usize, target: usize) -> Option<ChatPoint> {
+    pub fn point_for_column(&self, row: usize, target: usize) -> Option<ChatPoint> {
         let rendered = self.rows.get(row)?;
         let mut column = 0usize;
         for (index, cell) in rendered.cells.iter().enumerate() {
