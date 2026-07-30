@@ -665,6 +665,8 @@ struct ControlledState {
 }
 
 impl ControlledAgent {
+    const STARTUP_FLOOD_EVENTS: usize = 1_024;
+
     #[cfg(test)]
     fn new(work_item_id: String) -> Self {
         Self::build(work_item_id, true)
@@ -725,6 +727,8 @@ impl ControlledAgent {
             }
         }
         let state = Arc::clone(&agent.state);
+        let flood_startup = env::var_os("RQ_TUI_CONTROLLED_STARTUP_FLOOD").as_deref()
+            == Some(std::ffi::OsStr::new("1"));
         std::thread::spawn(move || {
             let storage = match Storage::open(&config.database_path) {
                 Ok(storage) => storage,
@@ -847,6 +851,21 @@ impl ControlledAgent {
                         },
                     ),
                 );
+            }
+            if flood_startup {
+                for _ in 0..Self::STARTUP_FLOOD_EVENTS {
+                    Self::schedule_shared(
+                        &state,
+                        Duration::ZERO,
+                        AgentEventEnvelope::agent(
+                            AgentLane::Main,
+                            AgentEvent::Activity {
+                                outbound_id: None,
+                                label: "Controlled startup event flood".into(),
+                            },
+                        ),
+                    );
+                }
             }
             Self::schedule_shared(
                 &state,

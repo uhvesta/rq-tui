@@ -280,7 +280,13 @@ class TerminalScreen:
 
 
 class Child:
-    def __init__(self, binary: Path, repo: Path, data_dir: Path) -> None:
+    def __init__(
+        self,
+        binary: Path,
+        repo: Path,
+        data_dir: Path,
+        extra_env: dict[str, str] | None = None,
+    ) -> None:
         self.pid, self.master = pty.fork()
         if self.pid == 0:
             os.chdir(repo)
@@ -296,6 +302,7 @@ class Child:
                     "TERM": "xterm-256color",
                 }
             )
+            env.update(extra_env or {})
             os.execve(
                 str(binary),
                 [str(binary), "review", str(repo), "--base", "main"],
@@ -372,6 +379,35 @@ class Child:
 
     def wait_for_screen(self, marker: str, timeout: float = 8.0) -> None:
         self.wait_for_screen_within(marker, timeout)
+
+    def wait_for_screen_state(
+        self,
+        required: tuple[str, ...],
+        forbidden: tuple[str, ...],
+        timeout: float = 8.0,
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.read(0.1)
+            text = self.screen.text()
+            if all(marker in text for marker in required) and all(
+                marker not in text for marker in forbidden
+            ):
+                return
+            status = self.poll()
+            if status is not None:
+                raise AssertionError(
+                    self.failure(
+                        f"process exited {status} before screen state "
+                        f"required={required!r} forbidden={forbidden!r}"
+                    )
+                )
+        raise AssertionError(
+            self.failure(
+                f"timed out waiting for screen state "
+                f"required={required!r} forbidden={forbidden!r}"
+            )
+        )
 
     def wait_for_screen_within(
         self, marker: str, timeout: float = 8.0
@@ -532,7 +568,12 @@ def main() -> int:
         # Rendering must syntax-highlight only the viewport; a full-diff pass
         # here starves Crossterm input for many seconds.
         repo = make_fixture(root, extra_changed_lines=12_000)
-        child = Child(binary, repo, app_root)
+        child = Child(
+            binary,
+            repo,
+            app_root,
+            {"RQ_TUI_CONTROLLED_STARTUP_FLOOD": "1"},
+        )
         burst_latency = 0.0
         try:
             child.resize(100, 24)
@@ -556,10 +597,14 @@ def main() -> int:
             )
             child.send(b"\x1b")
             # A generic NORMAL marker can survive in a differential terminal
-            # model while the command popup is still closing. Require the
-            # reducer's explicit acknowledgement before sending the next key;
-            # this also catches Escape-sequence timing regressions.
-            child.wait_for_screen("Command palette closed", timeout=4)
+            # model while the command popup is still closing. Require NORMAL
+            # and the popup's absence together. Do not depend on the transient
+            # close status: a concurrent SDK event may truthfully replace it.
+            child.wait_for_screen_state(
+                ("NORMAL",),
+                ("COMMAND MODE · Command palette",),
+                timeout=4,
+            )
 
             # PTY-31: the key that changes mode and the text following it can
             # arrive in one terminal read. Process that burst online so the
@@ -569,7 +614,7 @@ def main() -> int:
             child.wait_for_screen("INSERT  Enter/Ctrl-S", timeout=2)
             child.wait_for_screen("IMMEDIATE_INPUT", timeout=2)
             child.send(b"\x03")
-            child.wait_for_screen("Draft cancelled", timeout=4)
+            child.wait_for_screen_state(("NORMAL",), ("INSERT",), timeout=4)
 
             # PTY-30: the spec-required Ctrl-W focus chord must acknowledge
             # its pending state and then move between the file tree and diff.

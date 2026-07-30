@@ -304,15 +304,26 @@ fn run_loop<B: Backend>(
     let mut next_periodic_redraw = std::time::Instant::now();
     while !state.should_quit {
         // A noisy tool or streaming source must not starve drawing and input.
+        // Bound both the count and wall-clock slice: some events synchronously
+        // persist delivery state, so a count alone is not a latency bound.
         // Remaining events stay queued for the next frame.
         let mut received_agent_event = false;
-        for _ in 0..256 {
+        let mut agent_slice_saturated = false;
+        let mut agent_events_processed = 0;
+        let agent_slice_started = std::time::Instant::now();
+        for _ in 0..MAX_AGENT_EVENTS_PER_FRAME {
             let Some(event) = bridge.try_recv_laned() else {
                 break;
             };
             handle_agent_envelope(state, storage, event)?;
             received_agent_event = true;
+            agent_events_processed += 1;
+            if agent_slice_started.elapsed() >= MAX_AGENT_EVENT_SLICE {
+                agent_slice_saturated = true;
+                break;
+            }
         }
+        agent_slice_saturated |= agent_events_processed == MAX_AGENT_EVENTS_PER_FRAME;
         redraw |= received_agent_event;
         redraw |= state.ready_prune.is_some();
         finish_ready_prune(state, storage)?;
@@ -323,9 +334,15 @@ fn run_loop<B: Backend>(
             redraw = false;
             next_periodic_redraw = now + std::time::Duration::from_secs(1);
         }
-        let poll_timeout = next_periodic_redraw
-            .saturating_duration_since(std::time::Instant::now())
-            .min(std::time::Duration::from_millis(100));
+        let poll_timeout = if agent_slice_saturated {
+            // Check pending terminal input immediately between saturated SDK
+            // slices instead of adding an idle wait to every noisy batch.
+            std::time::Duration::ZERO
+        } else {
+            next_periodic_redraw
+                .saturating_duration_since(std::time::Instant::now())
+                .min(std::time::Duration::from_millis(100))
+        };
         let events = read_terminal_burst(poll_timeout)?;
         let mut navigation_limiter = NavigationBurstLimiter::default();
         for terminal_event in events {
@@ -374,6 +391,11 @@ fn run_loop<B: Backend>(
     Ok(())
 }
 
+const MAX_AGENT_EVENTS_PER_FRAME: usize = 256;
+const MAX_AGENT_EVENT_SLICE: std::time::Duration = std::time::Duration::from_millis(8);
+// Read the entire common auto-repeat backlog in one pass so the navigation
+// limiter below can discard stale repeats and reach a trailing actionable key
+// without forcing an expensive Review redraw between chunks.
 const MAX_TERMINAL_BURST: usize = 4_096;
 // Legacy terminal input does not distinguish a deliberately repeated motion
 // from keyboard auto-repeat. Keep enough events for normal Vim-style motion
