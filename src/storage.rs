@@ -66,6 +66,7 @@ pub(crate) struct PruneTarget {
 /// expose the new schema contract without requiring a runtime integration
 /// change in this migration-only step.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SideSessionRecord {
     pub(crate) id: String,
     pub(crate) work_item_id: String,
@@ -678,10 +679,8 @@ impl Storage {
     /// Persists the canonical SIDE row. When `session.active` is true, the
     /// ownership switch happens in the same transaction as the upsert, so a
     /// reader can never observe two active sessions for this Work Item.
-    pub(crate) fn persist_ephemeral_side_session(
-        &self,
-        session: &SideSessionRecord,
-    ) -> Result<()> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn persist_ephemeral_side_session(&self, session: &SideSessionRecord) -> Result<()> {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         if let Some((work_item_id, ephemeral)) = tx
             .query_row(
@@ -732,6 +731,7 @@ impl Storage {
     }
 
     /// Returns the active canonical SIDE session, if one exists.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn ephemeral_side_session(
         &self,
         work_item_id: &str,
@@ -759,6 +759,7 @@ impl Storage {
     /// Returns all persisted SIDE rows, including an inactive row awaiting
     /// teardown. The cleanup ledger remains separate and is not replaced by
     /// this canonical session history.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn ephemeral_side_sessions_for_work_item(
         &self,
         work_item_id: &str,
@@ -784,6 +785,7 @@ impl Storage {
     /// Atomically moves active ownership to an already-persisted SIDE row.
     /// Returns false when the requested row is not an ephemeral SIDE for the
     /// supplied Work Item; in that case no ownership is changed.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn activate_ephemeral_side_session(
         &self,
         work_item_id: &str,
@@ -818,6 +820,7 @@ impl Storage {
 
     /// Removes an inactive canonical SIDE row after the SDK session has been
     /// deleted. Active rows must first be switched away from by the caller.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn delete_ephemeral_side_session(
         &self,
         work_item_id: &str,
@@ -2285,7 +2288,9 @@ mod tests {
         storage.persist_ephemeral_side_session(&side).unwrap();
         assert_eq!(storage.ephemeral_side_session(&item.id).unwrap(), None);
         assert_eq!(
-            storage.ephemeral_side_sessions_for_work_item(&item.id).unwrap(),
+            storage
+                .ephemeral_side_sessions_for_work_item(&item.id)
+                .unwrap(),
             vec![side.clone()]
         );
         assert_eq!(
@@ -2299,7 +2304,10 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert_eq!(storage.active_session(&item.id).unwrap().unwrap().id, "main");
+        assert_eq!(
+            storage.active_session(&item.id).unwrap().unwrap().id,
+            "main"
+        );
 
         assert!(storage
             .activate_ephemeral_side_session(&item.id, &side.id)
@@ -2311,7 +2319,10 @@ mod tests {
                 ..side.clone()
             })
         );
-        assert_eq!(storage.active_session(&item.id).unwrap().unwrap().id, "side");
+        assert_eq!(
+            storage.active_session(&item.id).unwrap().unwrap().id,
+            "side"
+        );
         let active_count: i64 = storage
             .connection
             .query_row(
@@ -2374,7 +2385,10 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(storage.active_session(&item.id).unwrap().unwrap().id, "side");
+        assert_eq!(
+            storage.active_session(&item.id).unwrap().unwrap().id,
+            "side"
+        );
         assert!(!storage
             .sessions_for_work_item(&item.id)
             .unwrap()
@@ -2854,7 +2868,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(legacy_ephemeral, 0);
-        assert_eq!(storage.active_session("legacy").unwrap().unwrap().id, "legacy-main");
+        assert_eq!(
+            storage.active_session("legacy").unwrap().unwrap().id,
+            "legacy-main"
+        );
     }
 
     #[test]

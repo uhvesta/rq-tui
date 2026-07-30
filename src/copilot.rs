@@ -341,9 +341,6 @@ pub(crate) enum AgentCommand {
     ListModels,
     /// Apply the staged model -> reasoning effort -> context tier choice.
     SelectModel(ModelSelection),
-    /// Legacy one-stage model switch retained while callers migrate to
-    /// `SelectModel`.
-    SetModel(String),
     /// Delete every persisted Copilot session associated with reviewed Work
     /// Items before their local history is pruned.
     PruneSessions {
@@ -1388,11 +1385,6 @@ impl AgentSink for ControlledAgent {
                     AgentEvent::ModelChanged(selection.model_id),
                 );
             }
-            AgentCommand::SetModel(model) => self.schedule_agent(
-                AgentLane::Main,
-                Duration::ZERO,
-                AgentEvent::ModelChanged(model),
-            ),
             AgentCommand::PruneSessions {
                 request_id,
                 work_item_ids,
@@ -3269,37 +3261,6 @@ async fn worker(
                             }),
                         }
                     }
-                    AgentCommand::SetModel(model) => {
-                        let selection = ModelSelection {
-                            model_id: model,
-                            reasoning_effort: None,
-                            context_tier: None,
-                        };
-                        let events = main_events.on_lane(active_lane.clone());
-                        let slot = if let Some(side) =
-                            side.as_mut().filter(|_| active_lane != AgentLane::Main)
-                        {
-                            &mut side.slot
-                        } else {
-                            &mut main
-                        };
-                        match sdk_call(
-                            "Copilot model selection",
-                            slot.session
-                                .set_model(&selection.model_id, Some(SetModelOptions::default())),
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                events.emit(AgentEvent::ModelSelectionChanged(selection.clone()));
-                                events.emit(AgentEvent::ModelChanged(selection.model_id));
-                            }
-                            Err(error) => events.emit(AgentEvent::ModelSelectionFailed {
-                                selection: selection.clone(),
-                                message: error.to_string(),
-                            }),
-                        }
-                    }
                     AgentCommand::Compact(instructions) => {
                         let events = main_events.on_lane(active_lane.clone());
                         let slot = if let Some(side) =
@@ -3965,15 +3926,13 @@ async fn worker(
                     }
                     AgentCommand::Fork
                     | AgentCommand::Compact(_)
-                    | AgentCommand::SelectModel(_)
-                    | AgentCommand::SetModel(_) => {
+                    | AgentCommand::SelectModel(_) => {
                         let label = match &command {
                             AgentCommand::Fork => "Fork queued after the current response",
                             AgentCommand::Compact(_) => "Compaction queued after the current response",
                             AgentCommand::SelectModel(_) => {
                                 "Model selection queued after the current response"
                             }
-                            AgentCommand::SetModel(_) => "Model change queued after the current response",
                             _ => unreachable!(),
                         };
                         controls.push_back(command);

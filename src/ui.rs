@@ -7,7 +7,7 @@ use base64::Engine as _;
 use crossterm::cursor::Show;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -325,9 +325,14 @@ fn run_loop<B: Backend>(
         let poll_timeout = next_periodic_redraw
             .saturating_duration_since(std::time::Instant::now())
             .min(std::time::Duration::from_millis(100));
-        if event::poll(poll_timeout)? {
-            match event::read()? {
+        let events = read_terminal_burst(poll_timeout)?;
+        let mut navigation_limiter = NavigationBurstLimiter::default();
+        for terminal_event in events {
+            match terminal_event {
                 Event::Key(key) => {
+                    if !navigation_limiter.allow(state, key) {
+                        continue;
+                    }
                     let effects = state.handle_key(key);
                     for effect in effects {
                         if let Err(error) =
@@ -366,6 +371,74 @@ fn run_loop<B: Backend>(
         }
     }
     Ok(())
+}
+
+const MAX_TERMINAL_BURST: usize = 4_096;
+// Legacy terminal input does not distinguish a deliberately repeated motion
+// from keyboard auto-repeat. Keep enough events for normal Vim-style motion
+// sequences while bounding stale held-key backlogs to a tiny amount of work.
+const MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST: usize = 32;
+
+fn read_terminal_burst(timeout: std::time::Duration) -> Result<Vec<Event>> {
+    if !event::poll(timeout)? {
+        return Ok(Vec::new());
+    }
+    let mut events = Vec::with_capacity(16);
+    events.push(event::read()?);
+    while events.len() < MAX_TERMINAL_BURST && event::poll(std::time::Duration::ZERO)? {
+        events.push(event::read()?);
+    }
+    Ok(events)
+}
+
+#[derive(Default)]
+struct NavigationBurstLimiter {
+    counts: Vec<(KeyCode, KeyModifiers, usize)>,
+}
+
+impl NavigationBurstLimiter {
+    fn allow(&mut self, state: &AppState, key: KeyEvent) -> bool {
+        if key.kind == KeyEventKind::Release {
+            return false;
+        }
+        if !is_navigation_key(state, &key) {
+            return true;
+        }
+        if let Some((_, _, count)) = self
+            .counts
+            .iter_mut()
+            .find(|(code, modifiers, _)| *code == key.code && *modifiers == key.modifiers)
+        {
+            if *count >= MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST {
+                return false;
+            }
+            *count += 1;
+            return true;
+        }
+        self.counts.push((key.code, key.modifiers, 1));
+        true
+    }
+}
+
+fn is_navigation_key(state: &AppState, key: &KeyEvent) -> bool {
+    if matches!(
+        state.input_mode,
+        InputMode::Command | InputMode::Search | InputMode::Compose
+    ) {
+        return false;
+    }
+    matches!(
+        key.code,
+        KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::Char('j' | 'k' | 'h' | 'l' | 'g' | 'G' | 'n' | 'N' | '[' | ']')
+    )
 }
 
 pub(crate) fn mouse_scroll_effects(state: &mut AppState, kind: MouseEventKind) -> Vec<Effect> {
@@ -1261,22 +1334,6 @@ pub(crate) fn handle_effect(
                     .as_deref()
                     .unwrap_or("runtime default"),
             );
-        }
-        Effect::SetModel(model) => {
-            persist_model_preferences(
-                state,
-                storage,
-                &crate::copilot::ModelSelection {
-                    model_id: model.clone(),
-                    reasoning_effort: None,
-                    context_tier: None,
-                },
-            )?;
-            bridge.send(AgentCommand::SetModel(model.clone()))?;
-            state.model = model.clone();
-            state.reasoning_effort = None;
-            state.context_tier = None;
-            state.status = format!("Switching model to {model}…");
         }
         Effect::Snapshot => {
             let repo = state
@@ -3657,17 +3714,20 @@ pub(crate) fn render(
 ) {
     if frame.area().width < 40 || frame.area().height < 9 {
         let area = frame.area();
+        let block = if area.width >= 22 {
+            Block::default()
+                .title(" Terminal too small ")
+                .borders(Borders::ALL)
+        } else {
+            Block::default().borders(Borders::ALL)
+        };
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(format!(
                 "needs at least 40×9\ncurrent: {}×{}\nresize to continue\n:q still exits safely",
                 area.width, area.height
             ))
-            .block(
-                Block::default()
-                    .title(" Terminal too small ")
-                    .borders(Borders::ALL),
-            )
+            .block(block)
             .wrap(Wrap { trim: false }),
             area,
         );
@@ -5073,17 +5133,19 @@ fn review_row_lines(
         )],
         ReviewRow::Fold {
             hidden_lines, text, ..
-        } => vec![styled_full_row(
-            format!(
-                "{} ··· {} unchanged lines ···  {}",
-                if selected { "❯" } else { " " },
-                hidden_lines,
-                text
-            ),
-            width,
-            Style::default().fg(Color::Blue),
-            selected_style,
-        )],
+        } => {
+            let label = if text.contains("unchanged lines") {
+                text.clone()
+            } else {
+                format!("··· {hidden_lines} unchanged lines ···  {text}")
+            };
+            vec![styled_full_row(
+                format!("{} {label}", if selected { "❯" } else { " " }),
+                width,
+                Style::default().fg(Color::Blue),
+                selected_style,
+            )]
+        }
         ReviewRow::Source {
             file,
             line,
@@ -5687,8 +5749,8 @@ fn render_chat(
         format!(" Chat · {lane} · {row_range} ")
     } else {
         format!(
-            " {} — Chat · {lane} · {row_range} ",
-            state.work_item.item.name
+            " {} — Chat · {lane} · {} · {row_range} ",
+            state.work_item.item.name, state.model,
         )
     };
     frame.render_widget(
@@ -6080,7 +6142,10 @@ fn render_chat_composer(frame: &mut ratatui::Frame, state: &mut AppState, area: 
             } else if area.width < 60 {
                 format!(" NORMAL · {} ", state.status)
             } else {
-                format!(" NORMAL · {} · i edit · : commands ", state.status)
+                format!(
+                    " NORMAL · {} · i edit · Tab review · : commands ",
+                    state.status
+                )
             };
             (title, Color::DarkGray)
         }
@@ -6719,7 +6784,7 @@ mod tests {
     use std::sync::Mutex;
 
     use anyhow::Result;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -6727,7 +6792,8 @@ mod tests {
         copy_to_clipboard_with_writer, finish_ready_prune, handle_agent_envelope,
         handle_agent_event, handle_effect, handle_effect_failure, load_model_preferences,
         load_ui_preferences, markdown_to_html, mouse_scroll_effects, open_browser_preview,
-        parse_review_context, render, run_clipboard_candidate, table_cells,
+        parse_review_context, render, review_row_lines, run_clipboard_candidate, table_cells,
+        NavigationBurstLimiter, MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST,
     };
     use crate::app::{
         tests_support::state_for_ui, AgentPhase, ChatEntry, ComposeTarget, DiffLayout, Effect,
@@ -6741,6 +6807,7 @@ mod tests {
     use crate::diff::{DiffLine, LineKind};
     use crate::domain::{PendingChat, WorkItem};
     use crate::highlight::{Highlighter, PlainHighlighter, StyledSegment};
+    use crate::review_stream::{ReviewRow, ReviewRowKey};
     use crate::storage::{now, Storage};
 
     #[derive(Default)]
@@ -6817,6 +6884,30 @@ mod tests {
         assert!(content.contains("demo — Review"));
         assert!(content.contains("unified"));
         assert!(content.contains("a ask"));
+    }
+
+    #[test]
+    fn chat_header_and_footer_keep_model_and_review_return_visible() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = state_for_ui();
+        state.screen = Screen::Chat;
+        state.focus = Focus::Chat;
+        state.model = "gpt-test".into();
+        state.status = "Draft kept".into();
+        let mut highlighter = PlainHighlighter;
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Chat · MAIN · gpt-test"));
+        assert!(content.contains("Tab review"));
     }
 
     #[test]
@@ -7435,6 +7526,73 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(2),
             "clipboard timeout must not stall the TUI"
         );
+    }
+
+    #[test]
+    fn held_navigation_is_bounded_per_ready_terminal_burst() {
+        let state = state_for_ui();
+        let mut limiter = NavigationBurstLimiter::default();
+        let repeated = (0..100)
+            .filter(|_| {
+                limiter.allow(
+                    &state,
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('j'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Repeat,
+                    ),
+                )
+            })
+            .count();
+        assert_eq!(repeated, MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST);
+        assert!(!limiter.allow(
+            &state,
+            KeyEvent::new_with_kind(
+                KeyCode::Char('j'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )
+        ));
+
+        let mut composing = state_for_ui();
+        composing.input_mode = InputMode::Compose;
+        let mut composing_limiter = NavigationBurstLimiter::default();
+        assert!((0..20).all(|_| {
+            composing_limiter.allow(
+                &composing,
+                KeyEvent::new_with_kind(
+                    KeyCode::Char('j'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Repeat,
+                ),
+            )
+        }));
+    }
+
+    #[test]
+    fn unified_fold_row_does_not_duplicate_its_label() {
+        let row = ReviewRow::Fold {
+            key: ReviewRowKey::Fold {
+                repo_id: "repo".into(),
+                file: "src/main.rs".into(),
+                hunk: 0,
+                line: 4,
+            },
+            repo_id: "repo".into(),
+            file: "src/main.rs".into(),
+            hunk: 0,
+            line: 4,
+            hidden_lines: 173,
+            text: "··· 173 unchanged lines ··· (o expand 10 · O expand all)".into(),
+        };
+        let mut highlighter = PlainHighlighter;
+        let rendered = review_row_lines(&row, None, 100, 0, &mut highlighter);
+        let text = rendered[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text.matches("173 unchanged lines").count(), 1);
     }
 
     #[test]

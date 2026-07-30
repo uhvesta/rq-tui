@@ -171,7 +171,6 @@ pub(crate) enum Effect {
     Compact(Option<String>),
     LoadModels,
     SelectModel(ModelSelection),
-    SetModel(String),
     SetBase {
         branch: String,
         repo: Option<String>,
@@ -513,7 +512,10 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("stop", "cancel the active Copilot response"),
     ("abort", "cancel the active Copilot response"),
     ("progress", "inspect Copilot liveness and recent SDK events"),
-    ("side-exit", "leave the side conversation and return to main"),
+    (
+        "side-exit",
+        "leave the side conversation and return to main",
+    ),
     ("diff split", "show the side-by-side diff"),
     ("diff unified", "show a single-column diff"),
     ("diff expand", "expand all folded context"),
@@ -575,7 +577,9 @@ fn literal_command_completion(typed: &str, candidate: &str) -> bool {
     let candidate_tokens = candidate.split_whitespace().collect::<Vec<_>>();
     !typed_tokens.is_empty()
         && typed_tokens.len() <= candidate_tokens.len()
-        && candidate_tokens.iter().all(|token| !is_command_argument(token))
+        && candidate_tokens
+            .iter()
+            .all(|token| !is_command_argument(token))
         && typed_tokens
             .iter()
             .enumerate()
@@ -1101,25 +1105,25 @@ impl AppState {
                 line,
                 ..
             } => {
-                let visible = self
-                    .work_item
-                    .repos
-                    .iter()
-                    .find(|repo| repo.record.id == *repo_id)
-                    .and_then(|repo| {
-                        repo.diff.files.iter().find(|candidate| {
-                            candidate.path().to_string_lossy() == file.as_str()
+                let visible =
+                    self.work_item
+                        .repos
+                        .iter()
+                        .find(|repo| repo.record.id == *repo_id)
+                        .and_then(|repo| {
+                            repo.diff.files.iter().find(|candidate| {
+                                candidate.path().to_string_lossy() == file.as_str()
+                            })
                         })
-                    })
-                    .map(|file| {
-                        file.hunks
-                            .iter()
-                            .take(*hunk)
-                            .map(|hunk| hunk.lines.len())
-                            .sum::<usize>()
-                            .saturating_add(*line)
-                    })
-                    .unwrap_or(0);
+                        .map(|file| {
+                            file.hunks
+                                .iter()
+                                .take(*hunk)
+                                .map(|hunk| hunk.lines.len())
+                                .sum::<usize>()
+                                .saturating_add(*line)
+                        })
+                        .unwrap_or(0);
                 self.set_current_review_location(repo_id, file, visible);
             }
             ReviewRow::Source { .. } | ReviewRow::Annotation { .. } => {}
@@ -3047,7 +3051,9 @@ impl AppState {
             } else if selected
                 .is_some_and(|suggestion| literal_command_completion(typed, suggestion))
             {
-                selected.map(command_seed).unwrap_or_else(|| typed.to_owned())
+                selected
+                    .map(command_seed)
+                    .unwrap_or_else(|| typed.to_owned())
             } else if !typed.contains(char::is_whitespace) {
                 selected
                     .map(command_seed)
@@ -4674,7 +4680,7 @@ mod tests {
         AgentPhase, AppState, ComposeTarget, DiffLayout, Effect, Focus, InputMode, MarkdownPreview,
         PruneChoice, Screen,
     };
-    use crate::diff::{DiffLine, Hunk, LineKind};
+    use crate::diff::{DiffLine, LineKind};
     use crate::domain::{AskMessage, DeliveryState};
 
     fn state() -> AppState {
@@ -4757,9 +4763,7 @@ mod tests {
             super::command_matches("model"),
             vec![("model", "pick a runtime-supported model in stages")]
         );
-        assert!(
-            super::command_matches("model definitely-not-runtime-advertised").is_empty()
-        );
+        assert!(super::command_matches("model definitely-not-runtime-advertised").is_empty());
 
         let mut app = state();
         app.input_mode = InputMode::Command;

@@ -371,11 +371,17 @@ class Child:
         raise AssertionError(self.failure(f"timed out waiting for new {marker!r}"))
 
     def wait_for_screen(self, marker: str, timeout: float = 8.0) -> None:
+        self.wait_for_screen_within(marker, timeout)
+
+    def wait_for_screen_within(
+        self, marker: str, timeout: float = 8.0
+    ) -> float:
+        started = time.monotonic()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             self.read(0.1)
             if marker in self.screen.text():
-                return
+                return time.monotonic() - started
             status = self.poll()
             if status is not None:
                 raise AssertionError(
@@ -544,23 +550,30 @@ def main() -> int:
             # unambiguous, actionable acknowledgement: it proves the input
             # loop reached a new mode after the burst, not merely that the
             # terminal kept repainting the old review screen.
-            before_burst = len(child.output)
             child.send(NAVIGATION_BURST + b":")
-            burst_latency = child.wait_for_since_within(
-                "COMMAND MODE ACTIVE", before_burst, BURST_RESPONSE_TIMEOUT
+            burst_latency = child.wait_for_screen_within(
+                "COMMAND MODE · Command palette", BURST_RESPONSE_TIMEOUT
             )
             child.send(b"\x1b")
-            child.wait_for_since("NORMAL", before_burst, timeout=4)
+            child.wait_for_screen("NORMAL", timeout=4)
+
+            # PTY-31: the key that changes mode and the text following it can
+            # arrive in one terminal read. Process that burst online so the
+            # composer receives every character instead of dropping the text
+            # against the previous Normal-mode snapshot.
+            child.send(b"aIMMEDIATE_INPUT")
+            child.wait_for_screen("IMMEDIATE_INPUT", timeout=2)
+            child.send(b"\x03")
+            child.wait_for_screen("NORMAL", timeout=4)
 
             # PTY-30: the spec-required Ctrl-W focus chord must acknowledge
             # its pending state and then move between the file tree and diff.
-            before_focus = len(child.output)
             child.send(b"\x17")
-            child.wait_for_since("CTRL-W", before_focus, timeout=4)
+            child.wait_for_screen("CTRL-W", timeout=4)
             child.send(b"h")
-            child.wait_for_since("Focus: files", before_focus, timeout=4)
+            child.wait_for_screen("Focus: files", timeout=4)
             child.send(b"\x17l")
-            child.wait_for_since("Focus: diff", before_focus, timeout=4)
+            child.wait_for_screen("Focus: diff", timeout=4)
 
             # Resize the real terminal and require a post-resize redraw. The
             # ioctl is deliberately performed on the PTY master, so this also
@@ -578,7 +591,7 @@ def main() -> int:
             # call. The source text remains present after the smaller layout.
             child.send(b"j")
             child.send(b"v")
-            child.wait_for_screen("rows 2-2", timeout=4)
+            child.wait_for_screen("VISUAL CHAR", timeout=4)
             child.send(b"\x1b")
             child.wait_for_screen("NORMAL", timeout=4)
             child.send(b"\x16")
