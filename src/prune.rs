@@ -107,7 +107,9 @@ fn prune_work_item_inner(
             match version.kind {
                 crate::domain::VersionKind::Remote => {
                     if let Some(worktree) = version.worktree_path {
-                        git.remove_worktree(&repo.path, &worktree)?;
+                        if !storage.worktree_path_is_shared(&worktree, work_item_id)? {
+                            git.remove_worktree(&repo.path, &worktree)?;
+                        }
                     }
                 }
                 crate::domain::VersionKind::Snapshot => {
@@ -122,7 +124,7 @@ fn prune_work_item_inner(
                 crate::domain::VersionKind::WorkingTree => {}
             }
         }
-        if repo.remote_pr_url.is_some() {
+        if repo.remote_pr_url.is_some() && !storage.repo_path_is_shared(&repo.path, work_item_id)? {
             if let Some(cache_root) = repo.path.parent() {
                 remote_cache_roots.push(cache_root.to_path_buf());
             }
@@ -157,7 +159,7 @@ fn prune_work_item_inner(
 mod tests {
     use super::{prune_export_path, prune_work_item};
     use crate::config::AppPaths;
-    use crate::domain::{SessionRecord, WorkItem};
+    use crate::domain::{BaseBranchSource, Repo, SessionRecord, Version, VersionKind, WorkItem};
     use crate::storage::Storage;
 
     #[test]
@@ -232,6 +234,78 @@ mod tests {
 
         assert!(marker.exists());
         assert!(storage.work_item_by_id(&item.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn pruning_one_work_item_preserves_remote_cache_shared_by_another() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let cache = directory.path().join("cache");
+        let paths = AppPaths {
+            database: data.join("review.db"),
+            roots: data.join("roots"),
+            exports: data.join("exports"),
+            skills: data.join("skills"),
+            plugins: data.join("plugins"),
+            prs: cache.join("prs"),
+            data,
+            cache,
+        };
+        paths.ensure().unwrap();
+        let storage = Storage::open(&paths.database).unwrap();
+        let cache_root = paths.prs.join("acme-api-42");
+        let bare = cache_root.join("repo.git");
+        let worktree = cache_root.join("worktrees").join("v1");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(bare.join("must-survive"), "shared bare repository").unwrap();
+        std::fs::write(worktree.join("must-survive"), "shared worktree").unwrap();
+
+        for item_id in ["first-review", "second-review"] {
+            storage
+                .upsert_work_item(&WorkItem {
+                    id: item_id.into(),
+                    name: item_id.into(),
+                    workspace_root: paths.roots.join(item_id),
+                    created_at: "1".into(),
+                    updated_at: "1".into(),
+                    last_opened_at: Some("1".into()),
+                })
+                .unwrap();
+            let repo_id = format!("{item_id}-repo");
+            storage
+                .upsert_repo(&Repo {
+                    id: repo_id.clone(),
+                    work_item_id: item_id.into(),
+                    name: "api".into(),
+                    path: bare.clone(),
+                    remote_pr_url: Some("https://github.com/acme/api/pull/42".into()),
+                    pr_meta_json: None,
+                    base_branch: Some("main".into()),
+                    base_branch_source: BaseBranchSource::Auto,
+                    last_activity_at: None,
+                })
+                .unwrap();
+            storage
+                .upsert_version(&Version {
+                    id: format!("{repo_id}:v1"),
+                    repo_id,
+                    version_num: 1,
+                    kind: VersionKind::Remote,
+                    created_at: "1".into(),
+                    head_sha: "shared-head".into(),
+                    worktree_path: Some(worktree.clone()),
+                    last_opened_at: Some("1".into()),
+                })
+                .unwrap();
+        }
+
+        prune_work_item(&storage, &paths, "first-review", false, None, None).unwrap();
+
+        assert!(storage.work_item_by_id("first-review").unwrap().is_none());
+        assert!(storage.work_item_by_id("second-review").unwrap().is_some());
+        assert!(bare.join("must-survive").is_file());
+        assert!(worktree.join("must-survive").is_file());
     }
 
     #[test]

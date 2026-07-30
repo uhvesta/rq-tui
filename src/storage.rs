@@ -370,6 +370,38 @@ impl Storage {
         .collect()
     }
 
+    pub(crate) fn repo_path_is_shared(
+        &self,
+        path: &Path,
+        excluding_work_item_id: &str,
+    ) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM repos
+                WHERE path = ?1 AND work_item_id != ?2
+             )",
+            params![path.to_string_lossy(), excluding_work_item_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn worktree_path_is_shared(
+        &self,
+        path: &Path,
+        excluding_work_item_id: &str,
+    ) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM versions v
+                JOIN repos r ON r.id = v.repo_id
+                WHERE v.worktree_path = ?1 AND r.work_item_id != ?2
+             )",
+            params![path.to_string_lossy(), excluding_work_item_id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub(crate) fn upsert_version(&self, version: &Version) -> Result<()> {
         self.connection.execute(
             "INSERT INTO versions(
