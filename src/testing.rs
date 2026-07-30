@@ -1187,6 +1187,77 @@ mod tests {
     }
 
     #[test]
+    fn repeated_annotations_refocus_the_source_instead_of_a_prior_footer() {
+        let mut harness =
+            TuiHarness::from_unified_diff("repeat-inline", workflow_diff(), 72, 20).unwrap();
+        harness.key(key(KeyCode::Char('c'))).unwrap();
+        type_text(&mut harness, "first");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.key(key(KeyCode::Char('c'))).unwrap();
+        type_text(&mut harness, "second");
+        harness.key(key(KeyCode::Enter)).unwrap();
+
+        assert_eq!(harness.persisted_annotations().unwrap().len(), 2);
+        harness.key(key(KeyCode::Char('c'))).unwrap();
+        assert_eq!(harness.mode(), "INSERT");
+        assert!(harness.status().is_empty() || !harness.status().contains("Cannot annotate"));
+    }
+
+    #[test]
+    fn deleting_a_queued_ask_cancels_and_quarantines_its_late_response() {
+        let mut harness =
+            TuiHarness::from_unified_diff("delete-queued", workflow_diff(), 80, 20).unwrap();
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        type_text(&mut harness, "delete before response");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.key(key(KeyCode::Char(']'))).unwrap();
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        harness.key(key(KeyCode::Char('d'))).unwrap();
+        harness.key(key(KeyCode::Char('d'))).unwrap();
+
+        assert!(harness.persisted_annotations().unwrap().is_empty());
+        assert!(harness
+            .agent_commands()
+            .iter()
+            .any(|command| command.contains("CancelQueued")));
+        harness.start_next_response("late answer").unwrap();
+        assert!(harness.status().contains("deleted Ask"));
+        harness.complete_response(false).unwrap();
+        assert!(harness.render().is_ok());
+        assert!(harness.selected_cell_count().unwrap() > 0);
+    }
+
+    #[test]
+    fn visual_mode_cannot_start_on_review_chrome() {
+        let mut harness =
+            TuiHarness::from_unified_diff("header-visual", workflow_diff(), 80, 20).unwrap();
+        harness.key(key(KeyCode::Char('g'))).unwrap();
+        harness.key(key(KeyCode::Char('g'))).unwrap();
+        harness.key(key(KeyCode::Char('v'))).unwrap();
+        assert_eq!(harness.mode(), "NORMAL");
+        assert!(harness.status().contains("source rows"));
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        assert_eq!(harness.mode(), "NORMAL");
+        assert!(harness.status().contains("Cannot annotate"));
+    }
+
+    #[test]
+    fn global_review_jumps_clear_visual_selection_at_file_boundaries() {
+        let mut harness = TuiHarness::from_unified_diff(
+            "manyfiles",
+            &super::ui_script_fixture("manyfiles").unwrap().1,
+            90,
+            20,
+        )
+        .unwrap();
+        harness.key(key(KeyCode::Char('v'))).unwrap();
+        harness.key(key(KeyCode::Char('G'))).unwrap();
+        assert_eq!(harness.mode(), "NORMAL");
+        assert!(harness.status().contains("file boundary"));
+        assert!(harness.render().unwrap().contains("src/module_12.rs"));
+    }
+
+    #[test]
     fn i_on_an_ask_block_starts_a_new_follow_up_instead_of_editing_history() {
         let mut harness =
             TuiHarness::from_unified_diff("follow-up", workflow_diff(), 90, 22).unwrap();
@@ -1561,6 +1632,57 @@ mod tests {
         let frame = harness.render().unwrap();
         assert!(frame.contains("Command palette"));
         assert!(frame.contains(":diff"));
+    }
+
+    #[test]
+    fn exact_minimum_pins_inline_editor_identity_cursor_and_controls() {
+        let mut harness =
+            TuiHarness::from_unified_diff("minimum-editor", workflow_diff(), 40, 9).unwrap();
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        type_text(
+            &mut harness,
+            "How does a long contextual composer fit while keeping its cursor visible?",
+        );
+        let frame = harness.render().unwrap();
+        assert!(frame.contains("Ask · INSERT"));
+        assert!(frame.contains('▏'));
+        assert!(frame.contains("Enter"));
+        assert!(frame.contains("Esc keep"));
+        assert!(frame.contains("^C discard"));
+    }
+
+    #[test]
+    fn composers_never_wrap_inside_flags_keycaps_or_zwj_families() {
+        let text = "clusters 🇺🇸 1\u{fe0f}\u{20e3} 👨\u{200d}👩\u{200d}👧\u{200d}👦";
+        let mut chat =
+            TuiHarness::from_unified_diff("chat-graphemes", workflow_diff(), 40, 12).unwrap();
+        chat.key(key(KeyCode::Tab)).unwrap();
+        chat.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut chat, text);
+        let chat_frame = chat.render().unwrap();
+        assert!(chat_frame.contains("🇺🇸"));
+        assert!(chat_frame.contains("1\u{fe0f}\u{20e3}"));
+        assert!(chat_frame.contains("👨\u{200d}👩\u{200d}👧\u{200d}👦"));
+
+        let mut review =
+            TuiHarness::from_unified_diff("review-graphemes", workflow_diff(), 42, 12).unwrap();
+        review.key(key(KeyCode::Char('a'))).unwrap();
+        type_text(&mut review, text);
+        let review_frame = review.render().unwrap();
+        assert!(review_frame.contains("🇺🇸"));
+        assert!(review_frame.contains("1\u{fe0f}\u{20e3}"));
+        assert!(review_frame.contains("👨\u{200d}👩\u{200d}👧\u{200d}👦"));
+    }
+
+    #[test]
+    fn narrow_file_picker_uses_the_full_body_width() {
+        let mut harness =
+            TuiHarness::from_unified_diff("narrow-files", workflow_diff(), 40, 9).unwrap();
+        harness.key(key(KeyCode::Char('t'))).unwrap();
+        let frame = harness.render().unwrap();
+        assert!(frame.contains("▶ files"));
+        assert!(frame.contains("src/lib.rs"));
+        assert!(!frame.contains("unified"));
     }
 
     #[test]

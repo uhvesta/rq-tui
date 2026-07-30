@@ -27,6 +27,8 @@ RUNTIME_DEPS = crate_deps([
     "tempfile",
     "tokio",
     "two-face",
+    "unicode-segmentation",
+    "unicode-width",
     "uuid",
     "walkdir",
 ], package_name = "")

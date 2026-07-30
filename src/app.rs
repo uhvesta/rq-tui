@@ -16,6 +16,10 @@ use crate::domain::{
 use crate::review_stream::{
     InlineAnnotation, ReviewFile, ReviewRow, ReviewStream, SourceSide, StreamMovement,
 };
+use crate::terminal_text::{
+    cell_width, floor_grapheme_boundary, grapheme_indices, next_grapheme_boundary,
+    previous_grapheme_boundary,
+};
 use crate::work_item::ResolvedWorkItem;
 
 const INLINE_COMPOSER_ID: &str = "zzzzzzzz-inline-composer";
@@ -798,10 +802,7 @@ impl AppState {
         };
         let mut draft = self.compose.clone();
         if self.input_mode == InputMode::Compose {
-            let mut cursor = self.compose_cursor.min(draft.len());
-            while cursor > 0 && !draft.is_char_boundary(cursor) {
-                cursor -= 1;
-            }
+            let cursor = floor_grapheme_boundary(&draft, self.compose_cursor);
             draft.insert(cursor, '▏');
         }
         Some(
@@ -844,6 +845,8 @@ impl AppState {
     }
 
     fn move_review_stream(&mut self, movement: StreamMovement) {
+        let origin = (self.repo_index, self.file_index);
+        let was_visual = self.input_mode == InputMode::Visual;
         let mut stream = self.review_stream();
         stream.set_cursor(self.review_cursor);
         stream.move_by(movement, self.viewport_height.max(1));
@@ -851,6 +854,10 @@ impl AppState {
         let row = stream.current().cloned();
         if let Some(row) = row.as_ref() {
             self.sync_source_from_review_row(row);
+        }
+        if was_visual && origin != (self.repo_index, self.file_index) {
+            self.clear_visual_selection();
+            self.status = "Visual selection cleared at the file boundary".into();
         }
     }
 
@@ -927,7 +934,7 @@ impl AppState {
         );
     }
 
-    fn sync_review_cursor_to_current_file(&mut self) {
+    pub(crate) fn sync_review_cursor_to_current_file(&mut self) {
         let repo_id = self
             .work_item
             .repos
@@ -1365,8 +1372,16 @@ impl AppState {
                 if matches!(self.screen, Screen::Review | Screen::Chat)
                     && matches!(self.focus, Focus::Diff | Focus::InlineAsk) =>
             {
-                self.input_mode = InputMode::Visual;
-                self.visual_anchor = Some(self.cursor);
+                let mut stream = self.review_stream();
+                stream.set_cursor(self.review_cursor);
+                if matches!(stream.current(), Some(ReviewRow::Source { .. })) {
+                    self.input_mode = InputMode::Visual;
+                    self.visual_anchor = Some(self.cursor);
+                } else {
+                    self.status =
+                        "Visual selection starts on source rows, not headers or annotation blocks"
+                            .into();
+                }
             }
             KeyCode::Esc if self.input_mode == InputMode::Visual => {
                 self.input_mode = InputMode::Normal;
@@ -1465,7 +1480,7 @@ impl AppState {
                 }
             }
             KeyCode::Char('e') if self.screen == Screen::Review => {
-                if let Some((kind, annotation_id, text, ambiguous)) = self
+                if let Some((kind, annotation_id, text, ambiguous, outdated)) = self
                     .annotation_under_cursor()
                     .map(|(annotation, placement)| {
                         (
@@ -1473,10 +1488,11 @@ impl AppState {
                             annotation.id.clone(),
                             annotation.text.clone().unwrap_or_default(),
                             placement.ambiguous,
+                            placement.outdated,
                         )
                     })
                 {
-                    if ambiguous {
+                    if ambiguous || outdated {
                         let selection = self.diff_selection();
                         self.input_mode = InputMode::Normal;
                         self.visual_anchor = None;
@@ -2723,14 +2739,12 @@ impl AppState {
             self.status = "Cannot annotate a binary or empty file".into();
             return;
         }
-        if self.input_mode == InputMode::Normal {
-            let mut stream = self.review_stream();
-            stream.set_cursor(self.review_cursor);
-            if !matches!(stream.current(), Some(ReviewRow::Source { .. })) {
-                self.status =
-                    "Cannot annotate fold and metadata rows, file headers, or hunk headers".into();
-                return;
-            }
+        let mut stream = self.review_stream();
+        stream.set_cursor(self.review_cursor);
+        if !matches!(stream.current(), Some(ReviewRow::Source { .. })) {
+            self.status =
+                "Cannot annotate fold and metadata rows, file headers, or hunk headers".into();
+            return;
         }
         let Some(file) = self.current_file() else {
             self.status = "Cannot annotate a binary or empty file".into();
@@ -2756,19 +2770,11 @@ impl AppState {
     }
 
     fn previous_compose_boundary(&self) -> usize {
-        self.compose[..self.compose_cursor]
-            .char_indices()
-            .next_back()
-            .map(|(index, _)| index)
-            .unwrap_or(0)
+        previous_grapheme_boundary(&self.compose, self.compose_cursor)
     }
 
     fn next_compose_boundary(&self) -> usize {
-        self.compose[self.compose_cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(index, _)| self.compose_cursor + index)
-            .unwrap_or(self.compose.len())
+        next_grapheme_boundary(&self.compose, self.compose_cursor)
     }
 
     fn compose_line_start(&self) -> usize {
@@ -2786,7 +2792,19 @@ impl AppState {
     }
 
     fn move_compose_vertical(&mut self, direction: i8) {
-        let positions = editor_cursor_positions(&self.compose, self.compose_wrap_width);
+        let initial_column = matches!(
+            self.compose_target,
+            Some(
+                ComposeTarget::Annotation(_)
+                    | ComposeTarget::FollowUp(_)
+                    | ComposeTarget::EditAnnotation(_)
+                    | ComposeTarget::EditAskMessage { .. }
+            )
+        )
+        .then_some(2)
+        .unwrap_or(0);
+        let positions =
+            editor_cursor_positions(&self.compose, self.compose_wrap_width, initial_column);
         let Some((_, row, column)) = positions
             .iter()
             .find(|(byte, _, _)| *byte == self.compose_cursor)
@@ -3237,6 +3255,8 @@ impl AppState {
     }
 
     fn jump_annotation(&mut self, forward: bool) {
+        let origin = (self.repo_index, self.file_index);
+        let was_visual = self.input_mode == InputMode::Visual;
         let mut stream = self.review_stream();
         stream.set_cursor(self.review_cursor);
         let target = stream.jump_annotation(forward);
@@ -3247,6 +3267,10 @@ impl AppState {
         self.review_cursor = target;
         if let Some(row) = stream.current() {
             self.sync_source_from_review_row(row);
+        }
+        if was_visual && origin != (self.repo_index, self.file_index) {
+            self.clear_visual_selection();
+            self.status = "Visual selection cleared at the file boundary".into();
         }
     }
 
@@ -3310,20 +3334,28 @@ fn terminal_enter(key: &KeyEvent) -> bool {
             && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
-fn editor_cursor_positions(text: &str, width: usize) -> Vec<(usize, usize, usize)> {
+fn editor_cursor_positions(
+    text: &str,
+    width: usize,
+    initial_column: usize,
+) -> Vec<(usize, usize, usize)> {
     let width = width.max(1);
-    let mut positions = Vec::with_capacity(text.chars().count().saturating_add(1));
+    let mut positions = Vec::with_capacity(text.len().saturating_add(1));
     let mut row = 0usize;
-    let mut column = 0usize;
-    for (byte, character) in text.char_indices() {
+    let mut column = initial_column.min(width.saturating_sub(1));
+    for (byte, grapheme) in grapheme_indices(text) {
         positions.push((byte, row, column));
-        if character == '\n' {
+        if grapheme == "\n" {
             row = row.saturating_add(1);
             column = 0;
             continue;
         }
-        let character_width = terminal_cell_width(character);
-        if column > 0 && column.saturating_add(character_width) > width {
+        let grapheme_width = if grapheme == "\t" {
+            1
+        } else {
+            cell_width(grapheme)
+        };
+        if column > 0 && column.saturating_add(grapheme_width) > width {
             row = row.saturating_add(1);
             column = 0;
             if let Some(position) = positions.last_mut() {
@@ -3331,45 +3363,10 @@ fn editor_cursor_positions(text: &str, width: usize) -> Vec<(usize, usize, usize
                 position.2 = column;
             }
         }
-        column = column.saturating_add(character_width);
+        column = column.saturating_add(grapheme_width);
     }
     positions.push((text.len(), row, column));
     positions
-}
-
-fn terminal_cell_width(character: char) -> usize {
-    if character.is_control()
-        || matches!(
-            character as u32,
-            0x0300..=0x036f
-                | 0x1ab0..=0x1aff
-                | 0x1dc0..=0x1dff
-                | 0x20d0..=0x20ff
-                | 0xfe00..=0xfe0f
-                | 0xfe20..=0xfe2f
-                | 0x1f3fb..=0x1f3ff
-                | 0xe0100..=0xe01ef
-                | 0x200d
-        )
-    {
-        0
-    } else if matches!(
-        character as u32,
-        0x1100..=0x115f
-            | 0x2329..=0x232a
-            | 0x2e80..=0xa4cf
-            | 0xac00..=0xd7a3
-            | 0xf900..=0xfaff
-            | 0xfe10..=0xfe19
-            | 0xfe30..=0xfe6f
-            | 0xff00..=0xff60
-            | 0xffe0..=0xffe6
-            | 0x1f300..=0x1faff
-    ) {
-        2
-    } else {
-        1
-    }
 }
 
 fn placement_line(line: &crate::diff::DiffLine, side: Option<AnchorSide>) -> Option<usize> {
@@ -3526,8 +3523,31 @@ mod tests {
     }
 
     #[test]
+    fn contextual_composer_navigation_accounts_for_the_prompt_prefix() {
+        let mut app = state();
+        app.input_mode = InputMode::Compose;
+        app.compose_target = Some(ComposeTarget::Annotation(
+            crate::domain::AnnotationKind::Ask,
+        ));
+        app.compose_wrap_width = 44;
+        app.compose = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQR".into();
+        app.compose_cursor = app.compose.len();
+
+        app.handle_key(key(KeyCode::Up));
+
+        assert!(app.compose_cursor < app.compose.len());
+        assert_eq!(
+            super::editor_cursor_positions(&app.compose, 44, 2)
+                .into_iter()
+                .find(|(byte, _, _)| *byte == app.compose_cursor)
+                .map(|(_, row, _)| row),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn composer_combining_marks_do_not_consume_terminal_columns() {
-        let positions = super::editor_cursor_positions("e\u{301}x", 1);
+        let positions = super::editor_cursor_positions("e\u{301}x", 1, 0);
         assert_eq!(
             positions
                 .iter()
@@ -3539,6 +3559,31 @@ mod tests {
             positions.last().map(|(_, row, column)| (*row, *column)),
             Some((1, 1))
         );
+    }
+
+    #[test]
+    fn composer_edits_extended_graphemes_atomically() {
+        let mut app = state();
+        app.input_mode = InputMode::Compose;
+        app.compose_target = Some(ComposeTarget::Chat);
+
+        app.compose = "x👩\u{200d}💻y".into();
+        app.compose_cursor = "x👩\u{200d}💻".len();
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.compose, "xy");
+        assert_eq!(app.compose_cursor, 1);
+
+        app.compose = "x🇨🇦y".into();
+        app.compose_cursor = 1;
+        app.handle_key(key(KeyCode::Delete));
+        assert_eq!(app.compose, "xy");
+        assert_eq!(app.compose_cursor, 1);
+
+        app.compose = "x1\u{fe0f}\u{20e3}y".into();
+        app.compose_cursor = app.compose.len();
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.compose_cursor, 1);
     }
 
     #[test]

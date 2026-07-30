@@ -48,6 +48,7 @@ use crate::highlight::{Highlighter, StyledSegment, SyntectHighlighter};
 use crate::remote::{PrReference, RemoteResolver};
 use crate::review_stream::{AnnotationRowPart, ReviewRow};
 use crate::storage::{now, Storage};
+use crate::terminal_text::{cell_width, floor_grapheme_boundary, grapheme_indices};
 use crate::work_item::{combine_resolved, resolve_local};
 
 pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> Result<()> {
@@ -390,15 +391,36 @@ pub(crate) fn handle_effect(
                     }
                 }
             };
-            if let Some(header) = state.review_stream().rows().iter().position(|row| {
-                matches!(
-                    row,
-                    ReviewRow::Annotation { block, .. }
-                        if block.annotation_id == created_annotation_id
-                            && matches!(block.part, AnnotationRowPart::Header { .. })
-                )
-            }) {
-                state.review_cursor = header.saturating_sub(1);
+            let stream = state.review_stream();
+            if let Some((header, anchor)) =
+                stream
+                    .rows()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, row)| match row {
+                        ReviewRow::Annotation { block, .. }
+                            if block.annotation_id == created_annotation_id
+                                && matches!(block.part, AnnotationRowPart::Header { .. }) =>
+                        {
+                            Some((index, block.anchor.clone()))
+                        }
+                        _ => None,
+                    })
+            {
+                state.review_cursor = stream.rows()[..header]
+                    .iter()
+                    .rposition(|row| {
+                        matches!(
+                            row,
+                            ReviewRow::Source {
+                                old_anchor,
+                                new_anchor,
+                                ..
+                            } if old_anchor.as_ref() == Some(&anchor)
+                                || new_anchor.as_ref() == Some(&anchor)
+                        )
+                    })
+                    .unwrap_or_else(|| header.saturating_sub(1));
             }
         }
         Effect::SendChat(text) => {
@@ -676,6 +698,26 @@ pub(crate) fn handle_effect(
             state.status = "Annotation anchor re-pinned".into();
         }
         Effect::DeleteAnnotation(annotation_id) => {
+            let mut pending_ids = state
+                .chat
+                .iter()
+                .chain(state.pending_side_entries.iter())
+                .chain(state.main_chat.iter().flatten())
+                .filter(|message| message.annotation_id.as_deref() == Some(annotation_id.as_str()))
+                .filter_map(|message| message.outbound_id.clone())
+                .filter(|outbound_id| state.pending_outbound_ids.contains(outbound_id))
+                .collect::<Vec<_>>();
+            pending_ids.sort();
+            pending_ids.dedup();
+            for outbound_id in &pending_ids {
+                let command =
+                    if state.agent_progress.active_outbound_id.as_ref() == Some(outbound_id) {
+                        AgentCommand::Abort
+                    } else {
+                        AgentCommand::CancelQueued(outbound_id.clone())
+                    };
+                bridge.send(command)?;
+            }
             let annotation = storage
                 .annotation_by_id(&annotation_id)?
                 .ok_or_else(|| anyhow::anyhow!("annotation is missing"))?;
@@ -701,6 +743,9 @@ pub(crate) fn handle_effect(
                 .retain(|(current, _)| current.id != annotation_id);
             state.ask_threads.remove(&annotation_id);
             state.deleted_annotation = Some((annotation, placements, ask_messages));
+            let review_rows = state.review_stream().rows().len();
+            state.review_cursor = state.review_cursor.min(review_rows.saturating_sub(1));
+            state.review_scroll = state.review_scroll.min(review_rows.saturating_sub(1));
             state.status = "Annotation deleted · u undo".into();
         }
         Effect::UndoAnnotation => {
@@ -1294,6 +1339,8 @@ fn open_version(
             storage.ask_messages_for_annotation(&annotation.id)?,
         );
     }
+    state.review_scroll = 0;
+    state.sync_review_cursor_to_current_file();
     storage.mark_version_opened(version_id)?;
     if version.kind == crate::domain::VersionKind::Remote {
         for stale in storage.unopened_remote_versions(repo_id, version_id)? {
@@ -1690,6 +1737,8 @@ fn refresh_work_item(state: &mut AppState, storage: &Storage, paths: &AppPaths) 
             );
         }
     }
+    state.review_scroll = 0;
+    state.sync_review_cursor_to_current_file();
     load_version_choices(state, storage)?;
     Ok(())
 }
@@ -2024,6 +2073,15 @@ pub(crate) fn handle_agent_event(
                     assistant_message_id,
                     assistant_seq,
                 } => {
+                    if !state
+                        .annotations
+                        .iter()
+                        .any(|(annotation, _)| annotation.id == *annotation_id)
+                    {
+                        state.pending_outbound_ids.remove(&outbound_id);
+                        state.status = "Ignored a late Copilot response for a deleted Ask".into();
+                        return Ok(());
+                    }
                     let response = AskMessage {
                         id: assistant_message_id.clone(),
                         annotation_id: annotation_id.clone(),
@@ -2926,6 +2984,11 @@ fn render_review(
         .split(area);
     render_header(frame, state, vertical[0]);
 
+    if state.picker_open && vertical[1].width < 72 {
+        render_picker(frame, state, vertical[1]);
+        render_status(frame, state, vertical[2]);
+        return;
+    }
     let body = if state.picker_open {
         Layout::default()
             .direction(Direction::Horizontal)
@@ -3082,6 +3145,9 @@ fn render_unified(
     if area.height == 0 || area.width == 0 {
         return;
     }
+    if area.height <= 5 && render_compact_inline_composer(frame, state, area) {
+        return;
+    }
     let focused = state.focus == crate::app::Focus::Diff;
     frame.render_widget(
         Paragraph::new(if focused { "▶ unified" } else { "unified" }).style(
@@ -3143,6 +3209,9 @@ fn render_split(
     highlighter: &mut dyn Highlighter,
 ) {
     if area.height == 0 || area.width == 0 {
+        return;
+    }
+    if area.height <= 5 && render_compact_inline_composer(frame, state, area) {
         return;
     }
     let columns = Layout::default()
@@ -3308,6 +3377,87 @@ fn line_has_composer_cursor(line: &Line<'_>) -> bool {
     line.spans
         .iter()
         .any(|span| span.content.as_ref().contains('▏'))
+}
+
+fn render_compact_inline_composer(
+    frame: &mut ratatui::Frame,
+    state: &mut AppState,
+    area: Rect,
+) -> bool {
+    let label = match state.compose_target.as_ref() {
+        Some(ComposeTarget::Annotation(AnnotationKind::Ask)) => "Ask",
+        Some(ComposeTarget::Annotation(AnnotationKind::Comment)) => "Comment",
+        Some(ComposeTarget::FollowUp(_)) => "Ask follow-up",
+        Some(ComposeTarget::EditAnnotation(_) | ComposeTarget::EditAskMessage { .. }) => {
+            "Edit annotation"
+        }
+        _ => return false,
+    };
+    if state.input_mode != InputMode::Compose {
+        return false;
+    }
+
+    let mut marked = state.compose.clone();
+    marked.insert(floor_grapheme_boundary(&marked, state.compose_cursor), '▏');
+    let display = format!("❯ {marked}");
+    let (rows, _, _) = wrapped_editor_lines(&display, display.len(), area.width.max(1) as usize);
+    let cursor_row = rows
+        .iter()
+        .position(|row| row.contains('▏'))
+        .unwrap_or(rows.len().saturating_sub(1));
+    let editor_height = area.height.saturating_sub(2).max(1) as usize;
+    let scroll = cursor_row
+        .saturating_add(1)
+        .saturating_sub(editor_height)
+        .min(rows.len().saturating_sub(editor_height));
+    state.compose_scroll = scroll;
+    state.compose_wrap_width = area.width.max(1) as usize;
+
+    let title = format!(
+        "▶ {label} · INSERT · rows {}-{}/{}",
+        scroll + 1,
+        (scroll + editor_height).min(rows.len()),
+        rows.len()
+    );
+    frame.render_widget(
+        Paragraph::new(fit_terminal_text(&title, area.width as usize)).style(
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let visible = rows
+        .into_iter()
+        .skip(scroll)
+        .take(editor_height)
+        .map(|row| Line::raw(fit_terminal_text(&row, area.width as usize)))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(visible),
+        Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(2).max(1),
+        ),
+    );
+    if area.height >= 2 {
+        frame.render_widget(
+            Paragraph::new(fit_terminal_text(
+                "↑↓ move · Enter · Esc keep · ^C discard",
+                area.width as usize,
+            ))
+            .style(Style::default().fg(Color::Cyan)),
+            Rect::new(
+                area.x,
+                area.y + area.height.saturating_sub(1),
+                area.width,
+                1,
+            ),
+        );
+    }
+    true
 }
 
 fn review_row_selected(state: &AppState, row: &ReviewRow, index: usize) -> bool {
@@ -3503,13 +3653,13 @@ fn bordered_bottom(width: usize) -> String {
 fn fit_terminal_text(text: &str, width: usize) -> String {
     let mut result = String::new();
     let mut used = 0usize;
-    for character in text.chars() {
-        let cell_width = terminal_char_width(character);
-        if used.saturating_add(cell_width) > width {
+    for (_, grapheme) in grapheme_indices(text) {
+        let grapheme_width = cell_width(grapheme);
+        if used.saturating_add(grapheme_width) > width {
             break;
         }
-        result.push(character);
-        used = used.saturating_add(cell_width);
+        result.push_str(grapheme);
+        used = used.saturating_add(grapheme_width);
     }
     result.push_str(&" ".repeat(width.saturating_sub(used)));
     result
@@ -4111,72 +4261,38 @@ fn render_chat_composer(frame: &mut ratatui::Frame, state: &mut AppState, area: 
 
 fn wrapped_editor_lines(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize, usize) {
     let width = width.max(1);
+    let cursor = floor_grapheme_boundary(text, cursor);
     let mut lines = vec![String::new()];
     let mut row = 0usize;
     let mut col = 0usize;
     let mut cursor_row = 0usize;
     let mut cursor_col = 0usize;
-    for (byte, character) in text.char_indices() {
+    for (byte, grapheme) in grapheme_indices(text) {
         if byte == cursor {
             cursor_row = row;
             cursor_col = col;
         }
-        if character == '\n' {
+        if grapheme == "\n" {
             lines.push(String::new());
             row += 1;
             col = 0;
             continue;
         }
-        let rendered = if character == '\t' { ' ' } else { character };
-        let char_width = terminal_char_width(rendered);
-        if col > 0 && col + char_width > width {
+        let rendered = if grapheme == "\t" { " " } else { grapheme };
+        let grapheme_width = cell_width(rendered);
+        if col > 0 && col + grapheme_width > width {
             lines.push(String::new());
             row += 1;
             col = 0;
         }
-        lines[row].push(rendered);
-        col += char_width;
+        lines[row].push_str(rendered);
+        col += grapheme_width;
     }
     if cursor == text.len() {
         cursor_row = row;
         cursor_col = col;
     }
     (lines, cursor_row, cursor_col)
-}
-
-fn terminal_char_width(character: char) -> usize {
-    if character.is_control()
-        || matches!(
-            character as u32,
-            0x0300..=0x036f
-                | 0x1ab0..=0x1aff
-                | 0x1dc0..=0x1dff
-                | 0x20d0..=0x20ff
-                | 0xfe00..=0xfe0f
-                | 0xfe20..=0xfe2f
-                | 0x1f3fb..=0x1f3ff
-                | 0xe0100..=0xe01ef
-                | 0x200d
-        )
-    {
-        0
-    } else if matches!(
-        character as u32,
-        0x1100..=0x115f
-            | 0x2329..=0x232a
-            | 0x2e80..=0xa4cf
-            | 0xac00..=0xd7a3
-            | 0xf900..=0xfaff
-            | 0xfe10..=0xfe19
-            | 0xfe30..=0xfe6f
-            | 0xff00..=0xff60
-            | 0xffe0..=0xffe6
-            | 0x1f300..=0x1faff
-    ) {
-        2
-    } else {
-        1
-    }
 }
 
 fn visible_lane(state: &AppState) -> &'static str {

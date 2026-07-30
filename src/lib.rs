@@ -13,6 +13,7 @@ pub(crate) mod highlight;
 pub(crate) mod remote;
 pub(crate) mod review_stream;
 pub(crate) mod storage;
+pub(crate) mod terminal_text;
 #[doc(hidden)]
 pub mod testing;
 pub(crate) mod ui;
