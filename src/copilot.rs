@@ -566,6 +566,7 @@ impl AgentEventEnvelope {
 pub(crate) struct CopilotBridge {
     commands: AsyncSender<AgentCommand>,
     events: Receiver<AgentEventEnvelope>,
+    completed: Receiver<()>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -586,6 +587,7 @@ impl CopilotBridge {
     pub(crate) fn start(config: BridgeConfig) -> Self {
         let (command_tx, command_rx) = tokio::sync::mpsc::channel(PENDING_COMMAND_CAPACITY);
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
         // The worker can fail outside its async loop (for example while its
         // runtime is being created). Keep its most recently visible lane so
         // that a fatal Error/Stopped event is not silently filtered out while
@@ -600,6 +602,7 @@ impl CopilotBridge {
                         tracked_lane(&current_lane),
                         AgentEvent::Error(error.to_string()),
                     ));
+                    let _ = completed_tx.send(());
                     return;
                 }
             };
@@ -615,10 +618,12 @@ impl CopilotBridge {
                 tracked_lane(&current_lane),
                 AgentEvent::Stopped,
             ));
+            let _ = completed_tx.send(());
         });
         Self {
             commands: command_tx,
             events: event_rx,
+            completed: completed_rx,
             thread: Some(thread),
         }
     }
@@ -1597,8 +1602,23 @@ impl Drop for CopilotBridge {
     fn drop(&mut self) {
         let _ = self.commands.try_send(AgentCommand::Shutdown);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            // SDK control calls are individually bounded, but a worker can be
+            // inside one when the user quits. Never hold terminal restoration
+            // hostage to that remote operation. A completed worker is joined;
+            // a slow worker is detached and the process can exit normally.
+            join_completed_worker(thread, &self.completed);
         }
+    }
+}
+
+const COPILOT_BRIDGE_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+
+fn join_completed_worker(thread: JoinHandle<()>, completed: &Receiver<()>) {
+    let completed_in_time = completed
+        .recv_timeout(COPILOT_BRIDGE_SHUTDOWN_GRACE)
+        .is_ok();
+    if completed_in_time || thread.is_finished() {
+        let _ = thread.join();
     }
 }
 
@@ -2362,6 +2382,7 @@ struct LeaseHeartbeat {
     owned: Arc<AtomicBool>,
     lost: Arc<AtomicBool>,
     stop: Option<std::sync::mpsc::Sender<()>>,
+    completed: Receiver<()>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -2404,12 +2425,14 @@ impl LeaseHeartbeat {
         let worker_owned = Arc::clone(&owned);
         let worker_lost = Arc::clone(&lost);
         let (stop, stopped) = std::sync::mpsc::channel();
+        let (completed_tx, completed) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::spawn(move || {
             let ledger = match Storage::open(&database_path) {
                 Ok(ledger) => ledger,
                 Err(_) => {
                     worker_owned.store(false, Ordering::Release);
                     worker_lost.store(true, Ordering::Release);
+                    let _ = completed_tx.send(());
                     return;
                 }
             };
@@ -2437,11 +2460,13 @@ impl LeaseHeartbeat {
                     Err(_) => {}
                 }
             }
+            let _ = completed_tx.send(());
         });
         Self {
             owned,
             lost,
             stop: Some(stop),
+            completed,
             thread: Some(thread),
         }
     }
@@ -2464,7 +2489,7 @@ impl Drop for LeaseHeartbeat {
             stop.send(()).ok();
         }
         if let Some(thread) = self.thread.take() {
-            thread.join().ok();
+            join_completed_worker(thread, &self.completed);
         }
     }
 }
@@ -7330,6 +7355,32 @@ mod tests {
             skills: root.join("data").join("skills"),
             plugins: root.join("data").join("plugins"),
         }
+    }
+
+    #[test]
+    fn bridge_drop_never_waits_for_a_stalled_sdk_worker() {
+        let (commands, _command_rx) = tokio::sync::mpsc::channel(1);
+        let (_event_tx, events) = mpsc::channel();
+        let (_completion_guard, completed) = mpsc::channel();
+        let (release, wait_for_release) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _ = wait_for_release.recv();
+        });
+        let bridge = CopilotBridge {
+            commands,
+            events,
+            completed,
+            thread: Some(thread),
+        };
+
+        let started = Instant::now();
+        drop(bridge);
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "dropping the bridge must restore the terminal without joining a stalled SDK call"
+        );
+        release.send(()).unwrap();
     }
 
     #[derive(Default)]
