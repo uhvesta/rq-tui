@@ -1603,6 +1603,28 @@ once and are stated with their exact repro so they can be re-confirmed
 in-place. Severity: **P1** breaks a spec'd workflow, **P2** wrong but
 usable, **P3** polish.
 
+> **Resolution ledger (2026-07-30, current `abarzega/tui-wip`):** The
+> descriptions below are retained as historical repros. J1–J12 are resolved
+> and protected by Bazel regression coverage:
+>
+> | Finding | Current evidence |
+> |---|---|
+> | J1 fold `o`/`O` | `app::tests::fold_rows_map_to_their_source_line_for_context_expansion` plus the fold-key reducer assertions |
+> | J2 composer-open typing race | synchronous reducer transition coverage and PTY-21 oversized contextual-composer input |
+> | J3 generated-context editor route | `testing::tests::generate_context_command_reaches_editable_draft_screen` |
+> | J4 snapshots absent from Versions | `ui::tests::snapshot_command_refreshes_version_history_with_counts_and_selection` |
+> | J5 no in-block Ask follow-up | `ui::tests::production_review_renderer_keeps_ask_follow_up_inside_the_block` |
+> | J6 raw Markdown preview | `ui::tests::markdown_preview_renders_links_tables_inline_markup_and_code_safely` |
+> | J7 malformed pipe tables | `ui::tests::production_chat_renderer_keeps_markdown_semantics_tables_and_yy_bytes` and `tui_text::chat_render::tests::table_separator_uses_the_same_column_boundaries_as_rows` |
+> | J8 Chat `yy` copied zero bytes | `testing::tests::chat_yy_yanks_the_whole_current_message_without_visual_mode` |
+> | J9 invisible/non-wrapping search | `ui::tests::diff_and_chat_search_matches_have_visible_rendered_highlights` and the reducer wrap tests |
+> | J10 duplicate unified fold label | `ui::tests::unified_fold_row_does_not_duplicate_its_label` |
+> | J11 quiet/disconnected conflation | `testing::tests::disconnect_preserves_the_age_of_the_last_healthy_sdk_event`, PTY-25, and the `quiet` gallery state |
+> | J12 false model-stage numbering | `testing::tests::model_picker_numbers_only_runtime_supported_stages` |
+>
+> The full `bazel test //...` gate also drives the compiled PTY, deterministic
+> renderer, non-TTY CLI, Bazelisk bootstrap, lint, and formatting targets.
+
 ### 14.1 P1 — broken workflows
 
 - **J1. Fold-row expansion keys `o`/`O` are dead — silent no-op.**
