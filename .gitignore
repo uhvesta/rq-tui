@@ -1,0 +1,9 @@
+/bazel-bin/
+/bazel-out/
+/bazel-testlogs/
+/bazel-*
+/bazel-rq-tui
+/.bazel-cache/
+/target/
+*.tar.gz
+*.zip

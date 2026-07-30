@@ -1,0 +1,62 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: macos-x86_64
+            os: macos-13
+          - name: macos-aarch64
+            os: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazelbuild/setup-bazelisk@v3
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/bazel
+            ~/.cache/bazelisk
+          key: bazel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/*.bzl', 'MODULE.bazel', 'Cargo.lock') }}
+          restore-keys: bazel-${{ runner.os }}-${{ runner.arch }}-
+      - name: Build
+        run: bazel build //:rq-tui --announce_rc
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "bazel-bin/rq-tui" "dist/rq-tui-${{ matrix.name }}"
+          tar -C dist -czf "rq-tui-${{ matrix.name }}.tar.gz" "rq-tui-${{ matrix.name }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rq-tui-${{ matrix.name }}
+          path: rq-tui-${{ matrix.name }}.*
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: rq-tui-*
+          merge-multiple: true
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" --generate-notes
