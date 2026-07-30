@@ -158,6 +158,41 @@ impl ContextEditorState {
         self.generation_active = true;
     }
 
+    pub(crate) fn clear_fields_for_generation(&mut self) {
+        self.draft.title.clear();
+        self.draft.what.clear();
+        self.draft.why.clear();
+        self.draft.how.clear();
+        self.draft.considerations.clear();
+        self.draft.alternatives.clear();
+        self.draft.source = "generated".into();
+        self.draft.attached_to_session = false;
+        self.draft.delivery_state = crate::domain::DeliveryState::Draft;
+        self.dirty = false;
+    }
+
+    pub(crate) fn has_content(&self) -> bool {
+        FIELDS
+            .iter()
+            .any(|field| !field.get(&self.draft).trim().is_empty())
+    }
+
+    pub(crate) fn apply_generation_partial(&mut self, generation_id: &str) -> bool {
+        if !self.generation_active || self.generation_id.as_deref() != Some(generation_id) {
+            return false;
+        }
+        let parsed = parse_context(&self.draft.work_item_id, &self.raw_generation_stream);
+        if !self.dirty {
+            self.draft = parsed.context;
+            self.dirty = false;
+        }
+        true
+    }
+
+    pub(crate) fn fail_generation(&mut self, generation_id: &str) -> bool {
+        self.finish_generation(generation_id)
+    }
+
     pub(crate) fn append_generation_delta(&mut self, generation_id: &str, delta: &str) -> bool {
         if self.generation_active && self.generation_id.as_deref() == Some(generation_id) {
             self.raw_generation_stream.push_str(delta);

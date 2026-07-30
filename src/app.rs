@@ -9,11 +9,12 @@ use crate::chat_selection::{
     ChatCursor, ChatLayout, ChatMessageId, ChatPoint, ChatSelection, ChatSelectionMode, CopyPolicy,
     Movement,
 };
+use crate::context_editor::{ContextEditorState, ContextField};
 use crate::copilot::{ModelOption, ModelSelection, PruneSessionOutcome};
 use crate::diff::{DiffFile, DiffSet, LineKind};
 use crate::domain::{
     AnchorSide, Annotation, AnnotationKind, AskMessage, DeliveryState, PendingChat, Placement,
-    Version,
+    ReviewContext, Version,
 };
 use crate::review_stream::{
     InlineAnnotation, ReviewFile, ReviewRow, ReviewStream, SourceSide, StreamMovement,
@@ -121,7 +122,7 @@ pub(crate) enum Effect {
         format: Option<String>,
     },
     GenerateContext,
-    AttachContext(String),
+    AttachContext(ReviewContext),
     CreateAnnotation {
         kind: AnnotationKind,
         text: String,
@@ -243,7 +244,7 @@ pub(crate) enum ComposeTarget {
     },
     EditQueued(String),
     Chat,
-    Context,
+    ContextField(ContextField),
     SettingBase,
     SettingExpandStep,
 }
@@ -697,9 +698,8 @@ pub(crate) struct AppState {
     pub(crate) preview_scroll: usize,
     pub(crate) preview_total_rows: usize,
     preview_return: Option<PreviewReturnState>,
-    pub(crate) context_draft: String,
-    pub(crate) context_streaming: bool,
-    pub(crate) context_outbound_id: Option<String>,
+    pub(crate) context_editor: ContextEditorState,
+    pub(crate) context_regenerate_armed: bool,
     pub(crate) agent_connected: bool,
     pub(crate) agent_activity: String,
     pub(crate) agent_progress: AgentProgress,
@@ -740,6 +740,7 @@ impl AppState {
     const CTRL_W_TIMEOUT: Duration = Duration::from_millis(1_500);
 
     pub(crate) fn new(work_item: ResolvedWorkItem) -> Self {
+        let work_item_id = work_item.item.id.clone();
         let mut state = Self {
             work_item,
             screen: Screen::Review,
@@ -803,9 +804,11 @@ impl AppState {
             preview_scroll: 0,
             preview_total_rows: 0,
             preview_return: None,
-            context_draft: String::new(),
-            context_streaming: false,
-            context_outbound_id: None,
+            context_editor: ContextEditorState::new(ReviewContext {
+                work_item_id,
+                ..ReviewContext::default()
+            }),
+            context_regenerate_armed: false,
             agent_connected: false,
             agent_activity: "Connecting…".into(),
             agent_progress: AgentProgress::default(),
@@ -1037,7 +1040,7 @@ impl AppState {
             }
             ComposeTarget::EditQueued(_)
             | ComposeTarget::Chat
-            | ComposeTarget::Context
+            | ComposeTarget::ContextField(_)
             | ComposeTarget::SettingBase
             | ComposeTarget::SettingExpandStep => return None,
         };
@@ -2831,25 +2834,50 @@ impl AppState {
 
     fn handle_context_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
+            KeyCode::Char('q') => {
+                self.context_editor.discard();
+                self.context_regenerate_armed = false;
                 self.screen = self.previous_screen;
+                self.status = "Context edits discarded".into();
+                Vec::new()
+            }
+            KeyCode::Esc => {
+                self.context_regenerate_armed = false;
+                self.screen = self.previous_screen;
+                self.status = "Context editor closed · edits preserved".into();
+                Vec::new()
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.context_editor.select_next();
+                self.context_regenerate_armed = false;
+                Vec::new()
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.context_editor.select_previous();
+                self.context_regenerate_armed = false;
                 Vec::new()
             }
             KeyCode::Char('r') => {
-                self.context_draft.clear();
-                self.context_streaming = true;
-                self.context_outbound_id = None;
-                vec![Effect::GenerateContext]
+                if self.context_editor.dirty && !self.context_regenerate_armed {
+                    self.context_regenerate_armed = true;
+                    self.status = "Context has manual edits · press r again to replace them".into();
+                    Vec::new()
+                } else {
+                    self.context_regenerate_armed = false;
+                    vec![Effect::GenerateContext]
+                }
             }
-            KeyCode::Char('a') if !self.context_draft.trim().is_empty() => {
-                vec![Effect::AttachContext(self.context_draft.clone())]
+            KeyCode::Char('a') if self.context_editor.has_content() => {
+                vec![Effect::AttachContext(self.context_editor.draft.clone())]
             }
-            KeyCode::Char('e') => {
+            KeyCode::Char('e') | KeyCode::Enter => {
+                let field = self.context_editor.selected_field();
                 self.input_return_mode = InputMode::Normal;
                 self.input_mode = InputMode::Compose;
-                self.compose_target = Some(ComposeTarget::Context);
-                self.compose = self.context_draft.clone();
+                self.compose_target = Some(ComposeTarget::ContextField(field));
+                self.compose = self.context_editor.field(field).to_owned();
                 self.compose_cursor = self.compose.len();
+                self.status = format!("EDITING {} · Enter save · Esc keep", field.label());
                 Vec::new()
             }
             _ => Vec::new(),
@@ -3278,6 +3306,14 @@ impl AppState {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
+                    if matches!(self.compose_target, Some(ComposeTarget::ContextField(_))) {
+                        self.compose.clear();
+                        self.compose_cursor = 0;
+                        self.compose_target = None;
+                        self.input_mode = self.input_return_mode;
+                        self.status = "Field edit discarded".into();
+                        return Vec::new();
+                    }
                     if self.agent_progress.phase.is_active()
                         && self.agent_progress.active_outbound_id.is_some()
                     {
@@ -3320,6 +3356,16 @@ impl AppState {
         }
         match key.code {
             KeyCode::Esc => {
+                if let Some(ComposeTarget::ContextField(field)) = self.compose_target.clone() {
+                    self.context_editor.set_field(field, self.compose.clone());
+                    self.compose.clear();
+                    self.compose_cursor = 0;
+                    self.compose_target = None;
+                    self.input_mode = self.input_return_mode;
+                    self.screen = Screen::ContextEditor;
+                    self.status = format!("{} edit kept", field.label());
+                    return Vec::new();
+                }
                 self.input_mode = self.input_return_mode;
                 let preserve = matches!(
                     self.compose_target,
@@ -3437,7 +3483,9 @@ impl AppState {
     }
 
     fn submit_compose(&mut self) -> Vec<Effect> {
-        if self.compose.trim().is_empty() {
+        if self.compose.trim().is_empty()
+            && !matches!(self.compose_target, Some(ComposeTarget::ContextField(_)))
+        {
             self.status = "Enter text before submitting".into();
             return Vec::new();
         }
@@ -3521,8 +3569,13 @@ impl AppState {
             ComposeTarget::Chat => {
                 vec![Effect::SendChat(text)]
             }
-            ComposeTarget::Context => {
-                self.context_draft = text;
+            ComposeTarget::ContextField(field) => {
+                self.context_editor.set_field(field, text);
+                self.screen = Screen::ContextEditor;
+                self.status = format!(
+                    "{} updated · a attach · r regenerate · q discard",
+                    field.label()
+                );
                 Vec::new()
             }
             ComposeTarget::SettingBase => vec![Effect::SetBase {
@@ -3571,9 +3624,7 @@ impl AppState {
             }
             (Some("generate-context"), _) => {
                 self.open_overlay(Screen::ContextEditor);
-                self.context_draft.clear();
-                self.context_streaming = true;
-                self.context_outbound_id = None;
+                self.context_regenerate_armed = false;
                 vec![Effect::GenerateContext]
             }
             (Some("snapshot"), _) => vec![Effect::Snapshot],
@@ -4809,11 +4860,53 @@ mod tests {
         BlockId, ChatBlock, ChatCell, ChatLayout, ChatMessage, ChatPoint, ChatRow, RowBreak,
         SourceRange,
     };
+    use crate::context_editor::ContextField;
     use crate::diff::{DiffLine, LineKind};
     use crate::domain::{AskMessage, DeliveryState};
 
     fn state() -> AppState {
         state_for_ui()
+    }
+
+    #[test]
+    fn context_editor_edits_one_field_and_makes_discard_semantics_explicit() {
+        let mut app = state();
+        app.screen = Screen::ContextEditor;
+        app.context_editor.draft.title = "old".into();
+        app.context_editor.base.title = "old".into();
+
+        app.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(
+            app.compose_target,
+            Some(ComposeTarget::ContextField(ContextField::Title))
+        );
+        assert_eq!(app.compose, "old");
+        app.handle_key(key(KeyCode::End));
+        app.handle_key(key(KeyCode::Char('!')));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.context_editor.draft.title, "old!");
+        assert!(app.context_editor.dirty);
+
+        app.handle_key(key(KeyCode::Char('q')));
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.context_editor.draft.title, "old");
+        assert!(!app.context_editor.dirty);
+    }
+
+    #[test]
+    fn context_regeneration_requires_confirmation_when_dirty() {
+        let mut app = state();
+        app.screen = Screen::ContextEditor;
+        app.context_editor.set_field(ContextField::Why, "keep this");
+        assert!(app.handle_key(key(KeyCode::Char('r'))).is_empty());
+        assert!(app.context_regenerate_armed);
+        assert!(app.status.contains("press r again"));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('r'))),
+            vec![Effect::GenerateContext]
+        );
+        assert!(!app.context_regenerate_armed);
     }
 
     fn key(code: KeyCode) -> KeyEvent {

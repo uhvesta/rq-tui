@@ -35,6 +35,7 @@ use crate::chat_selection::{
     SourceRange as SelectionSourceRange,
 };
 use crate::config::AppPaths;
+use crate::context_editor::{render_context_markdown, ContextField};
 use crate::copilot::{
     start_agent, ActivityKind, AgentCommand, AgentEvent, AgentEventEnvelope, AgentRuntime,
     AgentSink, BridgeConfig, LaneEvent, Outbound, OutboundKind, PruneSessionOutcome,
@@ -42,7 +43,7 @@ use crate::copilot::{
 use crate::diff::{DiffFile, DiffLine, FileStatus, LineKind};
 use crate::domain::{
     AnchorSide, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState, PendingChat,
-    Placement, ReviewContext, SessionRecord,
+    Placement, SessionRecord,
 };
 use crate::export::{CommentExport, ExportFormat};
 use crate::git::Git;
@@ -144,7 +145,7 @@ pub(crate) fn run(
         }
     }
     if let Some(context) = storage.context_for_work_item(&state.work_item.item.id)? {
-        state.context_draft = render_review_context(&context);
+        state.context_editor = crate::context_editor::ContextEditorState::new(context);
     } else if state
         .work_item
         .repos
@@ -1282,7 +1283,7 @@ pub(crate) fn handle_effect(
                     },
                     format!(
                         "Accepted review context for this Work Item:\n{}",
-                        render_review_context(&context)
+                        render_context_markdown(&context)
                     ),
                 ),
             )?;
@@ -1444,20 +1445,22 @@ pub(crate) fn handle_effect(
                  Title:\nWhat:\nWhy:\nHow:\nConsiderations:\nOther approaches:\n\
                  Changed files:\n{changed_files}"
             );
-            state.context_draft.clear();
-            state.context_streaming = true;
             let outbound_id = queue_outbound(
                 state,
                 bridge,
                 Outbound::new(OutboundKind::ContextDraft, prompt),
             )?;
-            state.context_outbound_id = Some(outbound_id);
+            state.context_editor.clear_fields_for_generation();
+            state.context_editor.begin_generation(outbound_id);
             state.status = "Generating structured context…".into();
         }
-        Effect::AttachContext(draft) => {
-            let mut context = parse_review_context(&state.work_item.item.id, &draft);
+        Effect::AttachContext(mut context) => {
+            context.work_item_id = state.work_item.item.id.clone();
             context.delivery_state = DeliveryState::Pending;
+            context.attached_to_session = false;
             storage.upsert_context(&context)?;
+            state.context_editor = crate::context_editor::ContextEditorState::new(context.clone());
+            state.context_regenerate_armed = false;
             state.pending_context = true;
             let context_dir = state.work_item.session_root.join(".rq-tui");
             std::fs::create_dir_all(&context_dir)?;
@@ -1465,7 +1468,7 @@ pub(crate) fn handle_effect(
                 context_dir.join("context.md"),
                 format!(
                     "# Work Item context\n\n{}\n",
-                    render_review_context(&context)
+                    render_context_markdown(&context)
                 ),
             )?;
             queue_outbound(
@@ -1477,7 +1480,7 @@ pub(crate) fn handle_effect(
                     },
                     format!(
                         "Accepted review context for this Work Item:\n{}",
-                        render_review_context(&context)
+                        render_context_markdown(&context)
                     ),
                 ),
             )?;
@@ -1635,8 +1638,8 @@ pub(crate) fn handle_effect_failure(state: &mut AppState, effect: &Effect, error
                 format!("Could not stop the Copilot response: {error:#} · retry with :stop");
         }
         Effect::GenerateContext => {
-            state.context_streaming = false;
-            state.context_outbound_id = None;
+            state.context_editor.generation_active = false;
+            state.context_editor.generation_id = None;
             state.status =
                 format!("Context generation could not start: {error:#} · press r to retry");
         }
@@ -3112,9 +3115,11 @@ pub(crate) fn handle_agent_event(
                     None
                 }
                 OutboundKind::ContextDraft => {
-                    if state.context_outbound_id.as_deref() == Some(outbound_id.as_str()) {
-                        state.context_draft = first_delta.clone();
-                        state.context_streaming = true;
+                    if state
+                        .context_editor
+                        .append_generation_delta(&outbound_id, &first_delta)
+                    {
+                        state.context_editor.apply_generation_partial(&outbound_id);
                     }
                     None
                 }
@@ -3128,16 +3133,18 @@ pub(crate) fn handle_agent_event(
                     None
                 }
             };
-            state.chat.push(ChatEntry {
-                id: uuid::Uuid::new_v4().to_string(),
-                role: "copilot".into(),
-                text: first_delta,
-                streaming: true,
-                annotation_id,
-                outbound_id: Some(outbound_id.clone()),
-                error: None,
-            });
-            follow_chat(state);
+            if !matches!(&outbound, OutboundKind::ContextDraft) {
+                state.chat.push(ChatEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: "copilot".into(),
+                    text: first_delta,
+                    streaming: true,
+                    annotation_id,
+                    outbound_id: Some(outbound_id.clone()),
+                    error: None,
+                });
+                follow_chat(state);
+            }
             state.agent_activity = "Responding…".into();
             state.agent_progress.queue_depth = state.agent_progress.queue_depth.saturating_sub(1);
             state.agent_progress.record(
@@ -3163,8 +3170,11 @@ pub(crate) fn handle_agent_event(
                 ),
                 Some(outbound_id.clone()),
             );
-            if state.context_outbound_id.as_deref() == Some(outbound_id.as_str()) {
-                state.context_draft.push_str(&delta);
+            if state
+                .context_editor
+                .append_generation_delta(&outbound_id, &delta)
+            {
+                state.context_editor.apply_generation_partial(&outbound_id);
             }
             if let Some(message) = state.chat.iter_mut().find(|message| {
                 message.streaming && message.outbound_id.as_deref() == Some(outbound_id.as_str())
@@ -3193,8 +3203,9 @@ pub(crate) fn handle_agent_event(
                 format!("Snapshot now contains {} bytes", text.len()),
                 Some(outbound_id.clone()),
             );
-            if state.context_outbound_id.as_deref() == Some(outbound_id.as_str()) {
-                state.context_draft = text.clone();
+            if state.context_editor.generation_id.as_deref() == Some(outbound_id.as_str()) {
+                state.context_editor.raw_generation_stream = text.clone();
+                state.context_editor.apply_generation_partial(&outbound_id);
             }
             if let Some(message) = state.chat.iter_mut().find(|message| {
                 message.streaming && message.outbound_id.as_deref() == Some(outbound_id.as_str())
@@ -3227,10 +3238,13 @@ pub(crate) fn handle_agent_event(
                 == Some(outbound_id.as_str())
                 || state.agent_progress.active_outbound_id.is_none();
             let context_completed =
-                state.context_outbound_id.as_deref() == Some(outbound_id.as_str());
+                state.context_editor.generation_id.as_deref() == Some(outbound_id.as_str());
             if context_completed {
-                state.context_streaming = false;
-                state.context_outbound_id = None;
+                if aborted {
+                    state.context_editor.fail_generation(&outbound_id);
+                } else {
+                    let _ = state.context_editor.replace_from_generation(&outbound_id);
+                }
                 state.status = if aborted {
                     "Context generation stopped; the partial draft is editable".into()
                 } else {
@@ -3309,10 +3323,10 @@ pub(crate) fn handle_agent_event(
             }
             state.pending_outbound_ids.remove(&outbound_id);
             state.side_outbound_ids.remove(&outbound_id);
-            let context_failed = state.context_outbound_id.as_deref() == Some(outbound_id.as_str());
+            let context_failed =
+                state.context_editor.generation_id.as_deref() == Some(outbound_id.as_str());
             if context_failed {
-                state.context_streaming = false;
-                state.context_outbound_id = None;
+                state.context_editor.fail_generation(&outbound_id);
             }
             if let Some(chat) = state
                 .chat
@@ -3689,42 +3703,6 @@ pub(crate) fn handle_agent_event(
     Ok(())
 }
 
-fn parse_review_context(work_item_id: &str, draft: &str) -> ReviewContext {
-    let mut context = ReviewContext {
-        work_item_id: work_item_id.to_owned(),
-        source: "generated".into(),
-        ..ReviewContext::default()
-    };
-    for line in draft.lines() {
-        let Some((label, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim().to_owned();
-        match label.trim().to_ascii_lowercase().as_str() {
-            "title" => context.title = value,
-            "what" => context.what = value,
-            "why" => context.why = value,
-            "how" => context.how = value,
-            "considerations" => context.considerations = value,
-            "other approaches" | "alternatives" => context.alternatives = value,
-            _ => {}
-        }
-    }
-    context
-}
-
-fn render_review_context(context: &ReviewContext) -> String {
-    format!(
-        "Title: {}\nWhat: {}\nWhy: {}\nHow: {}\nConsiderations: {}\nOther approaches: {}",
-        context.title,
-        context.what,
-        context.why,
-        context.how,
-        context.considerations,
-        context.alternatives,
-    )
-}
-
 pub(crate) fn render(
     frame: &mut ratatui::Frame,
     state: &mut AppState,
@@ -3937,32 +3915,111 @@ fn render_recovery(frame: &mut ratatui::Frame, state: &AppState) {
 }
 
 fn render_context_editor(frame: &mut ratatui::Frame, state: &AppState) {
-    let title = if state.context_streaming {
-        "Generate Context — drafting…"
-    } else {
-        "Generate Context"
-    };
-    let body = if state.context_draft.is_empty() {
-        "Waiting for the read-only agent…".to_owned()
-    } else {
-        state.context_draft.clone()
-    };
-    frame.render_widget(
-        Paragraph::new(body)
-            .block(Block::default().title(title).borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
-        frame.area(),
-    );
     let area = frame.area();
-    frame.render_widget(
-        Paragraph::new("e edit · a accept & attach · r regenerate · q discard"),
-        Rect::new(
-            area.x.saturating_add(1),
-            area.bottom().saturating_sub(2),
-            area.width.saturating_sub(2),
-            1,
-        ),
+    let editor = &state.context_editor;
+    let status = if editor.generation_active {
+        "GENERATING"
+    } else if matches!(state.compose_target, Some(ComposeTarget::ContextField(_))) {
+        "EDITING"
+    } else if editor.dirty {
+        "DIRTY"
+    } else {
+        "READY"
+    };
+    let title = match state.compose_target {
+        Some(ComposeTarget::ContextField(field)) => {
+            format!(" Generate Context · {status} {} ", field.label())
+        }
+        _ => format!(" Generate Context · {status} "),
+    };
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [body, footer] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .areas(inner);
+
+    let value_width = body.width.saturating_sub(4).max(1) as usize;
+    let editing_field = match state.compose_target {
+        Some(ComposeTarget::ContextField(field)) => Some(field),
+        _ => None,
+    };
+    let items = ContextField::all()
+        .iter()
+        .map(|field| {
+            let live_value = editing_field
+                .filter(|editing| *editing == *field)
+                .map(|_| state.compose.as_str());
+            let value = live_value.unwrap_or_else(|| editor.field(*field));
+            let value = if let Some(live_value) = live_value {
+                let cursor = floor_grapheme_boundary(live_value, state.compose_cursor);
+                let mut visible = live_value.to_owned();
+                visible.insert(cursor, '▏');
+                visible
+            } else {
+                value.to_owned()
+            };
+            let value = if value.trim().is_empty() {
+                vec!["— empty —".to_owned()]
+            } else {
+                wrap_context_value(&value, value_width)
+            };
+            let mut lines = Vec::with_capacity(value.len());
+            for (index, value_line) in value.into_iter().enumerate() {
+                let prefix = if index == 0 {
+                    format!(
+                        "{}{}: ",
+                        if editor.selected_field() == *field {
+                            "▶ "
+                        } else {
+                            "  "
+                        },
+                        field.label()
+                    )
+                } else {
+                    "      ".into()
+                };
+                lines.push(Line::from(format!("{prefix}{value_line}")));
+            }
+            ListItem::new(Text::from(lines))
+        })
+        .collect::<Vec<_>>();
+    let mut list_state = ListState::default();
+    list_state.select(Some(editor.selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_symbol(""),
+        body,
+        &mut list_state,
     );
+    frame.render_widget(
+        Paragraph::new(if editor.generation_active {
+            "GENERATING · streaming correlated context · j/k select · Ctrl-C stop"
+        } else if editor.dirty {
+            "DIRTY · e/Enter edit · a attach · r confirm replacement · q discard"
+        } else {
+            "j/k select · e/Enter edit · a attach · r regenerate · q discard"
+        }),
+        footer,
+    );
+}
+
+fn wrap_context_value(value: &str, width: usize) -> Vec<String> {
+    value
+        .split('\n')
+        .flat_map(|line| {
+            let chars = line.chars().collect::<Vec<_>>();
+            if chars.is_empty() {
+                return vec![String::new()];
+            }
+            chars
+                .chunks(width.max(1))
+                .map(|chunk| chunk.iter().collect::<String>())
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn render_settings(frame: &mut ratatui::Frame, state: &AppState) {
@@ -4458,12 +4515,8 @@ fn render_header(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
         .current_file()
         .map(|file| file.path().display().to_string())
         .unwrap_or_else(|| "no changed files".into());
-    let context_title = state
-        .context_draft
-        .lines()
-        .find_map(|line| line.strip_prefix("Title:").map(str::trim))
-        .filter(|title| !title.is_empty())
-        .map(str::to_owned)
+    let context_title = (!state.context_editor.draft.title.trim().is_empty())
+        .then(|| state.context_editor.draft.title.trim().to_owned())
         .or_else(|| {
             state
                 .work_item
@@ -7012,15 +7065,16 @@ mod tests {
     use super::{
         copy_to_clipboard_with_writer, finish_ready_prune, handle_agent_envelope,
         handle_agent_event, handle_effect, handle_effect_failure, load_model_preferences,
-        load_ui_preferences, markdown_to_html, mouse_scroll_effects, open_browser_preview,
-        parse_review_context, render, review_row_lines, run_clipboard_candidate, search_ranges,
-        table_cells, NavigationBurstLimiter, MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST,
+        load_ui_preferences, markdown_to_html, mouse_scroll_effects, open_browser_preview, render,
+        review_row_lines, run_clipboard_candidate, search_ranges, table_cells,
+        NavigationBurstLimiter, MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST,
     };
     use crate::app::{
         tests_support::state_for_ui, AgentPhase, ChatEntry, ComposeTarget, DiffLayout, Effect,
         Focus, InputMode, MarkdownPreview, PendingPrune, PruneChoice, ReadyPrune, Screen,
     };
     use crate::config::AppPaths;
+    use crate::context_editor::{parse_context, ContextField};
     use crate::copilot::{
         AgentCommand, AgentEvent, AgentEventEnvelope, AgentLane, AgentSink, HistoryEntry,
         LaneEvent, ModelSelection, OutboundKind, PruneSessionOutcome,
@@ -8636,22 +8690,70 @@ mod tests {
 
     #[test]
     fn generated_context_parser_accepts_the_six_field_shape() {
-        let context = parse_review_context(
+        let context = parse_context(
             "work",
             "Title: Demo\nWhat: Change\nWhy: Safety\nHow: Checks\n\
              Considerations: Cost\nOther approaches: Cache",
-        );
+        )
+        .context;
         assert_eq!(context.work_item_id, "work");
         assert_eq!(context.title, "Demo");
         assert_eq!(context.alternatives, "Cache");
     }
 
     #[test]
+    fn context_editor_renders_live_field_input_at_the_exact_minimum() {
+        let backend = TestBackend::new(40, 9);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = state_for_ui();
+        state.screen = Screen::ContextEditor;
+        state.context_editor.draft.title = "old value".into();
+        state.context_editor.selected = ContextField::Title.index();
+        state.input_mode = InputMode::Compose;
+        state.compose_target = Some(ComposeTarget::ContextField(ContextField::Title));
+        state.compose = "new live value that wraps".into();
+        state.compose_cursor = 3;
+        let mut highlighter = PlainHighlighter;
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("EDITING"));
+        assert!(rendered.contains("new▏ live"));
+        assert!(!rendered.contains("old value"));
+        assert!(rendered.contains("Enter") || rendered.contains("e/Enter"));
+
+        state.input_mode = InputMode::Normal;
+        state.compose_target = None;
+        state.context_editor.selected = ContextField::Alternatives.index();
+        state.context_editor.draft.alternatives = "first alternative\nsecond alternative".into();
+        let backend = TestBackend::new(40, 9);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        let selected_rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(selected_rendered.contains("Other approaches"));
+        assert!(selected_rendered.contains("second alternative"));
+    }
+
+    #[test]
     fn generated_context_ignores_events_from_other_outbounds() {
         let storage = Storage::in_memory().unwrap();
         let mut state = state_for_ui();
-        state.context_streaming = true;
-        state.context_outbound_id = Some("context-turn".into());
+        state.context_editor.begin_generation("context-turn");
 
         handle_agent_event(
             &mut state,
@@ -8682,9 +8784,13 @@ mod tests {
         )
         .unwrap();
 
-        assert!(state.context_streaming);
-        assert_eq!(state.context_outbound_id.as_deref(), Some("context-turn"));
-        assert!(state.context_draft.is_empty());
+        assert!(state.context_editor.generation_active);
+        assert_eq!(
+            state.context_editor.generation_id.as_deref(),
+            Some("context-turn")
+        );
+        assert!(state.context_editor.raw_generation_stream.is_empty());
+        assert_eq!(state.chat.len(), 1);
 
         handle_agent_event(
             &mut state,
@@ -8715,7 +8821,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(state.context_draft, "Title: Draft\nWhat: Correlated");
+        assert_eq!(
+            state.context_editor.raw_generation_stream,
+            "Title: Draft\nWhat: Correlated"
+        );
+        assert_eq!(state.context_editor.draft.title, "Draft");
+        assert_eq!(state.context_editor.draft.what, "Correlated");
         handle_agent_event(
             &mut state,
             &storage,
@@ -8725,8 +8836,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!state.context_streaming);
-        assert_eq!(state.context_outbound_id, None);
+        assert!(!state.context_editor.generation_active);
+        assert_eq!(state.context_editor.generation_id, None);
+        assert_eq!(state.chat.len(), 1);
         assert!(state.status.contains("Context draft ready"));
     }
 
@@ -8734,8 +8846,7 @@ mod tests {
     fn stale_context_failure_cannot_cancel_a_new_generation() {
         let storage = Storage::in_memory().unwrap();
         let mut state = state_for_ui();
-        state.context_streaming = true;
-        state.context_outbound_id = Some("new-context".into());
+        state.context_editor.begin_generation("new-context");
 
         handle_agent_event(
             &mut state,
@@ -8748,8 +8859,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(state.context_streaming);
-        assert_eq!(state.context_outbound_id.as_deref(), Some("new-context"));
+        assert!(state.context_editor.generation_active);
+        assert_eq!(
+            state.context_editor.generation_id.as_deref(),
+            Some("new-context")
+        );
 
         handle_agent_event(
             &mut state,
@@ -8762,10 +8876,54 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!state.context_streaming);
-        assert_eq!(state.context_outbound_id, None);
+        assert!(!state.context_editor.generation_active);
+        assert_eq!(state.context_editor.generation_id, None);
         assert!(state.status.contains("press r to retry"));
         assert!(state.status.contains("e to edit"));
+    }
+
+    #[test]
+    fn failed_context_generation_keeps_correlated_partial_fields_out_of_chat() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+        state.context_editor.begin_generation("context-partial");
+
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::ResponseStarted {
+                outbound_id: "context-partial".into(),
+                outbound: OutboundKind::ContextDraft,
+                first_delta: "Title: Partial".into(),
+            },
+        )
+        .unwrap();
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::ResponseDelta {
+                outbound_id: "context-partial".into(),
+                delta: "\nWhy: Keep this".into(),
+            },
+        )
+        .unwrap();
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::TurnFailed {
+                outbound_id: "context-partial".into(),
+                outbound: OutboundKind::ContextDraft,
+                message: "network unavailable".into(),
+                response_started: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.context_editor.draft.title, "Partial");
+        assert_eq!(state.context_editor.draft.why, "Keep this");
+        assert!(!state.context_editor.generation_active);
+        assert!(state.chat.is_empty());
+        assert!(state.status.contains("press r to retry"));
     }
 
     #[test]

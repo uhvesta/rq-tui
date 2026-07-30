@@ -105,8 +105,9 @@ impl TuiHarness {
         let temp = tempfile::tempdir()?;
         let paths = fixture_paths(temp.path());
         let storage = Storage::open(&paths.database)?;
-        seed_storage(&storage, &state)?;
         let mut state = state;
+        state.work_item.session_root = temp.path().to_path_buf();
+        seed_storage(&storage, &state)?;
         let display_now = state.agent_progress.last_event_at;
         state.agent_progress.freeze_display_clock(display_now);
         Ok(Self {
@@ -409,6 +410,12 @@ impl TuiHarness {
                     self.storage.ask_messages_for_annotation(&annotation.id)?,
                 );
             }
+        }
+        if let Some(context) = self
+            .storage
+            .context_for_work_item(&state.work_item.item.id)?
+        {
+            state.context_editor = crate::context_editor::ContextEditorState::new(context);
         }
         state.pending_asks = self
             .storage
@@ -1363,7 +1370,8 @@ mod tests {
         ActivityKind, AgentEvent, AgentLane, ContextTierOption, HistoryEntry, ModelOption,
     };
     use crate::domain::{
-        AnchorSide, Annotation, AnnotationKind, DeliveryState, Placement, Version, VersionKind,
+        AnchorSide, Annotation, AnnotationKind, DeliveryState, Placement, ReviewContext, Version,
+        VersionKind,
     };
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1970,6 +1978,50 @@ mod tests {
         assert_eq!(annotation.side, "new");
         assert_eq!((annotation.line_start, annotation.line_end), (11, 12));
         assert!(visual.agent_commands().is_empty());
+    }
+
+    #[test]
+    fn structured_context_attach_round_trips_all_fields_through_restart() {
+        let mut harness =
+            TuiHarness::from_unified_diff("context-persistence", workflow_diff(), 80, 20).unwrap();
+        harness.state.screen = Screen::ContextEditor;
+        harness.state.context_editor.draft = ReviewContext {
+            work_item_id: harness.state.work_item.item.id.clone(),
+            title: "Review title".into(),
+            what: "What changed: safely".into(),
+            why: "Why\nwith a second line".into(),
+            how: "How to validate".into(),
+            considerations: "Keep this visible".into(),
+            alternatives: "Alternative A\nAlternative B".into(),
+            source: "manual".into(),
+            attached_to_session: false,
+            delivery_state: DeliveryState::Draft,
+        };
+        harness.state.context_editor.base = harness.state.context_editor.draft.clone();
+
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        let persisted = harness
+            .storage
+            .context_for_work_item(&harness.state.work_item.item.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.title, "Review title");
+        assert_eq!(persisted.why, "Why\nwith a second line");
+        assert_eq!(persisted.delivery_state, DeliveryState::Pending);
+        assert!(harness
+            .state
+            .work_item
+            .session_root
+            .join(".rq-tui/context.md")
+            .exists());
+
+        harness.restart().unwrap();
+        assert_eq!(harness.state.context_editor.draft.title, "Review title");
+        assert_eq!(
+            harness.state.context_editor.draft.alternatives,
+            "Alternative A\nAlternative B"
+        );
+        assert!(harness.state.pending_context);
     }
 
     #[test]
