@@ -200,6 +200,23 @@ struct PreviewReturnState {
     status: String,
 }
 
+/// The semantic and viewport state belonging to MAIN while SIDE owns the
+/// visible chat vector.  The renderer can rebuild width-specific layout rows
+/// after the swap; these values are the user-facing navigation contract.
+#[derive(Clone, Debug)]
+struct ChatViewportState {
+    focus: Focus,
+    input_mode: InputMode,
+    chat_cursor: usize,
+    chat_scroll: usize,
+    chat_total_rows: usize,
+    chat_viewport_rows: usize,
+    chat_autofollow: bool,
+    chat_navigation: Option<ChatCursor>,
+    chat_selection: Option<ChatSelection>,
+    chat_display_rows: Vec<usize>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum AgentPhase {
     Connecting,
@@ -483,6 +500,7 @@ pub(crate) struct AppState {
     pub(crate) expand_step: usize,
     pub(crate) chat: Vec<ChatEntry>,
     pub(crate) main_chat: Option<Vec<ChatEntry>>,
+    main_chat_viewport: Option<ChatViewportState>,
     pub(crate) pending_side_entries: Vec<ChatEntry>,
     pub(crate) chat_cursor: usize,
     pub(crate) chat_scroll: usize,
@@ -570,6 +588,7 @@ impl AppState {
             expand_step: 10,
             chat: Vec::new(),
             main_chat: None,
+            main_chat_viewport: None,
             pending_side_entries: Vec::new(),
             chat_cursor: 0,
             chat_scroll: 0,
@@ -639,6 +658,9 @@ impl AppState {
                 "CTRL-W focus navigation timed out · focus unchanged".into()
             };
         }
+        // Queue depth is derived from the lane-visible transcript rather than
+        // being trusted to survive a SIDE swap's teardown bookkeeping.
+        self.agent_progress.queue_depth = self.queue_entry_ids().len();
     }
 
     pub(crate) fn current_file(&self) -> Option<&DiffFile> {
@@ -1039,6 +1061,10 @@ impl AppState {
     }
 
     pub(crate) fn reset_chat_semantics(&mut self) {
+        let restore_main = !self.side_active
+            && !self.side_starting
+            && self.main_chat.is_none()
+            && self.main_chat_viewport.is_some();
         self.chat_layout = None;
         self.chat_navigation = None;
         self.chat_selection = None;
@@ -1046,6 +1072,47 @@ impl AppState {
         if self.input_mode == InputMode::Visual && self.focus == Focus::Chat {
             self.input_mode = InputMode::Normal;
         }
+        if restore_main {
+            self.restore_main_chat_viewport();
+        }
+        // SIDE teardown used to zero this value even when MAIN still had
+        // queued work. Recompute from the visible queue model after every
+        // lane swap so progress and :queue agree immediately.
+        self.agent_progress.queue_depth = self.queue_entry_ids().len();
+    }
+
+    fn capture_main_chat_viewport(&mut self) {
+        if self.side_active || self.side_starting {
+            return;
+        }
+        self.main_chat_viewport = Some(ChatViewportState {
+            focus: self.focus,
+            input_mode: self.input_mode,
+            chat_cursor: self.chat_cursor,
+            chat_scroll: self.chat_scroll,
+            chat_total_rows: self.chat_total_rows,
+            chat_viewport_rows: self.chat_viewport_rows,
+            chat_autofollow: self.chat_autofollow,
+            chat_navigation: self.chat_navigation.clone(),
+            chat_selection: self.chat_selection.clone(),
+            chat_display_rows: self.chat_display_rows.clone(),
+        });
+    }
+
+    fn restore_main_chat_viewport(&mut self) {
+        let Some(snapshot) = self.main_chat_viewport.take() else {
+            return;
+        };
+        self.focus = snapshot.focus;
+        self.input_mode = snapshot.input_mode;
+        self.chat_cursor = snapshot.chat_cursor.min(self.chat.len().saturating_sub(1));
+        self.chat_scroll = snapshot.chat_scroll;
+        self.chat_total_rows = snapshot.chat_total_rows;
+        self.chat_viewport_rows = snapshot.chat_viewport_rows;
+        self.chat_autofollow = snapshot.chat_autofollow;
+        self.chat_navigation = snapshot.chat_navigation;
+        self.chat_selection = snapshot.chat_selection;
+        self.chat_display_rows = snapshot.chat_display_rows;
     }
 
     pub(crate) fn chat_selection_mode(&self) -> Option<ChatSelectionMode> {
@@ -1426,6 +1493,11 @@ impl AppState {
                         )
                     })
                 {
+                    if kind == AnnotationKind::Ask && self.side_active {
+                        self.status =
+                            "MAIN Ask is unavailable while SIDE is active · use /main first".into();
+                        return Vec::new();
+                    }
                     self.input_return_mode = InputMode::Normal;
                     self.input_mode = InputMode::Compose;
                     self.compose_cursor = 0;
@@ -1472,6 +1544,12 @@ impl AppState {
                     .map(|(annotation, _)| (annotation.kind, annotation.id.clone()))
                 {
                     if kind == AnnotationKind::Ask {
+                        if self.side_active {
+                            self.status =
+                                "MAIN Ask is unavailable while SIDE is active · use /main first"
+                                    .into();
+                            return Vec::new();
+                        }
                         self.collapsed_annotations.remove(&annotation_id);
                         self.input_return_mode = InputMode::Normal;
                         self.input_mode = InputMode::Compose;
@@ -2583,8 +2661,10 @@ impl AppState {
             ComposeTarget::Chat => {
                 let trimmed = text.trim();
                 if trimmed == "/side" {
+                    self.capture_main_chat_viewport();
                     vec![Effect::StartSide(None)]
                 } else if let Some(question) = trimmed.strip_prefix("/side ") {
+                    self.capture_main_chat_viewport();
                     vec![Effect::StartSide(Some(question.trim().to_owned()))]
                 } else if let Some(correction) = trimmed.strip_prefix("/steer ") {
                     let correction = correction.trim().to_owned();
@@ -2699,6 +2779,7 @@ impl AppState {
                 let mut words = question.into_iter().collect::<Vec<_>>();
                 words.extend(parts);
                 let question = words.join(" ");
+                self.capture_main_chat_viewport();
                 vec![Effect::StartSide(
                     (!question.is_empty()).then_some(question),
                 )]
@@ -2735,6 +2816,10 @@ impl AppState {
     }
 
     fn start_composing(&mut self, kind: AnnotationKind) {
+        if kind == AnnotationKind::Ask && self.side_active {
+            self.status = "MAIN Ask is unavailable while SIDE is active · use /main first".into();
+            return;
+        }
         if !matches!(self.focus, Focus::Diff | Focus::InlineAsk) {
             self.status = "Move focus to a code line before creating an annotation".into();
             return;

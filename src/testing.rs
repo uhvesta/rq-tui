@@ -541,6 +541,7 @@ impl TuiHarness {
     }
 
     fn draw(&mut self) -> Result<Terminal<TestBackend>> {
+        self.state.tick(std::time::Instant::now());
         let backend = TestBackend::new(self.width, self.height);
         let mut terminal = Terminal::new(backend)?;
         let mut highlighter = PlainHighlighter;
@@ -2302,6 +2303,97 @@ mod tests {
     }
 
     #[test]
+    fn side_restores_main_chat_viewport_navigation_and_selection_exactly() {
+        let mut harness =
+            TuiHarness::from_unified_diff("side-viewport", workflow_diff(), 48, 14).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(
+            &mut harness,
+            "MAIN transcript text long enough to build a real scrollable semantic layout",
+        );
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.render().unwrap();
+
+        let navigation = harness
+            .state
+            .chat_navigation
+            .clone()
+            .expect("render creates a semantic chat cursor");
+        harness.state.chat_selection = Some(crate::chat_selection::ChatSelection::character(
+            navigation.point.clone(),
+        ));
+        harness.state.chat_cursor = 0;
+        harness.state.chat_scroll = 1;
+        harness.state.chat_autofollow = false;
+        let expected = (
+            harness.state.focus,
+            harness.state.input_mode,
+            harness.state.chat_cursor,
+            harness.state.chat_scroll,
+            harness.state.chat_total_rows,
+            harness.state.chat_viewport_rows,
+            harness.state.chat_autofollow,
+            harness.state.chat_navigation.clone(),
+            harness.state.chat_selection.clone(),
+        );
+
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "/side isolated viewport");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness
+            .inject_side_started("main-session", "side-session")
+            .unwrap();
+        assert!(harness.state.chat_selection.is_none());
+
+        harness
+            .inject_side_exited("main-session", "side-session")
+            .unwrap();
+        let restored = (
+            harness.state.focus,
+            harness.state.input_mode,
+            harness.state.chat_cursor,
+            harness.state.chat_scroll,
+            harness.state.chat_total_rows,
+            harness.state.chat_viewport_rows,
+            harness.state.chat_autofollow,
+            harness.state.chat_navigation.clone(),
+            harness.state.chat_selection.clone(),
+        );
+        assert_eq!(restored, expected);
+        assert!(harness.state.main_chat.is_none());
+        assert!(harness.state.pending_side_entries.is_empty());
+    }
+
+    #[test]
+    fn side_active_cannot_create_an_orphaned_main_ask_in_the_side_transcript() {
+        let mut harness =
+            TuiHarness::from_unified_diff("side-main-ask", workflow_diff(), 100, 24).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "/side isolated");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness
+            .inject_side_started("main-session", "side-session")
+            .unwrap();
+
+        harness.key(key(KeyCode::Char('g'))).unwrap();
+        harness.key(key(KeyCode::Char('r'))).unwrap();
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+
+        assert_eq!(harness.mode(), "NORMAL");
+        assert!(harness
+            .status()
+            .contains("MAIN Ask is unavailable while SIDE is active"));
+        assert!(harness
+            .state
+            .chat
+            .iter()
+            .all(|entry| entry.annotation_id.is_none()));
+        assert!(harness.state.pending_side_entries.is_empty());
+    }
+
+    #[test]
     fn liveness_panel_exposes_quiet_sdk_diagnostics_and_tool_skill_history() {
         let mut harness =
             TuiHarness::from_unified_diff("liveness", workflow_diff(), 110, 26).unwrap();
@@ -2474,6 +2566,10 @@ mod tests {
         let main = harness.render().unwrap();
         assert!(main.contains("main request waiting behind the side fork"));
         assert!(main.contains("queued"));
+        assert_eq!(
+            harness.state.agent_progress.queue_depth,
+            harness.state.queue_entry_ids().len()
+        );
     }
 
     #[test]
