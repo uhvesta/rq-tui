@@ -1966,10 +1966,7 @@ fn handle_session_event(
                         .and_then(|value| value.as_str())
                         == Some(id)
             });
-            let matches_content = event
-                .data
-                .get("content")
-                .and_then(|value| value.as_str())
+            let matches_content = event.data.get("content").and_then(|value| value.as_str())
                 == Some(active.outbound.text.as_str());
             if matches_sdk_id || matches_content {
                 active.accepted_event_ids.insert(event.id.clone());
