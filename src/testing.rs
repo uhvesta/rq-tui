@@ -2464,6 +2464,28 @@ mod tests {
     }
 
     #[test]
+    fn compact_review_caps_the_contextual_editor_without_hiding_its_identity() {
+        let mut harness =
+            TuiHarness::from_unified_diff("compact-editor", workflow_diff(), 44, 14).unwrap();
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        type_text(
+            &mut harness,
+            concat!(
+                "This deliberately long contextual question wraps through far more rows than ",
+                "the compact Review viewport can display, so the editor must follow its cursor ",
+                "inside the bordered block without covering the title, controls, or status."
+            ),
+        );
+
+        let frame = harness.render().unwrap();
+        assert!(frame.contains("Ask · draft"), "{frame}");
+        assert!(frame.contains('▏'), "{frame}");
+        assert!(frame.contains("↑/↓ scroll"), "{frame}");
+        assert!(frame.contains('╰'), "{frame}");
+        assert!(frame.contains("INSERT"), "{frame}");
+    }
+
+    #[test]
     fn exact_minimum_chat_keeps_the_sticky_composer_border_intact() {
         let mut harness =
             TuiHarness::from_unified_diff("minimum-chat", workflow_diff(), 40, 9).unwrap();

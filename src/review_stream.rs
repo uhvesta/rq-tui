@@ -343,7 +343,9 @@ impl ReviewDisplayLayout {
                 height,
             });
             if let Some(cursor_line) = cursor_line {
-                composer_cursor = Some(start.saturating_add(cursor_line));
+                // Follow one display row past the insertion cursor so the
+                // contextual editor's closing border remains in view.
+                composer_cursor = Some(start.saturating_add(cursor_line).saturating_add(1));
             }
             start = start.saturating_add(height);
         }

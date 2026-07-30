@@ -5213,7 +5213,7 @@ fn inline_composer_visible_rows(terminal_height: u16, viewport_height: u16) -> u
     usize::from(
         (terminal_height / 3)
             .clamp(1, 12)
-            .min(viewport_height.saturating_sub(3).max(1)),
+            .min(viewport_height.saturating_sub(4).max(1)),
     )
 }
 
