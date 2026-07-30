@@ -10,6 +10,7 @@ import pty
 import re
 import select
 import signal
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -35,8 +36,8 @@ def git(repo: Path, *args: str) -> None:
     )
 
 
-def make_fixture(root: Path) -> Path:
-    repo = root / "pty-fixture"
+def make_fixture(root: Path, name: str = "pty-fixture") -> Path:
+    repo = root / name
     repo.mkdir()
     git(repo, "init", "-b", "main")
     git(repo, "config", "user.email", "rq-tui-pty@example.invalid")
@@ -131,6 +132,17 @@ class Child:
                 raise AssertionError(self.failure(f"process exited {status} before {marker!r}"))
         raise AssertionError(self.failure(f"timed out waiting for {marker!r}"))
 
+    def wait_for_since(self, marker: str, offset: int, timeout: float = 8.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.read(0.1)
+            if marker in terminal_text(bytes(self.output[offset:])):
+                return
+            status = self.poll()
+            if status is not None:
+                raise AssertionError(self.failure(f"process exited {status} before {marker!r}"))
+        raise AssertionError(self.failure(f"timed out waiting for new {marker!r}"))
+
     def wait_for_exit(self, timeout: float = 8.0) -> int:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -149,13 +161,21 @@ class Child:
         status = self.poll()
         if status is None:
             try:
-                os.killpg(self.pid, signal.SIGTERM)
+                os.kill(self.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-            try:
-                os.waitpid(self.pid, 0)
-            except ChildProcessError:
-                pass
+            deadline = time.monotonic() + 1.0
+            while self.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if self.poll() is None:
+                try:
+                    os.kill(self.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(self.pid, 0)
+                except ChildProcessError:
+                    pass
         try:
             os.close(self.master)
         except OSError:
@@ -169,8 +189,21 @@ def main() -> int:
     binary = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="rq-tui-pty-") as temporary:
         root = Path(temporary)
+        app_root = root / "app"
+        old_repo = make_fixture(root, "old-fixture")
+        setup = Child(binary, old_repo, app_root)
+        try:
+            set_size(setup.master, 80, 18)
+            setup.wait_for("Review", timeout=8)
+            setup.wait_for("COPILOT MAIN", timeout=8)
+            setup.send(b":q\r")
+            if setup.wait_for_exit(timeout=8) != 0:
+                raise AssertionError(setup.failure("setup review did not exit cleanly"))
+        finally:
+            setup.close()
+
         repo = make_fixture(root)
-        child = Child(binary, repo, root / "app")
+        child = Child(binary, repo, app_root)
         try:
             set_size(child.master, 100, 24)
             child.wait_for("Review", timeout=8)
@@ -198,6 +231,21 @@ def main() -> int:
             child.send(b"\x1b")
             child.wait_for("NORMAL", timeout=4)
 
+            # The compiled TUI's prune screen must visibly disable the open
+            # Work Item and retain the live Copilot progress surface.
+            child.send(b":prune\r")
+            child.wait_for("OPEN(disabled)", timeout=4)
+            if "COPILOT MAIN" not in terminal_text(bytes(child.output)):
+                raise AssertionError(
+                    child.failure("prune screen hid the Copilot progress surface")
+                )
+            child.send(b" ")
+            child.send(b"d")
+            child.wait_for("Prune complete", timeout=8)
+            before_return = len(child.output)
+            child.send(b"q")
+            child.wait_for_since("NORMAL", before_return, timeout=4)
+
             # ':' must visibly enter command mode before the quit command is
             # submitted; this catches input routing regressions as well as exit.
             child.send(b":")
@@ -213,10 +261,16 @@ def main() -> int:
                 raise AssertionError(child.failure("panic text appeared in terminal output"))
             if b"\x1b[?1049l" not in raw:
                 raise AssertionError(child.failure("alternate screen was not restored on exit"))
+            with sqlite3.connect(app_root / "data" / "review.db") as database:
+                work_items = database.execute(
+                    "SELECT name FROM work_items ORDER BY name"
+                ).fetchall()
+            if work_items != [("pty-fixture",)]:
+                raise AssertionError(f"unexpected Work Items after prune: {work_items!r}")
         finally:
             child.close()
 
-    print("PTY_SMOKE_OK: entry resize key command-mode clean-exit no-panic")
+    print("PTY_SMOKE_OK: entry resize prune-progress command-mode clean-exit no-panic")
     return 0
 
 

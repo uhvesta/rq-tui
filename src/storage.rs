@@ -15,6 +15,7 @@ const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
 const MIGRATION_2: &str = include_str!("../migrations/0002_placement_side.sql");
 const MIGRATION_3: &str = include_str!("../migrations/0003_chat_outbox.sql");
 const MIGRATION_4: &str = include_str!("../migrations/0004_ephemeral_sessions.sql");
+const MIGRATION_5: &str = include_str!("../migrations/0005_prune_journal.sql");
 
 pub(crate) struct Storage {
     connection: Connection,
@@ -28,6 +29,31 @@ pub(crate) struct ReviewHistoryItem {
     pub(crate) last_opened_at: String,
     pub(crate) versions: usize,
     pub(crate) annotations: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PruneOperation {
+    pub(crate) operation_id: String,
+    pub(crate) work_item_id: String,
+    pub(crate) export_first: bool,
+    pub(crate) phase: String,
+    pub(crate) last_error: Option<String>,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PruneTarget {
+    pub(crate) operation_id: String,
+    pub(crate) target_key: String,
+    pub(crate) kind: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) side_operation_id: Option<String>,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) state: String,
+    pub(crate) last_error: Option<String>,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
 }
 
 impl Storage {
@@ -104,6 +130,7 @@ impl Storage {
             (2, MIGRATION_2),
             (3, MIGRATION_3),
             (4, MIGRATION_4),
+            (5, MIGRATION_5),
         ] {
             let applied = tx
                 .query_row(
@@ -495,6 +522,35 @@ impl Storage {
 
     pub(crate) fn activate_session(&self, session: &SessionRecord) -> Result<()> {
         let tx = self.connection.unchecked_transaction()?;
+        let pruning_operation = tx
+            .query_row(
+                "SELECT operation_id
+                 FROM prune_operations
+                 WHERE work_item_id = ?1",
+                [&session.work_item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(operation_id) = pruning_operation {
+            let timestamp = now();
+            tx.execute(
+                "INSERT OR IGNORE INTO prune_targets(
+                    operation_id, target_key, kind, session_id, side_operation_id,
+                    parent_id, state, last_error, created_at, updated_at
+                 ) VALUES (?1, ?2, 'persistent', ?3, NULL, ?4, 'pending', NULL, ?5, ?5)",
+                params![
+                    operation_id,
+                    format!("persistent:{}", session.id),
+                    session.id,
+                    session.parent_id,
+                    timestamp
+                ],
+            )?;
+            tx.commit()?;
+            anyhow::bail!(
+                "the Work Item is being pruned; the late Copilot session was captured for cleanup"
+            );
+        }
         tx.execute(
             "UPDATE sessions SET active = 0 WHERE work_item_id = ?1",
             [&session.work_item_id],
@@ -512,6 +568,66 @@ impl Storage {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Atomically promotes a remotely-created fork into persistent MAIN state
+    /// and clears the durable creation intent while the same owner still holds
+    /// the Work Item lease.
+    pub(crate) fn activate_session_from_ephemeral(
+        &self,
+        session: &SessionRecord,
+        operation_id: &str,
+        owner_id: &str,
+    ) -> Result<bool> {
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let may_activate = tx.query_row(
+            "SELECT
+                EXISTS (
+                  SELECT 1 FROM ephemeral_session_leases
+                  WHERE work_item_id = ?1 AND owner_id = ?2
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM prune_operations
+                  WHERE work_item_id = ?1
+                )
+                AND EXISTS (
+                  SELECT 1 FROM ephemeral_sessions
+                  WHERE operation_id = ?3 AND owner_id = ?2
+                )",
+            params![session.work_item_id, owner_id, operation_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !may_activate {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE sessions SET active = 0 WHERE work_item_id = ?1",
+            [&session.work_item_id],
+        )?;
+        tx.execute(
+            "INSERT INTO sessions(id, work_item_id, parent_id, active, created_at)
+             VALUES (?1, ?2, ?3, 1, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                parent_id = excluded.parent_id,
+                active = 1",
+            params![
+                session.id,
+                session.work_item_id,
+                session.parent_id,
+                session.created_at
+            ],
+        )?;
+        if tx.execute(
+            "DELETE FROM ephemeral_sessions
+             WHERE operation_id = ?1 AND owner_id = ?2",
+            params![operation_id, owner_id],
+        )? != 1
+        {
+            anyhow::bail!("MAIN fork creation intent disappeared during activation");
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     pub(crate) fn active_session(&self, work_item_id: &str) -> Result<Option<SessionRecord>> {
@@ -534,6 +650,7 @@ impl Storage {
             .optional()?)
     }
 
+    #[cfg(test)]
     pub(crate) fn sessions_for_work_item(&self, work_item_id: &str) -> Result<Vec<SessionRecord>> {
         let mut statement = self.connection.prepare(
             "SELECT id, work_item_id, parent_id, active, created_at
@@ -551,6 +668,294 @@ impl Storage {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Starts a durable, resumable prune operation by snapshotting every known
+    /// persistent and SIDE session before any Work Item cascade can remove it.
+    /// An existing unfinished operation wins over the supplied request id.
+    pub(crate) fn begin_prune_operation(
+        &self,
+        requested_operation_id: &str,
+        work_item_id: &str,
+        export_first: bool,
+    ) -> Result<String> {
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        if let Some(operation_id) = tx
+            .query_row(
+                "SELECT operation_id
+                 FROM prune_operations
+                 WHERE work_item_id = ?1",
+                [work_item_id],
+                |row| row.get(0),
+            )
+            .optional()?
+        {
+            tx.commit()?;
+            return Ok(operation_id);
+        }
+        let timestamp = now();
+        tx.execute(
+            "INSERT INTO prune_operations(
+                operation_id, work_item_id, export_first, phase, last_error,
+                created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'remote_pending', NULL, ?4, ?4)",
+            params![
+                requested_operation_id,
+                work_item_id,
+                export_first,
+                timestamp
+            ],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO prune_targets(
+                operation_id, target_key, kind, session_id, side_operation_id,
+                parent_id, state, last_error, created_at, updated_at
+             )
+             SELECT ?1, 'persistent:' || id, 'persistent', id, NULL, parent_id,
+                    'pending', NULL, ?2, ?2
+             FROM sessions
+             WHERE work_item_id = ?3",
+            params![requested_operation_id, timestamp, work_item_id],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO prune_targets(
+                operation_id, target_key, kind, session_id, side_operation_id,
+                parent_id, state, last_error, created_at, updated_at
+             )
+             SELECT ?1, 'side:' || operation_id, 'side', side_id, operation_id,
+                    parent_id, 'pending', NULL, ?2, ?2
+             FROM ephemeral_sessions
+             WHERE work_item_id = ?3",
+            params![requested_operation_id, timestamp, work_item_id],
+        )?;
+        tx.commit()?;
+        Ok(requested_operation_id.to_owned())
+    }
+
+    pub(crate) fn prune_operation(&self, operation_id: &str) -> Result<Option<PruneOperation>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT operation_id, work_item_id, export_first, phase, last_error,
+                        created_at, updated_at
+                 FROM prune_operations
+                 WHERE operation_id = ?1",
+                [operation_id],
+                |row| {
+                    Ok(PruneOperation {
+                        operation_id: row.get(0)?,
+                        work_item_id: row.get(1)?,
+                        export_first: row.get::<_, i64>(2)? != 0,
+                        phase: row.get(3)?,
+                        last_error: row.get(4)?,
+                        created_at: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn pending_prune_operations(&self) -> Result<Vec<PruneOperation>> {
+        let mut statement = self.connection.prepare(
+            "SELECT operation_id, work_item_id, export_first, phase, last_error,
+                    created_at, updated_at
+             FROM prune_operations
+             ORDER BY created_at, operation_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(PruneOperation {
+                operation_id: row.get(0)?,
+                work_item_id: row.get(1)?,
+                export_first: row.get::<_, i64>(2)? != 0,
+                phase: row.get(3)?,
+                last_error: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub(crate) fn prune_targets(&self, operation_id: &str) -> Result<Vec<PruneTarget>> {
+        let mut statement = self.connection.prepare(
+            "SELECT operation_id, target_key, kind, session_id, side_operation_id,
+                    parent_id, state, last_error, created_at, updated_at
+             FROM prune_targets
+             WHERE operation_id = ?1
+             ORDER BY target_key",
+        )?;
+        let rows = statement.query_map([operation_id], |row| {
+            Ok(PruneTarget {
+                operation_id: row.get(0)?,
+                target_key: row.get(1)?,
+                kind: row.get(2)?,
+                session_id: row.get(3)?,
+                side_operation_id: row.get(4)?,
+                parent_id: row.get(5)?,
+                state: row.get(6)?,
+                last_error: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn update_prune_target_session_id(
+        &self,
+        operation_id: &str,
+        target_key: &str,
+        session_id: Option<&str>,
+    ) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE prune_targets
+             SET session_id = ?3, updated_at = ?4
+             WHERE operation_id = ?1 AND target_key = ?2",
+            params![operation_id, target_key, session_id, now()],
+        )? == 1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_prune_target_deleted(
+        &self,
+        operation_id: &str,
+        target_key: &str,
+    ) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE prune_targets
+             SET state = 'deleted', last_error = NULL, updated_at = ?3
+             WHERE operation_id = ?1 AND target_key = ?2",
+            params![operation_id, target_key, now()],
+        )? == 1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_prune_phase(
+        &self,
+        operation_id: &str,
+        phase: &str,
+        last_error: Option<&str>,
+    ) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE prune_operations
+             SET phase = ?2, last_error = ?3, updated_at = ?4
+             WHERE operation_id = ?1",
+            params![operation_id, phase, last_error, now()],
+        )? == 1)
+    }
+
+    pub(crate) fn update_prune_target_session_id_if_owned(
+        &self,
+        operation_id: &str,
+        target_key: &str,
+        session_id: Option<&str>,
+        work_item_id: &str,
+        owner_id: &str,
+    ) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE prune_targets
+             SET session_id = ?3, updated_at = ?6
+             WHERE operation_id = ?1 AND target_key = ?2
+               AND EXISTS (
+                 SELECT 1 FROM ephemeral_session_leases
+                 WHERE work_item_id = ?4 AND owner_id = ?5
+               )",
+            params![
+                operation_id,
+                target_key,
+                session_id,
+                work_item_id,
+                owner_id,
+                now()
+            ],
+        )? == 1)
+    }
+
+    pub(crate) fn mark_prune_target_deleted_if_owned(
+        &self,
+        operation_id: &str,
+        target_key: &str,
+        work_item_id: &str,
+        owner_id: &str,
+    ) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE prune_targets
+             SET state = 'deleted', last_error = NULL, updated_at = ?5
+             WHERE operation_id = ?1 AND target_key = ?2
+               AND EXISTS (
+                 SELECT 1 FROM ephemeral_session_leases
+                 WHERE work_item_id = ?3 AND owner_id = ?4
+               )",
+            params![operation_id, target_key, work_item_id, owner_id, now()],
+        )? == 1)
+    }
+
+    pub(crate) fn mark_prune_target_error_if_owned(
+        &self,
+        operation_id: &str,
+        target_key: &str,
+        error: &str,
+        work_item_id: &str,
+        owner_id: &str,
+    ) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE prune_targets
+             SET last_error = ?3, updated_at = ?6
+             WHERE operation_id = ?1 AND target_key = ?2
+               AND EXISTS (
+                 SELECT 1 FROM ephemeral_session_leases
+                 WHERE work_item_id = ?4 AND owner_id = ?5
+               )",
+            params![
+                operation_id,
+                target_key,
+                error,
+                work_item_id,
+                owner_id,
+                now()
+            ],
+        )? == 1)
+    }
+
+    pub(crate) fn mark_prune_phase_if_owned(
+        &self,
+        operation_id: &str,
+        phase: &str,
+        last_error: Option<&str>,
+        work_item_id: &str,
+        owner_id: &str,
+    ) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE prune_operations
+             SET phase = ?2, last_error = ?3, updated_at = ?6
+             WHERE operation_id = ?1
+               AND EXISTS (
+                 SELECT 1 FROM ephemeral_session_leases
+                 WHERE work_item_id = ?4 AND owner_id = ?5
+               )",
+            params![
+                operation_id,
+                phase,
+                last_error,
+                work_item_id,
+                owner_id,
+                now()
+            ],
+        )? == 1)
+    }
+
+    pub(crate) fn clear_prune_operation(&self, operation_id: &str) -> Result<bool> {
+        Ok(self.connection.execute(
+            "DELETE FROM prune_operations
+             WHERE operation_id = ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM prune_targets
+                 WHERE operation_id = ?1 AND state != 'deleted'
+               )",
+            [operation_id],
+        )? == 1)
     }
 
     pub(crate) fn record_ephemeral_session(
@@ -679,6 +1084,59 @@ impl Storage {
              WHERE work_item_id = ?1 AND owner_id = ?2",
             params![work_item_id, owner_id, heartbeat_ms],
         )? == 1)
+    }
+
+    /// Atomically verifies prune ownership/remote completion, clears the
+    /// durable journal, and deletes the Work Item as the final local step.
+    pub(crate) fn finalize_prune_operation(
+        &self,
+        operation_id: &str,
+        work_item_id: &str,
+        owner_id: &str,
+        heartbeat_ms: i64,
+    ) -> Result<bool> {
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let owned = tx
+            .query_row(
+                "SELECT owner_id = ?2
+                 FROM ephemeral_session_leases
+                 WHERE work_item_id = ?1",
+                params![work_item_id, owner_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|owned| owned != 0);
+        anyhow::ensure!(
+            owned,
+            "Work Item cleanup ownership changed before final local deletion"
+        );
+        tx.execute(
+            "UPDATE ephemeral_session_leases
+             SET heartbeat_ms = ?3
+             WHERE work_item_id = ?1 AND owner_id = ?2",
+            params![work_item_id, owner_id, heartbeat_ms],
+        )?;
+        let pending: i64 = tx.query_row(
+            "SELECT COUNT(*)
+             FROM prune_targets
+             WHERE operation_id = ?1 AND state != 'deleted'",
+            [operation_id],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            pending == 0,
+            "a late Copilot session was captured; remote cleanup must retry before local deletion"
+        );
+        anyhow::ensure!(
+            tx.execute(
+                "DELETE FROM prune_operations WHERE operation_id = ?1",
+                [operation_id],
+            )? == 1,
+            "the durable prune journal changed before final local deletion"
+        );
+        let deleted = tx.execute("DELETE FROM work_items WHERE id = ?1", [work_item_id])? == 1;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     pub(crate) fn release_ephemeral_session_lease(
@@ -1518,7 +1976,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    use super::{Storage, MIGRATION_1, MIGRATION_2, MIGRATION_3};
+    use super::{Storage, MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4};
     use crate::domain::{
         AnchorSide, Annotation, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState,
         EphemeralSessionRecord, PendingChat, Placement, Repo, SessionRecord, Version, VersionKind,
@@ -1537,17 +1995,20 @@ mod tests {
                      'work_items', 'sessions', 'repos', 'contexts', 'versions',
                      'chat_outbox', 'ephemeral_sessions',
                      'ephemeral_session_leases',
+                     'prune_operations', 'prune_targets',
                      'annotations', 'placements', 'ask_messages', 'settings',
                      'versions_repo_version', 'placements_version',
                      'annotations_repo_submitted', 'ask_messages_annotation_seq',
                      'work_items_last_opened', 'chat_outbox_work_item_created',
-                     'ephemeral_sessions_work_item_created'
+                     'ephemeral_sessions_work_item_created',
+                     'prune_operations_one_unfinished_per_work_item',
+                     'prune_targets_operation_state'
                    )",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 19);
+        assert_eq!(count, 23);
     }
 
     #[test]
@@ -1594,6 +2055,226 @@ mod tests {
     }
 
     #[test]
+    fn begin_prune_operation_snapshots_persistent_and_side_session_history() {
+        let storage = Storage::in_memory().unwrap();
+        let item = WorkItem {
+            id: "prune-snapshot".into(),
+            name: "prune snapshot".into(),
+            workspace_root: PathBuf::from("/prune-snapshot"),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            last_opened_at: Some("1".into()),
+        };
+        storage.upsert_work_item(&item).unwrap();
+        storage
+            .activate_session(&SessionRecord {
+                id: "main-parent".into(),
+                work_item_id: item.id.clone(),
+                parent_id: None,
+                active: true,
+                created_at: "1".into(),
+            })
+            .unwrap();
+        storage
+            .activate_session(&SessionRecord {
+                id: "main-fork".into(),
+                work_item_id: item.id.clone(),
+                parent_id: Some("main-parent".into()),
+                active: true,
+                created_at: "2".into(),
+            })
+            .unwrap();
+        assert!(storage
+            .claim_ephemeral_session_lease(&item.id, "owner", 1_000, 0)
+            .unwrap());
+        for (operation_id, side_id, parent_id) in [
+            ("side-known", Some("side-session"), Some("main-fork")),
+            ("side-unknown", None, Some("main-parent")),
+        ] {
+            assert!(storage
+                .record_ephemeral_session(&EphemeralSessionRecord {
+                    operation_id: operation_id.into(),
+                    work_item_id: item.id.clone(),
+                    owner_id: "owner".into(),
+                    parent_id: parent_id.map(str::to_owned),
+                    side_id: side_id.map(str::to_owned),
+                    state: "active".into(),
+                    last_error: None,
+                    created_at: "3".into(),
+                    updated_at: "3".into(),
+                })
+                .unwrap());
+        }
+
+        let operation_id = storage
+            .begin_prune_operation("prune-op", &item.id, true)
+            .unwrap();
+
+        assert_eq!(operation_id, "prune-op");
+        let operation = storage.prune_operation(&operation_id).unwrap().unwrap();
+        assert_eq!(operation.work_item_id, item.id);
+        assert!(operation.export_first);
+        assert_eq!(operation.phase, "remote_pending");
+        assert_eq!(operation.last_error, None);
+
+        let targets = storage.prune_targets(&operation_id).unwrap();
+        assert_eq!(targets.len(), 4);
+        let persistent_parent = targets
+            .iter()
+            .find(|target| target.target_key == "persistent:main-parent")
+            .unwrap();
+        assert_eq!(persistent_parent.kind, "persistent");
+        assert_eq!(persistent_parent.session_id.as_deref(), Some("main-parent"));
+        assert_eq!(persistent_parent.parent_id, None);
+        let persistent_fork = targets
+            .iter()
+            .find(|target| target.target_key == "persistent:main-fork")
+            .unwrap();
+        assert_eq!(persistent_fork.parent_id.as_deref(), Some("main-parent"));
+        let known_side = targets
+            .iter()
+            .find(|target| target.target_key == "side:side-known")
+            .unwrap();
+        assert_eq!(known_side.kind, "side");
+        assert_eq!(known_side.session_id.as_deref(), Some("side-session"));
+        assert_eq!(known_side.side_operation_id.as_deref(), Some("side-known"));
+        assert_eq!(known_side.parent_id.as_deref(), Some("main-fork"));
+        let unknown_side = targets
+            .iter()
+            .find(|target| target.target_key == "side:side-unknown")
+            .unwrap();
+        assert_eq!(unknown_side.session_id, None);
+        assert_eq!(
+            unknown_side.side_operation_id.as_deref(),
+            Some("side-unknown")
+        );
+        assert_eq!(unknown_side.parent_id.as_deref(), Some("main-parent"));
+        assert_eq!(unknown_side.state, "pending");
+
+        assert!(storage
+            .update_prune_target_session_id(
+                &operation_id,
+                "side:side-unknown",
+                Some("reconciled-side"),
+            )
+            .unwrap());
+        assert!(storage
+            .mark_prune_target_deleted(&operation_id, "side:side-unknown")
+            .unwrap());
+        assert!(storage
+            .mark_prune_phase(&operation_id, "local_pending", None)
+            .unwrap());
+        let updated = storage
+            .prune_targets(&operation_id)
+            .unwrap()
+            .into_iter()
+            .find(|target| target.target_key == "side:side-unknown")
+            .unwrap();
+        assert_eq!(updated.session_id.as_deref(), Some("reconciled-side"));
+        assert_eq!(updated.state, "deleted");
+        assert_eq!(
+            storage
+                .prune_operation(&operation_id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            "local_pending"
+        );
+    }
+
+    #[test]
+    fn unfinished_prune_reuses_its_snapshot_and_captures_rejected_late_sessions() {
+        let storage = Storage::in_memory().unwrap();
+        let item = WorkItem {
+            id: "prune-reuse".into(),
+            name: "prune reuse".into(),
+            workspace_root: PathBuf::from("/prune-reuse"),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            last_opened_at: None,
+        };
+        storage.upsert_work_item(&item).unwrap();
+
+        assert_eq!(
+            storage
+                .begin_prune_operation("first-operation", &item.id, true)
+                .unwrap(),
+            "first-operation"
+        );
+        let late_error = storage
+            .activate_session(&SessionRecord {
+                id: "created-after-first-snapshot".into(),
+                work_item_id: item.id.clone(),
+                parent_id: None,
+                active: true,
+                created_at: "2".into(),
+            })
+            .unwrap_err();
+        assert!(late_error.to_string().contains("captured for cleanup"));
+        assert_eq!(
+            storage
+                .begin_prune_operation("second-operation", &item.id, false)
+                .unwrap(),
+            "first-operation"
+        );
+        let operations = storage.pending_prune_operations().unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].operation_id, "first-operation");
+        assert!(operations[0].export_first);
+        assert!(storage
+            .prune_targets("first-operation")
+            .unwrap()
+            .iter()
+            .any(|target| target.session_id.as_deref() == Some("created-after-first-snapshot")));
+    }
+
+    #[test]
+    fn prune_journal_survives_work_item_delete_until_explicitly_cleared() {
+        let storage = Storage::in_memory().unwrap();
+        let item = WorkItem {
+            id: "prune-survives-cascade".into(),
+            name: "prune survives cascade".into(),
+            workspace_root: PathBuf::from("/prune-survives-cascade"),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            last_opened_at: None,
+        };
+        storage.upsert_work_item(&item).unwrap();
+        storage
+            .activate_session(&SessionRecord {
+                id: "persistent-session".into(),
+                work_item_id: item.id.clone(),
+                parent_id: None,
+                active: true,
+                created_at: "1".into(),
+            })
+            .unwrap();
+        let operation_id = storage
+            .begin_prune_operation("durable-prune", &item.id, false)
+            .unwrap();
+        assert!(!storage.clear_prune_operation(&operation_id).unwrap());
+        assert!(storage
+            .mark_prune_target_deleted(&operation_id, "persistent:persistent-session")
+            .unwrap());
+
+        storage.delete_work_item(&item.id).unwrap();
+
+        assert!(storage.work_item_by_id(&item.id).unwrap().is_none());
+        assert_eq!(
+            storage
+                .prune_operation(&operation_id)
+                .unwrap()
+                .unwrap()
+                .work_item_id,
+            item.id
+        );
+        assert_eq!(storage.prune_targets(&operation_id).unwrap().len(), 1);
+        assert!(storage.clear_prune_operation(&operation_id).unwrap());
+        assert!(storage.prune_operation(&operation_id).unwrap().is_none());
+        assert!(storage.prune_targets(&operation_id).unwrap().is_empty());
+    }
+
+    #[test]
     fn concurrent_first_open_applies_each_migration_once() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("review.db");
@@ -1618,16 +2299,16 @@ mod tests {
         let count: i64 = storage
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2, 3, 4)",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
     }
 
     #[test]
-    fn schema_three_database_upgrades_side_cleanup_ledger_in_place() {
+    fn schema_four_database_upgrades_prune_journal_in_place() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("review.db");
         let connection = rusqlite::Connection::open(&database).unwrap();
@@ -1639,7 +2320,12 @@ mod tests {
                  );",
             )
             .unwrap();
-        for (version, sql) in [(1, MIGRATION_1), (2, MIGRATION_2), (3, MIGRATION_3)] {
+        for (version, sql) in [
+            (1, MIGRATION_1),
+            (2, MIGRATION_2),
+            (3, MIGRATION_3),
+            (4, MIGRATION_4),
+        ] {
             connection.execute_batch(sql).unwrap();
             connection
                 .execute(
@@ -1654,7 +2340,7 @@ mod tests {
         let migration_applied: i64 = storage
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version = 4",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 5",
                 [],
                 |row| row.get(0),
             )
@@ -1664,7 +2350,7 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
                  WHERE type = 'table'
-                   AND name IN ('ephemeral_sessions', 'ephemeral_session_leases')",
+                   AND name IN ('prune_operations', 'prune_targets')",
                 [],
                 |row| row.get(0),
             )
@@ -1890,6 +2576,124 @@ mod tests {
             .unwrap());
         let adopted = second.ephemeral_sessions(&item.id).unwrap();
         assert_eq!(adopted[0].owner_id, "owner-b");
+    }
+
+    #[test]
+    fn final_prune_transition_clears_journal_and_work_item_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("review.db");
+        let first = Storage::open(&database).unwrap();
+        let item = WorkItem {
+            id: "fenced-local-prune".into(),
+            name: "fenced".into(),
+            workspace_root: PathBuf::from("/tmp/fenced"),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            last_opened_at: None,
+        };
+        first.upsert_work_item(&item).unwrap();
+        assert!(first
+            .claim_ephemeral_session_lease(&item.id, "owner-a", 1_000, 0)
+            .unwrap());
+        let operation_id = first
+            .begin_prune_operation("atomic-finalize", &item.id, false)
+            .unwrap();
+        assert!(first
+            .finalize_prune_operation(&operation_id, &item.id, "owner-a", 1_001)
+            .unwrap());
+        assert!(first.work_item_by_id(&item.id).unwrap().is_none());
+        assert!(first.prune_operation(&operation_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_owner_cannot_advance_the_durable_prune_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("review.db");
+        let first = Storage::open(&database).unwrap();
+        let item = WorkItem {
+            id: "fenced-journal".into(),
+            name: "fenced".into(),
+            workspace_root: PathBuf::from("/tmp/fenced"),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            last_opened_at: None,
+        };
+        first.upsert_work_item(&item).unwrap();
+        assert!(first
+            .claim_ephemeral_session_lease(&item.id, "owner-a", 1_000, 0)
+            .unwrap());
+        let operation_id = first
+            .begin_prune_operation("fenced-operation", &item.id, false)
+            .unwrap();
+        let second = Storage::open(&database).unwrap();
+        assert!(second
+            .claim_ephemeral_session_lease(&item.id, "owner-b", 2_000, 1_500)
+            .unwrap());
+
+        assert!(!first
+            .mark_prune_phase_if_owned(&operation_id, "local_pending", None, &item.id, "owner-a",)
+            .unwrap());
+        assert!(second
+            .mark_prune_phase_if_owned(&operation_id, "local_pending", None, &item.id, "owner-b",)
+            .unwrap());
+    }
+
+    #[test]
+    fn main_fork_activation_and_intent_clear_are_one_owned_transaction() {
+        let storage = Storage::in_memory().unwrap();
+        let item = WorkItem {
+            id: "fork-intent".into(),
+            name: "fork".into(),
+            workspace_root: PathBuf::from("/fork"),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            last_opened_at: None,
+        };
+        storage.upsert_work_item(&item).unwrap();
+        storage
+            .activate_session(&SessionRecord {
+                id: "parent".into(),
+                work_item_id: item.id.clone(),
+                parent_id: None,
+                active: true,
+                created_at: "1".into(),
+            })
+            .unwrap();
+        assert!(storage
+            .claim_ephemeral_session_lease(&item.id, "owner", 1_000, 0)
+            .unwrap());
+        let intent = EphemeralSessionRecord {
+            operation_id: "fork-operation".into(),
+            work_item_id: item.id.clone(),
+            owner_id: "owner".into(),
+            parent_id: Some("parent".into()),
+            side_id: Some("fork-session".into()),
+            state: "opening".into(),
+            last_error: None,
+            created_at: "1".into(),
+            updated_at: "1".into(),
+        };
+        assert!(storage.record_ephemeral_session(&intent).unwrap());
+
+        assert!(storage
+            .activate_session_from_ephemeral(
+                &SessionRecord {
+                    id: "fork-session".into(),
+                    work_item_id: item.id.clone(),
+                    parent_id: Some("parent".into()),
+                    active: true,
+                    created_at: "2".into(),
+                },
+                &intent.operation_id,
+                "owner",
+            )
+            .unwrap());
+
+        assert_eq!(
+            storage.active_session(&item.id).unwrap().unwrap().id,
+            "fork-session"
+        );
+        assert!(storage.ephemeral_sessions(&item.id).unwrap().is_empty());
     }
 
     #[test]

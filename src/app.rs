@@ -188,7 +188,6 @@ pub(crate) enum Effect {
 pub(crate) struct PendingPrune {
     pub(crate) request_id: String,
     pub(crate) work_item_ids: Vec<String>,
-    pub(crate) export_first: bool,
     pub(crate) skipped_current: usize,
 }
 
@@ -594,6 +593,7 @@ pub(crate) struct AppState {
     pub(crate) prune_index: usize,
     pub(crate) pending_prune: Option<PendingPrune>,
     pub(crate) ready_prune: Option<ReadyPrune>,
+    pub(crate) prune_recoveries: HashSet<String>,
     pub(crate) settings_index: usize,
     pub(crate) should_quit: bool,
     pub(crate) viewport_height: usize,
@@ -691,6 +691,7 @@ impl AppState {
             prune_index: 0,
             pending_prune: None,
             ready_prune: None,
+            prune_recoveries: HashSet::new(),
             settings_index: 0,
             should_quit: false,
             viewport_height: 20,
@@ -1888,7 +1889,13 @@ impl AppState {
             }
             KeyCode::Char(' ') => {
                 if let Some(item) = self.prune_items.get_mut(self.prune_index) {
-                    item.selected = !item.selected;
+                    if item.id == self.work_item.item.id {
+                        self.status =
+                            "The open Work Item cannot be selected for pruning; switch first"
+                                .into();
+                    } else {
+                        item.selected = !item.selected;
+                    }
                 }
                 Vec::new()
             }
@@ -3679,7 +3686,7 @@ mod tests {
     use super::tests_support::state_for_ui;
     use super::{
         AgentPhase, AppState, ComposeTarget, DiffLayout, Effect, Focus, InputMode, MarkdownPreview,
-        Screen,
+        PruneChoice, Screen,
     };
     use crate::domain::{AskMessage, DeliveryState};
 
@@ -3711,6 +3718,24 @@ mod tests {
         }
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.layout, DiffLayout::Unified);
+    }
+
+    #[test]
+    fn prune_screen_marks_the_open_work_item_as_unselectable() {
+        let mut app = state();
+        app.screen = Screen::Prune;
+        app.prune_items = vec![PruneChoice {
+            id: app.work_item.item.id.clone(),
+            name: "open".into(),
+            last_opened_at: "now".into(),
+            versions: 1,
+            annotations: 0,
+            selected: false,
+        }];
+
+        assert!(app.handle_key(key(KeyCode::Char(' '))).is_empty());
+        assert!(!app.prune_items[0].selected);
+        assert!(app.status.contains("open Work Item cannot be selected"));
     }
 
     #[test]

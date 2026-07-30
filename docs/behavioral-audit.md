@@ -14,10 +14,10 @@ Evidence abbreviations:
 - `PTY-xx` refers to [`audit/pty-smoke.md`](audit/pty-smoke.md).
 - Other test names identify their Rust module directly.
 
-Current-evidence boundary: the deterministic harness baseline is 208 regular
+Current-evidence boundary: the deterministic harness baseline is 234 regular
 tests passing with 1 authenticated live test ignored by default. The ignored
 stream/resume test was also run explicitly against the installed Copilot CLI
-and passed. PTY-16 through PTY-21 are current compiled-binary evidence; earlier
+and passed. PTY-16 through PTY-22 are current compiled-binary evidence; earlier
 PTY references remain useful historical records.
 
 ## Findings remediated during this audit
@@ -75,7 +75,7 @@ PTY references remain useful historical records.
 | R-22 | Top command palette with autocomplete and execution | Working end-to-end | `WF::narrow_terminal_keeps_selection_composer_and_top_palette_visible`; PTY-08. |
 | R-23 | Settings screen | Partially working | Model, base, and context-step edits work. Diff-layout, file-tree, and Markdown launch defaults persist in SQLite; cache, skills, and storage paths are visible; compact viewports keep the selected row visible. Keybinding viewing/editing and detailed `gh auth` identity remain incomplete. |
 | R-24 | Generated context editor six-field presentation | Partially working | Parser and editor render; complete accept-to-session workflow untested. |
-| R-25 | Prune reviewed history, optional export, git/cache cleanup | Partially working | Review-scoped storage query and delete/export effects exist; no destructive workflow test, PR-state enrichment, or Copilot transcript deletion/path report. |
+| R-25 | Prune reviewed history, optional export, git/cache cleanup | Partially working | Review-scoped selection, visibly disabled current item, scrollable narrow rendering, typed mixed results, nonblocking controlled execution, startup recovery, durable export intent, collision-resistant archive names, per-Work-Item process locking, owner-fenced Git/filesystem cleanup, and atomic retry-safe final deletion are covered by deterministic tests and PTY-22. PR-state/size enrichment remains incomplete. |
 | R-26 | Markdown/JSON comment export and one structured session batch | Working end-to-end | Export format tests and `WF::comment_export_queues_one_batch_and_acknowledges_delivery`. |
 | R-27 | Never silently resend; pending before send, sent atomically at response start, explicit restart recovery | Working end-to-end | `storage::tests::ask_delivery_ack_is_persisted_atomically_with_response_start`; `WF::failed_agent_delivery_is_pending_and_restart_requires_recovery_choice`. |
 | R-28 | WAL, busy timeout, FKs, migrations, indexed SQLite model | Working end-to-end | Storage migration/concurrency tests; workflow tests use a real temporary SQLite file. |
@@ -83,7 +83,7 @@ PTY references remain useful historical records.
 | R-30 | Lazy viewport syntax highlighting behind a trait, broad language support | Working end-to-end | `highlight::tests::recognizes_common_languages`; `highlight::tests::highlights_only_requested_lines_and_reuses_cache`; deterministic rendered frames. |
 | R-31 | Read/search-only Ask permissions | Working in the audited local Copilot path | `copilot::tests::permission_handler_allows_reads_and_denies_shell_and_write`; LIVE-01 ran the authenticated bridge with its configured read-only permission handler. |
 | R-32 | Streaming events and persisted-session resume | Working end-to-end | Deterministic delta/final/resync/sub-agent tests pass; LIVE-01 streamed a real response, exercised SIDE teardown, disconnected, resumed the persisted MAIN session, and reloaded history. |
-| R-33 | Session deletion during prune or manual storage-path guidance | Not implemented | Current SDK path does not delete transcripts and prune does not yet provide a reliable CLI storage path. |
+| R-33 | Session deletion during prune or manual storage-path guidance | Working in deterministic tests | The SDK adapter deletes/absence-checks every persisted MAIN/fork and parent-bound SIDE target before local deletion, pre-journals client-selected MAIN IDs, durably records fork creation intents, atomically promotes a fork while clearing its intent, captures rejected late activations, records targets in a cascade-independent SQLite journal, conditionally advances that journal only for its lease owner, resumes interrupted operations, and reports `$COPILOT_HOME/session-state/<id>` (or the platform fallback) on failure. Live destructive SDK deletion is deliberately not exercised. |
 | R-34 | Interdiff view | Explicitly deferred by the specification | v1.x item in §11. |
 | R-35 | Live file-watcher/re-anchor cadence while review remains open | Explicitly deferred by the specification | Open item in §11; manual `:sync` is present. |
 | R-36 | Exact fuzzy threshold tuning and eager/lazy snapshot worktree policy | Explicitly deferred by the specification | Open items in §11. |
@@ -165,7 +165,7 @@ Source-line policy established by the audit:
 | `:snapshot` | Working end-to-end | Snapshot Git test and PTY first-annotation snapshot; explicit command itself is not separately recorded. |
 | `:generate-context` | Partially working | Controlled generation shape and editor exist; acceptance/restart test missing. |
 | `:export [markdown|json]` | Working end-to-end | Export workflow and format tests. |
-| `:prune` | Partially working | Review-scoped query/delete implementation; destructive workflow deliberately not run. |
+| `:prune` | Partially working | Review-scoped selection and deterministic destructive workflows cover current-item rejection, SDK-first session cleanup, durable restart retry, partial batches, and local cleanup. PR-state/size enrichment and authenticated destructive SDK deletion remain untested. |
 | `:settings` | Partially working | Model/base/context editing and persisted diff-layout, file-tree, and Markdown defaults are tested. Keybinding editing and detailed `gh auth` identity remain incomplete. |
 | `:sync` | Untested | Requires local/remote repository mutation during an open review. |
 | `:base ...` | Partially working | Effect exists; full multi-repo base-change workflow absent. |
@@ -180,7 +180,9 @@ Source-line policy established by the audit:
   authenticated GitHub PR fixture was not available, so remote fetch,
   multi-PR version update, remote carry-forward, and old-version materializing
   remain explicitly **Untested** or **Partially working**.
-- Session deletion/path reporting during prune is **Not implemented**.
+- Authenticated destructive Copilot session deletion is intentionally untested;
+  the SDK deletion, absence verification, durable retry journal, and manual
+  storage-path guidance are covered through the generic cleanup adapter.
 - Settings keybinding editing, detailed `gh auth` identity, and folder
   hierarchy in the picker are incomplete.
 - Interdiff and live file-watcher policy remain explicitly deferred by v2.
@@ -211,7 +213,7 @@ matrix so that new evidence is not confused with the earlier PTY run.
 The current checked-in regular-test baseline is:
 
 ```text
-208 regular tests passed; 1 authenticated live Copilot test ignored by default
+237 regular tests passed; 1 authenticated live Copilot test ignored by default
 ```
 
 The regular baseline includes the reducer/effect, storage, rendering, SDK
@@ -219,13 +221,14 @@ adapter, deterministic UI, model-picker, queue/steering, liveness, and
 MAIN/SIDE tests. The ignored test is the authenticated
 `copilot::tests::live_copilot_streams_and_resumes_persisted_history`; it is not
 part of the regular count. It was run separately with
-`RQ_TUI_LIVE_COPILOT=1` and passed as LIVE-01. PTY-16 through PTY-21 were
-captured from the current Bazel-built binary.
+`RQ_TUI_LIVE_COPILOT=1` and passed as LIVE-01. PTY-16 through PTY-22 were
+captured from the current Bazel-built binary, with PTY-22 added by the
+automated compiled-binary smoke test.
 
 ### Compiled PTY evidence
 
 Earlier records are kept for reproducibility and design context. The current
-pass is PTY-16 through PTY-21 in [`audit/pty-smoke.md`](audit/pty-smoke.md).
+pass is PTY-16 through PTY-22 in [`audit/pty-smoke.md`](audit/pty-smoke.md).
 
 The second compiled-binary audit used the Bazel-built binary and a controlled
 agent. It captured the following behaviors in a 100×28 tmux pane:

@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
+use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,11 +24,14 @@ use github_copilot_sdk::{
 };
 use github_copilot_sdk::{PermissionRequestData, PermissionRequestKind, RequestId};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
-use crate::domain::EphemeralSessionRecord;
-use crate::storage::{now, Storage};
+use crate::config::AppPaths;
+use crate::domain::{EphemeralSessionRecord, SessionRecord};
+use crate::prune::prune_work_item;
+use crate::storage::{now, PruneOperation, Storage};
 
 const SIDE_BOUNDARY: &str = "Side conversation boundary.\n\
 Everything before this boundary is inherited MAIN history and is reference context only, not the \
@@ -47,6 +51,7 @@ pub(crate) struct BridgeConfig {
     pub(crate) work_item_id: String,
     pub(crate) session_root: PathBuf,
     pub(crate) database_path: PathBuf,
+    pub(crate) app_paths: AppPaths,
     pub(crate) existing_session_id: Option<String>,
     pub(crate) model: String,
     /// Optional runtime-approved thinking level selected after the model.
@@ -343,6 +348,8 @@ pub(crate) enum AgentCommand {
     PruneSessions {
         request_id: String,
         work_item_ids: Vec<String>,
+        export_first: bool,
+        paths: AppPaths,
     },
     Shutdown,
 }
@@ -350,6 +357,8 @@ pub(crate) enum AgentCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PruneSessionOutcome {
     pub(crate) work_item_id: String,
+    pub(crate) remote_deleted: bool,
+    pub(crate) local_deleted: bool,
     pub(crate) error: Option<String>,
 }
 
@@ -443,9 +452,17 @@ pub(crate) enum AgentEvent {
         completed: usize,
         total: usize,
     },
+    PruneRecoveryStarted {
+        operation_id: String,
+        work_item_id: String,
+    },
     PruneSessionsComplete {
         request_id: String,
         outcomes: Vec<PruneSessionOutcome>,
+    },
+    PruneRecovery {
+        operation_id: String,
+        outcome: PruneSessionOutcome,
     },
     Error(String),
     Stopped,
@@ -611,14 +628,16 @@ impl AgentRuntime for CopilotBridge {
 
 pub(crate) fn start_agent(config: BridgeConfig) -> Box<dyn AgentRuntime> {
     if env::var_os("RQ_TUI_CONTROLLED_AGENT").as_deref() == Some(std::ffi::OsStr::new("1")) {
-        Box::new(ControlledAgent::new(config.work_item_id))
+        Box::new(ControlledAgent::with_config(config))
     } else {
         Box::new(CopilotBridge::start(config))
     }
 }
 
 struct ControlledAgent {
-    state: std::sync::Mutex<ControlledState>,
+    work_item_id: String,
+    state: Arc<std::sync::Mutex<ControlledState>>,
+    _process_lock: Option<WorkItemProcessLock>,
 }
 
 struct ControlledState {
@@ -631,34 +650,216 @@ struct ControlledState {
 }
 
 impl ControlledAgent {
+    #[cfg(test)]
     fn new(work_item_id: String) -> Self {
+        Self::build(work_item_id, true)
+    }
+
+    fn build(work_item_id: String, session_ready: bool) -> Self {
         let mut events = VecDeque::new();
-        events.push_back((
-            Instant::now(),
-            AgentEventEnvelope::agent(
-                AgentLane::Main,
-                AgentEvent::SessionReady {
-                    session_id: format!("controlled-{work_item_id}"),
-                    resumed: false,
-                    resume_warning: None,
-                },
-            ),
-        ));
+        if session_ready {
+            events.push_back((
+                Instant::now(),
+                AgentEventEnvelope::agent(
+                    AgentLane::Main,
+                    AgentEvent::SessionReady {
+                        session_id: format!("controlled-{work_item_id}"),
+                        resumed: false,
+                        resume_warning: None,
+                    },
+                ),
+            ));
+        }
         Self {
-            state: std::sync::Mutex::new(ControlledState {
+            work_item_id,
+            state: Arc::new(std::sync::Mutex::new(ControlledState {
                 events,
                 active_side: None,
                 next_side: 1,
                 busy_until: Instant::now(),
                 outbound_lanes: HashMap::new(),
                 active_outbound_id: None,
-            }),
+            })),
+            _process_lock: None,
         }
     }
 
+    fn with_config(config: BridgeConfig) -> Self {
+        let mut agent = Self::build(config.work_item_id.clone(), false);
+        match WorkItemProcessLock::try_acquire(&config.app_paths, &config.work_item_id) {
+            Ok(Some(lock)) => agent._process_lock = Some(lock),
+            Ok(None) => {
+                agent.schedule_agent(
+                    AgentLane::Main,
+                    Duration::ZERO,
+                    AgentEvent::Error(
+                        "another controlled rq-tui process is already using this Work Item".into(),
+                    ),
+                );
+                return agent;
+            }
+            Err(error) => {
+                agent.schedule_agent(
+                    AgentLane::Main,
+                    Duration::ZERO,
+                    AgentEvent::Error(format!(
+                        "controlled startup could not acquire its Work Item lock: {error}"
+                    )),
+                );
+                return agent;
+            }
+        }
+        let state = Arc::clone(&agent.state);
+        std::thread::spawn(move || {
+            let storage = match Storage::open(&config.database_path) {
+                Ok(storage) => storage,
+                Err(error) => {
+                    Self::schedule_shared(
+                        &state,
+                        Duration::ZERO,
+                        AgentEventEnvelope::agent(
+                            AgentLane::Main,
+                            AgentEvent::Error(format!(
+                                "controlled startup could not open recovery storage: {error}"
+                            )),
+                        ),
+                    );
+                    return;
+                }
+            };
+            let operations = match storage.pending_prune_operations() {
+                Ok(operations) => operations,
+                Err(error) => {
+                    Self::schedule_shared(
+                        &state,
+                        Duration::ZERO,
+                        AgentEventEnvelope::agent(
+                            AgentLane::Main,
+                            AgentEvent::Error(format!(
+                                "controlled startup could not inspect prune recovery: {error}"
+                            )),
+                        ),
+                    );
+                    return;
+                }
+            };
+            if operations
+                .iter()
+                .any(|operation| operation.work_item_id == config.work_item_id)
+            {
+                Self::schedule_shared(
+                    &state,
+                    Duration::ZERO,
+                    AgentEventEnvelope::agent(
+                        AgentLane::Main,
+                        AgentEvent::Error(
+                            "this Work Item has an interrupted prune operation and cannot open"
+                                .into(),
+                        ),
+                    ),
+                );
+                return;
+            }
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    Self::schedule_shared(
+                        &state,
+                        Duration::ZERO,
+                        AgentEventEnvelope::agent(
+                            AgentLane::Main,
+                            AgentEvent::Error(format!(
+                                "controlled startup could not create its recovery runtime: {error}"
+                            )),
+                        ),
+                    );
+                    return;
+                }
+            };
+            for operation in operations {
+                let operation_id = operation.operation_id.clone();
+                let work_item_id = operation.work_item_id.clone();
+                Self::schedule_shared(
+                    &state,
+                    Duration::ZERO,
+                    AgentEventEnvelope::agent(
+                        AgentLane::Main,
+                        AgentEvent::PruneRecoveryStarted {
+                            operation_id: operation_id.clone(),
+                            work_item_id: work_item_id.clone(),
+                        },
+                    ),
+                );
+                let progress_state = Arc::clone(&state);
+                let progress_operation = operation_id.clone();
+                let progress_item = work_item_id.clone();
+                let outcome = runtime.block_on(execute_prune_operation(
+                    &ControlledCleanupBackend,
+                    PruneExecution {
+                        ledger: &storage,
+                        database_path: &config.database_path,
+                        owner_id: "controlled-recovery-owner",
+                        requested_operation_id: &operation_id,
+                        work_item_id: &work_item_id,
+                        export_first: operation.export_first,
+                        paths: &config.app_paths,
+                    },
+                    move |label, completed, total| {
+                        Self::schedule_shared(
+                            &progress_state,
+                            Duration::ZERO,
+                            AgentEventEnvelope::agent(
+                                AgentLane::Main,
+                                AgentEvent::PruneSessionProgress {
+                                    request_id: progress_operation.clone(),
+                                    work_item_id: progress_item.clone(),
+                                    label,
+                                    completed,
+                                    total,
+                                },
+                            ),
+                        );
+                    },
+                ));
+                Self::schedule_shared(
+                    &state,
+                    Duration::ZERO,
+                    AgentEventEnvelope::agent(
+                        AgentLane::Main,
+                        AgentEvent::PruneRecovery {
+                            operation_id,
+                            outcome,
+                        },
+                    ),
+                );
+            }
+            Self::schedule_shared(
+                &state,
+                Duration::ZERO,
+                AgentEventEnvelope::agent(
+                    AgentLane::Main,
+                    AgentEvent::SessionReady {
+                        session_id: format!("controlled-{}", config.work_item_id),
+                        resumed: false,
+                        resume_warning: None,
+                    },
+                ),
+            );
+        });
+        agent
+    }
+
     fn schedule(&self, delay: Duration, event: AgentEventEnvelope) {
+        Self::schedule_shared(&self.state, delay, event);
+    }
+
+    fn schedule_shared(
+        state: &Arc<std::sync::Mutex<ControlledState>>,
+        delay: Duration,
+        event: AgentEventEnvelope,
+    ) {
         let available_at = Instant::now() + delay;
-        let mut state = self.state.lock().expect("controlled agent lock");
+        let mut state = state.lock().expect("controlled agent lock");
         let position = state
             .events
             .iter()
@@ -1106,6 +1307,8 @@ impl AgentSink for ControlledAgent {
             AgentCommand::PruneSessions {
                 request_id,
                 work_item_ids,
+                export_first,
+                paths,
             } => {
                 self.schedule_agent(
                     AgentLane::Main,
@@ -1115,21 +1318,89 @@ impl AgentSink for ControlledAgent {
                         work_items: work_item_ids.len(),
                     },
                 );
-                let outcomes = work_item_ids
-                    .into_iter()
-                    .map(|work_item_id| PruneSessionOutcome {
-                        work_item_id,
-                        error: None,
-                    })
-                    .collect();
-                self.schedule_agent(
-                    AgentLane::Main,
-                    Duration::ZERO,
-                    AgentEvent::PruneSessionsComplete {
-                        request_id,
-                        outcomes,
-                    },
-                );
+                let state = Arc::clone(&self.state);
+                let current_work_item_id = self.work_item_id.clone();
+                std::thread::spawn(move || {
+                    let outcomes = match (
+                        Storage::open(&paths.database),
+                        tokio::runtime::Runtime::new(),
+                    ) {
+                        (Ok(storage), Ok(runtime)) => work_item_ids
+                            .into_iter()
+                            .map(|work_item_id| {
+                                if work_item_id == current_work_item_id {
+                                    return PruneSessionOutcome {
+                                        work_item_id,
+                                        remote_deleted: false,
+                                        local_deleted: false,
+                                        error: Some(
+                                            "the controlled worker refused to prune its open Work Item"
+                                                .into(),
+                                        ),
+                                    };
+                                }
+                                let progress_request = request_id.clone();
+                                let progress_item = work_item_id.clone();
+                                let operation_id = format!("{request_id}:{work_item_id}");
+                                runtime.block_on(execute_prune_operation(
+                                    &ControlledCleanupBackend,
+                                    PruneExecution {
+                                        ledger: &storage,
+                                        database_path: &paths.database,
+                                        owner_id: "controlled-prune-owner",
+                                        requested_operation_id: &operation_id,
+                                        work_item_id: &work_item_id,
+                                        export_first,
+                                        paths: &paths,
+                                    },
+                                    |label, completed, total| {
+                                        Self::schedule_shared(
+                                            &state,
+                                            Duration::ZERO,
+                                            AgentEventEnvelope::agent(
+                                                AgentLane::Main,
+                                                AgentEvent::PruneSessionProgress {
+                                                    request_id: progress_request.clone(),
+                                                    work_item_id: progress_item.clone(),
+                                                    label,
+                                                    completed,
+                                                    total,
+                                                },
+                                            ),
+                                        );
+                                    },
+                                ))
+                            })
+                            .collect(),
+                        (storage, runtime) => {
+                            let error = storage
+                                .err()
+                                .map(|error| error.to_string())
+                                .or_else(|| runtime.err().map(|error| error.to_string()))
+                                .unwrap_or_else(|| "controlled prune setup failed".into());
+                            work_item_ids
+                                .into_iter()
+                                .map(|work_item_id| PruneSessionOutcome {
+                                    work_item_id,
+                                    remote_deleted: false,
+                                    local_deleted: false,
+                                    error: Some(error.clone()),
+                                })
+                                .collect()
+                        }
+                    };
+                    Self::schedule_shared(
+                        &state,
+                        Duration::ZERO,
+                        AgentEventEnvelope::agent(
+                            AgentLane::Main,
+                            AgentEvent::PruneSessionsComplete {
+                                request_id,
+                                outcomes,
+                            },
+                        ),
+                    );
+                });
             }
             AgentCommand::Shutdown => {
                 self.schedule_agent(AgentLane::Main, Duration::ZERO, AgentEvent::Stopped)
@@ -1453,6 +1724,30 @@ struct LeaseHeartbeat {
     thread: Option<JoinHandle<()>>,
 }
 
+struct WorkItemProcessLock {
+    _file: File,
+}
+
+impl WorkItemProcessLock {
+    fn try_acquire(paths: &AppPaths, work_item_id: &str) -> Result<Option<Self>> {
+        let directory = paths.data.join("work-item-locks");
+        std::fs::create_dir_all(&directory)?;
+        let digest = format!("{:x}", Sha256::digest(work_item_id.as_bytes()));
+        let path = directory.join(format!("{}.lock", &digest[..24]));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+}
+
 impl LeaseHeartbeat {
     fn start(database_path: PathBuf, work_item_id: String, owner_id: String, owned: bool) -> Self {
         let owned = Arc::new(AtomicBool::new(owned));
@@ -1477,13 +1772,20 @@ impl LeaseHeartbeat {
                 if !worker_owned.load(Ordering::Acquire) {
                     continue;
                 }
-                if !matches!(
-                    ledger
-                        .renew_ephemeral_session_lease(&work_item_id, &owner_id, wall_clock_ms(),),
-                    Ok(true)
+                match ledger.renew_ephemeral_session_lease(
+                    &work_item_id,
+                    &owner_id,
+                    wall_clock_ms(),
                 ) {
-                    worker_owned.store(false, Ordering::Release);
-                    worker_lost.store(true, Ordering::Release);
+                    Ok(true) => {}
+                    Ok(false) => {
+                        worker_owned.store(false, Ordering::Release);
+                        worker_lost.store(true, Ordering::Release);
+                    }
+                    // The local prune phase intentionally holds an IMMEDIATE
+                    // transaction as its filesystem fencing lock. Busy/IO
+                    // errors are not evidence that another owner took over.
+                    Err(_) => {}
                 }
             }
         });
@@ -1543,8 +1845,9 @@ fn wall_clock_ms() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
-fn side_session_name(operation_id: &str) -> String {
-    format!("rq-tui-side:{operation_id}")
+fn side_session_name(operation_id: &str, parent_id: &str) -> String {
+    let parent_hash = format!("{:x}", Sha256::digest(parent_id.as_bytes()));
+    format!("rq-tui-side:{operation_id}:{}", &parent_hash[..12])
 }
 
 fn short_session_id(id: &str) -> &str {
@@ -1599,58 +1902,123 @@ fn retryable_cleanup_state(state: &str) -> bool {
     matches!(state, "cleanup_pending" | "deleting")
 }
 
+fn durable_export_choice(existing: Option<&PruneOperation>, requested: bool) -> bool {
+    existing
+        .map(|operation| operation.export_first)
+        .unwrap_or(requested)
+}
+
 #[async_trait]
 trait SideCleanupBackend {
-    async fn reconcile_side_id(&self, operation_id: &str) -> Result<Option<String>>;
-    async fn delete_session_if_present(&self, session_id: &str) -> Result<()>;
+    async fn reconcile_side_id(
+        &self,
+        operation_id: &str,
+        parent_id: &str,
+    ) -> Result<Option<String>>;
+    async fn session_exists(&self, session_id: &str) -> Result<bool>;
+    async fn delete_session(&self, session_id: &str) -> Result<()>;
+
+    async fn delete_session_if_present(&self, session_id: &str) -> Result<()> {
+        if !self.session_exists(session_id).await? {
+            return Ok(());
+        }
+        match self.delete_session(session_id).await {
+            Ok(()) => {
+                for attempt in 0..3 {
+                    if !self.session_exists(session_id).await? {
+                        return Ok(());
+                    }
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+                anyhow::bail!(
+                    "Copilot session {} still exists after the delete API returned success",
+                    short_session_id(session_id)
+                )
+            }
+            Err(delete_error) => {
+                if self.session_exists(session_id).await? {
+                    Err(delete_error)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+struct ControlledCleanupBackend;
+
+#[async_trait]
+impl SideCleanupBackend for ControlledCleanupBackend {
+    async fn reconcile_side_id(
+        &self,
+        _operation_id: &str,
+        _parent_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    async fn session_exists(&self, _session_id: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    async fn delete_session(&self, _session_id: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl SideCleanupBackend for Client {
-    async fn reconcile_side_id(&self, operation_id: &str) -> Result<Option<String>> {
-        let expected_name = side_session_name(operation_id);
+    async fn reconcile_side_id(
+        &self,
+        operation_id: &str,
+        parent_id: &str,
+    ) -> Result<Option<String>> {
+        let expected_name = side_session_name(operation_id, parent_id);
         let sessions =
             sdk_call("Copilot SIDE reconciliation", self.rpc().sessions().list()).await?;
-        Ok(sessions.sessions.into_iter().find_map(|session| {
-            (session.get("name").and_then(serde_json::Value::as_str)
-                == Some(expected_name.as_str()))
-            .then(|| {
+        let matches = sessions
+            .sessions
+            .into_iter()
+            .filter(|session| {
+                let name_matches = session.get("name").and_then(serde_json::Value::as_str)
+                    == Some(expected_name.as_str());
+                let advertised_parent = session
+                    .get("parentSessionId")
+                    .or_else(|| session.get("detachedFromSpawningParentSessionId"))
+                    .and_then(serde_json::Value::as_str);
+                name_matches && advertised_parent.is_none_or(|parent| parent == parent_id)
+            })
+            .filter_map(|session| {
                 session
                     .get("sessionId")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned)
             })
-            .flatten()
-        }))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [session_id] => Ok(Some(session_id.clone())),
+            _ => anyhow::bail!(
+                "multiple Copilot sessions matched SIDE operation {operation_id}; refusing ambiguous cleanup"
+            ),
+        }
     }
 
-    async fn delete_session_if_present(&self, session_id: &str) -> Result<()> {
+    async fn session_exists(&self, session_id: &str) -> Result<bool> {
         let id = SessionId::new(session_id);
-        if sdk_call(
-            "Copilot SIDE existence check",
+        Ok(sdk_call(
+            "Copilot session existence check",
             self.get_session_metadata(&id),
         )
         .await?
-        .is_none()
-        {
-            return Ok(());
-        }
-        match delete_session_with_timeout(self, session_id).await {
-            Ok(()) => Ok(()),
-            Err(delete_error) => {
-                if sdk_call(
-                    "Copilot SIDE deletion verification",
-                    self.get_session_metadata(&id),
-                )
-                .await?
-                .is_none()
-                {
-                    Ok(())
-                } else {
-                    Err(delete_error)
-                }
-            }
-        }
+        .is_some())
+    }
+
+    async fn delete_session(&self, session_id: &str) -> Result<()> {
+        delete_session_with_timeout(self, session_id).await
     }
 }
 
@@ -1664,7 +2032,19 @@ async fn cleanup_ephemeral_record<B: SideCleanupBackend + Sync>(
         .clone()
         .unwrap_or_else(|| record.operation_id.clone());
     if record.side_id.is_none() {
-        match backend.reconcile_side_id(&record.operation_id).await {
+        let Some(parent_id) = record.parent_id.as_deref() else {
+            let message =
+                "SIDE fork has no durable parent identity; refusing ambiguous cleanup".to_owned();
+            record.state = "cleanup_pending".into();
+            record.last_error = Some(message.clone());
+            record.updated_at = now();
+            save_ephemeral_record(ledger, &record).ok();
+            return (label, Some(message));
+        };
+        match backend
+            .reconcile_side_id(&record.operation_id, parent_id)
+            .await
+        {
             Ok(Some(side_id)) => record.side_id = Some(side_id),
             Ok(None) => {
                 let message =
@@ -1750,35 +2130,288 @@ fn copilot_session_state_hint(session_id: &str) -> String {
     .unwrap_or_else(|| format!("<COPILOT_HOME>/session-state/{session_id}"))
 }
 
-async fn prune_remote_sessions<B, F>(
+async fn delete_journaled_remote_sessions<B, F>(
     backend: &B,
     ledger: &Storage,
     owner_id: &str,
+    operation_id: &str,
     work_item_id: &str,
+    mut progress: F,
+) -> Result<()>
+where
+    B: SideCleanupBackend + Sync,
+    F: FnMut(String, usize, usize),
+{
+    let targets = ledger.prune_targets(operation_id)?;
+    let total = targets.len();
+    let mut completed = targets
+        .iter()
+        .filter(|target| target.state == "deleted")
+        .count();
+    progress(
+        format!("Loaded {total} durable Copilot session target(s)"),
+        completed,
+        total,
+    );
+    for target in targets
+        .into_iter()
+        .filter(|target| target.state != "deleted")
+    {
+        if !matches!(
+            ledger.renew_ephemeral_session_lease(work_item_id, owner_id, wall_clock_ms()),
+            Ok(true)
+        ) {
+            anyhow::bail!(
+                "Work Item cleanup ownership changed; no further SDK deletions were attempted"
+            );
+        }
+        let deletion = if target.kind == "side" {
+            let side_operation_id = target
+                .side_operation_id
+                .as_deref()
+                .context("durable SIDE target is missing its operation id")?;
+            let record = ledger
+                .ephemeral_sessions(work_item_id)?
+                .into_iter()
+                .find(|record| record.operation_id == side_operation_id);
+            if let Some(record) = record {
+                let label = record
+                    .side_id
+                    .clone()
+                    .unwrap_or_else(|| format!("SIDE operation {}", record.operation_id));
+                progress(format!("Deleting {label}"), completed, total);
+                let (session_id, warning) = cleanup_ephemeral_record(backend, ledger, record).await;
+                if let Some(warning) = warning {
+                    Err(anyhow::anyhow!(warning))
+                } else {
+                    Ok(Some(session_id))
+                }
+            } else if let Some(session_id) = target.session_id.as_deref() {
+                progress(
+                    format!("Deleting SIDE {}", short_session_id(session_id)),
+                    completed,
+                    total,
+                );
+                backend
+                    .delete_session_if_present(session_id)
+                    .await
+                    .map(|()| None)
+            } else {
+                // SIDE ledger rows are cleared only after SDK deletion was
+                // confirmed. A missing row with no snapshotted ID therefore
+                // represents a crash between that confirmation and this
+                // journal target being acknowledged.
+                Ok(None)
+            }
+        } else {
+            let session_id = target
+                .session_id
+                .as_deref()
+                .context("durable persistent target is missing its session id")?;
+            progress(
+                format!("Deleting Copilot session {}", short_session_id(session_id)),
+                completed,
+                total,
+            );
+            backend
+                .delete_session_if_present(session_id)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "could not delete Copilot session {}: {error}. Local fallback path: {}",
+                        short_session_id(session_id),
+                        copilot_session_state_hint(session_id)
+                    )
+                })
+                .map(|()| None)
+        };
+        let reconciled_session_id = match deletion {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                ledger
+                    .mark_prune_target_error_if_owned(
+                        operation_id,
+                        &target.target_key,
+                        &error.to_string(),
+                        work_item_id,
+                        owner_id,
+                    )
+                    .ok();
+                return Err(error);
+            }
+        };
+        if !matches!(
+            ledger.renew_ephemeral_session_lease(work_item_id, owner_id, wall_clock_ms()),
+            Ok(true)
+        ) {
+            anyhow::bail!(
+                "Work Item cleanup ownership changed while the SDK deletion was in flight"
+            );
+        }
+        if let Some(session_id) = reconciled_session_id {
+            if !ledger.update_prune_target_session_id_if_owned(
+                operation_id,
+                &target.target_key,
+                Some(&session_id),
+                work_item_id,
+                owner_id,
+            )? {
+                anyhow::bail!("durable SIDE target or cleanup ownership disappeared");
+            }
+        }
+        if !ledger.mark_prune_target_deleted_if_owned(
+            operation_id,
+            &target.target_key,
+            work_item_id,
+            owner_id,
+        )? {
+            anyhow::bail!(
+                "durable prune target or cleanup ownership disappeared after SDK deletion"
+            );
+        }
+        completed += 1;
+        progress(
+            format!("Remote deletion confirmed for {}", target.target_key),
+            completed,
+            total,
+        );
+    }
+    if !matches!(
+        ledger.renew_ephemeral_session_lease(work_item_id, owner_id, wall_clock_ms()),
+        Ok(true)
+    ) {
+        anyhow::bail!("Work Item cleanup ownership changed before local cleanup");
+    }
+    if !ledger.mark_prune_phase_if_owned(
+        operation_id,
+        "local_pending",
+        None,
+        work_item_id,
+        owner_id,
+    )? {
+        anyhow::bail!(
+            "durable prune operation or cleanup ownership disappeared before local cleanup"
+        );
+    }
+    Ok(())
+}
+
+struct PruneExecution<'a> {
+    ledger: &'a Storage,
+    database_path: &'a std::path::Path,
+    owner_id: &'a str,
+    requested_operation_id: &'a str,
+    work_item_id: &'a str,
+    export_first: bool,
+    paths: &'a AppPaths,
+}
+
+async fn execute_prune_operation<B, F>(
+    backend: &B,
+    execution: PruneExecution<'_>,
     mut progress: F,
 ) -> PruneSessionOutcome
 where
     B: SideCleanupBackend + Sync,
     F: FnMut(String, usize, usize),
 {
-    let fail = |error: String| PruneSessionOutcome {
+    let PruneExecution {
+        ledger,
+        database_path,
+        owner_id,
+        requested_operation_id,
+        work_item_id,
+        export_first,
+        paths,
+    } = execution;
+    let failure = |error: String| PruneSessionOutcome {
         work_item_id: work_item_id.to_owned(),
+        remote_deleted: false,
+        local_deleted: false,
         error: Some(error),
     };
+    let _process_lock = match WorkItemProcessLock::try_acquire(paths, work_item_id) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return failure(
+                "another rq-tui process is using this Work Item; local history was retained".into(),
+            )
+        }
+        Err(error) => {
+            return failure(format!(
+                "could not acquire the Work Item process lock: {error}"
+            ))
+        }
+    };
+    let existing_operation = match ledger.pending_prune_operations() {
+        Ok(operations) => operations
+            .into_iter()
+            .find(|operation| operation.work_item_id == work_item_id),
+        Err(error) => return failure(format!("could not inspect the prune journal: {error}")),
+    };
+    match ledger.work_item_by_id(work_item_id) {
+        Ok(None) => {
+            let Some(operation) = existing_operation else {
+                return PruneSessionOutcome {
+                    work_item_id: work_item_id.to_owned(),
+                    remote_deleted: false,
+                    local_deleted: true,
+                    error: Some("local Work Item no longer exists".into()),
+                };
+            };
+            let all_remote_deleted = ledger
+                .prune_targets(&operation.operation_id)
+                .is_ok_and(|targets| targets.iter().all(|target| target.state == "deleted"));
+            if !all_remote_deleted {
+                return PruneSessionOutcome {
+                    work_item_id: work_item_id.to_owned(),
+                    remote_deleted: false,
+                    local_deleted: true,
+                    error: Some(
+                        "local Work Item is missing while remote prune targets remain unresolved"
+                            .into(),
+                    ),
+                };
+            }
+            return match ledger.clear_prune_operation(&operation.operation_id) {
+                Ok(true) => PruneSessionOutcome {
+                    work_item_id: work_item_id.to_owned(),
+                    remote_deleted: true,
+                    local_deleted: true,
+                    error: None,
+                },
+                Ok(false) => PruneSessionOutcome {
+                    work_item_id: work_item_id.to_owned(),
+                    remote_deleted: true,
+                    local_deleted: true,
+                    error: Some("completed prune journal disappeared during recovery".into()),
+                },
+                Err(error) => PruneSessionOutcome {
+                    work_item_id: work_item_id.to_owned(),
+                    remote_deleted: true,
+                    local_deleted: true,
+                    error: Some(format!(
+                        "local cleanup completed, but its prune journal could not be cleared: {error}"
+                    )),
+                },
+            };
+        }
+        Ok(Some(_)) => {}
+        Err(error) => return failure(format!("could not inspect local Work Item state: {error}")),
+    }
     let now_ms = wall_clock_ms();
     let stale_before_ms =
         now_ms.saturating_sub(SIDE_LEASE_TTL.as_millis().try_into().unwrap_or(i64::MAX));
     match ledger.claim_ephemeral_session_lease(work_item_id, owner_id, now_ms, stale_before_ms) {
         Ok(true) => {}
         Ok(false) => {
-            return fail(
-                "another rq-tui process is using this Work Item; local history was retained".into(),
-            )
+            let message =
+                "another rq-tui process is using this Work Item; local history was retained";
+            return failure(message.into());
         }
         Err(error) => {
-            return fail(format!(
-                "could not acquire the Work Item cleanup lease: {error}"
-            ))
+            let message = format!("could not acquire the Work Item cleanup lease: {error}");
+            return failure(message);
         }
     }
     let lease = EphemeralLeaseGuard {
@@ -1787,85 +2420,125 @@ where
         owner_id,
         owned: Cell::new(true),
     };
-
-    let persistent = match ledger.sessions_for_work_item(work_item_id) {
-        Ok(sessions) => sessions,
-        Err(error) => return fail(format!("could not enumerate Copilot sessions: {error}")),
-    };
-    let ephemeral = match ledger.ephemeral_sessions(work_item_id) {
-        Ok(sessions) => sessions,
-        Err(error) => return fail(format!("could not enumerate SIDE sessions: {error}")),
-    };
-    let total = persistent.len() + ephemeral.len();
-    progress(
-        format!("Collected {total} Copilot session record(s)"),
-        0,
-        total,
+    let heartbeat = LeaseHeartbeat::start(
+        database_path.to_path_buf(),
+        work_item_id.to_owned(),
+        owner_id.to_owned(),
+        true,
     );
-    let mut completed = 0;
-
-    for record in ephemeral {
-        if !matches!(
-            ledger.renew_ephemeral_session_lease(work_item_id, owner_id, wall_clock_ms()),
-            Ok(true)
-        ) {
-            return fail(
-                "Work Item cleanup ownership changed; no further SDK deletions were attempted"
-                    .into(),
-            );
+    let operation_id =
+        match ledger.begin_prune_operation(requested_operation_id, work_item_id, export_first) {
+            Ok(operation_id) => operation_id,
+            Err(error) => {
+                return failure(format!(
+                    "could not create the durable prune journal: {error}"
+                ))
+            }
+        };
+    let durable_operation = match ledger.prune_operation(&operation_id) {
+        Ok(Some(operation)) => operation,
+        Ok(None) => {
+            return failure("durable prune journal disappeared before cleanup began".into())
         }
-        let label = record
-            .side_id
-            .clone()
-            .unwrap_or_else(|| format!("SIDE operation {}", record.operation_id));
-        progress(format!("Deleting {label}"), completed, total);
-        let (_, warning) = cleanup_ephemeral_record(backend, ledger, record).await;
-        if let Some(warning) = warning {
-            return fail(warning);
+        Err(error) => {
+            return failure(format!(
+                "could not reload the durable prune journal: {error}"
+            ))
         }
-        completed += 1;
-        progress("SIDE deletion confirmed".into(), completed, total);
+    };
+    let durable_export_first = durable_export_choice(Some(&durable_operation), export_first);
+    if let Err(error) = delete_journaled_remote_sessions(
+        backend,
+        ledger,
+        owner_id,
+        &operation_id,
+        work_item_id,
+        &mut progress,
+    )
+    .await
+    {
+        ledger
+            .mark_prune_phase_if_owned(
+                &operation_id,
+                "failed",
+                Some(&error.to_string()),
+                work_item_id,
+                owner_id,
+            )
+            .ok();
+        return failure(error.to_string());
+    }
+    if heartbeat.take_lost() {
+        let message =
+            "Work Item cleanup lease was lost before local cleanup; the durable journal was retained";
+        ledger
+            .mark_prune_phase_if_owned(
+                &operation_id,
+                "failed",
+                Some(message),
+                work_item_id,
+                owner_id,
+            )
+            .ok();
+        return failure(message.into());
     }
 
-    let mut seen = std::collections::HashSet::new();
-    for session in persistent {
-        if !seen.insert(session.id.clone()) {
-            continue;
-        }
-        if !matches!(
-            ledger.renew_ephemeral_session_lease(work_item_id, owner_id, wall_clock_ms()),
-            Ok(true)
-        ) {
-            return fail(
-                "Work Item cleanup ownership changed; no further SDK deletions were attempted"
-                    .into(),
-            );
-        }
-        progress(
-            format!("Deleting Copilot session {}", short_session_id(&session.id)),
-            completed,
-            total,
-        );
-        if let Err(error) = backend.delete_session_if_present(&session.id).await {
-            return fail(format!(
-                "could not delete Copilot session {}: {error}. Local fallback path: {}",
-                short_session_id(&session.id),
-                copilot_session_state_hint(&session.id)
-            ));
-        }
-        completed += 1;
-        progress(
+    progress("Cleaning local Git, cache, and history state".into(), 0, 0);
+    let database_path = database_path.to_path_buf();
+    let local_paths = paths.clone();
+    let local_id = work_item_id.to_owned();
+    let local_owner = owner_id.to_owned();
+    let local_operation_id = operation_id.clone();
+    let local_result = tokio::task::spawn_blocking(move || {
+        let storage = Storage::open(&database_path)?;
+        prune_work_item(
+            &storage,
+            &local_paths,
+            &local_id,
+            durable_export_first,
+            Some(&local_operation_id),
+            Some(&local_owner),
+        )
+    })
+    .await;
+    let local_failure = match local_result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(format!("local cleanup failed and can be retried: {error}")),
+        Err(error) => Some(format!("the local cleanup worker failed: {error}")),
+    };
+    if let Some(failure_detail) = local_failure {
+        let remote_deleted = ledger
+            .prune_targets(&operation_id)
+            .is_ok_and(|targets| targets.iter().all(|target| target.state == "deleted"));
+        let error = if remote_deleted {
+            format!("Copilot sessions are gone, but {failure_detail}")
+        } else {
             format!(
-                "Deletion confirmed for Copilot session {}",
-                short_session_id(&session.id)
-            ),
-            completed,
-            total,
-        );
+                "A late Copilot session was captured; local history was retained and remote cleanup will retry: {failure_detail}"
+            )
+        };
+        ledger
+            .mark_prune_phase_if_owned(
+                &operation_id,
+                "failed",
+                Some(&error),
+                work_item_id,
+                owner_id,
+            )
+            .ok();
+        return PruneSessionOutcome {
+            work_item_id: work_item_id.to_owned(),
+            remote_deleted,
+            local_deleted: false,
+            error: Some(error),
+        };
     }
+    drop(heartbeat);
     drop(lease);
     PruneSessionOutcome {
         work_item_id: work_item_id.to_owned(),
+        remote_deleted: true,
+        local_deleted: true,
         error: None,
     }
 }
@@ -1877,8 +2550,21 @@ async fn worker(
     current_lane: Arc<std::sync::Mutex<AgentLane>>,
 ) -> Result<()> {
     let main_events = EventPublisher::new(raw_events, AgentLane::Main);
+    let _process_lock = WorkItemProcessLock::try_acquire(&config.app_paths, &config.work_item_id)?
+        .context(
+            "another rq-tui process is already using this Work Item; refusing a concurrent session",
+        )?;
     let ledger = Storage::open(&config.database_path)
         .context("cannot open the SIDE session cleanup ledger")?;
+    if ledger
+        .pending_prune_operations()?
+        .iter()
+        .any(|operation| operation.work_item_id == config.work_item_id)
+    {
+        anyhow::bail!(
+            "this Work Item has an interrupted prune operation and cannot open a new Copilot session; open another Work Item and retry its prune"
+        );
+    }
     let owner_id = Uuid::new_v4().to_string();
     let now_ms = wall_clock_ms();
     let stale_before_ms =
@@ -1889,6 +2575,11 @@ async fn worker(
         now_ms,
         stale_before_ms,
     )?;
+    if !has_side_lease {
+        anyhow::bail!(
+            "another rq-tui process is already using this Work Item; refusing to create a concurrent Copilot session"
+        );
+    }
     let lease_guard = EphemeralLeaseGuard {
         ledger: &ledger,
         work_item_id: &config.work_item_id,
@@ -1914,6 +2605,56 @@ async fn worker(
         .env
         .push(("COPILOT_PLUGIN_DIR_ONLY".into(), "true".into()));
     let client = sdk_call("Copilot client startup", Client::start(options)).await?;
+    for operation in ledger.pending_prune_operations()? {
+        if operation.work_item_id == config.work_item_id {
+            main_events.activity(
+                None,
+                AgentActivity::other(
+                    "This Work Item has an interrupted prune journal; cleanup is paused while it is open"
+                ),
+            );
+            continue;
+        }
+        main_events.activity(
+            None,
+            AgentActivity::other(format!(
+                "Resuming interrupted prune for {}…",
+                operation.work_item_id
+            )),
+        );
+        let recovery_request = operation.operation_id.clone();
+        let recovery_item = operation.work_item_id.clone();
+        main_events.emit(AgentEvent::PruneRecoveryStarted {
+            operation_id: operation.operation_id.clone(),
+            work_item_id: operation.work_item_id.clone(),
+        });
+        let outcome = execute_prune_operation(
+            &client,
+            PruneExecution {
+                ledger: &ledger,
+                database_path: &config.database_path,
+                owner_id: &owner_id,
+                requested_operation_id: &operation.operation_id,
+                work_item_id: &operation.work_item_id,
+                export_first: operation.export_first,
+                paths: &config.app_paths,
+            },
+            |label, completed, total| {
+                main_events.emit(AgentEvent::PruneSessionProgress {
+                    request_id: recovery_request.clone(),
+                    work_item_id: recovery_item.clone(),
+                    label,
+                    completed,
+                    total,
+                });
+            },
+        )
+        .await;
+        main_events.emit(AgentEvent::PruneRecovery {
+            operation_id: operation.operation_id,
+            outcome,
+        });
+    }
     let mut orphan_cleanup_results = Vec::new();
     if has_side_lease {
         for record in ledger.ephemeral_sessions(&config.work_item_id)? {
@@ -1929,7 +2670,7 @@ async fn worker(
     }
     let boot = sdk_call(
         "Copilot session create/resume",
-        create_or_resume_session(&client, &config, &main_events),
+        create_or_resume_session(&client, &config, &main_events, &ledger),
     )
     .await?;
     let session = boot.session;
@@ -1999,6 +2740,8 @@ async fn worker(
                     AgentCommand::PruneSessions {
                         request_id,
                         work_item_ids,
+                        export_first,
+                        paths,
                     } => {
                         main_events.emit(AgentEvent::PruneSessionsStarted {
                             request_id: request_id.clone(),
@@ -2006,13 +2749,32 @@ async fn worker(
                         });
                         let mut outcomes = Vec::with_capacity(work_item_ids.len());
                         for work_item_id in work_item_ids {
+                            if work_item_id == config.work_item_id {
+                                outcomes.push(PruneSessionOutcome {
+                                    work_item_id,
+                                    remote_deleted: false,
+                                    local_deleted: false,
+                                    error: Some(
+                                        "the worker refused to prune its open Work Item; switch Work Items first"
+                                            .into(),
+                                    ),
+                                });
+                                continue;
+                            }
                             let progress_request = request_id.clone();
                             let progress_item = work_item_id.clone();
-                            let outcome = prune_remote_sessions(
+                            let operation_id = format!("{request_id}:{work_item_id}");
+                            let outcome = execute_prune_operation(
                                 &client,
-                                &ledger,
-                                &owner_id,
-                                &work_item_id,
+                                PruneExecution {
+                                    ledger: &ledger,
+                                    database_path: &config.database_path,
+                                    owner_id: &owner_id,
+                                    requested_operation_id: &operation_id,
+                                    work_item_id: &work_item_id,
+                                    export_first,
+                                    paths: &paths,
+                                },
                                 |label, completed, total| {
                                     main_events.emit(AgentEvent::PruneSessionProgress {
                                         request_id: progress_request.clone(),
@@ -2097,7 +2859,7 @@ async fn worker(
                                 client.rpc().sessions().fork(SessionsForkRequest {
                                     session_id: SessionId::new(parent_id.clone()),
                                     to_event_id: None,
-                                    name: Some(side_session_name(&operation_id)),
+                                    name: Some(side_session_name(&operation_id, &parent_id)),
                                 }),
                             )
                             .await
@@ -2482,18 +3244,72 @@ async fn worker(
                             continue;
                         }
                         let parent_id = main.session.id().to_string();
+                        if !matches!(
+                            ledger.renew_ephemeral_session_lease(
+                                &config.work_item_id,
+                                &owner_id,
+                                wall_clock_ms(),
+                            ),
+                            Ok(true)
+                        ) {
+                            main_events.activity(
+                                None,
+                                AgentActivity::other(
+                                    "Cannot fork MAIN because Work Item ownership changed",
+                                ),
+                            );
+                            continue;
+                        }
+                        let operation_id = Uuid::new_v4().to_string();
+                        let created_at = now();
+                        let mut fork_intent = ephemeral_record(
+                            &config,
+                            &owner_id,
+                            &operation_id,
+                            Some(parent_id.clone()),
+                            None,
+                            "intent",
+                            created_at,
+                        );
+                        if let Err(error) = save_ephemeral_record(&ledger, &fork_intent) {
+                            main_events.activity(
+                                None,
+                                AgentActivity::other(format!(
+                                    "Could not journal MAIN fork intent: {error}"
+                                )),
+                            );
+                            continue;
+                        }
                         match sdk_call(
                             "Copilot MAIN fork",
                             client.rpc().sessions().fork(SessionsForkRequest {
                                 session_id: SessionId::new(parent_id.clone()),
                                 to_event_id: None,
-                                name: None,
+                                name: Some(side_session_name(&operation_id, &parent_id)),
                             }),
                         )
                         .await
                         {
                             Ok(result) => {
                                 let new_id = result.session_id.to_string();
+                                fork_intent.side_id = Some(new_id.clone());
+                                fork_intent.state = "opening".into();
+                                fork_intent.updated_at = now();
+                                if let Err(error) = save_ephemeral_record(&ledger, &fork_intent) {
+                                    let (_, cleanup_warning) =
+                                        cleanup_ephemeral_record(&client, &ledger, fork_intent)
+                                            .await;
+                                    main_events.activity(
+                                        None,
+                                        AgentActivity::other(format!(
+                                            "MAIN fork ownership changed before activation: {error}{}",
+                                            cleanup_warning
+                                                .map(|warning| format!("; {warning}"))
+                                                .unwrap_or_default()
+                                        )),
+                                    );
+                                    continue;
+                                }
                                 let mut resume = resume_config(
                                     SessionId::new(new_id.clone()),
                                     &config,
@@ -2507,28 +3323,91 @@ async fn worker(
                                 .await
                                 {
                                     Ok(session) => {
-                                        disconnect_session(&main.session).await.ok();
-                                        main = SessionSlot {
-                                            subscription: session.subscribe(),
-                                            session,
-                                        };
-                                        main_events.emit(AgentEvent::Forked {
-                                            parent_id,
-                                            session_id: new_id,
-                                        });
+                                        let activation = ledger.activate_session_from_ephemeral(
+                                            &SessionRecord {
+                                                id: new_id.clone(),
+                                                work_item_id: config.work_item_id.clone(),
+                                                parent_id: Some(parent_id.clone()),
+                                                active: true,
+                                                created_at: now(),
+                                            },
+                                            &operation_id,
+                                            &owner_id,
+                                        );
+                                        if !matches!(activation, Ok(true)) {
+                                            disconnect_session(&session).await.ok();
+                                            fork_intent.state = "cleanup_pending".into();
+                                            fork_intent.last_error =
+                                                activation.err().map(|error| error.to_string());
+                                            fork_intent.updated_at = now();
+                                            save_ephemeral_record(&ledger, &fork_intent).ok();
+                                            let (_, cleanup_warning) = cleanup_ephemeral_record(
+                                                &client,
+                                                &ledger,
+                                                fork_intent,
+                                            )
+                                            .await;
+                                            let cleanup = cleanup_warning
+                                                .map(|warning| format!("; {warning}"))
+                                                .unwrap_or_default();
+                                            main_events.activity(
+                                                None,
+                                                AgentActivity::other(format!(
+                                                    "Refused an unfenced MAIN fork{cleanup}"
+                                                )),
+                                            );
+                                        } else {
+                                            disconnect_session(&main.session).await.ok();
+                                            main = SessionSlot {
+                                                subscription: session.subscribe(),
+                                                session,
+                                            };
+                                            main_events.emit(AgentEvent::Forked {
+                                                parent_id,
+                                                session_id: new_id,
+                                            });
+                                        }
                                     }
-                                    Err(error) => main_events.activity(
-                                        None,
-                                        AgentActivity::other(format!(
-                                            "Fork was created but could not be activated: {error}"
-                                        )),
-                                    ),
+                                    Err(error) => {
+                                        fork_intent.state = "cleanup_pending".into();
+                                        fork_intent.last_error = Some(error.to_string());
+                                        fork_intent.updated_at = now();
+                                        save_ephemeral_record(&ledger, &fork_intent).ok();
+                                        let (_, cleanup_warning) =
+                                            cleanup_ephemeral_record(&client, &ledger, fork_intent)
+                                                .await;
+                                        main_events.activity(
+                                            None,
+                                            AgentActivity::other(format!(
+                                                "Fork was created but could not be activated: {error}{}",
+                                                cleanup_warning
+                                                    .map(|warning| format!("; {warning}"))
+                                                    .unwrap_or_default()
+                                            )),
+                                        );
+                                    }
                                 }
                             }
-                            Err(error) => main_events.activity(
-                                None,
-                                AgentActivity::other(format!("Could not fork session: {error}")),
-                            ),
+                            Err(error) => {
+                                fork_intent.state = "cleanup_pending".into();
+                                fork_intent.last_error = Some(error.to_string());
+                                fork_intent.updated_at = now();
+                                // The RPC can fail after the remote side commits.
+                                // Retain the name-bound intent so startup can
+                                // reconcile and delete that possible orphan.
+                                save_ephemeral_record(&ledger, &fork_intent).ok();
+                                let (_, cleanup_warning) =
+                                    cleanup_ephemeral_record(&client, &ledger, fork_intent).await;
+                                main_events.activity(
+                                    None,
+                                    AgentActivity::other(format!(
+                                        "Could not fork session: {error}{}",
+                                        cleanup_warning
+                                            .map(|warning| format!("; {warning}"))
+                                            .unwrap_or_default()
+                                    )),
+                                );
+                            }
                         }
                     }
                     AgentCommand::Send(_)
@@ -3951,6 +4830,7 @@ async fn create_or_resume_session(
     client: &Client,
     config: &BridgeConfig,
     events: &EventPublisher,
+    ledger: &Storage,
 ) -> Result<SessionBoot> {
     if let Some(id) = &config.existing_session_id {
         match client
@@ -3969,9 +4849,7 @@ async fn create_or_resume_session(
                 });
             }
             Err(error) => {
-                let session = client
-                    .create_session(create_config(config, Some(events)))
-                    .await?;
+                let session = create_tracked_session(client, config, events, ledger).await?;
                 return Ok(SessionBoot {
                     session,
                     resumed: false,
@@ -3983,12 +4861,48 @@ async fn create_or_resume_session(
         }
     }
     Ok(SessionBoot {
-        session: client
-            .create_session(create_config(config, Some(events)))
-            .await?,
+        session: create_tracked_session(client, config, events, ledger).await?,
         resumed: false,
         resume_warning: None,
     })
+}
+
+async fn create_tracked_session(
+    client: &Client,
+    config: &BridgeConfig,
+    events: &EventPublisher,
+    ledger: &Storage,
+) -> Result<Session> {
+    let session_id = Uuid::new_v4().to_string();
+    // Persist the client-selected ID before asking the SDK to create it. A
+    // crash at any later instruction leaves an idempotent prune target rather
+    // than an untracked remote session.
+    ledger.activate_session(&SessionRecord {
+        id: session_id.clone(),
+        work_item_id: config.work_item_id.clone(),
+        parent_id: None,
+        active: true,
+        created_at: now(),
+    })?;
+    let session = client
+        .create_session(
+            create_config(config, Some(events)).with_session_id(SessionId::new(session_id.clone())),
+        )
+        .await?;
+    if session.id().as_str() != session_id {
+        let unexpected_id = session.id().to_string();
+        disconnect_session(&session).await.ok();
+        let cleanup = client
+            .delete_session_if_present(&unexpected_id)
+            .await
+            .err()
+            .map(|error| format!("; cleanup failed: {error}"))
+            .unwrap_or_default();
+        anyhow::bail!(
+            "Copilot created session {unexpected_id} instead of the pre-journaled id {session_id}{cleanup}"
+        );
+    }
+    Ok(session)
 }
 
 fn create_config(config: &BridgeConfig, events: Option<&EventPublisher>) -> SessionConfig {
@@ -4131,42 +5045,81 @@ mod tests {
     };
 
     use super::{
-        cleanup_ephemeral_record, create_config, enqueue_message, handle_session_event,
-        history_entries, model_option, now, prune_remote_sessions, register_sdk_message_root,
-        resume_config, resumed_active_from_history, retryable_cleanup_state, ActiveOutbound,
-        ActivityKind, AgentCommand, AgentEvent, AgentLane, AgentRuntime, AgentSink, BridgeConfig,
+        cleanup_ephemeral_record, create_config, delete_journaled_remote_sessions,
+        durable_export_choice, enqueue_message, execute_prune_operation, handle_session_event,
+        history_entries, model_option, now, register_sdk_message_root, resume_config,
+        resumed_active_from_history, retryable_cleanup_state, ActiveOutbound, ActivityKind,
+        AgentCommand, AgentEvent, AgentLane, AgentRuntime, AgentSink, BridgeConfig,
         ControlledAgent, CopilotBridge, EventPublisher, HistoryEntry, LaneEvent, Outbound,
-        OutboundKind, ProgressHooks, ReadOnlyPermissionHandler,
+        OutboundKind, ProgressHooks, PruneExecution, ReadOnlyPermissionHandler, SideCleanupBackend,
+        WorkItemProcessLock,
     };
+    use crate::config::AppPaths;
     use crate::domain::{EphemeralSessionRecord, SessionRecord, WorkItem};
-    use crate::storage::Storage;
+    use crate::storage::{PruneOperation, Storage};
+
+    fn test_app_paths(root: PathBuf) -> AppPaths {
+        AppPaths {
+            data: root.join("data"),
+            cache: root.join("cache"),
+            database: root.join("data").join("review.db"),
+            roots: root.join("data").join("roots"),
+            prs: root.join("cache").join("prs"),
+            exports: root.join("data").join("exports"),
+            skills: root.join("data").join("skills"),
+            plugins: root.join("data").join("plugins"),
+        }
+    }
 
     #[derive(Default)]
     struct FakeSideCleanup {
         named_sessions: Mutex<HashMap<String, String>>,
         deleted_sessions: Mutex<Vec<String>>,
         delete_error: Mutex<Option<String>>,
+        absent_sessions: Mutex<HashSet<String>>,
+        successful_delete_sticks: Mutex<bool>,
+        failed_delete_removes: Mutex<bool>,
     }
 
     #[async_trait::async_trait]
     impl super::SideCleanupBackend for FakeSideCleanup {
-        async fn reconcile_side_id(&self, operation_id: &str) -> Result<Option<String>> {
+        async fn reconcile_side_id(
+            &self,
+            operation_id: &str,
+            parent_id: &str,
+        ) -> Result<Option<String>> {
             Ok(self
                 .named_sessions
                 .lock()
                 .unwrap()
-                .get(operation_id)
+                .get(&super::side_session_name(operation_id, parent_id))
                 .cloned())
         }
 
-        async fn delete_session_if_present(&self, session_id: &str) -> Result<()> {
+        async fn session_exists(&self, session_id: &str) -> Result<bool> {
+            Ok(!self.absent_sessions.lock().unwrap().contains(session_id))
+        }
+
+        async fn delete_session(&self, session_id: &str) -> Result<()> {
             if let Some(error) = self.delete_error.lock().unwrap().clone() {
+                if *self.failed_delete_removes.lock().unwrap() {
+                    self.absent_sessions
+                        .lock()
+                        .unwrap()
+                        .insert(session_id.to_owned());
+                }
                 anyhow::bail!(error);
             }
             self.deleted_sessions
                 .lock()
                 .unwrap()
                 .push(session_id.to_owned());
+            if !*self.successful_delete_sticks.lock().unwrap() {
+                self.absent_sessions
+                    .lock()
+                    .unwrap()
+                    .insert(session_id.to_owned());
+            }
             Ok(())
         }
     }
@@ -4208,11 +5161,10 @@ mod tests {
         let record = cleanup_record(&item, None);
         assert!(storage.record_ephemeral_session(&record).unwrap());
         let backend = FakeSideCleanup::default();
-        backend
-            .named_sessions
-            .lock()
-            .unwrap()
-            .insert(record.operation_id.clone(), "side-1".into());
+        backend.named_sessions.lock().unwrap().insert(
+            super::side_session_name(&record.operation_id, record.parent_id.as_deref().unwrap()),
+            "side-1".into(),
+        );
 
         let (session_id, warning) = tokio::runtime::Runtime::new()
             .unwrap()
@@ -4225,6 +5177,28 @@ mod tests {
             ["side-1"]
         );
         assert!(storage.ephemeral_sessions(&item.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn side_reconciliation_rejects_a_name_bound_to_another_parent() {
+        let (storage, item) = cleanup_storage();
+        let record = cleanup_record(&item, None);
+        assert!(storage.record_ephemeral_session(&record).unwrap());
+        let backend = FakeSideCleanup::default();
+        backend.named_sessions.lock().unwrap().insert(
+            super::side_session_name(&record.operation_id, "different-parent"),
+            "unrelated-side".into(),
+        );
+
+        let (_, warning) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(cleanup_ephemeral_record(&backend, &storage, record));
+
+        assert!(warning
+            .as_deref()
+            .is_some_and(|message| message.contains("still unresolved")));
+        assert!(backend.deleted_sessions.lock().unwrap().is_empty());
+        assert_eq!(storage.ephemeral_sessions(&item.id).unwrap().len(), 1);
     }
 
     #[test]
@@ -4319,25 +5293,141 @@ mod tests {
             .unwrap();
         let backend = FakeSideCleanup::default();
         let mut progress = Vec::new();
+        let operation_id = storage
+            .begin_prune_operation("prune-operation", &item.id, false)
+            .unwrap();
 
-        let outcome = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(prune_remote_sessions(
-                &backend,
-                &storage,
-                "owner-1",
-                &item.id,
-                |label, completed, total| progress.push((label, completed, total)),
-            ));
+        let outcome =
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(delete_journaled_remote_sessions(
+                    &backend,
+                    &storage,
+                    "owner-1",
+                    &operation_id,
+                    &item.id,
+                    |label, completed, total| progress.push((label, completed, total)),
+                ));
 
-        assert!(outcome.error.is_none());
+        assert!(outcome.is_ok());
         assert_eq!(
             backend.deleted_sessions.lock().unwrap().as_slice(),
-            ["main-parent", "main-fork"]
+            ["main-fork", "main-parent"]
         );
         assert!(progress
             .iter()
             .any(|(_, completed, total)| *completed == 2 && *total == 2));
+    }
+
+    #[test]
+    fn session_deletion_is_absence_checked_before_and_after_the_sdk_call() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let already_absent = FakeSideCleanup::default();
+        already_absent
+            .absent_sessions
+            .lock()
+            .unwrap()
+            .insert("missing".into());
+        runtime
+            .block_on(already_absent.delete_session_if_present("missing"))
+            .unwrap();
+        assert!(already_absent.deleted_sessions.lock().unwrap().is_empty());
+
+        let sticky = FakeSideCleanup::default();
+        *sticky.successful_delete_sticks.lock().unwrap() = true;
+        let error = runtime
+            .block_on(sticky.delete_session_if_present("still-present"))
+            .unwrap_err();
+        assert!(error.to_string().contains("still exists"));
+
+        let error_but_absent = FakeSideCleanup::default();
+        *error_but_absent.delete_error.lock().unwrap() = Some("transport failed".into());
+        *error_but_absent.failed_delete_removes.lock().unwrap() = true;
+        runtime
+            .block_on(error_but_absent.delete_session_if_present("deleted-remotely"))
+            .unwrap();
+    }
+
+    #[test]
+    fn durable_prune_retries_remote_failure_then_finishes_local_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_app_paths(directory.path().to_path_buf());
+        paths.ensure().unwrap();
+        let storage = Storage::open(&paths.database).unwrap();
+        let item = WorkItem {
+            id: "durable-prune".into(),
+            name: "durable prune".into(),
+            workspace_root: directory.path().join("workspace"),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            last_opened_at: Some("1".into()),
+        };
+        storage.upsert_work_item(&item).unwrap();
+        storage
+            .activate_session(&SessionRecord {
+                id: "persistent-session".into(),
+                work_item_id: item.id.clone(),
+                parent_id: None,
+                active: true,
+                created_at: "1".into(),
+            })
+            .unwrap();
+        let backend = FakeSideCleanup::default();
+        *backend.delete_error.lock().unwrap() = Some("controlled remote failure".into());
+
+        let first = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(execute_prune_operation(
+                &backend,
+                PruneExecution {
+                    ledger: &storage,
+                    database_path: &paths.database,
+                    owner_id: "prune-owner",
+                    requested_operation_id: "first-request",
+                    work_item_id: &item.id,
+                    export_first: false,
+                    paths: &paths,
+                },
+                |_, _, _| {},
+            ));
+
+        assert!(
+            first
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("controlled remote failure")),
+            "{:?}",
+            first.error
+        );
+        assert!(storage.work_item_by_id(&item.id).unwrap().is_some());
+        let journal = storage.pending_prune_operations().unwrap();
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].phase, "failed");
+        *backend.delete_error.lock().unwrap() = None;
+
+        let second = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(execute_prune_operation(
+                &backend,
+                PruneExecution {
+                    ledger: &storage,
+                    database_path: &paths.database,
+                    owner_id: "prune-owner",
+                    requested_operation_id: "second-request",
+                    work_item_id: &item.id,
+                    export_first: false,
+                    paths: &paths,
+                },
+                |_, _, _| {},
+            ));
+
+        assert!(second.error.is_none(), "{:?}", second.error);
+        assert!(storage.work_item_by_id(&item.id).unwrap().is_none());
+        assert!(storage.pending_prune_operations().unwrap().is_empty());
+        assert_eq!(
+            backend.deleted_sessions.lock().unwrap().as_slice(),
+            ["persistent-session"]
+        );
     }
 
     #[test]
@@ -4346,6 +5436,22 @@ mod tests {
         assert!(retryable_cleanup_state("deleting"));
         assert!(!retryable_cleanup_state("active"));
         assert!(!retryable_cleanup_state("opening"));
+    }
+
+    #[test]
+    fn prune_retry_keeps_the_original_durable_export_choice() {
+        let operation = PruneOperation {
+            operation_id: "operation".into(),
+            work_item_id: "work".into(),
+            export_first: true,
+            phase: "failed".into(),
+            last_error: Some("retry".into()),
+            created_at: "1".into(),
+            updated_at: "2".into(),
+        };
+
+        assert!(durable_export_choice(Some(&operation), false));
+        assert!(!durable_export_choice(None, false));
     }
 
     #[test]
@@ -4388,6 +5494,161 @@ mod tests {
     }
 
     #[test]
+    fn worker_defense_in_depth_rejects_pruning_its_open_work_item() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_app_paths(directory.path().to_path_buf());
+        paths.ensure().unwrap();
+        let agent = ControlledAgent::new("work-item".into());
+        let _ = agent.try_recv_laned(); // SessionReady.
+
+        agent
+            .send(AgentCommand::PruneSessions {
+                request_id: "prune-current".into(),
+                work_item_ids: vec!["work-item".into()],
+                export_first: false,
+                paths,
+            })
+            .expect("worker returns a typed per-item rejection");
+
+        let started = agent.try_recv_laned().expect("prune started");
+        assert!(matches!(
+            started.event,
+            LaneEvent::Agent(AgentEvent::PruneSessionsStarted {
+                ref request_id,
+                work_items: 1,
+            }) if request_id == "prune-current"
+        ));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let complete = loop {
+            if let Some(event) = agent.try_recv_laned() {
+                break event;
+            }
+            assert!(Instant::now() < deadline, "prune complete");
+            std::thread::yield_now();
+        };
+        assert!(matches!(
+            complete.event,
+            LaneEvent::Agent(AgentEvent::PruneSessionsComplete {
+                ref request_id,
+                ref outcomes,
+            }) if request_id == "prune-current"
+                && outcomes.len() == 1
+                && outcomes[0].work_item_id == "work-item"
+                && outcomes[0]
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("open Work Item"))
+        ));
+    }
+
+    #[test]
+    fn process_locks_are_exclusive_per_work_item_but_independent_across_items() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_app_paths(directory.path().to_path_buf());
+        paths.ensure().unwrap();
+
+        let first = WorkItemProcessLock::try_acquire(&paths, "work-a")
+            .unwrap()
+            .expect("first lock");
+        assert!(WorkItemProcessLock::try_acquire(&paths, "work-a")
+            .unwrap()
+            .is_none());
+        assert!(WorkItemProcessLock::try_acquire(&paths, "work-b")
+            .unwrap()
+            .is_some());
+
+        drop(first);
+        assert!(WorkItemProcessLock::try_acquire(&paths, "work-a")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn controlled_runtime_replays_startup_prune_recovery_through_typed_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_app_paths(directory.path().to_path_buf());
+        paths.ensure().unwrap();
+        let storage = Storage::open(&paths.database).unwrap();
+        for id in ["current", "interrupted"] {
+            storage
+                .upsert_work_item(&WorkItem {
+                    id: id.into(),
+                    name: id.into(),
+                    workspace_root: directory.path().join(id),
+                    created_at: "1".into(),
+                    updated_at: "1".into(),
+                    last_opened_at: Some("1".into()),
+                })
+                .unwrap();
+        }
+        storage
+            .activate_session(&SessionRecord {
+                id: "interrupted-session".into(),
+                work_item_id: "interrupted".into(),
+                parent_id: None,
+                active: true,
+                created_at: "1".into(),
+            })
+            .unwrap();
+        storage
+            .begin_prune_operation("recovery-operation", "interrupted", false)
+            .unwrap();
+        drop(storage);
+        let agent = ControlledAgent::with_config(BridgeConfig {
+            work_item_id: "current".into(),
+            session_root: directory.path().join("current"),
+            database_path: paths.database.clone(),
+            app_paths: paths.clone(),
+            existing_session_id: None,
+            model: "controlled-fast".into(),
+            reasoning_effort: None,
+            context_tier: None,
+            skill_directories: Vec::new(),
+            plugin_directories: Vec::new(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut events = Vec::new();
+        while Instant::now() < deadline {
+            if let Some(event) = agent.try_recv_laned() {
+                let ready = matches!(
+                    event.event,
+                    LaneEvent::Agent(AgentEvent::SessionReady { .. })
+                );
+                events.push(event);
+                if ready {
+                    break;
+                }
+            } else {
+                std::thread::yield_now();
+            }
+        }
+
+        assert!(events.iter().any(|event| matches!(
+            event.event,
+            LaneEvent::Agent(AgentEvent::PruneRecoveryStarted {
+                ref operation_id,
+                ..
+            }) if operation_id == "recovery-operation"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.event,
+            LaneEvent::Agent(AgentEvent::PruneSessionProgress { total: 1, .. })
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.event,
+            LaneEvent::Agent(AgentEvent::PruneRecovery {
+                ref outcome,
+                ..
+            }) if outcome.remote_deleted && outcome.local_deleted && outcome.error.is_none()
+        )));
+        assert!(Storage::open(&paths.database)
+            .unwrap()
+            .work_item_by_id("interrupted")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn normal_turns_use_explicit_sdk_enqueue_delivery() {
         let outbound = Outbound {
             id: "outbound".into(),
@@ -4408,6 +5669,7 @@ mod tests {
             work_item_id: "work-item".into(),
             session_root: PathBuf::from("."),
             database_path: PathBuf::from("review.db"),
+            app_paths: test_app_paths(PathBuf::from("/tmp/rq-tui-resume-config")),
             existing_session_id: Some("previous".into()),
             model: "controlled-fast".into(),
             reasoning_effort: Some("high".into()),
@@ -5314,6 +6576,7 @@ mod tests {
             work_item_id: format!("live-test-{}", uuid::Uuid::new_v4()),
             session_root: env::current_dir().expect("current directory"),
             database_path: live_state.path().join("review.db"),
+            app_paths: test_app_paths(live_state.path().to_path_buf()),
             existing_session_id: None,
             model,
             reasoning_effort: None,

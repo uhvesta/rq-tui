@@ -16,7 +16,7 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 
 use crate::annotations::{
@@ -43,7 +43,7 @@ use crate::domain::{
     AnnotationKind, AskMessage, BaseBranchSource, DeliveryState, PendingChat, Placement,
     ReviewContext, SessionRecord,
 };
-use crate::export::{CommentExport, ExportFormat, ReviewArchive};
+use crate::export::{CommentExport, ExportFormat};
 use crate::git::Git;
 use crate::highlight::{Highlighter, StyledSegment, SyntectHighlighter};
 use crate::markdown::{escape_html, render_inline_html};
@@ -163,6 +163,7 @@ pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> R
         work_item_id: state.work_item.item.id.clone(),
         session_root: state.work_item.session_root.clone(),
         database_path: paths.database.clone(),
+        app_paths: paths.clone(),
         existing_session_id,
         model,
         reasoning_effort: state.reasoning_effort.clone(),
@@ -246,7 +247,7 @@ fn run_loop<B: Backend>(
             };
             handle_agent_envelope(state, storage, event)?;
         }
-        finish_ready_prune(state, storage, paths)?;
+        finish_ready_prune(state, storage)?;
         state.tick(std::time::Instant::now());
         terminal.draw(|frame| render(frame, state, highlighter))?;
         if event::poll(std::time::Duration::from_millis(100))? {
@@ -912,21 +913,31 @@ pub(crate) fn handle_effect(
             bridge.send(AgentCommand::PruneSessions {
                 request_id: request_id.clone(),
                 work_item_ids: eligible.clone(),
+                export_first,
+                paths: paths.clone(),
             })?;
             state.pending_prune = Some(PendingPrune {
                 request_id,
                 work_item_ids: eligible.clone(),
-                export_first,
                 skipped_current,
             });
+            state.agent_progress.record(
+                AgentPhase::Queued,
+                "Prune queued",
+                format!(
+                    "{} Work Item(s) waiting for the current Copilot turn to finish",
+                    eligible.len()
+                ),
+                None,
+            );
             state.status = if skipped_current == 0 {
                 format!(
-                    "Deleting Copilot sessions for {} Work Item(s)… local history is unchanged",
+                    "Prune queued for {} Work Item(s)… waiting for the current Copilot turn; local history is unchanged",
                     eligible.len()
                 )
             } else {
                 format!(
-                    "Deleting Copilot sessions for {} Work Item(s)… skipped the open Work Item",
+                    "Prune queued for {} Work Item(s)… waiting for the current Copilot turn; skipped the open Work Item",
                     eligible.len()
                 )
             };
@@ -1607,11 +1618,7 @@ fn set_session_link(link: &std::path::Path, target: &std::path::Path) -> Result<
     Ok(())
 }
 
-pub(crate) fn finish_ready_prune(
-    state: &mut AppState,
-    storage: &Storage,
-    paths: &AppPaths,
-) -> Result<()> {
+pub(crate) fn finish_ready_prune(state: &mut AppState, storage: &Storage) -> Result<()> {
     let Some(ready) = state.ready_prune.take() else {
         return Ok(());
     };
@@ -1624,28 +1631,48 @@ pub(crate) fn finish_ready_prune(
     }
 
     let mut pruned = Vec::new();
-    let mut failures = Vec::new();
+    let mut retained_failures = Vec::new();
+    let mut remote_failures = Vec::new();
+    let mut warnings = Vec::new();
     for work_item_id in &pending.work_item_ids {
         let outcome = ready
             .outcomes
             .iter()
             .find(|outcome| outcome.work_item_id == *work_item_id);
-        match outcome {
-            Some(outcome) if outcome.error.is_none() => {
-                match prune_work_item(storage, paths, work_item_id, pending.export_first) {
-                    Ok(()) => pruned.push(work_item_id.clone()),
-                    Err(error) => failures.push(format!(
-                        "{}: Copilot sessions are gone, but local cleanup failed and can be retried: {error}",
-                        work_item_id
-                    )),
+        if storage.work_item_by_id(work_item_id)?.is_none() {
+            pruned.push(work_item_id.clone());
+            match outcome {
+                Some(outcome) if outcome.remote_deleted => {
+                    if let Some(error) = outcome.error.as_deref() {
+                        warnings.push(format!("{work_item_id}: {error}"));
+                    }
                 }
+                Some(outcome) => remote_failures.push(format!(
+                    "{}: {}",
+                    work_item_id,
+                    outcome
+                        .error
+                        .as_deref()
+                        .unwrap_or("local history is gone, but remote cleanup is unresolved")
+                )),
+                None => remote_failures.push(format!(
+                    "{work_item_id}: local history is gone, but the worker returned no result"
+                )),
             }
-            Some(outcome) => failures.push(format!(
+            continue;
+        }
+        match outcome {
+            Some(outcome) if outcome.local_deleted => {
+                retained_failures.push(format!(
+                    "{work_item_id}: cleanup reported success, but local history still exists"
+                ));
+            }
+            Some(outcome) => retained_failures.push(format!(
                 "{}: {}",
                 work_item_id,
                 outcome.error.as_deref().unwrap_or("session cleanup failed")
             )),
-            None => failures.push(format!(
+            None => retained_failures.push(format!(
                 "{work_item_id}: Copilot worker returned no cleanup result; local history was retained"
             )),
         }
@@ -1657,9 +1684,10 @@ pub(crate) fn finish_ready_prune(
     state.prune_index = state
         .prune_index
         .min(state.prune_items.len().saturating_sub(1));
-    let failed = failures.len();
+    let retained = retained_failures.len();
+    let unresolved_remote = remote_failures.len();
     let skipped = pending.skipped_current;
-    if failed == 0 {
+    if retained == 0 && unresolved_remote == 0 && warnings.is_empty() {
         state.agent_progress.record(
             AgentPhase::Idle,
             "Prune complete",
@@ -1680,15 +1708,33 @@ pub(crate) fn finish_ready_prune(
                 pruned.len()
             )
         };
+    } else if retained == 0 && unresolved_remote == 0 {
+        let detail = warnings.join(" · ");
+        state.agent_progress.record(
+            AgentPhase::Idle,
+            "Prune completed with a journal warning",
+            detail.clone(),
+            None,
+        );
+        state.status = format!(
+            "Pruned {} Work Item(s) · local history deleted · {}",
+            pruned.len(),
+            detail
+        );
     } else {
-        let detail = failures.join(" · ");
+        let mut details = Vec::new();
+        details.extend(remote_failures);
+        details.extend(retained_failures);
+        details.extend(warnings);
+        let detail = details.join(" · ");
         state
             .agent_progress
             .record(AgentPhase::Failed, "Prune incomplete", detail.clone(), None);
         state.status = format!(
-            "Pruned {} · failed {} · retained failed local history{} · {}",
+            "Local history deleted {} · remote unresolved {} · retained local history {}{} · {}",
             pruned.len(),
-            failed,
+            unresolved_remote,
+            retained,
             if skipped == 0 {
                 String::new()
             } else {
@@ -1696,70 +1742,6 @@ pub(crate) fn finish_ready_prune(
             },
             detail
         );
-    }
-    Ok(())
-}
-
-fn prune_work_item(
-    storage: &Storage,
-    paths: &AppPaths,
-    work_item_id: &str,
-    export_first: bool,
-) -> Result<()> {
-    let item = storage
-        .work_item_by_id(work_item_id)?
-        .context("review history item no longer exists")?;
-    if export_first {
-        let archive = ReviewArchive::load(storage, &item)?;
-        if !archive.annotations.is_empty() {
-            let path = paths
-                .exports
-                .join(format!("{}-pruned.md", item.name.replace(['/', ' '], "-")));
-            archive.write_markdown(&path)?;
-        }
-    }
-
-    let git = Git::default();
-    let repos = storage.repos_for_work_item(work_item_id)?;
-    let mut remote_cache_roots = Vec::new();
-    for repo in &repos {
-        for version in storage.versions_for_repo(&repo.id)? {
-            match version.kind {
-                crate::domain::VersionKind::Remote => {
-                    if let Some(worktree) = version.worktree_path {
-                        git.remove_worktree(&repo.path, &worktree)?;
-                    }
-                }
-                crate::domain::VersionKind::Snapshot => {
-                    git.delete_snapshot_ref(&repo.path, &version.id)?;
-                    let materialized = paths
-                        .cache
-                        .join("history")
-                        .join(&repo.id)
-                        .join(format!("s{}", version.version_num));
-                    git.remove_worktree(&repo.path, &materialized)?;
-                }
-                crate::domain::VersionKind::WorkingTree => {}
-            }
-        }
-        if repo.remote_pr_url.is_some() {
-            if let Some(cache_root) = repo.path.parent() {
-                remote_cache_roots.push(cache_root.to_path_buf());
-            }
-        }
-    }
-    storage.delete_work_item(work_item_id)?;
-    for cache_root in remote_cache_roots {
-        if cache_root.starts_with(&paths.prs) && cache_root != paths.prs {
-            std::fs::remove_dir_all(cache_root)?;
-        }
-    }
-    let synthetic_root = paths.roots.join(work_item_id);
-    if synthetic_root.starts_with(&paths.roots)
-        && synthetic_root != paths.roots
-        && synthetic_root.exists()
-    {
-        std::fs::remove_dir_all(synthetic_root)?;
     }
     Ok(())
 }
@@ -2359,8 +2341,13 @@ pub(crate) fn handle_agent_envelope(
                 &agent_event,
                 AgentEvent::PruneSessionsStarted { .. }
                     | AgentEvent::PruneSessionProgress { .. }
+                    | AgentEvent::PruneRecoveryStarted { .. }
                     | AgentEvent::PruneSessionsComplete { .. }
+                    | AgentEvent::PruneRecovery { .. }
             ) {
+                if lane != crate::copilot::AgentLane::Main {
+                    return Ok(());
+                }
                 handle_agent_event(state, storage, agent_event)?;
                 return Ok(());
             }
@@ -2499,6 +2486,8 @@ fn fail_pending_prune(state: &mut AppState, message: String) {
                 .iter()
                 .map(|work_item_id| PruneSessionOutcome {
                     work_item_id: work_item_id.clone(),
+                    remote_deleted: false,
+                    local_deleted: false,
                     error: Some(message.clone()),
                 })
                 .collect(),
@@ -3142,6 +3131,19 @@ pub(crate) fn handle_agent_event(
                     format!("Copilot session cleanup started for {work_items} Work Item(s)…");
             }
         }
+        AgentEvent::PruneRecoveryStarted {
+            operation_id,
+            work_item_id,
+        } => {
+            state.prune_recoveries.insert(operation_id);
+            state.agent_progress.record(
+                AgentPhase::Tool,
+                "Recovering interrupted prune",
+                format!("{work_item_id} · loading the durable cleanup journal"),
+                None,
+            );
+            state.status = format!("Recovering interrupted prune for {work_item_id}…");
+        }
         AgentEvent::PruneSessionProgress {
             request_id,
             work_item_id,
@@ -3149,11 +3151,12 @@ pub(crate) fn handle_agent_event(
             completed,
             total,
         } => {
-            if state
+            let interactive = state
                 .pending_prune
                 .as_ref()
-                .is_some_and(|pending| pending.request_id == request_id)
-            {
+                .is_some_and(|pending| pending.request_id == request_id);
+            let recovering = state.prune_recoveries.contains(&request_id);
+            if interactive || recovering {
                 let detail = if total == 0 {
                     format!("{work_item_id} · {label}")
                 } else {
@@ -3161,7 +3164,11 @@ pub(crate) fn handle_agent_event(
                 };
                 state.agent_progress.record(
                     AgentPhase::Tool,
-                    "Deleting Copilot sessions",
+                    if interactive {
+                        "Deleting Copilot sessions"
+                    } else {
+                        "Recovering interrupted prune"
+                    },
                     detail.clone(),
                     None,
                 );
@@ -3191,11 +3198,54 @@ pub(crate) fn handle_agent_event(
                     "Copilot session cleanup finished · finalizing local history…".into();
             }
         }
+        AgentEvent::PruneRecovery {
+            operation_id,
+            outcome,
+        } => {
+            if !state.prune_recoveries.remove(&operation_id) {
+                return Ok(());
+            }
+            let work_item_id = outcome.work_item_id;
+            if let Some(error) = outcome.error {
+                if outcome.local_deleted {
+                    state.prune_items.retain(|item| item.id != work_item_id);
+                }
+                state.agent_progress.record(
+                    AgentPhase::Failed,
+                    "Interrupted prune still needs attention",
+                    if outcome.local_deleted {
+                        format!(
+                            "{work_item_id}: local history is already deleted; remote/journal cleanup remains unresolved: {error}"
+                        )
+                    } else {
+                        format!("{work_item_id}: local history was retained: {error}")
+                    },
+                    None,
+                );
+                state.status = if outcome.local_deleted {
+                    format!(
+                        "Could not finish prune for {work_item_id} · local history deleted · cleanup still unresolved"
+                    )
+                } else {
+                    format!("Could not resume prune for {work_item_id} · local history retained")
+                };
+            } else {
+                state.prune_items.retain(|item| item.id != work_item_id);
+                state.agent_progress.record(
+                    AgentPhase::Idle,
+                    "Interrupted prune recovered",
+                    format!("{work_item_id}: remote and local cleanup completed"),
+                    None,
+                );
+                state.status = format!("Recovered interrupted prune for {work_item_id}");
+            }
+        }
         AgentEvent::Error(error) => {
             fail_pending_prune(
                 state,
                 format!("Copilot worker failed during prune: {error}"),
             );
+            state.prune_recoveries.clear();
             state.agent_connected = false;
             state.agent_activity = "Disconnected".into();
             state.agent_progress.record(
@@ -3220,6 +3270,7 @@ pub(crate) fn handle_agent_event(
                 state,
                 "Copilot worker stopped before prune completion; local history was retained".into(),
             );
+            state.prune_recoveries.clear();
             let cleanup_warning = (state.agent_progress.summary == "SIDE cleanup needs attention")
                 .then(|| state.agent_progress.detail.clone());
             state.agent_connected = false;
@@ -3813,6 +3864,11 @@ fn render_versions(frame: &mut ratatui::Frame, state: &AppState) {
 }
 
 fn render_prune(frame: &mut ratatui::Frame, state: &AppState) {
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(4)])
+        .split(frame.area());
+    let row_width = areas[0].width.saturating_sub(2) as usize;
     let items = state
         .prune_items
         .iter()
@@ -3823,21 +3879,38 @@ fn render_prune(frame: &mut ratatui::Frame, state: &AppState) {
             } else {
                 " "
             };
+            let is_open = item.id == state.work_item.item.id;
             let selected = if item.selected { "x" } else { " " };
-            ListItem::new(format!(
-                "{cursor} [{selected}] {:<28} last reviewed {} · {} versions · {} annotations",
+            let availability = if is_open {
+                " OPEN(disabled)"
+            } else {
+                ""
+            };
+            let text = format!(
+                "{cursor} [{selected}]{availability} {} · reviewed {} · {} versions · {} annotations",
                 item.name, item.last_opened_at, item.versions, item.annotations
-            ))
+            );
+            let row = ListItem::new(truncate_terminal_line(&text, row_width));
+            if is_open {
+                row.style(Style::default().fg(Color::DarkGray))
+            } else {
+                row
+            }
         })
         .collect::<Vec<_>>();
-    frame.render_widget(
-        List::new(items).block(
-            Block::default()
-                .title("Prune — reviewed items (oldest first)")
-                .borders(Borders::ALL),
-        ),
-        frame.area(),
+    let title = if areas[0].width < 72 {
+        "Prune · Space select · d delete · x export"
+    } else {
+        "Prune · Space select · d delete · x export+delete · open item disabled"
+    };
+    let mut list_state = ListState::default()
+        .with_selected((!state.prune_items.is_empty()).then_some(state.prune_index));
+    frame.render_stateful_widget(
+        List::new(items).block(Block::default().title(title).borders(Borders::ALL)),
+        areas[0],
+        &mut list_state,
     );
+    render_agent_progress(frame, state, areas[1]);
 }
 
 fn render_review(
@@ -5559,7 +5632,8 @@ mod tests {
         parse_review_context, render, run_clipboard_candidate, table_cells,
     };
     use crate::app::{
-        tests_support::state_for_ui, ChatEntry, DiffLayout, Effect, Focus, MarkdownPreview, Screen,
+        tests_support::state_for_ui, AgentPhase, ChatEntry, DiffLayout, Effect, Focus,
+        MarkdownPreview, PendingPrune, PruneChoice, ReadyPrune, Screen,
     };
     use crate::config::AppPaths;
     use crate::copilot::{
@@ -6108,6 +6182,56 @@ mod tests {
     }
 
     #[test]
+    fn prune_is_visibly_queued_until_the_worker_reports_that_cleanup_started() {
+        let storage = Storage::in_memory().unwrap();
+        let agent = FakeAgent::default();
+        let mut state = state_for_ui();
+        storage.upsert_work_item(&state.work_item.item).unwrap();
+        storage
+            .upsert_work_item(&WorkItem {
+                id: "old-review".into(),
+                name: "old review".into(),
+                workspace_root: PathBuf::from("/old-review"),
+                created_at: "1".into(),
+                updated_at: "1".into(),
+                last_opened_at: Some("1".into()),
+            })
+            .unwrap();
+
+        handle_effect(
+            &mut state,
+            &storage,
+            &paths(),
+            &agent,
+            Effect::PruneWorkItems {
+                ids: vec!["old-review".into()],
+                export_first: false,
+            },
+        )
+        .unwrap();
+
+        let request_id = state.pending_prune.as_ref().unwrap().request_id.clone();
+        assert!(state.status.contains("Prune queued"));
+        assert!(state
+            .status
+            .contains("waiting for the current Copilot turn"));
+        assert_eq!(state.agent_progress.summary, "Prune queued");
+
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::PruneSessionsStarted {
+                request_id,
+                work_items: 1,
+            },
+        )
+        .unwrap();
+
+        assert!(state.status.contains("cleanup started"));
+        assert_eq!(state.agent_progress.summary, "Deleting Copilot sessions");
+    }
+
+    #[test]
     fn prune_completion_applies_each_work_item_independently() {
         let storage = Storage::in_memory().unwrap();
         let agent = FakeAgent::default();
@@ -6146,23 +6270,243 @@ mod tests {
                 outcomes: vec![
                     PruneSessionOutcome {
                         work_item_id: "prune-ok".into(),
+                        remote_deleted: true,
+                        local_deleted: true,
                         error: None,
                     },
                     PruneSessionOutcome {
                         work_item_id: "prune-failed".into(),
+                        remote_deleted: false,
+                        local_deleted: false,
                         error: Some("controlled SDK failure".into()),
                     },
                 ],
             },
         )
         .unwrap();
-        finish_ready_prune(&mut state, &storage, &paths()).unwrap();
+        storage.delete_work_item("prune-ok").unwrap();
+        finish_ready_prune(&mut state, &storage).unwrap();
 
         assert!(storage.work_item_by_id("prune-ok").unwrap().is_none());
         assert!(storage.work_item_by_id("prune-failed").unwrap().is_some());
-        assert!(state.status.contains("Pruned 1"));
-        assert!(state.status.contains("failed 1"));
+        assert!(state.status.contains("Local history deleted 1"));
+        assert!(state.status.contains("retained local history 1"));
         assert!(state.status.contains("controlled SDK failure"));
+    }
+
+    #[test]
+    fn interrupted_prune_progress_is_visible_without_an_interactive_request() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::PruneRecoveryStarted {
+                operation_id: "startup-recovery".into(),
+                work_item_id: "old-review".into(),
+            },
+        )
+        .unwrap();
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::PruneSessionProgress {
+                request_id: "startup-recovery".into(),
+                work_item_id: "old-review".into(),
+                label: "Deleting Copilot session abc123".into(),
+                completed: 2,
+                total: 3,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.agent_progress.summary, "Recovering interrupted prune");
+        assert!(state.agent_progress.detail.contains("old-review"));
+        assert!(state.agent_progress.detail.contains("2/3"));
+        assert!(state.status.contains("Deleting Copilot session abc123"));
+    }
+
+    #[test]
+    fn journal_warning_never_claims_already_deleted_local_history_was_retained() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+        state.prune_items = vec![PruneChoice {
+            id: "gone".into(),
+            name: "gone".into(),
+            last_opened_at: "1".into(),
+            versions: 1,
+            annotations: 0,
+            selected: true,
+        }];
+        state.pending_prune = Some(PendingPrune {
+            request_id: "request".into(),
+            work_item_ids: vec!["gone".into()],
+            skipped_current: 0,
+        });
+        state.ready_prune = Some(ReadyPrune {
+            request_id: "request".into(),
+            outcomes: vec![PruneSessionOutcome {
+                work_item_id: "gone".into(),
+                remote_deleted: true,
+                local_deleted: true,
+                error: Some(
+                    "local cleanup completed, but its prune journal could not be cleared".into(),
+                ),
+            }],
+        });
+
+        finish_ready_prune(&mut state, &storage).unwrap();
+
+        assert!(state.prune_items.is_empty());
+        assert!(state.status.contains("local history deleted"));
+        assert!(!state.status.contains("retained"));
+        assert_eq!(
+            state.agent_progress.summary,
+            "Prune completed with a journal warning"
+        );
+    }
+
+    #[test]
+    fn mixed_prune_results_keep_both_failures_and_journal_warnings_visible() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+        storage
+            .upsert_work_item(&WorkItem {
+                id: "retained".into(),
+                name: "retained".into(),
+                workspace_root: PathBuf::from("/retained"),
+                created_at: "1".into(),
+                updated_at: "1".into(),
+                last_opened_at: Some("1".into()),
+            })
+            .unwrap();
+        state.pending_prune = Some(PendingPrune {
+            request_id: "request".into(),
+            work_item_ids: vec!["gone".into(), "retained".into()],
+            skipped_current: 0,
+        });
+        state.ready_prune = Some(ReadyPrune {
+            request_id: "request".into(),
+            outcomes: vec![
+                PruneSessionOutcome {
+                    work_item_id: "gone".into(),
+                    remote_deleted: true,
+                    local_deleted: true,
+                    error: Some("completed journal could not be cleared".into()),
+                },
+                PruneSessionOutcome {
+                    work_item_id: "retained".into(),
+                    remote_deleted: false,
+                    local_deleted: false,
+                    error: Some("controlled remote failure".into()),
+                },
+            ],
+        });
+
+        finish_ready_prune(&mut state, &storage).unwrap();
+
+        assert!(state
+            .status
+            .contains("completed journal could not be cleared"));
+        assert!(state.status.contains("controlled remote failure"));
+        assert!(state.status.contains("retained local history 1"));
+        assert_eq!(state.agent_progress.phase, AgentPhase::Failed);
+    }
+
+    #[test]
+    fn side_lane_cannot_inject_global_prune_recovery_events() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+        let prior_summary = state.agent_progress.summary.clone();
+
+        handle_agent_envelope(
+            &mut state,
+            &storage,
+            AgentEventEnvelope {
+                lane: AgentLane::Side { id: "side".into() },
+                event: LaneEvent::Agent(AgentEvent::PruneRecoveryStarted {
+                    operation_id: "stale".into(),
+                    work_item_id: "victim".into(),
+                }),
+                activity: None,
+            },
+        )
+        .unwrap();
+
+        assert!(state.prune_recoveries.is_empty());
+        assert_eq!(state.agent_progress.summary, prior_summary);
+    }
+
+    #[test]
+    fn prune_render_labels_the_open_item_as_disabled() {
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = state_for_ui();
+        state.screen = Screen::Prune;
+        state.prune_items = vec![PruneChoice {
+            id: state.work_item.item.id.clone(),
+            name: "open review".into(),
+            last_opened_at: "now".into(),
+            versions: 1,
+            annotations: 2,
+            selected: false,
+        }];
+        let mut highlighter = PlainHighlighter;
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(content.contains("open item disabled"));
+        assert!(content.contains("OPEN(disabled)"));
+        assert!(content.contains("Starting Copilot SDK session"));
+    }
+
+    #[test]
+    fn prune_render_scrolls_to_selection_and_keeps_disabled_marker_at_narrow_width() {
+        let backend = TestBackend::new(50, 9);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = state_for_ui();
+        state.screen = Screen::Prune;
+        state.prune_items = (0..10)
+            .map(|index| PruneChoice {
+                id: if index == 9 {
+                    state.work_item.item.id.clone()
+                } else {
+                    format!("item-{index}")
+                },
+                name: format!("item-{index}-with-a-name-that-is-far-too-long-for-the-terminal"),
+                last_opened_at: "now".into(),
+                versions: 1,
+                annotations: 2,
+                selected: false,
+            })
+            .collect();
+        state.prune_index = 9;
+        let mut highlighter = PlainHighlighter;
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(content.contains("OPEN(disabled)"));
+        assert!(content.contains("item-9"));
+        assert!(!content.contains("item-0-with"));
     }
 
     #[test]
