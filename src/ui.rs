@@ -1952,6 +1952,14 @@ pub(crate) fn handle_agent_envelope(
                 }
             };
             if !lane_is_visible {
+                let globally_visible =
+                    matches!(&agent_event, AgentEvent::Error(_) | AgentEvent::Stopped);
+                if lane == crate::copilot::AgentLane::Main && state.side_active {
+                    handle_parked_main_event(state, storage, agent_event.clone())?;
+                }
+                if globally_visible {
+                    handle_agent_event(state, storage, agent_event)?;
+                }
                 return Ok(());
             }
             if let Some(activity) = activity {
@@ -1993,6 +2001,49 @@ pub(crate) fn handle_agent_envelope(
         }
     }
     Ok(())
+}
+
+/// Apply a MAIN event while SIDE owns the visible transcript. The parked MAIN
+/// conversation must continue to stream and settle in the background, but its
+/// cursor, scroll, and progress updates must not make the SIDE surface jump.
+fn handle_parked_main_event(
+    state: &mut AppState,
+    storage: &Storage,
+    event: AgentEvent,
+) -> Result<()> {
+    let Some(mut main_chat) = state.main_chat.take() else {
+        return Ok(());
+    };
+    let side_chat = std::mem::replace(&mut state.chat, std::mem::take(&mut main_chat));
+    let visible_chat_layout = state.chat_layout.clone();
+    let visible_chat_navigation = state.chat_navigation.clone();
+    let visible_chat_selection = state.chat_selection.clone();
+    let visible_chat_display_rows = state.chat_display_rows.clone();
+    let visible_chat_cursor = state.chat_cursor;
+    let visible_chat_scroll = state.chat_scroll;
+    let visible_chat_total_rows = state.chat_total_rows;
+    let visible_chat_viewport_rows = state.chat_viewport_rows;
+    let visible_chat_autofollow = state.chat_autofollow;
+    let visible_status = state.status.clone();
+    let visible_agent_activity = state.agent_activity.clone();
+    let visible_agent_progress = state.agent_progress.clone();
+
+    let result = handle_agent_event(state, storage, event);
+    main_chat = std::mem::replace(&mut state.chat, side_chat);
+    state.main_chat = Some(main_chat);
+    state.chat_layout = visible_chat_layout;
+    state.chat_navigation = visible_chat_navigation;
+    state.chat_selection = visible_chat_selection;
+    state.chat_display_rows = visible_chat_display_rows;
+    state.chat_cursor = visible_chat_cursor;
+    state.chat_scroll = visible_chat_scroll;
+    state.chat_total_rows = visible_chat_total_rows;
+    state.chat_viewport_rows = visible_chat_viewport_rows;
+    state.chat_autofollow = visible_chat_autofollow;
+    state.status = visible_status;
+    state.agent_activity = visible_agent_activity;
+    state.agent_progress = visible_agent_progress;
+    result
 }
 
 pub(crate) fn handle_agent_event(
@@ -4802,11 +4853,15 @@ mod tests {
     use ratatui::Terminal;
 
     use super::{
-        handle_agent_event, handle_effect, markdown_to_html, parse_review_context, render,
+        handle_agent_envelope, handle_agent_event, handle_effect, markdown_to_html,
+        parse_review_context, render,
     };
     use crate::app::{tests_support::state_for_ui, ChatEntry, Effect, Focus, Screen};
     use crate::config::AppPaths;
-    use crate::copilot::{AgentCommand, AgentEvent, AgentSink, HistoryEntry, OutboundKind};
+    use crate::copilot::{
+        AgentCommand, AgentEvent, AgentEventEnvelope, AgentLane, AgentSink, HistoryEntry,
+        LaneEvent, OutboundKind,
+    };
     use crate::highlight::PlainHighlighter;
     use crate::storage::Storage;
 
@@ -4854,6 +4909,108 @@ mod tests {
         assert!(content.contains("demo — Review"));
         assert!(content.contains("unified"));
         assert!(content.contains("a ask"));
+    }
+
+    #[test]
+    fn hidden_main_stream_updates_parked_transcript_without_moving_side() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+        state.side_active = true;
+        state.side_session_id = Some("side-session".into());
+        state.main_chat = Some(vec![ChatEntry {
+            id: "main-user".into(),
+            role: "you".into(),
+            text: "main prompt".into(),
+            streaming: false,
+            annotation_id: None,
+            outbound_id: Some("main-outbound".into()),
+            error: None,
+        }]);
+        state.chat = vec![ChatEntry {
+            id: "side-user".into(),
+            role: "you".into(),
+            text: "side prompt".into(),
+            streaming: false,
+            annotation_id: None,
+            outbound_id: Some("side-outbound".into()),
+            error: None,
+        }];
+        state.chat_scroll = 7;
+        state.chat_autofollow = false;
+        state.status = "SIDE remains visible".into();
+
+        handle_agent_envelope(
+            &mut state,
+            &storage,
+            AgentEventEnvelope {
+                lane: AgentLane::Main,
+                event: LaneEvent::Agent(AgentEvent::ResponseStarted {
+                    outbound_id: "main-outbound".into(),
+                    outbound: OutboundKind::Chat,
+                    first_delta: "background MAIN response".into(),
+                }),
+                activity: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.chat.len(), 1);
+        assert_eq!(state.chat[0].text, "side prompt");
+        assert_eq!(state.chat_scroll, 7);
+        assert!(!state.chat_autofollow);
+        assert_eq!(state.status, "SIDE remains visible");
+        assert!(state
+            .main_chat
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.text == "background MAIN response"));
+    }
+
+    #[test]
+    fn hidden_lane_disconnect_is_globally_visible_and_settles_both_transcripts() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+        state.agent_connected = true;
+        state.side_active = true;
+        state.side_session_id = Some("side-session".into());
+        state.main_chat = Some(vec![ChatEntry {
+            id: "main-stream".into(),
+            role: "copilot".into(),
+            text: "main partial".into(),
+            streaming: true,
+            annotation_id: None,
+            outbound_id: Some("main-outbound".into()),
+            error: None,
+        }]);
+        state.chat = vec![ChatEntry {
+            id: "side-stream".into(),
+            role: "copilot".into(),
+            text: "side partial".into(),
+            streaming: true,
+            annotation_id: None,
+            outbound_id: Some("side-outbound".into()),
+            error: None,
+        }];
+
+        handle_agent_envelope(
+            &mut state,
+            &storage,
+            AgentEventEnvelope {
+                lane: AgentLane::Main,
+                event: LaneEvent::Agent(AgentEvent::Error("event stream closed".into())),
+                activity: None,
+            },
+        )
+        .unwrap();
+
+        assert!(!state.agent_connected);
+        assert!(state.status.contains("event stream closed"));
+        assert_eq!(state.chat[0].error.as_deref(), Some("connection lost"));
+        assert_eq!(
+            state.main_chat.as_ref().unwrap()[0].error.as_deref(),
+            Some("connection lost")
+        );
     }
 
     #[test]
