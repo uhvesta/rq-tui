@@ -511,13 +511,13 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("side [question]", "start an ephemeral side conversation"),
     ("main", "leave the side conversation and return to main"),
     ("stop", "cancel the active Copilot response"),
+    ("abort", "cancel the active Copilot response"),
+    ("progress", "inspect Copilot liveness and recent SDK events"),
+    ("side-exit", "leave the side conversation and return to main"),
     ("diff split", "show the side-by-side diff"),
     ("diff unified", "show a single-column diff"),
     ("diff expand", "expand all folded context"),
-    (
-        "model [name]",
-        "pick model, reasoning, and context in stages",
-    ),
+    ("model", "pick a runtime-supported model in stages"),
     ("fork", "fork and activate a persistent session"),
     (
         "compact [instructions]",
@@ -540,21 +540,46 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ),
     ("q", "quit when no delivery is pending"),
     ("q!", "force quit"),
+    ("quit", "quit when no delivery is pending"),
+    ("quit!", "force quit"),
 ];
 
 pub(crate) fn command_matches(prefix: &str) -> Vec<(&'static str, &'static str)> {
-    let needle = prefix.split_whitespace().next().unwrap_or_default();
+    let typed = prefix.split_whitespace().collect::<Vec<_>>();
     COMMANDS
         .iter()
         .copied()
-        .filter(|(command, _)| {
-            needle.is_empty()
-                || command
-                    .split_whitespace()
-                    .next()
-                    .is_some_and(|name| name.starts_with(needle))
-        })
+        .filter(|(command, _)| command_matches_tokens(&typed, command))
         .collect()
+}
+
+fn command_matches_tokens(typed: &[&str], candidate: &str) -> bool {
+    if typed.is_empty() {
+        return true;
+    }
+    let candidate_tokens = candidate.split_whitespace().collect::<Vec<_>>();
+    typed.iter().enumerate().all(|(index, token)| {
+        let Some(candidate_token) = candidate_tokens.get(index) else {
+            return false;
+        };
+        is_command_argument(candidate_token) || candidate_token.starts_with(token)
+    })
+}
+
+fn is_command_argument(token: &str) -> bool {
+    token.contains('<') || token.contains('[') || token.contains(']')
+}
+
+fn literal_command_completion(typed: &str, candidate: &str) -> bool {
+    let typed_tokens = typed.split_whitespace().collect::<Vec<_>>();
+    let candidate_tokens = candidate.split_whitespace().collect::<Vec<_>>();
+    !typed_tokens.is_empty()
+        && typed_tokens.len() <= candidate_tokens.len()
+        && candidate_tokens.iter().all(|token| !is_command_argument(token))
+        && typed_tokens
+            .iter()
+            .enumerate()
+            .all(|(index, token)| candidate_tokens[index].starts_with(token))
 }
 
 fn command_seed(command: &str) -> String {
@@ -1341,6 +1366,14 @@ impl AppState {
         // queued work. Recompute from the visible queue model after every
         // lane swap so progress and :queue agree immediately.
         self.agent_progress.queue_depth = self.queue_entry_ids().len();
+    }
+
+    fn enter_chat_surface(&mut self) {
+        self.screen = Screen::Chat;
+        self.focus = Focus::Chat;
+        self.input_mode = InputMode::Normal;
+        self.input_return_mode = InputMode::Normal;
+        self.compose_target = Some(ComposeTarget::Chat);
     }
 
     fn capture_main_chat_viewport(&mut self) {
@@ -2989,6 +3022,10 @@ impl AppState {
                 selected.map(command_seed).unwrap_or_default()
             } else if exact.is_some() {
                 typed.to_owned()
+            } else if selected
+                .is_some_and(|suggestion| literal_command_completion(typed, suggestion))
+            {
+                selected.map(command_seed).unwrap_or_else(|| typed.to_owned())
             } else if !typed.contains(char::is_whitespace) {
                 selected
                     .map(command_seed)
@@ -3346,19 +3383,13 @@ impl AppState {
         );
         if slash_commands_enabled {
             let trimmed = text.trim();
-            let enter_chat = |state: &mut Self| {
-                state.screen = Screen::Chat;
-                state.focus = Focus::Chat;
-                state.input_mode = InputMode::Normal;
-                state.compose_target = Some(ComposeTarget::Chat);
-            };
             if trimmed == "/side" {
-                enter_chat(self);
+                self.enter_chat_surface();
                 self.capture_main_chat_viewport();
                 return vec![Effect::StartSide(None)];
             }
             if let Some(question) = trimmed.strip_prefix("/side ") {
-                enter_chat(self);
+                self.enter_chat_surface();
                 self.capture_main_chat_viewport();
                 return vec![Effect::StartSide(Some(question.trim().to_owned()))];
             }
@@ -3376,7 +3407,7 @@ impl AppState {
                 };
             }
             if matches!(trimmed, "/main" | "/side-exit") {
-                enter_chat(self);
+                self.enter_chat_surface();
                 return vec![Effect::ExitSide];
             }
         }
@@ -3509,18 +3540,21 @@ impl AppState {
                 let mut words = question.into_iter().collect::<Vec<_>>();
                 words.extend(parts);
                 let question = words.join(" ");
+                self.enter_chat_surface();
                 self.capture_main_chat_viewport();
                 vec![Effect::StartSide(
                     (!question.is_empty()).then_some(question),
                 )]
             }
-            (Some("main" | "side-exit"), _) => vec![Effect::ExitSide],
+            (Some("main" | "side-exit"), _) => {
+                self.enter_chat_surface();
+                vec![Effect::ExitSide]
+            }
             (Some("model"), _) if self.side_active => {
                 self.status =
                     "Model changes are MAIN-scoped · return with /main before using :model".into();
                 Vec::new()
             }
-            (Some("model"), Some(model)) => vec![Effect::SetModel(model.to_owned())],
             (Some("model"), None) => {
                 self.open_overlay(Screen::ModelPicker);
                 self.model_picker_stage = ModelPickerStage::Model;
@@ -4648,6 +4682,83 @@ mod tests {
         }
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.layout, DiffLayout::Unified);
+    }
+
+    #[test]
+    fn command_completion_matches_subcommands_and_executes_the_selected_literal() {
+        let matches = super::command_matches("diff u");
+        assert_eq!(matches, vec![("diff unified", "show a single-column diff")]);
+
+        let mut app = state();
+        app.input_mode = InputMode::Command;
+        for character in "diff u".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Vec::new());
+        assert_eq!(app.layout, DiffLayout::Unified);
+        assert!(!app.status.contains("Unknown command"));
+    }
+
+    #[test]
+    fn colon_side_and_main_enter_the_chat_surface_before_the_effect_runs() {
+        let mut side = state();
+        side.input_mode = InputMode::Command;
+        for character in "side inspect this".chars() {
+            side.handle_key(key(KeyCode::Char(character)));
+        }
+        assert_eq!(
+            side.handle_key(key(KeyCode::Enter)),
+            vec![Effect::StartSide(Some("inspect this".into()))]
+        );
+        assert_eq!(side.screen, Screen::Chat);
+        assert_eq!(side.focus, Focus::Chat);
+        assert_eq!(side.input_mode, InputMode::Normal);
+        assert_eq!(side.compose_target, Some(ComposeTarget::Chat));
+
+        let mut main = state();
+        main.side_active = true;
+        main.input_mode = InputMode::Command;
+        for character in "main".chars() {
+            main.handle_key(key(KeyCode::Char(character)));
+        }
+        assert_eq!(main.handle_key(key(KeyCode::Enter)), vec![Effect::ExitSide]);
+        assert_eq!(main.screen, Screen::Chat);
+        assert_eq!(main.focus, Focus::Chat);
+        assert_eq!(main.input_mode, InputMode::Normal);
+        assert_eq!(main.compose_target, Some(ComposeTarget::Chat));
+    }
+
+    #[test]
+    fn model_command_always_uses_the_runtime_picker_and_rejects_arbitrary_names() {
+        assert_eq!(
+            super::command_matches("model"),
+            vec![("model", "pick a runtime-supported model in stages")]
+        );
+        assert!(
+            super::command_matches("model definitely-not-runtime-advertised").is_empty()
+        );
+
+        let mut app = state();
+        app.input_mode = InputMode::Command;
+        for character in "model definitely-not-runtime-advertised".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
+        assert!(app.status.contains("Unknown command"));
+        assert!(app
+            .model_options
+            .iter()
+            .all(|option| option.id != "definitely-not-runtime-advertised"));
+    }
+
+    #[test]
+    fn command_aliases_are_discoverable_when_the_reducer_accepts_them() {
+        for command in ["quit", "abort", "progress", "side-exit"] {
+            assert!(
+                !super::command_matches(command).is_empty(),
+                "missing palette descriptor for :{command}"
+            );
+        }
     }
 
     #[test]
