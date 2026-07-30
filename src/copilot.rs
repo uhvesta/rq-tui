@@ -4138,21 +4138,196 @@ async fn start_next(
     }
 }
 
+/// Event types that are useful to a terminal client even though they do not
+/// carry visible assistant text. Keep this list aligned with the generated
+/// SessionEventType names from github-copilot-sdk 1.0.8. The payload remains
+/// untyped at this boundary because the CLI can add fields without requiring a
+/// bridge release.
+fn is_observability_event(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "session.start"
+            | "session.resume"
+            | "session.info"
+            | "session.warning"
+            | "session.remote_steerable_changed"
+            | "session.model_change"
+            | "session.session_limits_changed"
+            | "session.context_changed"
+            | "session.usage_info"
+            | "session.shutdown"
+            | "session.compaction_start"
+            | "session.compaction_complete"
+            | "assistant.turn_start"
+            | "assistant.streaming_delta"
+            | "assistant.turn_end"
+            | "tool.user_requested"
+            | "permission.requested"
+            | "permission.completed"
+            | "user_input.requested"
+            | "user_input.completed"
+            | "elicitation.requested"
+            | "elicitation.completed"
+    )
+}
+
+/// Return true for event types which already have a normalizer arm. An event
+/// with a new SDK name must not disappear through the wildcard arm below.
+fn is_normalized_event(event_type: &str) -> bool {
+    is_observability_event(event_type)
+        || matches!(
+            event_type,
+            "user.message"
+                | "assistant.intent"
+                | "assistant.reasoning_delta"
+                | "assistant.turn_retry"
+                | "assistant.message_start"
+                | "assistant.message_delta"
+                | "assistant.message"
+                | "assistant.usage"
+                | "tool.execution_start"
+                | "tool.execution_partial_result"
+                | "tool.execution_progress"
+                | "tool.execution_complete"
+                | "skill.invoked"
+                | "subagent.started"
+                | "subagent.completed"
+                | "subagent.failed"
+                | "subagent.selected"
+                | "subagent.deselected"
+                | "session.task_complete"
+                | "session.idle"
+                | "session.error"
+        )
+}
+
+fn sanitize_event_text(text: &str) -> String {
+    let mut result = String::new();
+    let mut pending_space = false;
+    for character in text.chars() {
+        if character.is_control() || character.is_whitespace() {
+            pending_space = !result.is_empty();
+            continue;
+        }
+        if pending_space {
+            result.push(' ');
+            pending_space = false;
+        }
+        result.push(character);
+        if result.chars().count() >= 160 {
+            break;
+        }
+    }
+    if text.chars().count() > result.chars().count() {
+        result.push('…');
+    }
+    result
+}
+
+fn event_value_summary(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => Some(sanitize_event_text(value)),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn event_detail(data: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let details = keys
+        .iter()
+        .filter_map(|key| {
+            data.get(*key)
+                .and_then(event_value_summary)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("{key}={value}"))
+        })
+        .collect::<Vec<_>>();
+    (!details.is_empty()).then(|| details.join(" · "))
+}
+
+/// Summarize an event without serializing arbitrary payloads into the UI.
+/// In particular, unknown events may contain reasoning, tool arguments, or
+/// user content, so only a small allow-list of scalar metadata is displayed.
+fn unknown_event_detail(data: &serde_json::Value) -> String {
+    const SAFE_KEYS: &[&str] = &[
+        "message",
+        "reason",
+        "status",
+        "state",
+        "name",
+        "toolName",
+        "tool_name",
+        "requestId",
+        "request_id",
+        "sessionId",
+        "session_id",
+        "remoteUrl",
+        "remote_url",
+        "url",
+        "infoType",
+        "info_type",
+        "mode",
+        "success",
+        "aborted",
+        "turnId",
+        "turn_id",
+        "model",
+        "totalResponseSizeBytes",
+        "total_response_size_bytes",
+    ];
+    if let Some(detail) = event_detail(data, SAFE_KEYS) {
+        return detail;
+    }
+    match data {
+        serde_json::Value::Object(values) if values.is_empty() => "payload=empty".into(),
+        serde_json::Value::Object(values) => {
+            let mut fields = values.keys().cloned().collect::<Vec<_>>();
+            fields.sort();
+            format!("payload=object fields={}", fields.join(","))
+        }
+        serde_json::Value::Array(_) => "payload=array".into(),
+        serde_json::Value::Null => "payload=null".into(),
+        serde_json::Value::String(_) => "payload=string".into(),
+        serde_json::Value::Bool(_) => "payload=boolean".into(),
+        serde_json::Value::Number(_) => "payload=number".into(),
+    }
+}
+
+fn emit_unknown_event(
+    event: &SessionEvent,
+    active: &Option<ActiveOutbound>,
+    events: &impl EventOutput,
+) {
+    events.activity(
+        active.as_ref().map(|turn| turn.outbound.id.clone()),
+        AgentActivity::other(format!(
+            "SDK event {} · {}",
+            event.event_type,
+            unknown_event_detail(&event.data)
+        )),
+    );
+}
+
 fn handle_session_event(
     event: SessionEvent,
     active: &mut Option<ActiveOutbound>,
     events: &impl EventOutput,
 ) {
     let root_agent_event = event.agent_id.is_none();
+    let observability_event = is_observability_event(&event.event_type);
+    let unknown_event = !is_normalized_event(&event.event_type);
     let session_boundary_event = matches!(
         event.event_type.as_str(),
-        "session.idle" | "session.error" | "session.task_complete"
+        "session.idle" | "session.error" | "session.task_complete" | "session.shutdown"
     );
     let turn_or_session_event = event.event_type.starts_with("assistant.")
         || event.event_type.starts_with("tool.")
         || event.event_type.starts_with("skill.")
         || event.event_type.starts_with("subagent.")
-        || session_boundary_event;
+        || session_boundary_event
+        || observability_event
+        || unknown_event;
     if let Some(active) = active.as_mut() {
         if event.event_type == "user.message" {
             let matches_sdk_id = active.sdk_message_ids.contains(&event.id)
@@ -4176,8 +4351,9 @@ fn handle_session_event(
                 .parent_id
                 .as_ref()
                 .is_some_and(|parent| active.accepted_event_ids.contains(parent));
-        let unparented_session_boundary = session_boundary_event && event.parent_id.is_none();
-        if turn_or_session_event && !chained && !unparented_session_boundary {
+        let unparented_observability_event =
+            (session_boundary_event || observability_event) && event.parent_id.is_none();
+        if turn_or_session_event && !chained && !unparented_observability_event && !unknown_event {
             if env::var_os("RQ_TUI_DEBUG_EVENTS").is_some() {
                 eprintln!(
                     "rq-tui rejected SDK event type={} id={} parent={:?} roots={:?}",
@@ -4208,10 +4384,10 @@ fn handle_session_event(
                 .map(str::to_owned);
         }
         send_activity(
-            active,
-            AgentActivity {
-                kind: ActivityKind::Intent,
-                label: "Thinking…".into(),
+                active,
+                AgentActivity {
+                    kind: ActivityKind::Intent,
+                    label: "Assistant turn started".into(),
                 tool: None,
                 detail: event
                     .data
@@ -4227,13 +4403,60 @@ fn handle_session_event(
         || event.event_type.starts_with("tool.")
         || event.event_type.starts_with("skill.")
         || event.event_type.starts_with("subagent.");
-    if turn_scoped && active.as_ref().is_none_or(|active| !active.turn_started) {
+    if turn_scoped
+        && !observability_event
+        && !unknown_event
+        && active.as_ref().is_none_or(|active| !active.turn_started)
+    {
         // A previous turn can leave buffered deltas behind after its idle
         // boundary. Never attach those bytes to a newly dispatched outbound
         // until that outbound's own turn-start event has arrived.
         return;
     }
     match event.event_type.as_str() {
+        "assistant.turn_start" => {
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::Intent,
+                    label: if root_agent_event {
+                        "Assistant turn started".into()
+                    } else {
+                        "Subagent turn started".into()
+                    },
+                    tool: Some("assistant_turn".into()),
+                    detail: event_detail(&event.data, &["turnId", "model"]),
+                },
+                events,
+            );
+        }
+        "assistant.turn_end" => {
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::ToolComplete,
+                    label: "Assistant turn ended".into(),
+                    tool: Some("assistant_turn".into()),
+                    detail: event_detail(&event.data, &["turnId", "model"]),
+                },
+                events,
+            );
+        }
+        "assistant.streaming_delta" => {
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::ToolProgress,
+                    label: "Receiving streamed response…".into(),
+                    tool: Some("assistant_stream".into()),
+                    detail: event_detail(
+                        &event.data,
+                        &["totalResponseSizeBytes", "total_response_size_bytes"],
+                    ),
+                },
+                events,
+            );
+        }
         "assistant.intent" if root_agent_event => {
             let intent = event
                 .data
@@ -4368,6 +4591,26 @@ fn handle_session_event(
                     }
                 }
             }
+        }
+        "tool.user_requested" => {
+            let tool = event
+                .data
+                .get("toolName")
+                .or_else(|| event.data.get("tool_name"))
+                .and_then(|value| value.as_str())
+                .map(sanitize_event_text)
+                .filter(|tool| !tool.is_empty())
+                .unwrap_or_else(|| "tool".into());
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::ToolStart,
+                    label: format!("User requested {tool}…"),
+                    tool: Some(tool),
+                    detail: event_detail(&event.data, &["toolCallId", "tool_call_id"]),
+                },
+                events,
+            );
         }
         "tool.execution_start" => {
             let tool = event
@@ -4609,6 +4852,227 @@ fn handle_session_event(
             },
             events,
         ),
+        "session.compaction_start" => {
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::ToolProgress,
+                    label: "Compacting conversation context…".into(),
+                    tool: Some("context_compaction".into()),
+                    detail: event_detail(
+                        &event.data,
+                        &[
+                            "model",
+                            "conversationTokens",
+                            "systemTokens",
+                            "toolDefinitionsTokens",
+                        ],
+                    ),
+                },
+                events,
+            );
+        }
+        "session.compaction_complete" => {
+            let succeeded = event.data.get("success").and_then(|value| value.as_bool());
+            if succeeded == Some(false) {
+                send_activity(
+                    active,
+                    AgentActivity {
+                        kind: ActivityKind::Failure,
+                        label: "Context compaction failed".into(),
+                        tool: Some("context_compaction".into()),
+                        detail: event_detail(&event.data, &["error", "statusCode"]),
+                    },
+                    events,
+                );
+            } else {
+                send_activity(
+                    active,
+                    AgentActivity {
+                        kind: ActivityKind::ToolComplete,
+                        label: "Conversation context compacted".into(),
+                        tool: Some("context_compaction".into()),
+                        detail: event_detail(
+                            &event.data,
+                            &["tokensRemoved", "postCompactionTokens", "success"],
+                        ),
+                    },
+                    events,
+                );
+                if succeeded == Some(true) {
+                    events.emit(AgentEvent::Compacted);
+                }
+            }
+        }
+        "permission.requested" => {
+            let permission_kind = event
+                .data
+                .get("permissionRequest")
+                .or_else(|| event.data.get("permission_request"))
+                .and_then(|value| value.get("kind"))
+                .and_then(event_value_summary);
+            let request_id = event_detail(&event.data, &["requestId", "request_id"]);
+            let detail = permission_kind
+                .map(|kind| format!("kind={kind}"))
+                .into_iter()
+                .chain(request_id)
+                .collect::<Vec<_>>();
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::Other,
+                    label: "Permission requested · waiting for policy decision".into(),
+                    tool: Some("permission".into()),
+                    detail: (!detail.is_empty()).then(|| detail.join(" · ")),
+                },
+                events,
+            );
+        }
+        "permission.completed" => {
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::ToolComplete,
+                    label: "Permission request resolved".into(),
+                    tool: Some("permission".into()),
+                    detail: event_detail(&event.data, &["requestId", "request_id"]),
+                },
+                events,
+            );
+        }
+        "user_input.requested" => {
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::Other,
+                    label: "Copilot is waiting for your input".into(),
+                    tool: Some("user_input".into()),
+                    detail: event_detail(&event.data, &["question", "requestId", "request_id"]),
+                },
+                events,
+            );
+        }
+        "user_input.completed" => {
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::ToolComplete,
+                    label: "User input received".into(),
+                    tool: Some("user_input".into()),
+                    detail: event_detail(&event.data, &["requestId", "request_id"]),
+                },
+                events,
+            );
+        }
+        "elicitation.requested" => {
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::Other,
+                    label: "Copilot is waiting for confirmation".into(),
+                    tool: Some("elicitation".into()),
+                    detail: event_detail(
+                        &event.data,
+                        &["message", "mode", "requestId", "request_id"],
+                    ),
+                },
+                events,
+            );
+        }
+        "elicitation.completed" => {
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::ToolComplete,
+                    label: "User confirmation received".into(),
+                    tool: Some("elicitation".into()),
+                    detail: event_detail(&event.data, &["action", "requestId", "request_id"]),
+                },
+                events,
+            );
+        }
+        "session.info" => {
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::Other,
+                    label: "Copilot session info".into(),
+                    tool: Some("session_info".into()),
+                    detail: event_detail(&event.data, &["message", "infoType", "url"]),
+                },
+                events,
+            );
+        }
+        "session.warning" => {
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::Failure,
+                    label: "Copilot session warning".into(),
+                    tool: Some("session_warning".into()),
+                    detail: event_detail(&event.data, &["message", "warningType", "url"]),
+                },
+                events,
+            );
+        }
+        "session.remote_steerable_changed" => {
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::Other,
+                    label: "Remote session steering state changed".into(),
+                    tool: Some("remote_session".into()),
+                    detail: event_detail(
+                        &event.data,
+                        &["remoteSteerable", "steerable", "status", "url"],
+                    ),
+                },
+                events,
+            );
+        }
+        "session.start" | "session.resume" => {
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::Other,
+                    label: if event.event_type == "session.resume" {
+                        "Copilot session resumed".into()
+                    } else {
+                        "Copilot session started".into()
+                    },
+                    tool: Some("session".into()),
+                    detail: event_detail(&event.data, &["sessionId", "session_id", "url"]),
+                },
+                events,
+            );
+        }
+        "session.model_change"
+        | "session.session_limits_changed"
+        | "session.context_changed"
+        | "session.usage_info" => {
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::Other,
+                    label: format!("Copilot {}", event.event_type.replace("session.", "")),
+                    tool: Some("session_metadata".into()),
+                    detail: Some(unknown_event_detail(&event.data)),
+                },
+                events,
+            );
+        }
+        "session.shutdown" => {
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::Other,
+                    label: "Copilot session shutting down".into(),
+                    tool: Some("session".into()),
+                    detail: event_detail(&event.data, &["reason", "message"]),
+                },
+                events,
+            );
+        }
         "assistant.usage" if root_agent_event => {
             events.emit(AgentEvent::Usage {
                 model: event
@@ -4705,6 +5169,7 @@ fn handle_session_event(
                 );
             }
         }
+        _ if unknown_event => emit_unknown_event(&event, active, events),
         _ => {}
     }
 }
@@ -5973,6 +6438,226 @@ mod tests {
 
     fn drain(receiver: &mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
         receiver.try_iter().collect()
+    }
+
+    #[test]
+    fn documented_streaming_event_fixtures_are_visible() {
+        let fixtures = [
+            (
+                "assistant.turn_start",
+                serde_json::json!({"turnId": "test-turn"}),
+                "Assistant turn started",
+            ),
+            (
+                "assistant.turn_end",
+                serde_json::json!({"turnId": "test-turn", "model": "fixture-model"}),
+                "Assistant turn ended",
+            ),
+            (
+                "assistant.streaming_delta",
+                serde_json::json!({"totalResponseSizeBytes": 128}),
+                "Receiving streamed response",
+            ),
+            (
+                "session.compaction_start",
+                serde_json::json!({"model": "fixture-model", "conversationTokens": 9000}),
+                "Compacting conversation context",
+            ),
+            (
+                "session.compaction_complete",
+                serde_json::json!({"success": true, "tokensRemoved": 700}),
+                "Conversation context compacted",
+            ),
+            (
+                "permission.requested",
+                serde_json::json!({
+                    "requestId": "permission-1",
+                    "permissionRequest": {"kind": "shell"}
+                }),
+                "Permission requested",
+            ),
+            (
+                "permission.completed",
+                serde_json::json!({"requestId": "permission-1"}),
+                "Permission request resolved",
+            ),
+            (
+                "user_input.requested",
+                serde_json::json!({
+                    "requestId": "input-1",
+                    "question": "Which environment should I use?"
+                }),
+                "waiting for your input",
+            ),
+            (
+                "user_input.completed",
+                serde_json::json!({"requestId": "input-1"}),
+                "User input received",
+            ),
+            (
+                "elicitation.requested",
+                serde_json::json!({
+                    "requestId": "elicit-1",
+                    "message": "Confirm the remote session",
+                    "mode": "form"
+                }),
+                "waiting for confirmation",
+            ),
+            (
+                "elicitation.completed",
+                serde_json::json!({"requestId": "elicit-1", "action": "accept"}),
+                "User confirmation received",
+            ),
+            (
+                "tool.user_requested",
+                serde_json::json!({"toolCallId": "tool-1", "toolName": "read_file"}),
+                "User requested read_file",
+            ),
+            (
+                "session.info",
+                serde_json::json!({
+                    "infoType": "remote",
+                    "message": "Remote session is ready"
+                }),
+                "Copilot session info",
+            ),
+            (
+                "session.warning",
+                serde_json::json!({"warningType": "policy", "message": "Read-only mode"}),
+                "Copilot session warning",
+            ),
+            (
+                "session.remote_steerable_changed",
+                serde_json::json!({"remoteSteerable": true}),
+                "Remote session steering state changed",
+            ),
+            (
+                "session.start",
+                serde_json::json!({"sessionId": "session-1"}),
+                "Copilot session started",
+            ),
+            (
+                "session.resume",
+                serde_json::json!({"sessionId": "session-1"}),
+                "Copilot session resumed",
+            ),
+            (
+                "session.model_change",
+                serde_json::json!({"newModel": "fixture-model"}),
+                "Copilot model_change",
+            ),
+            (
+                "session.session_limits_changed",
+                serde_json::json!({"status": "available"}),
+                "Copilot session_limits_changed",
+            ),
+            (
+                "session.context_changed",
+                serde_json::json!({"status": "updated"}),
+                "Copilot context_changed",
+            ),
+            (
+                "session.usage_info",
+                serde_json::json!({"currentTokens": 400, "tokenLimit": 8000}),
+                "Copilot usage_info",
+            ),
+            (
+                "session.shutdown",
+                serde_json::json!({"reason": "fixture complete"}),
+                "Copilot session shutting down",
+            ),
+        ];
+
+        for (event_type, data, expected_label) in fixtures {
+            let (sender, receiver) = mpsc::channel();
+            let mut active = active();
+            handle_session_event(session_event(event_type, data), &mut active, &sender);
+            let emitted = drain(&receiver);
+            assert!(
+                emitted.iter().any(
+                    |event| matches!(event, AgentEvent::Activity { label, .. } if label.contains(expected_label))
+                ),
+                "event {event_type} did not produce {expected_label:?}: {emitted:?}"
+            );
+            if event_type == "session.compaction_complete" {
+                assert!(emitted
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::Compacted)));
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_events_preserve_type_and_sanitize_detail() {
+        let (sender, receiver) = mpsc::channel();
+        let mut active = active();
+        handle_session_event(
+            session_event(
+                "vendor.future_signal",
+                serde_json::json!({
+                    "content": "private reasoning must not be shown",
+                    "arguments": {"token": "secret"},
+                    "message": "queued\nnow"
+                }),
+            ),
+            &mut active,
+            &sender,
+        );
+        assert!(matches!(
+            drain(&receiver).as_slice(),
+            [AgentEvent::Activity { label, .. }]
+                if label == "SDK event vendor.future_signal · message=queued now"
+        ));
+    }
+
+    #[test]
+    fn documented_event_fixtures_tolerate_malformed_payloads() {
+        let event_types = [
+            "assistant.turn_start",
+            "assistant.turn_end",
+            "assistant.streaming_delta",
+            "session.compaction_start",
+            "session.compaction_complete",
+            "permission.requested",
+            "permission.completed",
+            "user_input.requested",
+            "user_input.completed",
+            "elicitation.requested",
+            "elicitation.completed",
+            "tool.user_requested",
+            "session.info",
+            "session.warning",
+            "session.remote_steerable_changed",
+            "session.start",
+            "session.resume",
+            "session.model_change",
+            "session.session_limits_changed",
+            "session.context_changed",
+            "session.usage_info",
+            "session.shutdown",
+            "vendor.malformed",
+        ];
+        let malformed_payloads = [
+            serde_json::Value::Null,
+            serde_json::json!("not-an-object"),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ];
+
+        for event_type in event_types {
+            for data in malformed_payloads.clone() {
+                let (sender, receiver) = mpsc::channel();
+                let mut active = active();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_session_event(session_event(event_type, data), &mut active, &sender);
+                }));
+                assert!(
+                    result.is_ok(),
+                    "normalizing malformed event {event_type} panicked"
+                );
+                let _ = drain(&receiver);
+            }
+        }
     }
 
     #[test]
