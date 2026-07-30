@@ -3,6 +3,7 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::cmp;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,7 +23,7 @@ use crate::domain::{
     AnchorSide, Annotation, AnnotationKind, AskMessage, DeliveryState, PendingChat, Placement,
     ReviewContext, Version,
 };
-use crate::highlight::{Highlighter, PlainHighlighter};
+use crate::highlight::{Highlighter, SyntectHighlighter};
 use crate::review_stream::{
     InlineAnnotation, ReviewDisplayLayout, ReviewFile, ReviewRow, ReviewStream, SourceSide,
     StreamMovement,
@@ -63,6 +64,14 @@ impl BackgroundChatRender {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .try_recv()
+    }
+}
+
+struct BackgroundRenderSlot(Arc<AtomicUsize>);
+
+impl Drop for BackgroundRenderSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -747,6 +756,7 @@ pub(crate) struct AppState {
     review_layout_builds: Cell<usize>,
     chat_render_revision: u64,
     chat_render_cache: RefCell<ChatRenderCache>,
+    chat_background_renderers: Arc<AtomicUsize>,
     #[cfg(test)]
     chat_markdown_builds: Cell<usize>,
     #[cfg(test)]
@@ -871,6 +881,7 @@ impl AppState {
             review_layout_builds: Cell::new(0),
             chat_render_revision: 1,
             chat_render_cache: RefCell::default(),
+            chat_background_renderers: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             chat_markdown_builds: Cell::new(0),
             #[cfg(test)]
@@ -1210,6 +1221,7 @@ impl AppState {
         highlighter: &mut dyn Highlighter,
     ) -> ChatRenderProgress {
         let width = width.max(1);
+        let background_slots = Arc::clone(&self.chat_background_renderers);
         let mut semantic_changed = false;
         let mut cache = self.chat_render_cache.borrow_mut();
         let active_message_changed = self
@@ -1319,15 +1331,21 @@ impl AppState {
             }
             if entry.text.len() >= CHAT_BACKGROUND_RENDER_THRESHOLD
                 && background_renderers < CHAT_BACKGROUND_RENDERERS
+                && background_slots
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                        (active < CHAT_BACKGROUND_RENDERERS).then_some(active + 1)
+                    })
+                    .is_ok()
             {
                 let text = entry.text.clone();
                 let (sender, receiver) = mpsc::sync_channel(1);
+                let background_slots = Arc::clone(&background_slots);
                 std::thread::spawn(move || {
+                    let _slot = BackgroundRenderSlot(background_slots);
                     // Pathological transcripts must never monopolize the input
                     // thread. Preserve Markdown/source mappings in the
-                    // background; syntax highlighting resumes for ordinary
-                    // messages, while huge fenced outputs use plain styling.
-                    let mut highlighter = PlainHighlighter;
+                    // background with an independent syntax cache.
+                    let mut highlighter = SyntectHighlighter::default();
                     let mapped = render_markdown_mapped(&text, width, &mut highlighter);
                     sender.send(mapped).ok();
                 });
