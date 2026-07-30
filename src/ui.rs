@@ -1533,7 +1533,7 @@ pub(crate) fn handle_effect_failure(state: &mut AppState, effect: &Effect, error
         }
         Effect::AbortAgent => {
             state.agent_progress.record(
-                AgentPhase::Failed,
+                AgentPhase::Responding,
                 "Could not request cancellation",
                 format!(
                     "{error:#} · the response may still be active; inspect :agent-status and retry"
@@ -2550,6 +2550,7 @@ pub(crate) fn handle_agent_envelope(
                     ActivityKind::ToolStart
                     | ActivityKind::ToolProgress
                     | ActivityKind::ToolComplete => AgentPhase::Tool,
+                    ActivityKind::Failure => AgentPhase::Failed,
                     ActivityKind::Other => state.agent_progress.phase,
                 };
                 let detail = match (&activity.tool, &activity.detail) {
@@ -2879,18 +2880,29 @@ pub(crate) fn handle_agent_event(
             storage.delete_queued_chat(&steering_id)?;
             state.pending_outbound_ids.remove(&steering_id);
             state.side_outbound_ids.remove(&steering_id);
-            state.agent_progress.record(
-                AgentPhase::Planning,
-                "Steering accepted by Copilot",
-                format!(
-                    "Correction {} is attached to active turn {}",
-                    short_id(&steering_id),
-                    short_id(&active_outbound_id)
-                ),
-                Some(active_outbound_id),
+            let detail = format!(
+                "Correction {} is attached to turn {}",
+                short_id(&steering_id),
+                short_id(&active_outbound_id)
             );
-            state.status =
-                "Steering accepted immediately · the active response is continuing".into();
+            if state.agent_progress.active_outbound_id.as_deref()
+                == Some(active_outbound_id.as_str())
+            {
+                state.agent_progress.record(
+                    AgentPhase::Planning,
+                    "Steering accepted by Copilot",
+                    detail,
+                    Some(active_outbound_id),
+                );
+                state.status =
+                    "Steering accepted immediately · the active response is continuing".into();
+            } else {
+                state
+                    .agent_progress
+                    .record_observation("Late steering acknowledgement", detail);
+                state.status =
+                    "Steering was accepted for an earlier turn · current work is unchanged".into();
+            }
         }
         AgentEvent::SteeringFailed {
             steering_id,
@@ -2909,14 +2921,28 @@ pub(crate) fn handle_agent_event(
             {
                 chat.error = Some(format!("steering failed: {message}"));
             }
-            state.agent_progress.record(
-                AgentPhase::Responding,
-                "Steering was not accepted",
-                format!("{message} · the original response is still active"),
-                Some(active_outbound_id),
-            );
-            state.status =
-                format!("Steering failed: {message} · the original response is still running");
+            if state.agent_progress.active_outbound_id.as_deref()
+                == Some(active_outbound_id.as_str())
+            {
+                state.agent_progress.record(
+                    AgentPhase::Responding,
+                    "Steering was not accepted",
+                    format!("{message} · the original response is still active"),
+                    Some(active_outbound_id),
+                );
+                state.status =
+                    format!("Steering failed: {message} · the original response is still running");
+            } else {
+                state.agent_progress.record_observation(
+                    "Late steering failure",
+                    format!(
+                        "Turn {}: {message} · current work is unchanged",
+                        short_id(&active_outbound_id)
+                    ),
+                );
+                state.status =
+                    "Steering failed for an earlier turn · current work is unchanged".into();
+            }
         }
         AgentEvent::ResponseStarted {
             outbound_id,
@@ -3150,6 +3176,27 @@ pub(crate) fn handle_agent_event(
                 );
             }
         }
+        AgentEvent::StopSettledAlreadyIdle => {
+            if let Some(outbound_id) = state.agent_progress.active_outbound_id.clone() {
+                handle_agent_event(
+                    state,
+                    storage,
+                    AgentEvent::ResponseComplete {
+                        outbound_id,
+                        aborted: false,
+                    },
+                )?;
+            }
+            state.agent_activity.clear();
+            state.agent_progress.record(
+                AgentPhase::Idle,
+                "Copilot was already idle",
+                "The stop request raced with SDK completion; no response remains to cancel",
+                None,
+            );
+            state.status =
+                "Copilot was already idle when the stop request arrived · nothing is stuck".into();
+        }
         AgentEvent::TurnFailed {
             outbound_id,
             outbound,
@@ -3294,6 +3341,21 @@ pub(crate) fn handle_agent_event(
                     .context_tier
                     .as_deref()
                     .unwrap_or("runtime default"),
+            );
+        }
+        AgentEvent::ModelSelectionFailed { selection, message } => {
+            state.agent_progress.record(
+                AgentPhase::Failed,
+                "Model selection failed",
+                format!(
+                    "{} was rejected: {message} · active model remains {}",
+                    selection.model_id, state.model
+                ),
+                state.agent_progress.active_outbound_id.clone(),
+            );
+            state.status = format!(
+                "Could not switch to {}: {message} · still using {} · retry with :model",
+                selection.model_id, state.model
             );
         }
         AgentEvent::ModelChanged(model) => {
@@ -5858,14 +5920,25 @@ fn render_chat_composer(frame: &mut ratatui::Frame, state: &mut AppState, area: 
                 Color::Yellow,
             )
         }
-        InputMode::Compose if state.status.starts_with("Pasted ") => (
-            if area.width < 60 {
-                " PASTED MULTILINE · Enter send · Esc keep ".to_owned()
-            } else {
-                format!(" {} · Enter send · Esc keep ", state.status)
-            },
-            Color::Green,
-        ),
+        InputMode::Compose if state.status.starts_with("Pasted ") => {
+            let range = format!(
+                "{}-{}/{}",
+                state.compose_scroll + 1,
+                (state.compose_scroll + visible_rows).min(lines.len()),
+                lines.len()
+            );
+            (
+                if area.width < 60 {
+                    format!(" PASTE {range} · ↑/↓ · Enter · Esc ")
+                } else {
+                    format!(
+                        " {} · rows {range} · ↑/↓ scroll · Enter send · Esc keep ",
+                        state.status
+                    )
+                },
+                Color::Green,
+            )
+        }
         InputMode::Compose if lines.len() > visible_rows => {
             let range = format!(
                 "{}-{}/{}",
@@ -6098,10 +6171,17 @@ fn render_agent_progress(frame: &mut ratatui::Frame, state: &AppState, area: Rec
         Color::DarkGray
     };
     let compact = area.width < 60;
-    let headline = if compact {
+    let headline = if compact && area.height <= 3 {
         format!(
-            " COPILOT {lane} {state_marker} q{} · {}",
-            progress.queue_depth, progress.summary,
+            " COPILOT {lane} {} · {}",
+            progress.phase.label(),
+            progress.summary
+        )
+    } else if compact {
+        format!(
+            " COPILOT {lane} {state_marker} {} · q{}",
+            progress.phase.label(),
+            progress.queue_depth,
         )
     } else if area.width < 90 {
         format!(
@@ -6198,6 +6278,23 @@ fn render_agent_status(frame: &mut ratatui::Frame, state: &AppState) {
     let progress = &state.agent_progress;
     let lane = visible_lane(state);
     let compact = area.width < 60 || area.height < 16;
+    let fixed_rows = if compact { 5 } else { 8 };
+    let visible_timeline_rows = (body.height as usize).saturating_sub(fixed_rows);
+    let timeline_total = progress.timeline.len();
+    let timeline_start = if timeline_total == 0 {
+        0
+    } else {
+        state.scroll.min(timeline_total.saturating_sub(1)) + 1
+    };
+    let timeline_end = if timeline_total == 0 {
+        0
+    } else {
+        state
+            .scroll
+            .saturating_add(visible_timeline_rows.max(1))
+            .min(timeline_total)
+    };
+    let timeline_position = format!("{timeline_start}-{timeline_end}/{timeline_total}");
     let fit = |text: String| {
         Line::raw(fit_terminal_text(
             &text,
@@ -6226,7 +6323,10 @@ fn render_agent_status(frame: &mut ratatui::Frame, state: &AppState) {
                 progress.event_count,
                 state.agent_connected
             )),
-            fit(format!("working: {}", progress.summary)),
+            fit(format!(
+                "working: {} — {}",
+                progress.summary, progress.detail
+            )),
             fit(format!(
                 "outbound: {}",
                 progress
@@ -6236,7 +6336,10 @@ fn render_agent_status(frame: &mut ratatui::Frame, state: &AppState) {
                     .unwrap_or("none")
             )),
             Line::styled(
-                "Recent SDK activity",
+                fit_terminal_text(
+                    &format!("Recent SDK activity · {timeline_position}"),
+                    inner.width.saturating_sub(1) as usize,
+                ),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ]
@@ -6268,7 +6371,7 @@ fn render_agent_status(frame: &mut ratatui::Frame, state: &AppState) {
             )),
             Line::from(""),
             Line::styled(
-                "Recent SDK activity (newest last)",
+                format!("Recent SDK activity · {timeline_position} (newest last)"),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ]
@@ -6292,9 +6395,9 @@ fn render_agent_status(frame: &mut ratatui::Frame, state: &AppState) {
         frame.render_widget(paragraph.wrap(Wrap { trim: false }), body);
     }
     let controls = if area.width < 60 {
-        "j/k scroll · s stop · q/Esc back"
+        "j/k scroll · s/C-c stop · q/Esc back"
     } else {
-        "q/Esc return · j/k scroll · s stop current response"
+        "q/Esc return · j/k or wheel · PgUp/PgDn · g/G · s/Ctrl-C stop"
     };
     frame.render_widget(
         Paragraph::new(controls).style(Style::default().fg(Color::DarkGray)),
@@ -6381,11 +6484,11 @@ fn render_queue(frame: &mut ratatui::Frame, state: &AppState) {
     );
     let area = frame.area();
     let controls = if area.width < 50 {
-        "j/k · e edit · d cancel · s stop · q"
+        "j/k e edit · d cancel · s stop/C-c · q"
     } else if area.width < 80 {
-        "j/k select · e edit · d cancel · s stop · q/Esc back"
+        "j/k/Pg/g/G · wheel · e edit · d cancel · s/C-c stop · q/Esc"
     } else {
-        "j/k select · e edit selected queued prompt · d cancel selected queued prompt · s stop active · q/Esc return"
+        "j/k/Pg/g/G or wheel · e edit · d cancel · s/Ctrl-C stop · q/Esc"
     };
     frame.render_widget(
         Paragraph::new(controls).style(Style::default().fg(Color::DarkGray)),
@@ -6562,9 +6665,9 @@ mod tests {
         AgentCommand, AgentEvent, AgentEventEnvelope, AgentLane, AgentSink, HistoryEntry,
         LaneEvent, ModelSelection, OutboundKind, PruneSessionOutcome,
     };
-    use crate::domain::WorkItem;
+    use crate::domain::{PendingChat, WorkItem};
     use crate::highlight::PlainHighlighter;
-    use crate::storage::Storage;
+    use crate::storage::{now, Storage};
 
     #[derive(Default)]
     struct FakeAgent {
@@ -6710,6 +6813,36 @@ mod tests {
     }
 
     #[test]
+    fn rejected_model_selection_retains_the_active_configuration_and_is_retryable() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+        state.model = "current-model".into();
+        state.reasoning_effort = Some("medium".into());
+        state.context_tier = Some("default".into());
+
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::ModelSelectionFailed {
+                selection: ModelSelection {
+                    model_id: "rejected-model".into(),
+                    reasoning_effort: Some("high".into()),
+                    context_tier: Some("long_context".into()),
+                },
+                message: "runtime refused this model".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.model, "current-model");
+        assert_eq!(state.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(state.context_tier.as_deref(), Some("default"));
+        assert_eq!(state.agent_progress.phase, AgentPhase::Failed);
+        assert!(state.status.contains("still using current-model"));
+        assert!(state.status.contains("retry with :model"));
+    }
+
+    #[test]
     fn rejected_immediate_steering_settles_its_durable_record() {
         let storage = Storage::in_memory().unwrap();
         let agent = FakeAgent::default();
@@ -6785,13 +6918,96 @@ mod tests {
         .unwrap_err();
         handle_effect_failure(&mut state, &effect, &error);
 
-        assert_eq!(state.agent_progress.phase, AgentPhase::Failed);
+        assert_eq!(state.agent_progress.phase, AgentPhase::Responding);
         assert_eq!(
             state.agent_progress.active_outbound_id.as_deref(),
             Some("active-turn")
         );
         assert!(state.status.contains("retry with :stop"));
         assert!(state.agent_progress.detail.contains("may still be active"));
+
+        state.input_mode = InputMode::Command;
+        for character in "stop".chars() {
+            state.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![Effect::AbortAgent]
+        );
+        assert_eq!(state.agent_progress.phase, AgentPhase::Stopping);
+    }
+
+    #[test]
+    fn stop_acknowledgement_after_sdk_idle_cannot_leave_the_ui_stopping() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+        state.agent_progress.phase = AgentPhase::Stopping;
+        state.agent_progress.active_outbound_id = Some("settled-turn".into());
+        state.pending_outbound_ids.insert("settled-turn".into());
+        state.chat.push(ChatEntry {
+            id: "settled-response".into(),
+            role: "assistant".into(),
+            text: "finished before cancellation arrived".into(),
+            outbound_id: Some("settled-turn".into()),
+            streaming: true,
+            annotation_id: None,
+            error: None,
+        });
+
+        handle_agent_event(&mut state, &storage, AgentEvent::StopSettledAlreadyIdle).unwrap();
+
+        assert_eq!(state.agent_progress.phase, AgentPhase::Idle);
+        assert_eq!(state.agent_progress.active_outbound_id, None);
+        assert!(!state.pending_outbound_ids.contains("settled-turn"));
+        assert!(!state.chat.last().unwrap().streaming);
+        assert!(state.status.contains("nothing is stuck"));
+    }
+
+    #[test]
+    fn late_steering_results_settle_without_rewinding_the_current_turn() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+        storage.upsert_work_item(&state.work_item.item).unwrap();
+        state.agent_progress.phase = AgentPhase::Responding;
+        state.agent_progress.active_outbound_id = Some("new-turn".into());
+
+        for (steering_id, accepted) in [("late-accepted", true), ("late-failed", false)] {
+            state.pending_outbound_ids.insert(steering_id.into());
+            storage
+                .enqueue_chat(&PendingChat {
+                    id: steering_id.into(),
+                    work_item_id: state.work_item.item.id.clone(),
+                    text: "late correction".into(),
+                    kind: "correction".into(),
+                    lane: "main".into(),
+                    created_at: now(),
+                })
+                .unwrap();
+            let event = if accepted {
+                AgentEvent::SteeringAccepted {
+                    steering_id: steering_id.into(),
+                    active_outbound_id: "old-turn".into(),
+                }
+            } else {
+                AgentEvent::SteeringFailed {
+                    steering_id: steering_id.into(),
+                    active_outbound_id: "old-turn".into(),
+                    message: "late rejection".into(),
+                }
+            };
+            handle_agent_event(&mut state, &storage, event).unwrap();
+
+            assert_eq!(state.agent_progress.phase, AgentPhase::Responding);
+            assert_eq!(
+                state.agent_progress.active_outbound_id.as_deref(),
+                Some("new-turn")
+            );
+            assert!(!state.pending_outbound_ids.contains(steering_id));
+        }
+        assert!(storage
+            .pending_chats(&state.work_item.item.id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

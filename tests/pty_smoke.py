@@ -675,15 +675,16 @@ def main() -> int:
 
             # No events after the large delta should become visibly quiet
             # rather than looking frozen. Ctrl-C then stops only the active
-            # response; the waiting prompt remains independently cancellable.
+            # response; the waiting prompt is then promoted immediately and
+            # remains independently stoppable.
             child.wait_for_screen("quiet for", timeout=8)
             child.send(b"\x03")
             child.wait_for_screen("STOPPING", timeout=4)
             child.wait_for_screen("response cancelled", timeout=4)
             child.send(b":queue\r")
             child.wait_for_screen("1 pending", timeout=4)
-            child.wait_for_screen("QUEUED", timeout=4)
-            child.send(b"d")
+            child.wait_for_screen("ACTIVE", timeout=4)
+            child.send(b"s")
             child.wait_for_screen("No active or queued questions", timeout=4)
             child.send(b"q")
             child.wait_for_screen("Chat", timeout=4)
@@ -703,7 +704,24 @@ def main() -> int:
                 duration=4,
             )
 
-            child.resize(42, 9)
+            # PTY-28: exercise the compiled ephemeral SIDE lifecycle. The
+            # SIDE prompt starts on its isolated lane; /main restores the
+            # persistent transcript immediately while abort/cleanup finishes.
+            child.resize(80, 18)
+            child.wait_for_screen("Type a message", timeout=4)
+            child.send(b"i")
+            child.wait_for_screen("INSERT", timeout=4)
+            child.send(b"/side inspect the cleanup path in isolation\r")
+            child.wait_for_screen("COPILOT SIDE", timeout=4)
+            child.wait_for_screen("you · SIDE", timeout=4)
+            child.wait_for_screen("Using read_file", timeout=6)
+            child.send(b"i")
+            child.wait_for_screen("INSERT", timeout=4)
+            child.send(b"/main\r")
+            child.wait_for_screen("COPILOT MAIN", timeout=4)
+            child.wait_for_screen("SIDE cleanup complete", timeout=6)
+
+            child.resize(40, 9)
             child.wait_for_chat_rows(lambda rows: rows[2] > 100, timeout=8)
             child.send(
                 b"i"

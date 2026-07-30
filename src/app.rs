@@ -440,6 +440,29 @@ impl AgentProgress {
         }
     }
 
+    pub(crate) fn record_observation(
+        &mut self,
+        summary: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        let now = Instant::now();
+        let summary = summary.into();
+        let detail = detail.into();
+        self.last_event_at = now;
+        self.event_count = self.event_count.saturating_add(1);
+        self.timeline.push_back(AgentTimelineEntry {
+            at: now,
+            label: if detail.is_empty() || detail == summary {
+                summary
+            } else {
+                format!("{summary} — {detail}")
+            },
+        });
+        while self.timeline.len() > 24 {
+            self.timeline.pop_front();
+        }
+    }
+
     pub(crate) fn last_event_age(&self) -> Duration {
         self.now().saturating_duration_since(self.last_event_at)
     }
@@ -1662,6 +1685,8 @@ impl AppState {
             return self.handle_settings_key(key);
         }
         if self.screen == Screen::AgentStatus {
+            let total = self.agent_progress.timeline.len();
+            let page = self.viewport_height.saturating_sub(6).max(1);
             return match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => {
                     self.screen = self.previous_screen;
@@ -1678,13 +1703,39 @@ impl AppState {
                     self.scroll = self.scroll.saturating_sub(1);
                     Vec::new()
                 }
-                KeyCode::Char('s') => self.request_agent_stop(
+                KeyCode::PageDown | KeyCode::Char('f') if key.modifiers.is_empty() => {
+                    self.scroll = self
+                        .scroll
+                        .saturating_add(page)
+                        .min(total.saturating_sub(1));
+                    Vec::new()
+                }
+                KeyCode::PageUp | KeyCode::Char('b') if key.modifiers.is_empty() => {
+                    self.scroll = self.scroll.saturating_sub(page);
+                    Vec::new()
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.scroll = 0;
+                    Vec::new()
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.scroll = total.saturating_sub(1);
+                    Vec::new()
+                }
+                KeyCode::Char('s')
+                | KeyCode::Char('c') if key.code == KeyCode::Char('s')
+                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.request_agent_stop(
                     "Cancellation was requested from Agent Status; waiting for the SDK idle event",
-                ),
+                    )
+                }
                 _ => Vec::new(),
             };
         }
         if self.screen == Screen::Queue {
+            let total = self.queue_entry_ids().len();
+            let page = self.viewport_height.max(1);
             return match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => {
                     self.screen = self.previous_screen;
@@ -1701,9 +1752,33 @@ impl AppState {
                     self.scroll = self.scroll.saturating_sub(1);
                     Vec::new()
                 }
-                KeyCode::Char('s') => self.request_agent_stop(
-                    "Cancellation was requested from the queue; waiting for the SDK idle event",
-                ),
+                KeyCode::PageDown | KeyCode::Char('f') if key.modifiers.is_empty() => {
+                    self.scroll = self
+                        .scroll
+                        .saturating_add(page)
+                        .min(total.saturating_sub(1));
+                    Vec::new()
+                }
+                KeyCode::PageUp | KeyCode::Char('b') if key.modifiers.is_empty() => {
+                    self.scroll = self.scroll.saturating_sub(page);
+                    Vec::new()
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.scroll = 0;
+                    Vec::new()
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.scroll = total.saturating_sub(1);
+                    Vec::new()
+                }
+                KeyCode::Char('s') | KeyCode::Char('c')
+                    if key.code == KeyCode::Char('s')
+                        || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.request_agent_stop(
+                        "Cancellation was requested from the queue; waiting for the SDK idle event",
+                    )
+                }
                 KeyCode::Char('d') => {
                     let Some((outbound_id, active)) =
                         self.queue_entry_ids().get(self.scroll).cloned()
@@ -4980,6 +5055,16 @@ mod tests {
                 Some("active")
             );
         }
+
+        let mut diagnostics = state();
+        diagnostics.screen = Screen::AgentStatus;
+        diagnostics.agent_progress.phase = AgentPhase::Responding;
+        diagnostics.agent_progress.active_outbound_id = Some("active".into());
+        assert_eq!(
+            diagnostics.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL,)),
+            vec![Effect::AbortAgent]
+        );
+        assert_eq!(diagnostics.agent_progress.phase, AgentPhase::Stopping);
 
         let mut idle = state();
         idle.input_mode = InputMode::Command;

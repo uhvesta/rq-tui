@@ -107,6 +107,7 @@ pub(crate) enum ActivityKind {
     ToolProgress,
     ToolComplete,
     Retry,
+    Failure,
     Other,
 }
 
@@ -420,6 +421,10 @@ pub(crate) enum AgentEvent {
         outbound_id: String,
         aborted: bool,
     },
+    /// A stop request reached the runtime after its active turn had already
+    /// settled. This is distinct from generic activity because the UI must
+    /// leave STOPPING even when no turn-scoped idle event follows.
+    StopSettledAlreadyIdle,
     TurnFailed {
         outbound_id: String,
         outbound: OutboundKind,
@@ -443,6 +448,10 @@ pub(crate) enum AgentEvent {
     ModelsListed(Vec<ModelOption>),
     /// Detailed selection acknowledgement for staged pickers.
     ModelSelectionChanged(ModelSelection),
+    ModelSelectionFailed {
+        selection: ModelSelection,
+        message: String,
+    },
     /// Legacy one-stage acknowledgement retained for existing callers.
     ModelChanged(String),
     Compacted,
@@ -1302,7 +1311,31 @@ impl AgentSink for ControlledAgent {
                         state.events.retain(|(_, envelope)| {
                             envelope_outbound_id(envelope).as_ref() != Some(target)
                         });
-                        state.busy_until = Instant::now();
+                        let now = Instant::now();
+                        if let Some(next_turn_at) = state
+                            .events
+                            .iter()
+                            .filter(|(_, envelope)| envelope_outbound_id(envelope).is_some())
+                            .map(|(scheduled, _)| *scheduled)
+                            .min()
+                        {
+                            let advance = next_turn_at.saturating_duration_since(now);
+                            if !advance.is_zero() {
+                                for (scheduled, envelope) in &mut state.events {
+                                    if envelope_outbound_id(envelope).is_some() {
+                                        *scheduled =
+                                            scheduled.checked_sub(advance).unwrap_or(now).max(now);
+                                    }
+                                }
+                                state.busy_until = state
+                                    .busy_until
+                                    .checked_sub(advance)
+                                    .unwrap_or(now)
+                                    .max(now);
+                            }
+                        } else {
+                            state.busy_until = now;
+                        }
                     }
                     (lane, target)
                 };
@@ -1320,6 +1353,12 @@ impl AgentSink for ControlledAgent {
                             outbound_id,
                             aborted: true,
                         },
+                    );
+                } else {
+                    self.schedule_agent(
+                        lane,
+                        Duration::from_millis(1),
+                        AgentEvent::StopSettledAlreadyIdle,
                     );
                 }
             }
@@ -1795,6 +1834,14 @@ impl WorkItemProcessLock {
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
         }
+    }
+}
+
+impl Drop for WorkItemProcessLock {
+    fn drop(&mut self) {
+        // Do not rely on descriptor destruction timing here: prune retry can
+        // reacquire the same Work Item immediately on another runtime/thread.
+        self._file.unlock().ok();
     }
 }
 
@@ -3208,17 +3255,15 @@ async fn worker(
                                         .emit(AgentEvent::ModelSelectionChanged(selection.clone()));
                                     events.emit(AgentEvent::ModelChanged(selection.model_id));
                                 }
-                                Err(error) => events.activity(
-                                    None,
-                                    AgentActivity::other(format!(
-                                        "Could not change model: {error}"
-                                    )),
-                                ),
+                                Err(error) => events.emit(AgentEvent::ModelSelectionFailed {
+                                    selection: selection.clone(),
+                                    message: error.to_string(),
+                                }),
                             },
-                            Err(error) => events.activity(
-                                None,
-                                AgentActivity::other(format!("Could not change model: {error}")),
-                            ),
+                            Err(error) => events.emit(AgentEvent::ModelSelectionFailed {
+                                selection: selection.clone(),
+                                message: error.to_string(),
+                            }),
                         }
                     }
                     AgentCommand::SetModel(model) => {
@@ -3246,10 +3291,10 @@ async fn worker(
                                 events.emit(AgentEvent::ModelSelectionChanged(selection.clone()));
                                 events.emit(AgentEvent::ModelChanged(selection.model_id));
                             }
-                            Err(error) => events.activity(
-                                None,
-                                AgentActivity::other(format!("Could not change model: {error}")),
-                            ),
+                            Err(error) => events.emit(AgentEvent::ModelSelectionFailed {
+                                selection: selection.clone(),
+                                message: error.to_string(),
+                            }),
                         }
                     }
                     AgentCommand::Compact(instructions) => {
@@ -3857,10 +3902,9 @@ async fn worker(
                                 }
                             }
                         } else {
-                            main_events.on_lane(active_lane.clone()).activity(
-                                None,
-                                AgentActivity::other("Copilot is already idle"),
-                            );
+                            main_events
+                                .on_lane(active_lane.clone())
+                                .emit(AgentEvent::StopSettledAlreadyIdle);
                         }
                     }
                     AgentCommand::StartSide { .. } => {
@@ -4131,14 +4175,15 @@ fn handle_session_event(
     events: &impl EventOutput,
 ) {
     let root_agent_event = event.agent_id.is_none();
+    let session_boundary_event = matches!(
+        event.event_type.as_str(),
+        "session.idle" | "session.error" | "session.task_complete"
+    );
     let turn_or_session_event = event.event_type.starts_with("assistant.")
         || event.event_type.starts_with("tool.")
         || event.event_type.starts_with("skill.")
         || event.event_type.starts_with("subagent.")
-        || matches!(
-            event.event_type.as_str(),
-            "session.idle" | "session.error" | "session.task_complete"
-        );
+        || session_boundary_event;
     if let Some(active) = active.as_mut() {
         if event.event_type == "user.message" {
             let matches_sdk_id = active.sdk_message_ids.contains(&event.id)
@@ -4162,7 +4207,8 @@ fn handle_session_event(
                 .parent_id
                 .as_ref()
                 .is_some_and(|parent| active.accepted_event_ids.contains(parent));
-        if turn_or_session_event && !chained {
+        let unparented_session_boundary = session_boundary_event && event.parent_id.is_none();
+        if turn_or_session_event && !chained && !unparented_session_boundary {
             if env::var_os("RQ_TUI_DEBUG_EVENTS").is_some() {
                 eprintln!(
                     "rq-tui rejected SDK event type={} id={} parent={:?} roots={:?}",
@@ -4529,7 +4575,7 @@ fn handle_session_event(
             send_activity(
                 active,
                 AgentActivity {
-                    kind: ActivityKind::Other,
+                    kind: ActivityKind::Failure,
                     label: format!("Subagent {name} failed"),
                     tool: Some(format!("subagent:{name}")),
                     detail: Some(detail.into()),
@@ -5841,6 +5887,12 @@ mod tests {
         }
     }
 
+    fn session_event(event_type: &str, data: serde_json::Value) -> SessionEvent {
+        let mut event = event(event_type, data);
+        event.parent_id = None;
+        event
+    }
+
     fn active() -> Option<ActiveOutbound> {
         Some(ActiveOutbound {
             outbound: Outbound {
@@ -6267,7 +6319,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut active = active();
         handle_session_event(
-            event("session.idle", serde_json::json!({"aborted": true})),
+            session_event("session.idle", serde_json::json!({"aborted": true})),
             &mut active,
             &sender,
         );
@@ -6286,7 +6338,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut active = active();
         handle_session_event(
-            event(
+            session_event(
                 "session.idle",
                 serde_json::json!({
                     "backgroundTasks": {"agents": [{"id": "research"}], "shells": []}
@@ -6303,7 +6355,7 @@ mod tests {
         ));
 
         handle_session_event(
-            event(
+            session_event(
                 "session.idle",
                 serde_json::json!({"backgroundTasks": {"agents": [], "shells": []}}),
             ),
@@ -6325,7 +6377,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut active = active();
         handle_session_event(
-            event(
+            session_event(
                 "session.task_complete",
                 serde_json::json!({"summary": "The requested review is complete."}),
             ),
@@ -6337,6 +6389,27 @@ mod tests {
             drain(&receiver).as_slice(),
             [AgentEvent::Activity { label, .. }]
                 if label == "Copilot marked the task complete"
+        ));
+    }
+
+    #[test]
+    fn unparented_session_error_fails_the_active_turn() {
+        let (sender, receiver) = mpsc::channel();
+        let mut active = active();
+        handle_session_event(
+            session_event(
+                "session.error",
+                serde_json::json!({"message": "session-level controlled failure"}),
+            ),
+            &mut active,
+            &sender,
+        );
+
+        assert!(active.is_none());
+        assert!(matches!(
+            drain(&receiver).as_slice(),
+            [AgentEvent::TurnFailed { message, .. }]
+                if message == "session-level controlled failure"
         ));
     }
 
@@ -6467,6 +6540,46 @@ mod tests {
                 }) if id == &outbound_id
             )
         }));
+    }
+
+    #[test]
+    fn controlled_abort_advances_the_next_queued_turn_immediately() {
+        let agent = ControlledAgent::new("work-item".into());
+        let _ = agent.try_recv_laned();
+        let first = Outbound::new(OutboundKind::Chat, "first".into());
+        let first_id = first.id.clone();
+        let second = Outbound::new(OutboundKind::Chat, "second".into());
+        let second_id = second.id.clone();
+        agent.send(AgentCommand::Send(first)).unwrap();
+        agent.send(AgentCommand::Send(second)).unwrap();
+        agent.send(AgentCommand::Abort).unwrap();
+
+        let state = agent.state.lock().expect("controlled agent lock");
+        assert!(state.events.iter().all(|(_, envelope)| {
+            if envelope_outbound_id(envelope).as_deref() != Some(first_id.as_str()) {
+                return true;
+            }
+            matches!(
+                &envelope.event,
+                LaneEvent::Agent(
+                    AgentEvent::Activity { .. }
+                        | AgentEvent::ResponseComplete { aborted: true, .. }
+                )
+            )
+        }));
+        let next_at = state
+            .events
+            .iter()
+            .filter(|(_, envelope)| {
+                envelope_outbound_id(envelope).as_deref() == Some(second_id.as_str())
+            })
+            .map(|(scheduled, _)| *scheduled)
+            .min()
+            .expect("second turn remains scheduled");
+        assert!(
+            next_at.saturating_duration_since(Instant::now()) < Duration::from_millis(100),
+            "queued continuation should not inherit the cancelled turn's old deadline"
+        );
     }
 
     #[test]
@@ -6642,6 +6755,37 @@ mod tests {
                 && activity.kind == ActivityKind::ToolProgress
                 && activity.tool.as_deref() == Some("run_skill")
                 && activity.detail.as_deref() == Some("Running security-review skill")
+        ));
+    }
+
+    #[test]
+    fn raw_subagent_failure_is_typed_and_keeps_its_diagnostics() {
+        let (sender, receiver) = mpsc::channel();
+        let publisher = EventPublisher::new(sender, AgentLane::Main);
+        let mut active = active();
+        handle_session_event(
+            event(
+                "subagent.failed",
+                serde_json::json!({
+                    "agentDisplayName": "Edge auditor",
+                    "error": "controlled subagent failure"
+                }),
+            ),
+            &mut active,
+            &publisher,
+        );
+
+        let envelope = receiver.recv().expect("subagent failure activity");
+        assert!(matches!(
+            envelope,
+            super::AgentEventEnvelope {
+                lane: AgentLane::Main,
+                activity: Some(ref activity),
+                ..
+            } if activity.kind == ActivityKind::Failure
+                && activity.label == "Subagent Edge auditor failed"
+                && activity.tool.as_deref() == Some("subagent:Edge auditor")
+                && activity.detail.as_deref() == Some("controlled subagent failure")
         ));
     }
 

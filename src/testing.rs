@@ -1067,7 +1067,7 @@ fn decode_script_text(text: &str) -> Result<String> {
 ///   history <role> <text> load a one-entry persisted-history snapshot
 ///   history-append <role> <text> append one deterministic transcript entry
 ///   activity <kind> <label> inject intent/reasoning/tool-start/tool-progress/
-///                     tool-complete/retry/other durable SDK activity
+///                     tool-complete/retry/failure/other durable SDK activity
 ///   models            inject deterministic model capabilities
 ///   quiet <seconds>   backdate active progress for quiet/warning rendering
 ///   disconnect <text> inject a visible SDK disconnect/error
@@ -1236,9 +1236,10 @@ pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Re
                     "tool-progress" => ActivityKind::ToolProgress,
                     "tool-complete" => ActivityKind::ToolComplete,
                     "retry" => ActivityKind::Retry,
+                    "failure" => ActivityKind::Failure,
                     "other" | "skill" | "subagent" => ActivityKind::Other,
                     _ => anyhow::bail!(
-                        "activity kind must be intent, reasoning, tool-start, tool-progress, tool-complete, retry, skill, subagent, or other"
+                        "activity kind must be intent, reasoning, tool-start, tool-progress, tool-complete, retry, failure, skill, subagent, or other"
                     ),
                 };
                 let tool = matches!(
@@ -1246,6 +1247,7 @@ pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Re
                     ActivityKind::ToolStart
                         | ActivityKind::ToolProgress
                         | ActivityKind::ToolComplete
+                        | ActivityKind::Failure
                 )
                 .then(|| "deterministic-tool".to_owned());
                 harness.inject_activity(kind, label, tool, Some("ui-script injection".into()))?;
@@ -2953,7 +2955,7 @@ mod tests {
         assert!(queue.contains("first background question"));
         assert!(queue.contains("second queued follow-up"));
         assert!(!queue.contains("ACTIVE"));
-        assert!(queue.contains("d cancel selected queued prompt"));
+        assert!(queue.contains("d cancel"));
 
         let second_id = harness.state.queue_entry_ids()[1].0.clone();
         harness.key(key(KeyCode::Down)).unwrap();
@@ -3415,6 +3417,16 @@ mod tests {
         let quiet = harness.render().unwrap();
         assert!(quiet.contains("no SDK events for"));
         assert!(quiet.contains(":agent-status"));
+        for index in 0..12 {
+            harness
+                .inject_activity(
+                    ActivityKind::ToolProgress,
+                    format!("background audit step {index}"),
+                    Some("audit".into()),
+                    None,
+                )
+                .unwrap();
+        }
 
         harness.key(key(KeyCode::Char(':'))).unwrap();
         type_text(&mut harness, "agent-status");
@@ -3424,12 +3436,32 @@ mod tests {
         assert!(diagnostics.contains("Running security-review skill"));
         assert!(diagnostics.contains("last SDK event"));
         assert!(diagnostics.contains("outbound id"));
+        harness.key(key(KeyCode::End)).unwrap();
+        let end = harness.state.scroll;
+        assert_eq!(
+            end,
+            harness
+                .state
+                .agent_progress
+                .timeline
+                .len()
+                .saturating_sub(1)
+        );
+        harness.key(key(KeyCode::PageUp)).unwrap();
+        assert!(harness.state.scroll < end);
+        let before_wheel = harness.state.scroll;
+        harness.mouse_scroll(false).unwrap();
+        assert!(harness.state.scroll > before_wheel);
+        harness.key(key(KeyCode::Home)).unwrap();
+        assert_eq!(harness.state.scroll, 0);
 
         harness.resize(40, 9);
         let narrow_diagnostics = harness.render().unwrap();
         assert!(narrow_diagnostics.contains("j/k scroll"));
-        assert!(narrow_diagnostics.contains("s stop"));
+        assert!(narrow_diagnostics.contains("s/C-c stop"));
         assert!(narrow_diagnostics.contains("q/Esc back"));
+        assert!(narrow_diagnostics.contains("Recent SDK activity"));
+        assert!(narrow_diagnostics.contains('/'));
         let mut activity_visible = narrow_diagnostics.contains("Running security");
         for _ in 0..16 {
             if activity_visible {
@@ -3457,8 +3489,28 @@ mod tests {
         let standard_frame = standard.render().unwrap();
         assert!(standard_frame.contains("running review skill: exhaustive audit"));
         assert!(standard_frame.contains("· q0"));
+        standard
+            .inject_activity(
+                ActivityKind::Failure,
+                "Subagent edge auditor failed",
+                Some("subagent:edge-auditor".into()),
+                Some("controlled failure details".into()),
+            )
+            .unwrap();
+        let failure_frame = standard.render().unwrap();
+        assert_eq!(standard.state.agent_progress.phase, AgentPhase::Failed);
+        assert!(failure_frame.contains("FAILED"));
+        assert!(failure_frame.contains("Subagent edge auditor failed"));
         standard.resize(40, 9);
-        assert!(standard.render().unwrap().contains("running review skill"));
+        let compact_failure = standard.render().unwrap();
+        assert!(
+            compact_failure.contains("FAILED"),
+            "compact failure phase was hidden:\n{compact_failure}"
+        );
+        assert!(
+            compact_failure.contains("Subagent edge auditor"),
+            "compact failure summary was hidden:\n{compact_failure}"
+        );
     }
 
     #[test]
@@ -3615,6 +3667,25 @@ mod tests {
             .captured_effects()
             .iter()
             .any(|effect| effect.contains("SendChat")));
+
+        let mut compact =
+            TuiHarness::from_unified_diff("compact paste", workflow_diff(), 40, 9).unwrap();
+        compact.key(key(KeyCode::Tab)).unwrap();
+        compact.key(key(KeyCode::Char('i'))).unwrap();
+        compact
+            .paste(
+                &(1..=12)
+                    .map(|line| format!("pasted line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+        let bottom = compact.render().unwrap();
+        assert!(bottom.contains("PASTE 12-12/12"));
+        assert!(bottom.contains("↑/↓"));
+        compact.key(key(KeyCode::Up)).unwrap();
+        let moved = compact.render().unwrap();
+        assert!(moved.contains("PASTE 11-11/12"));
     }
 
     #[test]
