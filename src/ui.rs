@@ -4346,10 +4346,11 @@ fn truncate_terminal_line(text: &str, max_cells: usize) -> String {
 
 fn render_model_picker(frame: &mut ratatui::Frame, state: &AppState) {
     let compact = frame.area().width < 60;
-    let (_, title, subtitle, rows) = match state.model_picker_stage {
+    let (_, title, compact_title, subtitle, rows) = match state.model_picker_stage {
         ModelPickerStage::Model => (
             1,
             "Choose a model",
+            "Choose model",
             "Choices reported by Copilot",
             state
                 .model_options
@@ -4365,7 +4366,13 @@ fn render_model_picker(frame: &mut ratatui::Frame, state: &AppState) {
                         model.supported_reasoning_efforts.join("/")
                     };
                     if compact {
-                        format!("{} [{}] · {context} · {efforts}", model.name, model.id)
+                        format!(
+                            "{}·{}·{}·{}",
+                            model.name,
+                            compact_token_count(model.max_context_tokens),
+                            compact_efforts(&model.supported_reasoning_efforts),
+                            model.id,
+                        )
                     } else {
                         format!(
                             "{:<24} {:<24} · context {context} · {efforts}",
@@ -4388,6 +4395,7 @@ fn render_model_picker(frame: &mut ratatui::Frame, state: &AppState) {
             (
                 2,
                 "Choose reasoning effort",
+                "Reasoning",
                 "Levels supported by this model",
                 model
                     .map(|model| {
@@ -4421,6 +4429,7 @@ fn render_model_picker(frame: &mut ratatui::Frame, state: &AppState) {
             (
                 3,
                 "Choose context tier",
+                "Context tier",
                 "Runtime-advertised capacity",
                 model
                     .map(|model| {
@@ -4456,15 +4465,17 @@ fn render_model_picker(frame: &mut ratatui::Frame, state: &AppState) {
         .take(viewport)
         .map(|(index, row)| {
             let selected = index == state.model_picker_index;
-            ListItem::new(format!("{} {row}", if selected { "❯" } else { " " })).style(
-                if selected {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                },
-            )
+            let row = truncate_terminal_line(
+                &format!("{} {row}", if selected { "❯" } else { " " }),
+                frame.area().width.saturating_sub(2) as usize,
+            );
+            ListItem::new(row).style(if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            })
         })
         .collect::<Vec<_>>();
     let items = if items.is_empty() {
@@ -4475,9 +4486,11 @@ fn render_model_picker(frame: &mut ratatui::Frame, state: &AppState) {
     frame.render_widget(
         List::new(items).block(
             Block::default()
-                .title(format!(
-                    " Model picker · step {step}/{total_steps} · {title} "
-                ))
+                .title(if compact {
+                    format!(" Model {step}/{total_steps} · {compact_title} ")
+                } else {
+                    format!(" Model picker · step {step}/{total_steps} · {title} ")
+                })
                 .borders(Borders::ALL),
         ),
         frame.area(),
@@ -4535,6 +4548,29 @@ fn format_token_count(tokens: i64) -> String {
     } else {
         format!("{tokens} tokens")
     }
+}
+
+fn compact_token_count(tokens: Option<i64>) -> String {
+    tokens
+        .map(|tokens| {
+            format_token_count(tokens)
+                .strip_suffix(" tokens")
+                .unwrap_or("runtime")
+                .to_owned()
+        })
+        .unwrap_or_else(|| "runtime".into())
+}
+
+fn compact_efforts(efforts: &[String]) -> String {
+    if efforts.is_empty() {
+        return "fixed".into();
+    }
+    efforts
+        .iter()
+        .filter_map(|effort| effort.chars().next())
+        .map(|initial| initial.to_string())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn render_versions(frame: &mut ratatui::Frame, state: &AppState) {
@@ -4751,7 +4787,7 @@ fn render_header(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
         .map(|diff| diff.files.len())
         .unwrap_or(0);
     let title = if area.width < 60 {
-        fit_terminal_text(
+        truncate_terminal_line(
             &format!(
                 " Review · {focus} · {}/{} · {file} ",
                 state.file_index.saturating_add(1),
@@ -5767,7 +5803,7 @@ fn paint_content_columns(
 }
 
 fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
-    let compact = area.width < 60;
+    let compact = area.width < 72;
     let mode = match state.input_mode {
         InputMode::Normal => "NORMAL",
         InputMode::Visual => "VISUAL",
@@ -5993,9 +6029,9 @@ fn render_command_palette_area(
     } else {
         state.command_index.min(matches.len() - 1) + 1
     };
-    let compact = palette.width < 60;
+    let compact = palette.width < 72;
     let controls = if compact {
-        " ↑/↓ Pg · Home/End · Enter · Esc"
+        " ↑/↓ · Pg · Home/End · Enter run · Esc"
     } else {
         " ↑/↓ wrap · PgUp/PgDn · Home/End · Tab complete · Enter run · Esc cancel"
     };
@@ -6005,7 +6041,10 @@ fn render_command_palette_area(
     let help = if controls_width == 0 {
         fit_terminal_text(&counter, inner_width)
     } else {
-        format!("{} {counter}", fit_terminal_text(controls, controls_width))
+        format!(
+            "{} {counter}",
+            truncate_terminal_line(controls, controls_width)
+        )
     };
     lines.push(Line::styled(help, Style::default().fg(Color::DarkGray)));
     frame.render_widget(Clear, palette);
@@ -6052,7 +6091,7 @@ fn render_chat(
         3
     };
     let minimum_chat = if state.input_mode == InputMode::Command && frame.area().height < 14 {
-        1
+        0
     } else {
         3
     };
@@ -6785,7 +6824,9 @@ fn render_agent_progress(frame: &mut ratatui::Frame, state: &AppState, area: Rec
         Color::DarkGray
     };
     let compact = area.width < 60;
-    let compact_liveness = if progress.phase == AgentPhase::Disconnected || !state.agent_connected {
+    let compact_liveness = if progress.phase == AgentPhase::Connecting {
+        "STARTING".to_owned()
+    } else if progress.phase == AgentPhase::Disconnected || (!state.agent_connected && !active) {
         "OFFLINE".to_owned()
     } else if quiet {
         format!("QUIET {}", format_duration(age))
@@ -6840,30 +6881,41 @@ fn render_agent_progress(frame: &mut ratatui::Frame, state: &AppState, area: Rec
         return;
     }
     if area.height > 1 {
+        let connection = if progress.phase == AgentPhase::Connecting {
+            "connecting"
+        } else if active {
+            "stream active"
+        } else if state.agent_connected {
+            "connected"
+        } else {
+            "offline"
+        };
+        let detail = if warning {
+            format!(
+                " :agent-status INSPECT · no SDK events for {} · {connection} · Ctrl-C stop · {}",
+                format_duration(age),
+                progress.summary,
+            )
+        } else if quiet {
+            format!(
+                " :agent-status INSPECT · quiet for {} · {connection} · {}",
+                format_duration(age),
+                progress.summary,
+            )
+        } else {
+            format!(" {} — {}", progress.summary, progress.detail)
+        };
         lines.push(Line::styled(
-            if warning {
-                format!(
-                    " :agent-status INSPECT · no SDK events for {} · connected={} · Ctrl-C stop · {}",
-                    format_duration(age),
-                    state.agent_connected,
-                    progress.summary,
-                )
-            } else if quiet {
-                format!(
-                    " :agent-status INSPECT · quiet for {} · connected={} · {}",
-                    format_duration(age),
-                    state.agent_connected,
-                    progress.summary,
-                )
-            } else {
-                format!(" {} — {}", progress.summary, progress.detail)
-            },
+            truncate_terminal_line(&detail, area.width.saturating_sub(2) as usize),
             Style::default().fg(color),
         ));
     }
     if compact && area.height > 3 {
         lines.push(Line::styled(
-            format!(" detail: {}", progress.detail),
+            truncate_terminal_line(
+                &format!(" detail: {}", progress.detail),
+                area.width.saturating_sub(2) as usize,
+            ),
             Style::default().fg(color),
         ));
     }

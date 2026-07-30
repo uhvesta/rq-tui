@@ -3264,6 +3264,13 @@ mod tests {
             "selected command must remain visible:\n{compact_frame}"
         );
         assert!(compact_frame.contains("COPILOT"));
+        assert!(
+            compact.state.command_viewport_rows >= 2,
+            "minimum Chat command mode must show adjacent choices:\n{compact_frame}"
+        );
+        assert!(compact_frame.contains("Enter run"));
+        assert!(compact_frame.contains("STARTING"));
+        assert!(!compact_frame.contains("OFFLINE"));
 
         let mut medium =
             TuiHarness::from_unified_diff("medium commands", workflow_diff(), 70, 20).unwrap();
@@ -3275,6 +3282,7 @@ mod tests {
             medium_frame.contains("28/28"),
             "the scroll position must stay visible at medium widths:\n{medium_frame}"
         );
+        assert!(medium_frame.contains("Enter run"));
 
         let mut empty =
             TuiHarness::from_unified_diff("empty commands", workflow_diff(), 42, 12).unwrap();
@@ -3629,8 +3637,10 @@ mod tests {
             .unwrap();
 
         let frame = harness.render().unwrap();
+        assert!(frame.contains("Model 1/3 · Choose model"), "{frame}");
         assert!(frame.contains("Compact Model"));
         assert!(frame.contains("compact-model"));
+        assert!(frame.contains("128k"));
         assert!(frame.contains("↑/↓ select"));
         assert!(frame.contains("Enter next"));
         assert!(frame.contains("Esc cancel"));
@@ -3840,6 +3850,8 @@ mod tests {
         let quiet = harness.render().unwrap();
         assert!(quiet.contains("no SDK events for"));
         assert!(quiet.contains(":agent-status"));
+        assert!(quiet.contains("stream active"));
+        assert!(!quiet.contains("connected=false"));
         harness.state.agent_connected = true;
         harness.resize(40, 9);
         let compact_quiet = harness.render().unwrap();
