@@ -272,6 +272,12 @@ pub(crate) enum AgentCommand {
     Steer(Outbound),
     /// Remove a prompt that has not started yet.
     CancelQueued(String),
+    /// Replace a waiting prompt in place. If it already started, reject the
+    /// replacement instead of running both requests.
+    ReplaceQueued {
+        outbound_id: String,
+        replacement: Outbound,
+    },
     /// Fork the persisted main session and enter an ephemeral side lane.
     StartSide {
         outbound: Option<Outbound>,
@@ -315,6 +321,17 @@ pub(crate) enum AgentEvent {
     },
     QueueCancelled {
         outbound_id: String,
+    },
+    QueueReplaced {
+        outbound_id: String,
+        replacement_id: String,
+        position: usize,
+    },
+    QueueReplaceRejected {
+        outbound_id: String,
+        replacement_id: String,
+        original_active: bool,
+        reason: String,
     },
     ResponseStarted {
         outbound_id: String,
@@ -726,6 +743,71 @@ impl AgentSink for ControlledAgent {
                     );
                 }
             }
+            AgentCommand::ReplaceQueued {
+                outbound_id,
+                replacement,
+            } => {
+                let replacement_id = replacement.id.clone();
+                let (scheduled, original_active) = {
+                    let mut state = self.state.lock().expect("controlled agent lock");
+                    let queued = state.events.iter().find_map(|(available_at, envelope)| {
+                        matches!(
+                            &envelope.event,
+                            LaneEvent::Agent(AgentEvent::Queued {
+                                outbound_id: queued_id,
+                                ..
+                            }) if queued_id == &outbound_id
+                        )
+                        .then(|| (*available_at, envelope.lane.clone()))
+                    });
+                    let original_active = queued.is_none()
+                        && state.events.iter().any(|(_, envelope)| {
+                            envelope_outbound_id(envelope).as_deref() == Some(outbound_id.as_str())
+                        });
+                    if queued.is_some() {
+                        state.events.retain(|(_, envelope)| {
+                            envelope_outbound_id(envelope).as_deref() != Some(outbound_id.as_str())
+                        });
+                    }
+                    (queued, original_active)
+                };
+                if let Some((available_at, lane)) = scheduled {
+                    let delay = available_at.saturating_duration_since(Instant::now());
+                    self.schedule_agent(
+                        lane.clone(),
+                        Duration::ZERO,
+                        AgentEvent::QueueReplaced {
+                            outbound_id,
+                            replacement_id,
+                            position: 0,
+                        },
+                    );
+                    self.schedule_turn(lane, replacement, delay);
+                } else {
+                    let lane = self
+                        .state
+                        .lock()
+                        .expect("controlled agent lock")
+                        .active_side
+                        .clone()
+                        .map(|id| AgentLane::Side { id })
+                        .unwrap_or(AgentLane::Main);
+                    self.schedule_agent(
+                        lane,
+                        Duration::ZERO,
+                        AgentEvent::QueueReplaceRejected {
+                            outbound_id,
+                            replacement_id,
+                            original_active,
+                            reason: if original_active {
+                                "prompt already started".into()
+                            } else {
+                                "prompt already left the queue".into()
+                            },
+                        },
+                    );
+                }
+            }
             AgentCommand::StartSide { outbound } => {
                 let (side_id, parent_id, delay) = {
                     let mut state = self.state.lock().expect("controlled agent lock");
@@ -950,6 +1032,8 @@ fn envelope_outbound_id(envelope: &AgentEventEnvelope) -> Option<String> {
         LaneEvent::Agent(
             AgentEvent::Queued { outbound_id, .. }
             | AgentEvent::QueueCancelled { outbound_id }
+            | AgentEvent::QueueReplaced { outbound_id, .. }
+            | AgentEvent::QueueReplaceRejected { outbound_id, .. }
             | AgentEvent::ResponseStarted { outbound_id, .. }
             | AgentEvent::ResponseDelta { outbound_id, .. }
             | AgentEvent::ResponseSnapshot { outbound_id, .. }
@@ -1522,6 +1606,7 @@ async fn worker(
                     AgentCommand::Send(_)
                     | AgentCommand::Steer(_)
                     | AgentCommand::CancelQueued(_)
+                    | AgentCommand::ReplaceQueued { .. }
                     | AgentCommand::SendSide(_)
                     | AgentCommand::CancelSide
                     | AgentCommand::Abort
@@ -1641,6 +1726,61 @@ async fn worker(
                                 AgentActivity::other(
                                     "Prompt was already active or no longer queued",
                                 ),
+                            );
+                        }
+                    }
+                    AgentCommand::ReplaceQueued {
+                        outbound_id,
+                        replacement,
+                    } => {
+                        let replacement_id = replacement.id.clone();
+                        if let Some(position) = main_queue
+                            .iter()
+                            .position(|queued| queued.id == outbound_id)
+                        {
+                            main_queue[position] = replacement;
+                            main_events.emit(AgentEvent::QueueReplaced {
+                                outbound_id,
+                                replacement_id,
+                                position: position
+                                    + usize::from(
+                                        active_lane == AgentLane::Main && active.is_some(),
+                                    ),
+                            });
+                        } else if let Some(position) = side_queue
+                            .iter()
+                            .position(|queued| queued.id == outbound_id)
+                        {
+                            side_queue[position] = replacement;
+                            let lane = side
+                                .as_ref()
+                                .map(|side| AgentLane::Side {
+                                    id: side.id.clone(),
+                                })
+                                .unwrap_or_else(|| active_lane.clone());
+                            main_events.on_lane(lane).emit(AgentEvent::QueueReplaced {
+                                outbound_id,
+                                replacement_id,
+                                position: position
+                                    + usize::from(
+                                        active_lane != AgentLane::Main && active.is_some(),
+                                    ),
+                            });
+                        } else {
+                            let original_active = active
+                                .as_ref()
+                                .is_some_and(|turn| turn.outbound.id == outbound_id);
+                            main_events.on_lane(active_lane.clone()).emit(
+                                AgentEvent::QueueReplaceRejected {
+                                    outbound_id,
+                                    replacement_id,
+                                    original_active,
+                                    reason: if original_active {
+                                        "prompt already started".into()
+                                    } else {
+                                        "prompt already left the queue".into()
+                                    },
+                                },
                             );
                         }
                     }

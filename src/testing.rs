@@ -63,6 +63,18 @@ impl AgentSink for FakeAgent {
                     .expect("agent lock")
                     .push_back(outbound.clone());
             }
+            AgentCommand::ReplaceQueued {
+                outbound_id,
+                replacement,
+            } => {
+                let mut pending = self.pending.lock().expect("agent lock");
+                if let Some(position) = pending
+                    .iter()
+                    .position(|outbound| outbound.id == *outbound_id)
+                {
+                    pending[position] = replacement.clone();
+                }
+            }
             _ => {}
         }
         self.commands.lock().expect("agent lock").push(command);
@@ -151,6 +163,39 @@ impl TuiHarness {
                     &self.storage,
                     AgentEvent::QueueCancelled { outbound_id },
                 )?;
+            } else if let Effect::ReplaceQueued { outbound_id, .. } = effect {
+                let command = self
+                    .agent
+                    .commands
+                    .lock()
+                    .expect("agent lock")
+                    .last()
+                    .cloned();
+                let Some(AgentCommand::ReplaceQueued { replacement, .. }) = command else {
+                    anyhow::bail!("fake agent did not receive queue replacement");
+                };
+                let position = self
+                    .agent
+                    .pending
+                    .lock()
+                    .expect("agent lock")
+                    .iter()
+                    .position(|outbound| outbound.id == replacement.id);
+                let event = if let Some(position) = position {
+                    AgentEvent::QueueReplaced {
+                        outbound_id,
+                        replacement_id: replacement.id,
+                        position,
+                    }
+                } else {
+                    AgentEvent::QueueReplaceRejected {
+                        outbound_id,
+                        replacement_id: replacement.id,
+                        original_active: false,
+                        reason: "prompt already left the queue".into(),
+                    }
+                };
+                handle_agent_event(&mut self.state, &self.storage, event)?;
             }
         }
         Ok(descriptions)
@@ -1316,6 +1361,7 @@ mod tests {
         harness.key(key(KeyCode::Char(':'))).unwrap();
         type_text(&mut harness, "queue");
         harness.key(key(KeyCode::Enter)).unwrap();
+        let original_id = harness.state.queue_entry_ids()[1].0.clone();
         harness.key(key(KeyCode::Down)).unwrap();
         harness.key(key(KeyCode::Char('e'))).unwrap();
         assert_eq!(harness.mode(), "INSERT");
@@ -1328,11 +1374,66 @@ mod tests {
         assert!(harness
             .captured_effects()
             .iter()
-            .any(|effect| effect.contains("CancelQueued")));
+            .any(|effect| effect.contains("ReplaceQueued")));
         assert!(harness
-            .captured_effects()
+            .agent_commands()
             .iter()
-            .any(|effect| effect.contains("SendChat(\"queued replacement\")")));
+            .any(|command| command.contains("ReplaceQueued")));
+        assert!(harness.status().contains("replaced atomically"));
+        let pending = harness.agent.pending.lock().expect("agent lock");
+        assert!(!pending.iter().any(|outbound| outbound.id == original_id));
+        assert!(pending
+            .iter()
+            .any(|outbound| outbound.text == "queued replacement"));
+    }
+
+    #[test]
+    fn queue_edit_rejection_never_enqueues_a_duplicate_replacement() {
+        let mut harness =
+            TuiHarness::from_unified_diff("queue-race", workflow_diff(), 84, 22).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "active prompt");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.start_next_response("working").unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "queued original");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "queue");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        let original_id = harness.state.queue_entry_ids()[1].0.clone();
+        harness.key(key(KeyCode::Down)).unwrap();
+        harness.key(key(KeyCode::Char('e'))).unwrap();
+        harness
+            .key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
+        type_text(&mut harness, "must not run");
+
+        harness
+            .agent
+            .pending
+            .lock()
+            .expect("agent lock")
+            .retain(|outbound| outbound.id != original_id);
+        harness.key(key(KeyCode::Enter)).unwrap();
+
+        assert!(harness.status().contains("rejected"));
+        assert!(!harness.state.pending_outbound_ids.contains(&original_id));
+        assert!(!harness
+            .agent
+            .pending
+            .lock()
+            .expect("agent lock")
+            .iter()
+            .any(|outbound| outbound.text == "must not run"));
+        assert!(harness
+            .state
+            .chat
+            .iter()
+            .find(|entry| entry.text == "must not run")
+            .and_then(|entry| entry.error.as_deref())
+            .is_some_and(|error| error.contains("rejected")));
     }
 
     #[test]
@@ -1961,6 +2062,8 @@ mod tests {
         harness.key(key(KeyCode::Enter)).unwrap();
         let queue = harness.render().unwrap();
         assert!(queue.contains("Copilot queue · 2 pending · background FIFO"));
+        assert!(queue.contains("▶ #1"));
+        assert!(queue.contains("  #2"));
         assert!(queue.contains("first background question"));
         assert!(queue.contains("second queued follow-up"));
         assert!(!queue.contains("ACTIVE"));

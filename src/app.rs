@@ -125,6 +125,10 @@ pub(crate) enum Effect {
     SendChat(String),
     SteerChat(String),
     CancelQueued(String),
+    ReplaceQueued {
+        outbound_id: String,
+        text: String,
+    },
     StartSide(Option<String>),
     ExitSide,
     AbortAgent,
@@ -2574,7 +2578,7 @@ impl AppState {
                 text,
             }],
             ComposeTarget::EditQueued(outbound_id) => {
-                vec![Effect::CancelQueued(outbound_id), Effect::SendChat(text)]
+                vec![Effect::ReplaceQueued { outbound_id, text }]
             }
             ComposeTarget::Chat => {
                 let trimmed = text.trim();

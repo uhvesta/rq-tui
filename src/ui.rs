@@ -478,6 +478,39 @@ pub(crate) fn handle_effect(
             bridge.send(AgentCommand::CancelQueued(outbound_id.clone()))?;
             state.status = format!("Cancelling queued prompt {}…", short_id(&outbound_id));
         }
+        Effect::ReplaceQueued { outbound_id, text } => {
+            let replacement = Outbound::new(OutboundKind::Chat, text.clone());
+            let replacement_id = replacement.id.clone();
+            bridge.send(AgentCommand::ReplaceQueued {
+                outbound_id: outbound_id.clone(),
+                replacement,
+            })?;
+            if let Some(message) = state
+                .chat
+                .iter_mut()
+                .chain(state.pending_side_entries.iter_mut())
+                .chain(state.main_chat.iter_mut().flatten())
+                .find(|message| message.outbound_id.as_deref() == Some(outbound_id.as_str()))
+            {
+                message.error = Some("replacement pending".into());
+            }
+            state.pending_outbound_ids.remove(&outbound_id);
+            state.pending_outbound_ids.insert(replacement_id.clone());
+            if state.side_outbound_ids.remove(&outbound_id) {
+                state.side_outbound_ids.insert(replacement_id.clone());
+            }
+            state.chat.push(ChatEntry {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: "you".into(),
+                text,
+                streaming: false,
+                annotation_id: None,
+                outbound_id: Some(replacement_id),
+                error: None,
+            });
+            follow_chat(state);
+            state.status = "Replacing the queued prompt atomically…".into();
+        }
         Effect::StartSide(question) => {
             if state.side_active || state.side_starting {
                 state.status =
@@ -1213,6 +1246,15 @@ pub(crate) fn handle_effect_failure(state: &mut AppState, effect: &Effect, error
                 "Could not cancel queued prompt {}: {error:#}",
                 short_id(outbound_id)
             );
+        }
+        Effect::ReplaceQueued { outbound_id, text } => {
+            state.screen = Screen::Chat;
+            state.input_return_mode = InputMode::Normal;
+            state.input_mode = InputMode::Compose;
+            state.compose_target = Some(ComposeTarget::EditQueued(outbound_id.clone()));
+            state.compose = text.clone();
+            state.compose_cursor = state.compose.len();
+            state.status = format!("Could not replace the queued prompt: {error:#}");
         }
         Effect::StartSide(question) => {
             for entry in state.pending_side_entries.drain(..) {
@@ -2059,6 +2101,85 @@ pub(crate) fn handle_agent_event(
                 .scroll
                 .min(state.queue_entry_ids().len().saturating_sub(1));
             state.status = format!("Cancelled queued prompt {}", short_id(&outbound_id));
+        }
+        AgentEvent::QueueReplaced {
+            outbound_id,
+            replacement_id,
+            position,
+        } => {
+            if let Some(message) = state
+                .chat
+                .iter_mut()
+                .chain(state.pending_side_entries.iter_mut())
+                .chain(state.main_chat.iter_mut().flatten())
+                .find(|message| message.outbound_id.as_deref() == Some(outbound_id.as_str()))
+            {
+                message.error = Some("replaced before start".into());
+            }
+            state.pending_outbound_ids.remove(&outbound_id);
+            state.pending_outbound_ids.insert(replacement_id.clone());
+            state.status = format!(
+                "Queued prompt replaced atomically at position {}",
+                position + 1
+            );
+            state.agent_progress.record_queued(
+                "Queued prompt replaced",
+                format!(
+                    "{} → {} at queue position {}",
+                    short_id(&outbound_id),
+                    short_id(&replacement_id),
+                    position + 1
+                ),
+            );
+        }
+        AgentEvent::QueueReplaceRejected {
+            outbound_id,
+            replacement_id,
+            original_active,
+            reason,
+        } => {
+            state.pending_outbound_ids.remove(&replacement_id);
+            if original_active {
+                state.pending_outbound_ids.insert(outbound_id.clone());
+            } else {
+                state.pending_outbound_ids.remove(&outbound_id);
+            }
+            if state.side_outbound_ids.remove(&replacement_id) && original_active {
+                state.side_outbound_ids.insert(outbound_id.clone());
+            }
+            if let Some(message) = state
+                .chat
+                .iter_mut()
+                .chain(state.pending_side_entries.iter_mut())
+                .chain(state.main_chat.iter_mut().flatten())
+                .find(|message| message.outbound_id.as_deref() == Some(outbound_id.as_str()))
+            {
+                message.error = None;
+            }
+            if let Some(message) = state
+                .chat
+                .iter_mut()
+                .chain(state.pending_side_entries.iter_mut())
+                .chain(state.main_chat.iter_mut().flatten())
+                .find(|message| message.outbound_id.as_deref() == Some(replacement_id.as_str()))
+            {
+                message.error = Some(format!("queue edit rejected: {reason}"));
+            }
+            state.status = format!("Queue edit rejected: {reason}");
+            state.agent_progress.record_queued(
+                "Queued prompt was not replaced",
+                if original_active {
+                    format!(
+                        "Original request {} is already active",
+                        short_id(&outbound_id)
+                    )
+                } else {
+                    format!(
+                        "Original request {} already left the queue; no replacement was added",
+                        short_id(&outbound_id)
+                    )
+                },
+            );
         }
         AgentEvent::ResponseStarted {
             outbound_id,
@@ -4451,7 +4572,7 @@ fn render_agent_status(frame: &mut ratatui::Frame, state: &AppState) {
 }
 
 fn render_queue(frame: &mut ratatui::Frame, state: &AppState) {
-    let visible_width = frame.area().width.saturating_sub(34).max(8) as usize;
+    let visible_width = frame.area().width.saturating_sub(40).max(8) as usize;
     let main_entries = state.main_chat.as_ref().into_iter().flatten().chain(
         (state.main_chat.is_none())
             .then_some(&state.chat)
@@ -4491,7 +4612,8 @@ fn render_queue(frame: &mut ratatui::Frame, state: &AppState) {
             let preview = text.chars().take(visible_width).collect::<String>();
             let marker = if index == state.scroll { "▶" } else { " " };
             ListItem::new(format!(
-                "{marker} {status:<6} {lane:<4} {}  {preview}",
+                "{marker} #{:<3} {status:<6} {lane:<4} {}  {preview}",
+                index + 1,
                 short_id(id)
             ))
             .style(if index == state.scroll {
@@ -4556,6 +4678,8 @@ fn agent_event_outbound_id(event: &AgentEvent) -> Option<String> {
     match event {
         AgentEvent::Queued { outbound_id, .. }
         | AgentEvent::QueueCancelled { outbound_id }
+        | AgentEvent::QueueReplaced { outbound_id, .. }
+        | AgentEvent::QueueReplaceRejected { outbound_id, .. }
         | AgentEvent::ResponseStarted { outbound_id, .. }
         | AgentEvent::ResponseDelta { outbound_id, .. }
         | AgentEvent::ResponseSnapshot { outbound_id, .. }
