@@ -26,6 +26,7 @@ pub(crate) enum Screen {
     AgentStatus,
     Queue,
     ModelPicker,
+    Preview,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -133,6 +134,7 @@ pub(crate) enum Effect {
     },
     SetExpandStep(usize),
     Preview,
+    PreviewBrowser,
     Yank(String),
 }
 
@@ -168,6 +170,18 @@ pub(crate) struct ChatEntry {
     pub(crate) annotation_id: Option<String>,
     pub(crate) outbound_id: Option<String>,
     pub(crate) error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PreviewReturnState {
+    screen: Screen,
+    focus: Focus,
+    input_mode: InputMode,
+    compose: String,
+    compose_cursor: usize,
+    compose_scroll: usize,
+    compose_target: Option<ComposeTarget>,
+    status: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -369,6 +383,10 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("versions", "open exact review-version history"),
     ("snapshot", "pin the current working-tree version"),
     ("generate-context", "draft structured review context"),
+    (
+        "preview-browser",
+        "open Markdown preview in the system browser",
+    ),
     ("export [markdown|json]", "export review annotations"),
     ("prune", "remove old work items"),
     ("settings", "open settings"),
@@ -451,6 +469,10 @@ pub(crate) struct AppState {
     pub(crate) chat_total_rows: usize,
     pub(crate) chat_viewport_rows: usize,
     pub(crate) chat_autofollow: bool,
+    pub(crate) preview_markdown: Option<String>,
+    pub(crate) preview_scroll: usize,
+    pub(crate) preview_total_rows: usize,
+    preview_return: Option<PreviewReturnState>,
     pub(crate) context_draft: String,
     pub(crate) context_streaming: bool,
     pub(crate) agent_connected: bool,
@@ -532,6 +554,10 @@ impl AppState {
             chat_total_rows: 0,
             chat_viewport_rows: 0,
             chat_autofollow: true,
+            preview_markdown: None,
+            preview_scroll: 0,
+            preview_total_rows: 0,
+            preview_return: None,
             context_draft: String::new(),
             context_streaming: false,
             agent_connected: false,
@@ -575,14 +601,19 @@ impl AppState {
     }
 
     pub(crate) fn tick(&mut self, now: Instant) {
-        if self.pending_prefix == "ctrl-w"
+        if matches!(self.pending_prefix.as_str(), "ctrl-w" | "preview-g")
             && self.pending_prefix_started.is_some_and(|started| {
                 now.saturating_duration_since(started) >= Self::CTRL_W_TIMEOUT
             })
         {
+            let prefix = self.pending_prefix.clone();
             self.pending_prefix.clear();
             self.pending_prefix_started = None;
-            self.status = "CTRL-W focus navigation timed out · focus unchanged".into();
+            self.status = if prefix == "preview-g" {
+                "Markdown preview prefix timed out · scroll unchanged".into()
+            } else {
+                "CTRL-W focus navigation timed out · focus unchanged".into()
+            };
         }
     }
 
@@ -794,6 +825,9 @@ impl AppState {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        if self.screen == Screen::Preview {
+            return self.handle_preview_key(key);
+        }
         if self.screen == Screen::Recovery {
             return self.handle_recovery_key(key);
         }
@@ -1112,6 +1146,124 @@ impl AppState {
             }
         }
         Vec::new()
+    }
+
+    fn handle_preview_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        if self.pending_prefix == "preview-g" {
+            self.pending_prefix.clear();
+            self.pending_prefix_started = None;
+            if key.code == KeyCode::Char('g') {
+                self.preview_scroll = 0;
+            }
+            return Vec::new();
+        }
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.close_preview();
+            }
+            KeyCode::Char('j') | KeyCode::Down if key.modifiers.is_empty() => {
+                self.preview_scroll = self.preview_scroll.saturating_add(1);
+                self.clamp_preview_scroll();
+            }
+            KeyCode::Char('k') | KeyCode::Up if key.modifiers.is_empty() => {
+                self.preview_scroll = self.preview_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.preview_scroll = self
+                    .preview_scroll
+                    .saturating_add((self.viewport_height / 2).max(1));
+                self.clamp_preview_scroll();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.preview_scroll = self
+                    .preview_scroll
+                    .saturating_sub((self.viewport_height / 2).max(1));
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.preview_scroll = self
+                    .preview_scroll
+                    .saturating_add(self.viewport_height.max(1));
+                self.clamp_preview_scroll();
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.preview_scroll = self
+                    .preview_scroll
+                    .saturating_sub(self.viewport_height.max(1));
+            }
+            KeyCode::Char('G') => {
+                self.preview_scroll = self
+                    .preview_total_rows
+                    .saturating_sub(self.viewport_height.max(1));
+            }
+            KeyCode::Char('g') => {
+                self.pending_prefix = "preview-g".into();
+                self.pending_prefix_started = Some(Instant::now());
+            }
+            _ => {
+                if self.pending_prefix == "preview-g" {
+                    if key.code == KeyCode::Char('g') {
+                        self.preview_scroll = 0;
+                    } else {
+                        self.pending_prefix.clear();
+                        self.pending_prefix_started = None;
+                    }
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    fn clamp_preview_scroll(&mut self) {
+        self.preview_scroll = self.preview_scroll.min(
+            self.preview_total_rows
+                .saturating_sub(self.viewport_height.max(1)),
+        );
+    }
+
+    pub(crate) fn open_preview(&mut self, markdown: String) {
+        if self.screen == Screen::Preview {
+            return;
+        }
+        self.preview_return = Some(PreviewReturnState {
+            screen: self.screen,
+            focus: self.focus,
+            input_mode: self.input_mode,
+            compose: self.compose.clone(),
+            compose_cursor: self.compose_cursor,
+            compose_scroll: self.compose_scroll,
+            compose_target: self.compose_target.clone(),
+            status: self.status.clone(),
+        });
+        self.preview_markdown = Some(markdown);
+        self.preview_scroll = 0;
+        self.preview_total_rows = 0;
+        self.screen = Screen::Preview;
+        self.input_mode = InputMode::Normal;
+        self.pending_prefix.clear();
+        self.pending_prefix_started = None;
+        self.status = "Markdown preview open · j/k scroll · q/Esc close".into();
+    }
+
+    fn close_preview(&mut self) {
+        let Some(previous) = self.preview_return.take() else {
+            self.screen = Screen::Review;
+            self.focus = Focus::Diff;
+            self.input_mode = InputMode::Normal;
+            return;
+        };
+        self.screen = previous.screen;
+        self.focus = previous.focus;
+        self.input_mode = previous.input_mode;
+        self.compose = previous.compose;
+        self.compose_cursor = previous.compose_cursor;
+        self.compose_scroll = previous.compose_scroll;
+        self.compose_target = previous.compose_target;
+        self.status = previous.status;
+        self.preview_markdown = None;
+        self.preview_scroll = 0;
+        self.preview_total_rows = 0;
+        self.pending_prefix.clear();
+        self.pending_prefix_started = None;
     }
 
     fn handle_prune_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -1987,6 +2139,7 @@ impl AppState {
                 vec![Effect::GenerateContext]
             }
             (Some("snapshot"), _) => vec![Effect::Snapshot],
+            (Some("preview-browser"), _) => vec![Effect::PreviewBrowser],
             (Some("sync"), _) => vec![Effect::Sync],
             (Some("fork"), _) => vec![Effect::Fork],
             (Some("compact"), _) => {
@@ -2938,6 +3091,56 @@ mod tests {
             app.handle_key(key(KeyCode::Char('m'))),
             vec![Effect::Preview]
         );
+    }
+
+    #[test]
+    fn markdown_preview_restores_the_exact_prior_chat_draft() {
+        let mut app = state();
+        app.screen = Screen::Chat;
+        app.focus = Focus::Chat;
+        app.input_mode = InputMode::Compose;
+        app.compose_target = Some(ComposeTarget::Chat);
+        app.compose = "draft with **markdown**".into();
+        app.compose_cursor = 7;
+        app.compose_scroll = 2;
+        app.status = "draft status".into();
+
+        app.open_preview("# Preview\n\nbody".into());
+        assert_eq!(app.screen, Screen::Preview);
+        assert_eq!(app.preview_scroll, 0);
+        app.preview_total_rows = 40;
+        app.viewport_height = 8;
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(app.preview_scroll > 0);
+        app.handle_key(key(KeyCode::Esc));
+
+        assert_eq!(app.screen, Screen::Chat);
+        assert_eq!(app.focus, Focus::Chat);
+        assert_eq!(app.input_mode, InputMode::Compose);
+        assert_eq!(app.compose, "draft with **markdown**");
+        assert_eq!(app.compose_cursor, 7);
+        assert_eq!(app.compose_scroll, 2);
+        assert_eq!(app.compose_target, Some(ComposeTarget::Chat));
+        assert_eq!(app.status, "draft status");
+        assert!(app.preview_markdown.is_none());
+    }
+
+    #[test]
+    fn markdown_preview_supports_vim_and_page_scroll_commands() {
+        let mut app = state();
+        app.open_preview((0..80).map(|n| format!("line {n}\n")).collect());
+        app.preview_total_rows = 80;
+        app.viewport_height = 10;
+
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.preview_scroll, 70);
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(app.preview_scroll, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert_eq!(app.preview_scroll, 10);
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(app.preview_scroll, 0);
     }
 
     #[test]

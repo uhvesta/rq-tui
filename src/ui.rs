@@ -1070,8 +1070,12 @@ pub(crate) fn handle_effect(
             state.expand_step = step;
             state.status = format!("Diff expansion step changed to {step}");
         }
-        Effect::Preview => match preview_markdown(state, paths) {
-            Ok(path) => state.status = format!("Opened preview {}", path.display()),
+        Effect::Preview => match markdown_preview_source(state) {
+            Ok(markdown) => state.open_preview(markdown),
+            Err(error) => state.status = error.to_string(),
+        },
+        Effect::PreviewBrowser => match preview_markdown(state, paths) {
+            Ok(path) => state.status = format!("Opened browser preview {}", path.display()),
             Err(error) => state.status = error.to_string(),
         },
         Effect::Yank(text) => {
@@ -1468,7 +1472,7 @@ fn copy_with_native_clipboard(text: &str) -> Result<&'static str> {
     anyhow::bail!("no native clipboard backend accepted the text")
 }
 
-fn preview_markdown(state: &AppState, paths: &AppPaths) -> Result<std::path::PathBuf> {
+fn markdown_preview_source(state: &AppState) -> Result<String> {
     let markdown = if state.input_mode == InputMode::Compose {
         state.compose.clone()
     } else if state.screen == Screen::Chat {
@@ -1511,6 +1515,11 @@ fn preview_markdown(state: &AppState, paths: &AppPaths) -> Result<std::path::Pat
             .context("no repository under cursor")?;
         std::fs::read_to_string(repo.record.path.join(path))?
     };
+    Ok(markdown)
+}
+
+fn preview_markdown(state: &AppState, paths: &AppPaths) -> Result<std::path::PathBuf> {
+    let markdown = markdown_preview_source(state)?;
     let preview_dir = paths.cache.join("previews");
     std::fs::create_dir_all(&preview_dir)?;
     let path = preview_dir.join(format!("{}.html", state.work_item.item.id));
@@ -2454,9 +2463,79 @@ pub(crate) fn render(
         Screen::AgentStatus => render_agent_status(frame, state),
         Screen::Queue => render_queue(frame, state),
         Screen::ModelPicker => render_model_picker(frame, state),
+        Screen::Preview => render_markdown_preview(frame, state, highlighter),
     }
     if state.input_mode == InputMode::Command {
         render_command_palette(frame, state);
+    }
+}
+
+fn render_markdown_preview(
+    frame: &mut ratatui::Frame,
+    state: &mut AppState,
+    highlighter: &mut dyn Highlighter,
+) {
+    let area = frame.area();
+    let width = area.width.saturating_sub(4).max(1) as usize;
+    let rendered = state
+        .preview_markdown
+        .as_deref()
+        .map(|markdown| render_markdown_mapped(markdown, width, highlighter))
+        .unwrap_or_else(|| MappedMarkdown {
+            rows: Vec::new(),
+            elided: Vec::new(),
+        });
+    let lines = rendered
+        .rows
+        .iter()
+        .map(|row| row.line.clone())
+        .collect::<Vec<_>>();
+
+    let preview_block = Block::default()
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(Color::Cyan))
+        .borders(Borders::ALL);
+    let inner = preview_block.inner(area);
+    let footer_height = usize::from(inner.height > 1);
+    let content_height = inner.height.saturating_sub(footer_height as u16);
+    state.preview_total_rows = lines.len();
+    state.preview_scroll = state
+        .preview_scroll
+        .min(lines.len().saturating_sub(content_height.max(1) as usize));
+    let first_row = if lines.is_empty() {
+        0
+    } else {
+        state.preview_scroll + 1
+    };
+    let last_row = (state.preview_scroll + content_height.max(1) as usize).min(lines.len());
+    let block = preview_block.title(format!(
+        " Markdown preview · rows {first_row}-{last_row}/{} ",
+        lines.len(),
+    ));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let content = Rect::new(inner.x, inner.y, inner.width, content_height);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .scroll((state.preview_scroll.min(u16::MAX as usize) as u16, 0))
+            .wrap(Wrap { trim: false }),
+        content,
+    );
+    if footer_height > 0 {
+        let footer = if inner.width < 60 {
+            " j/k scroll · C-u/d · C-f/b · gg/G · q/Esc close "
+        } else {
+            " j/k · C-u/d half · C-f/b page · gg/G · q/Esc · :preview-browser "
+        };
+        frame.render_widget(
+            Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+            Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+        );
     }
 }
 
@@ -4468,7 +4547,7 @@ mod tests {
     use super::{
         handle_agent_event, handle_effect, markdown_to_html, parse_review_context, render,
     };
-    use crate::app::{tests_support::state_for_ui, Effect};
+    use crate::app::{tests_support::state_for_ui, ChatEntry, Effect, Focus, Screen};
     use crate::config::AppPaths;
     use crate::copilot::{AgentCommand, AgentEvent, AgentSink, HistoryEntry, OutboundKind};
     use crate::highlight::PlainHighlighter;
@@ -4518,6 +4597,76 @@ mod tests {
         assert!(content.contains("demo — Review"));
         assert!(content.contains("unified"));
         assert!(content.contains("a ask"));
+    }
+
+    #[test]
+    fn markdown_preview_renders_full_height_with_scroll_controls() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = state_for_ui();
+        state.open_preview(
+            "# Review\n\nA paragraph with **emphasis**.\n\n```rust\nfn main() {}\n```\n\n"
+                .to_owned()
+                + &(0..30)
+                    .map(|index| format!("line {index}\n"))
+                    .collect::<String>(),
+        );
+        let mut highlighter = PlainHighlighter;
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        let first = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(first.contains("Markdown preview"));
+        assert!(first.contains("Review"));
+        assert!(first.contains("C-u/d half"));
+        assert!(state.preview_total_rows > 24);
+
+        state.preview_scroll = 20;
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        let second = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(second.contains("Markdown preview · rows "));
+        assert!(state.preview_scroll > 0);
+        assert!(state.preview_scroll < 20);
+        assert!(second.contains("line 20"));
+    }
+
+    #[test]
+    fn preview_effect_opens_the_in_tui_overlay_without_browser_side_effects() {
+        let storage = Storage::in_memory().unwrap();
+        let agent = FakeAgent::default();
+        let mut state = state_for_ui();
+        state.screen = Screen::Chat;
+        state.focus = Focus::Chat;
+        state.chat.push(ChatEntry {
+            id: "chat-message".into(),
+            role: "you".into(),
+            text: "# In TUI\n\npreview me".into(),
+            streaming: false,
+            annotation_id: None,
+            outbound_id: None,
+            error: None,
+        });
+        handle_effect(&mut state, &storage, &paths(), &agent, Effect::Preview).unwrap();
+        assert_eq!(state.screen, Screen::Preview);
+        assert_eq!(state.focus, Focus::Chat);
+        assert_eq!(
+            state.preview_markdown.as_deref(),
+            Some("# In TUI\n\npreview me")
+        );
     }
 
     #[test]
