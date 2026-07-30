@@ -1233,11 +1233,13 @@ mod tests {
 
     use super::TuiHarness;
     use crate::app::tests_support::state_for_ui;
-    use crate::app::AgentPhase;
+    use crate::app::{AgentPhase, Focus, Screen, VersionChoice};
     use crate::copilot::{
         ActivityKind, AgentEvent, AgentLane, ContextTierOption, HistoryEntry, ModelOption,
     };
-    use crate::domain::{AnchorSide, Annotation, AnnotationKind, DeliveryState, Placement};
+    use crate::domain::{
+        AnchorSide, Annotation, AnnotationKind, DeliveryState, Placement, Version, VersionKind,
+    };
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1296,6 +1298,66 @@ mod tests {
         assert!(output.contains("repo > src/module_1.rs"));
         assert!(output.contains("repo > src/module_2.rs  │  2/12 files"));
         assert!(output.contains("M repo > src/module_3.rs"));
+    }
+
+    #[test]
+    fn compact_file_tree_keeps_the_selected_file_visible_with_change_counts() {
+        let mut script = String::from("key t\n");
+        for _ in 0..8 {
+            script.push_str("key j\n");
+        }
+        script.push_str("snapshot selected\n");
+
+        let output = super::run_ui_script("manyfiles", 40, 9, &script).unwrap();
+
+        assert!(output.contains("src/module_9.rs"));
+        assert!(output.contains("+1 -0"));
+        assert!(output.contains("files · 8-10/13"));
+    }
+
+    #[test]
+    fn file_tree_fuzzy_filter_selects_and_reveals_the_first_live_match() {
+        let output = super::run_ui_script(
+            "manyfiles",
+            40,
+            9,
+            "key t\nkey /\ntype m12\nsnapshot filtered\nkey Enter\nsnapshot accepted\n",
+        )
+        .unwrap();
+
+        assert!(output.contains("/m12"));
+        assert!(output.contains("src/module_12.rs"));
+        assert!(output.contains("status: File filter: m12"));
+    }
+
+    #[test]
+    fn compact_version_history_keeps_the_selected_version_and_controls_visible() {
+        let mut harness = TuiHarness::new(state_for_ui(), 40, 9).unwrap();
+        harness.state.screen = Screen::Versions;
+        harness.state.versions = (1..=12)
+            .map(|number| VersionChoice {
+                repo_name: format!("repo-{number}"),
+                version: Version {
+                    id: format!("version-{number}"),
+                    repo_id: "repo".into(),
+                    version_num: number,
+                    kind: VersionKind::Remote,
+                    created_at: number.to_string(),
+                    head_sha: format!("head-{number}"),
+                    worktree_path: None,
+                    last_opened_at: (number < 12).then(|| "earlier".into()),
+                },
+                asks: number as usize,
+                comments: 0,
+            })
+            .collect();
+        harness.state.version_index = 11;
+
+        let frame = harness.render().unwrap();
+
+        assert!(frame.contains("repo-12"));
+        assert!(frame.contains("Version History · 7-12/12"));
+        assert!(frame.contains("Enter open · q/Esc back"));
     }
 
     #[test]
@@ -1497,6 +1559,10 @@ mod tests {
         harness.key(key(KeyCode::Char('e'))).unwrap();
         assert_eq!(harness.mode(), "INSERT");
         assert_eq!(harness.compose_text(), "queued original");
+        let edit_frame = harness.render().unwrap();
+        assert!(edit_frame.contains("EDIT QUEUED"));
+        assert!(edit_frame.contains("Enter replaces"));
+        assert!(edit_frame.contains(&original_id[..8]));
         harness
             .key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
             .unwrap();
@@ -2030,6 +2096,24 @@ mod tests {
     }
 
     #[test]
+    fn compact_inline_composer_keeps_a_scrollable_rectangle() {
+        let mut harness =
+            TuiHarness::from_unified_diff("compact-composer", workflow_diff(), 40, 9).unwrap();
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        type_text(
+            &mut harness,
+            "How does this overflow-resistant editor keep all of this content reachable?",
+        );
+        let frame = harness.render().unwrap();
+
+        assert!(frame.contains("╭─ ▶ Ask · INSERT"), "{frame}");
+        assert!(frame.contains("╰─ ↑↓ · Enter"), "{frame}");
+        assert!(frame.contains('/'), "{frame}");
+        assert_eq!(harness.state.compose_wrap_width, 37);
+        assert!(harness.state.compose_scroll > 0);
+    }
+
+    #[test]
     fn visual_search_extends_the_fixed_anchor_and_chat_visual_yanks_messages() {
         let mut review = TuiHarness::from_unified_diff("search", workflow_diff(), 100, 24).unwrap();
         review.key(key(KeyCode::Char('v'))).unwrap();
@@ -2052,8 +2136,11 @@ mod tests {
         chat.key(key(KeyCode::Char('G'))).unwrap();
         assert!(chat.render().unwrap().contains("VISUAL CHAR"));
         chat.key(key(KeyCode::Char('y'))).unwrap();
-        assert_eq!(chat.last_yank(), Some("hello\n\nstreamed answer"));
-        assert!(chat.render().unwrap().contains("Yanked 22 bytes"));
+        assert_eq!(
+            chat.last_yank(),
+            Some("you: hello\n\ncopilot: streamed answer")
+        );
+        assert!(chat.render().unwrap().contains("Yanked 36 bytes"));
     }
 
     #[test]
@@ -2138,7 +2225,7 @@ mod tests {
         assert!(harness.render().unwrap().contains("VISUAL LINE"));
         assert!(harness.selected_cell_count().unwrap() > 2);
         harness.key(key(KeyCode::Char('y'))).unwrap();
-        assert_eq!(harness.last_yank(), Some("## café 👩\u{200d}💻\n"));
+        assert_eq!(harness.last_yank(), Some("café 👩\u{200d}💻\n"));
 
         harness
             .key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL))
@@ -2148,6 +2235,27 @@ mod tests {
         assert!(frame.contains("VISUAL BLOCK"));
         assert!(frame.contains("fn main()"));
         assert!(harness.selected_cell_count().unwrap() > 1);
+    }
+
+    #[test]
+    fn chat_copy_omits_markdown_decoration_cells() {
+        let mut harness =
+            TuiHarness::from_unified_diff("markdown-copy", workflow_diff(), 52, 18).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness
+            .inject_agent_event(AgentEvent::HistoryLoaded(vec![HistoryEntry {
+                role: "assistant".into(),
+                text: "# Heading\n- item".into(),
+            }]))
+            .unwrap();
+        harness.render().unwrap();
+        harness.key(key(KeyCode::Char('g'))).unwrap();
+        harness.key(key(KeyCode::Char('g'))).unwrap();
+        harness.key(key(KeyCode::Char('V'))).unwrap();
+        harness.key(key(KeyCode::Char('G'))).unwrap();
+        harness.key(key(KeyCode::Char('y'))).unwrap();
+
+        assert_eq!(harness.last_yank(), Some("Heading\nitem\n"));
     }
 
     #[test]
@@ -2201,6 +2309,9 @@ mod tests {
         harness.key(key(KeyCode::Enter)).unwrap();
         assert_eq!(harness.agent_commands().len(), 1);
         assert!(harness.status().contains("Comment batch queued"));
+        assert_eq!(harness.state.screen, Screen::Chat);
+        assert_eq!(harness.state.focus, Focus::Chat);
+        assert!(harness.render().unwrap().contains("comments submitted"));
         assert_eq!(
             harness.persisted_annotations().unwrap()[0].delivery_state,
             "pending"
@@ -2211,6 +2322,54 @@ mod tests {
         let annotation = harness.persisted_annotations().unwrap().remove(0);
         assert!(annotation.submitted);
         assert_eq!(annotation.delivery_state, "sent");
+    }
+
+    #[test]
+    fn delivered_annotation_correction_requires_explicit_recovery_after_restart() {
+        let mut harness =
+            TuiHarness::from_unified_diff("correction-recovery", workflow_diff(), 90, 22).unwrap();
+        harness.key(key(KeyCode::Char('c'))).unwrap();
+        type_text(&mut harness, "original comment");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "export");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.stream_next_response(&["batch received"]).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char(']'))).unwrap();
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        harness.key(key(KeyCode::Char('e'))).unwrap();
+        harness.state.compose.clear();
+        harness.state.compose_cursor = 0;
+        type_text(&mut harness, "revised comment");
+        harness.key(key(KeyCode::Enter)).unwrap();
+
+        assert!(harness.status().contains("correction queued"));
+        assert_eq!(
+            harness
+                .storage
+                .pending_chats(&harness.state.work_item.item.id)
+                .unwrap()[0]
+                .kind,
+            "correction"
+        );
+
+        harness.restart().unwrap();
+        assert_eq!(harness.state.screen, Screen::Recovery);
+        assert!(harness.render().unwrap().contains("MAIN correction"));
+        harness.key(key(KeyCode::Char('r'))).unwrap();
+        assert!(harness.status().contains("correction intentionally resent"));
+        harness
+            .stream_next_response(&["correction received"])
+            .unwrap();
+        harness.restart().unwrap();
+
+        assert_ne!(harness.state.screen, Screen::Recovery);
+        assert!(harness
+            .storage
+            .pending_chats(&harness.state.work_item.item.id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2919,6 +3078,124 @@ mod tests {
         assert!(main.contains("persistent main message"));
         assert!(!main.contains("ephemeral secret"));
         assert!(!main.contains("side answer"));
+    }
+
+    #[test]
+    fn side_round_trip_restores_the_main_draft_cursor_and_input_state() {
+        let mut harness =
+            TuiHarness::from_unified_diff("side-draft", workflow_diff(), 80, 20).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "MAIN preserved draft");
+        harness.key(key(KeyCode::Esc)).unwrap();
+        let main_cursor = harness.state.compose_cursor;
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "side");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness
+            .inject_side_started("main-session", "side-session")
+            .unwrap();
+
+        assert!(harness.state.compose.is_empty());
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "main");
+        harness.key(key(KeyCode::Enter)).unwrap();
+
+        assert_eq!(harness.state.compose, "MAIN preserved draft");
+        assert_eq!(harness.state.compose_cursor, main_cursor);
+        assert_eq!(harness.state.input_mode, crate::app::InputMode::Normal);
+        assert_eq!(
+            harness.state.compose_target,
+            Some(crate::app::ComposeTarget::Chat)
+        );
+    }
+
+    #[test]
+    fn inline_ask_composer_intercepts_side_instead_of_creating_an_annotation() {
+        let mut harness =
+            TuiHarness::from_unified_diff("inline-side", workflow_diff(), 80, 20).unwrap();
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        type_text(&mut harness, "/side inspect this separately");
+        harness.key(key(KeyCode::Enter)).unwrap();
+
+        assert_eq!(harness.state.screen, Screen::Chat);
+        assert!(harness
+            .agent_commands()
+            .iter()
+            .any(|command| command.contains("StartSide")));
+        assert!(harness.persisted_annotations().unwrap().is_empty());
+        harness
+            .inject_side_started("main-session", "side-session")
+            .unwrap();
+        let frame = harness.render().unwrap();
+        assert!(frame.contains("SIDE"));
+        assert!(frame.contains("inspect this separately"));
+    }
+
+    #[test]
+    fn chat_search_finds_current_message_occurrences_in_both_directions() {
+        let mut harness =
+            TuiHarness::from_unified_diff("chat-search", workflow_diff(), 80, 20).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness
+            .inject_agent_event(AgentEvent::HistoryLoaded(vec![HistoryEntry {
+                role: "assistant".into(),
+                text: "foo middle foo end".into(),
+            }]))
+            .unwrap();
+        harness.render().unwrap();
+        harness.key(key(KeyCode::Char('/'))).unwrap();
+        type_text(&mut harness, "foo");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        let first = harness
+            .state
+            .chat_navigation
+            .as_ref()
+            .unwrap()
+            .point
+            .byte_offset;
+        harness.key(key(KeyCode::Char('n'))).unwrap();
+        let second = harness
+            .state
+            .chat_navigation
+            .as_ref()
+            .unwrap()
+            .point
+            .byte_offset;
+        harness.key(key(KeyCode::Char('N'))).unwrap();
+        let previous = harness
+            .state
+            .chat_navigation
+            .as_ref()
+            .unwrap()
+            .point
+            .byte_offset;
+
+        assert_eq!(first, 0);
+        assert_eq!(second, 11);
+        assert_eq!(previous, first);
+    }
+
+    #[test]
+    fn bracketed_multiline_paste_is_inserted_without_submitting() {
+        let mut harness = TuiHarness::from_unified_diff("paste", workflow_diff(), 80, 20).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        let effects = harness
+            .state
+            .handle_paste("first line\r\nsecond line\rthird line");
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            harness.compose_text(),
+            "first line\nsecond line\nthird line"
+        );
+        assert_eq!(harness.mode(), "INSERT");
+        assert!(harness.status().contains("across 3 lines"));
+        assert!(!harness
+            .captured_effects()
+            .iter()
+            .any(|effect| effect.contains("SendChat")));
     }
 
     #[test]

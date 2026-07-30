@@ -473,6 +473,22 @@ def main() -> int:
             setup.resize(80, 18)
             setup.wait_for("Review", timeout=8)
             setup.wait_for("COPILOT MAIN", timeout=8)
+            setup.send(b"\t")
+            setup.wait_for_screen("Chat", timeout=4)
+            setup.send(b"i")
+            setup.wait_for_screen("INSERT", timeout=4)
+            setup.send(
+                b"\x1b[200~"
+                b"PASTE_FIRST_LINE\nPASTE_SECOND_LINE"
+                b"\x1b[201~"
+            )
+            setup.wait_for_screen("PASTE_FIRST_LINE", timeout=4)
+            setup.wait_for_screen("PASTE_SECOND_LINE", timeout=4)
+            setup.wait_for_screen("Pasted 34 bytes across 2 lines", timeout=4)
+            setup.send(b"\x03")
+            setup.wait_for_screen("Type a message", timeout=4)
+            setup.send(b"\t")
+            setup.wait_for_screen("Review", timeout=4)
             setup.send(b":q\r")
             if setup.wait_for_exit(timeout=8) != 0:
                 raise AssertionError(setup.failure("setup review did not exit cleanly"))
@@ -644,7 +660,7 @@ def main() -> int:
             if not long_payloads:
                 raise AssertionError(child.failure("long Visual yank emitted no OSC 52 payload"))
             long_copy = base64.b64decode(long_payloads[-1], validate=True)
-            if not long_copy.startswith(b"First ") or b"audit-token-349" not in long_copy:
+            if not long_copy.startswith(b"you: First ") or b"audit-token-349" not in long_copy:
                 raise AssertionError(
                     f"long Visual yank missed semantic endpoints: "
                     f"{long_copy[:32]!r} ... {long_copy[-64:]!r}"

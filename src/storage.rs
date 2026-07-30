@@ -16,6 +16,7 @@ const MIGRATION_2: &str = include_str!("../migrations/0002_placement_side.sql");
 const MIGRATION_3: &str = include_str!("../migrations/0003_chat_outbox.sql");
 const MIGRATION_4: &str = include_str!("../migrations/0004_ephemeral_sessions.sql");
 const MIGRATION_5: &str = include_str!("../migrations/0005_prune_journal.sql");
+const MIGRATION_6: &str = include_str!("../migrations/0006_outbox_metadata.sql");
 
 pub(crate) struct Storage {
     connection: Connection,
@@ -131,6 +132,7 @@ impl Storage {
             (3, MIGRATION_3),
             (4, MIGRATION_4),
             (5, MIGRATION_5),
+            (6, MIGRATION_6),
         ] {
             let applied = tx
                 .query_row(
@@ -498,10 +500,10 @@ impl Storage {
         Ok(())
     }
 
-    pub(crate) fn unopened_remote_versions(
+    pub(crate) fn unopened_remote_versions_older_than(
         &self,
         repo_id: &str,
-        except_version_id: &str,
+        reviewed_version_num: i64,
     ) -> Result<Vec<Version>> {
         Ok(self
             .versions_for_repo(repo_id)?
@@ -509,7 +511,7 @@ impl Storage {
             .filter(|version| {
                 version.kind == VersionKind::Remote
                     && version.last_opened_at.is_none()
-                    && version.id != except_version_id
+                    && version.version_num < reviewed_version_num
             })
             .collect())
     }
@@ -1154,10 +1156,20 @@ impl Storage {
 
     pub(crate) fn enqueue_chat(&self, chat: &PendingChat) -> Result<()> {
         self.connection.execute(
-            "INSERT INTO chat_outbox(id, work_item_id, text, created_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET text = excluded.text",
-            params![chat.id, chat.work_item_id, chat.text, chat.created_at],
+            "INSERT INTO chat_outbox(id, work_item_id, text, kind, lane, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                text = excluded.text,
+                kind = excluded.kind,
+                lane = excluded.lane",
+            params![
+                chat.id,
+                chat.work_item_id,
+                chat.text,
+                chat.kind,
+                chat.lane,
+                chat.created_at
+            ],
         )?;
         Ok(())
     }
@@ -1170,12 +1182,14 @@ impl Storage {
         let tx = self.connection.unchecked_transaction()?;
         tx.execute("DELETE FROM chat_outbox WHERE id = ?1", [old_id])?;
         tx.execute(
-            "INSERT INTO chat_outbox(id, work_item_id, text, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO chat_outbox(id, work_item_id, text, kind, lane, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 replacement.id,
                 replacement.work_item_id,
                 replacement.text,
+                replacement.kind,
+                replacement.lane,
                 replacement.created_at,
             ],
         )?;
@@ -1191,7 +1205,7 @@ impl Storage {
 
     pub(crate) fn pending_chats(&self, work_item_id: &str) -> Result<Vec<PendingChat>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, work_item_id, text, created_at
+            "SELECT id, work_item_id, text, kind, lane, created_at
              FROM chat_outbox
              WHERE work_item_id = ?1
              ORDER BY created_at, id",
@@ -1201,7 +1215,9 @@ impl Storage {
                 id: row.get(0)?,
                 work_item_id: row.get(1)?,
                 text: row.get(2)?,
-                created_at: row.get(3)?,
+                kind: row.get(3)?,
+                lane: row.get(4)?,
+                created_at: row.get(5)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -2055,6 +2071,64 @@ mod tests {
     }
 
     #[test]
+    fn unopened_remote_cleanup_never_targets_a_newer_version() {
+        let storage = Storage::in_memory().unwrap();
+        let item = WorkItem {
+            id: "remote-history".into(),
+            name: "remote history".into(),
+            workspace_root: PathBuf::from("/remote-history"),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            last_opened_at: Some("1".into()),
+        };
+        storage.upsert_work_item(&item).unwrap();
+        storage
+            .upsert_repo(&Repo {
+                id: "repo".into(),
+                work_item_id: item.id,
+                name: "repo".into(),
+                path: PathBuf::from("/remote-history/repo.git"),
+                remote_pr_url: Some("https://github.com/acme/repo/pull/1".into()),
+                pr_meta_json: None,
+                base_branch: Some("main".into()),
+                base_branch_source: BaseBranchSource::Auto,
+                last_activity_at: None,
+            })
+            .unwrap();
+        for (number, opened) in [(1, None), (2, Some("reviewed")), (3, None)] {
+            storage
+                .upsert_version(&Version {
+                    id: format!("v{number}"),
+                    repo_id: "repo".into(),
+                    version_num: number,
+                    kind: VersionKind::Remote,
+                    created_at: number.to_string(),
+                    head_sha: format!("head-{number}"),
+                    worktree_path: Some(PathBuf::from(format!("/worktrees/v{number}"))),
+                    last_opened_at: opened.map(str::to_owned),
+                })
+                .unwrap();
+        }
+
+        let stale = storage
+            .unopened_remote_versions_older_than("repo", 2)
+            .unwrap();
+
+        assert_eq!(
+            stale
+                .iter()
+                .map(|version| version.id.as_str())
+                .collect::<Vec<_>>(),
+            ["v1"]
+        );
+        assert!(storage
+            .versions_for_repo("repo")
+            .unwrap()
+            .iter()
+            .any(|version| version.id == "v3"));
+    }
+
+    #[test]
     fn begin_prune_operation_snapshots_persistent_and_side_session_history() {
         let storage = Storage::in_memory().unwrap();
         let item = WorkItem {
@@ -2299,12 +2373,12 @@ mod tests {
         let count: i64 = storage
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, 6);
     }
 
     #[test]
@@ -2337,10 +2411,10 @@ mod tests {
         drop(connection);
 
         let storage = Storage::open(&database).unwrap();
-        let migration_applied: i64 = storage
+        let migrations_applied: i64 = storage
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version = 5",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (5, 6)",
                 [],
                 |row| row.get(0),
             )
@@ -2355,7 +2429,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migration_applied, 1);
+        assert_eq!(migrations_applied, 2);
         assert_eq!(tables, 2);
     }
 
@@ -2390,6 +2464,8 @@ mod tests {
             id: "chat-1".into(),
             work_item_id: item.id.clone(),
             text: "original".into(),
+            kind: "chat".into(),
+            lane: "main".into(),
             created_at: "1".into(),
         };
         storage.enqueue_chat(&original).unwrap();
@@ -2399,6 +2475,8 @@ mod tests {
             id: "chat-2".into(),
             work_item_id: item.id.clone(),
             text: "replacement".into(),
+            kind: "chat".into(),
+            lane: "main".into(),
             created_at: "2".into(),
         };
         storage.replace_queued_chat("chat-1", &replacement).unwrap();

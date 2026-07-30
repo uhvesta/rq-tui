@@ -14,10 +14,10 @@ Evidence abbreviations:
 - `PTY-xx` refers to [`audit/pty-smoke.md`](audit/pty-smoke.md).
 - Other test names identify their Rust module directly.
 
-Current-evidence boundary: 246 tests are discovered: 245 regular tests pass
+Current-evidence boundary: 259 tests are discovered: 258 regular tests pass
 and 1 authenticated live test is ignored by default. The ignored
 stream/resume test was also run explicitly against the installed Copilot CLI
-and passed. PTY-16 through PTY-25 are current compiled-binary evidence; earlier
+and passed. PTY-16 through PTY-26 are current compiled-binary evidence; earlier
 PTY references remain useful historical records.
 
 ## Findings remediated during this audit
@@ -46,6 +46,10 @@ PTY references remain useful historical records.
 | P1 | Lagged/closed SDK subscriptions, stale deltas, and resumed pending work could strand or corrupt the local active turn. | Lagged/closed streams fail active and queued work visibly instead of hanging; resumed in-flight turns receive a synthetic local outbound; a dispatched prompt binds through its matching `user.message` event before descendants are accepted, so late events from an older chain cannot complete the new turn. Corresponding `copilot::tests::*` race tests and LIVE-01 pass. |
 | P1 | SDK control calls could wait forever without a diagnosable operation boundary. | Startup, session create/resume, history, model, steering, delivery, fork, compaction, abort, disconnect, deletion, and shutdown calls now carry named 15-second async timeouts. The SDK worker remains on its own OS thread so even a CLI-side synchronous startup stall cannot block input or rendering. |
 | P1 | The checked-in Bzlmod lock was incomplete for strict consumers and the root alias could not analyze under `bazel test //...`. | The lockfile is refreshed, CI/release use `--lockfile_mode=error`, package visibility admits only the root alias, and the full aggregate Bazel gate passes. |
+| P1 | Opening an older reviewed remote version could delete a newer unseen version, and carry-forward could flip an old-side annotation onto the new side. | Remote cleanup now targets only lower version numbers, and re-anchoring preserves the prior placement side while reading the matching base/current source. `storage::tests::unopened_remote_cleanup_never_targets_a_newer_version`; `annotations::tests::exact_reanchor_preserves_the_placement_side`. |
+| P1 | Delivered annotation corrections were sent without durable recovery metadata. | Migration 6 records outbox kind and MAIN/SIDE lane; corrections are persisted before delivery and require explicit resend/discard after restart. `WF::delivered_annotation_correction_requires_explicit_recovery_after_restart`. |
+| P1 | The 40×9 contextual composer lost its rectangle or clipped the insertion cursor, and compact file/version lists could hide the selected row. | Compact editors now retain top/body/bottom borders with an independently scrolled content viewport; file and version lists window around their selection. The exact-minimum composer, file-tree, and version-history tests cover these states. |
+| P1 | Bracketed multiline paste was dropped or submitted only its first line; generic Vim prefixes could remain invisibly armed; queue editing looked like a new prompt. | Bracketed paste is enabled and inserted atomically with visible multiline feedback; every prefix is labelled, cancellable, and timed; queue replacement uses a yellow `EDIT QUEUED <id>` contract. PTY-26 and the corresponding deterministic paste/prefix/queue tests pass. |
 
 ## Requirement traceability
 
@@ -60,9 +64,9 @@ PTY references remain useful historical records.
 | R-07 | Local `v0`, first-annotation/explicit/export snapshots without moving HEAD/index | Working end-to-end | `git::tests::snapshot_preserves_head_and_index_and_pins_the_worktree`; PTY-04 pinned `s1`. |
 | R-08 | Remote bare cache, detached worktrees, immutable versions on new commits | Untested | Implemented in `remote.rs`; external `gh` workflow not exercised. |
 | R-09 | Synthetic session root spanning every repo | Partially working | Root/symlink creation exists; no multi-repo session read test. |
-| R-10 | Version picker with exact per-version counts and old-version reopening | Partially working | Storage queries and screen exist; no full old-version materialization workflow test. |
+| R-10 | Version picker with exact per-version counts and old-version reopening | Partially working | Storage queries and a selection-pinned compact screen exist; opening a reviewed version can prune only older unseen versions, never newer history. Full old-version materialization still lacks an external workflow test. |
 | R-11 | Annotation identity plus per-version placement | Working end-to-end | Temporary SQLite workflows persist and reload exact placements; migration/storage tests pass. |
-| R-12 | Content snippet/hash anchoring and fuzzy carry-forward | Partially working | Exact, ambiguous, and missing-anchor unit tests pass; full remote-version carry-forward remains untested. |
+| R-12 | Content snippet/hash anchoring and fuzzy carry-forward | Partially working | Exact, ambiguous, missing-anchor, moved-content, and old/new-side-preservation tests pass; full remote-version carry-forward remains untested. |
 | R-13 | Rename following and `≈` ambiguity review | Partially working | Rename parsing and re-anchor primitives exist; no complete rename-fetch workflow. |
 | R-14 | Normal/Visual Ask grounded to exact range, queued serially, streamed inline | Working end-to-end | `WF::normal_line_ask_persists_queues_streams_and_completes_inline`; `WF::visual_range_ask_uses_exact_new_source_range`; PTY-05/06/07. |
 | R-15 | Inline Ask follow-ups remain self-contained | Working end-to-end | `WF::annotation_edit_delete_undo_and_inline_follow_up_are_complete_workflows`; message envelope test coverage in `annotations.rs`. |
@@ -79,7 +83,7 @@ PTY references remain useful historical records.
 | R-26 | Markdown/JSON comment export and one structured session batch | Working end-to-end | Export format tests and `WF::comment_export_queues_one_batch_and_acknowledges_delivery`. |
 | R-27 | Never silently resend; pending before send, sent atomically at response start, explicit restart recovery | Working end-to-end | `storage::tests::ask_delivery_ack_is_persisted_atomically_with_response_start`; `WF::failed_agent_delivery_is_pending_and_restart_requires_recovery_choice`. |
 | R-28 | WAL, busy timeout, FKs, migrations, indexed SQLite model | Working end-to-end | Storage migration/concurrency tests; workflow tests use a real temporary SQLite file. |
-| R-29 | Editing delivered content queues correction rather than rewriting history | Partially working | Effects implement correction messages; delivered-edit workflow not yet tested against a real SDK session. |
+| R-29 | Editing delivered content queues correction rather than rewriting history | Working in deterministic persistence/recovery tests | Effects persist correction kind/lane before SDK delivery and clear only at response start; delivered annotation edits recover explicitly after restart. A real authenticated correction turn is not part of the regular gate. |
 | R-30 | Lazy viewport syntax highlighting behind a trait, broad language support | Working end-to-end | `highlight::tests::recognizes_common_languages`; `highlight::tests::highlights_only_requested_lines_and_reuses_cache`; deterministic rendered frames. |
 | R-31 | Read/search-only Ask permissions | Working in the audited local Copilot path | `copilot::tests::permission_handler_allows_reads_and_denies_shell_and_write`; LIVE-01 ran the authenticated bridge with its configured read-only permission handler. |
 | R-32 | Streaming events and persisted-session resume | Working end-to-end | Deterministic delta/final/resync/sub-agent tests pass; LIVE-01 streamed a real response, exercised SIDE teardown, disconnected, resumed the persisted MAIN session, and reloaded history. |
@@ -198,7 +202,7 @@ matrix so that new evidence is not confused with the earlier PTY run.
 | T-01 | Chat has explicit NORMAL, INSERT, COMMAND, SEARCH, and VISUAL modes with visible mode text | Working in deterministic frames and compiled PTY | `testing::tests::command_palette_is_scrollable_selectable_and_keeps_the_sticky_composer`, `testing::tests::sticky_chat_composer_wraps_edits_preserves_and_explicitly_discards_drafts`, PTY-23, and the `ui-snapshot` gallery. |
 | T-02 | Command palette selection and scrolling | Working in the deterministic harness and compiled PTY | Composer-local completions retain the sticky input and preserved draft; Up/Down wrap, PageUp/PageDown, Home/End, Tab completion, mouse wheel routing, narrow text-tail scrolling, and visible selection are covered by deterministic tests plus PTY-12/23. |
 | T-03 | Chat scrolling by rendered rows, including wrapped single messages | Working in the deterministic harness and compiled PTY | `WF::chat_scrolls_by_rendered_rows_and_pauses_live_following`; PTY-24 verifies immediate normal-mode Up/PageUp/SGR-wheel movement and resize reflow against visible row ranges. Native mouse-drag remains a terminal-owned fallback rather than app state. |
-| T-04 | Sticky multiline composer with wrapping, independent scroll, editing, preserved drafts, and explicit discard | Working in the deterministic harness and compiled PTY | `WF::sticky_chat_composer_wraps_edits_preserves_and_explicitly_discards_drafts`; exact-minimum tests keep the bottom border intact; PTY-21 exercised a 21-row contextual composer and PTY-23 exercised the 42×9 Chat composer. |
+| T-04 | Sticky multiline composer with wrapping, independent scroll, editing, preserved drafts, explicit discard, and atomic multiline paste | Working in the deterministic harness and compiled PTY | `WF::sticky_chat_composer_wraps_edits_preserves_and_explicitly_discards_drafts`; exact-minimum tests keep the full rectangle and cursor intact; PTY-21 exercised a 21-row contextual composer, PTY-23 exercised the 42×9 Chat composer, and PTY-26 proves bracketed two-line paste remains one editable draft. |
 | T-05 | Cancel draft versus cancel active Copilot turn | Working in the deterministic harness and compiled PTY | Draft preservation/discard and deterministic abort/reusable-session paths pass. PTY-18 stopped an active response while preserving the draft in Insert mode. |
 | T-06 | Markdown semantics in Chat and fenced-code rendering | Working in deterministic frames | `chat_render::*`, `markdown::*`, and `WF::markdown_history_and_minimum_terminal_state_have_inspectable_frames`; the source-mapped terminal renderer covers headings, lists, task lists, nested blockquotes, emphasis, inline code, safe link affordances, pipe tables, wrapping, blank lines, and syntax-highlighted fences. Browser output shares safe inline parsing, rejects executable URL schemes, and renders aligned tables. |
 | T-07 | Lazy cached syntax highlighting for diff lines and fenced code | Working in unit tests and deterministic frames | `highlight::tests::recognizes_common_languages`, `highlight::tests::highlights_only_requested_lines_and_reuses_cache`, and `chat_render::tests::highlights_fenced_code_with_a_language_specific_synthetic_path`. |
@@ -206,14 +210,14 @@ matrix so that new evidence is not confused with the earlier PTY run.
 | T-09 | `/side` isolated ephemeral conversation and `/main` restoration | Working in deterministic, compiled-PTY, and authenticated paths | `WF::side_conversation_is_visibly_isolated_and_main_transcript_is_restored`; PTY-20 returned from an active SIDE turn promptly, and LIVE-01 exercised real SIDE creation and SDK deletion. |
 | T-10 | Deterministic state gallery for visual inspection | Working as headless command paths | `ui-snapshot --state all` exercises review, ask, command, composer, quiet, queue, side, model, markdown, and tiny states through the production renderer. `ui-script` drives resize, input, stream events, and snapshots. Gallery output is terminal text, not a committed image artifact. |
 | T-11 | Copilot SDK decoupled behind a testable agent interface | Working for deterministic tests | `TuiHarness` uses a fake agent and injected lane/activity events; the production bridge remains the only path that starts the real Copilot CLI. |
-| T-12 | Mouse wheel scrolling and exact terminal text selection | Working in deterministic tests and compiled PTY | Wheel events route through the active mode, so they scroll Chat/diff, command completions, and the multiline composer rather than a hidden underlying surface. Built-in Chat Visual mode selects exact mapped rendered text by character, line, or block and copies source text without Markdown decoration or soft-wrap newlines. PTY-24 decodes the OSC 52 payload and verifies exact inclusive bytes after keyboard selection; Shift-drag remains available for native terminal selection. |
+| T-12 | Mouse wheel scrolling and exact terminal text selection | Working in deterministic tests and compiled PTY | Wheel events route through the active mode, so they scroll Chat/diff, command completions, and the multiline composer rather than a hidden underlying surface. Built-in Chat Visual mode selects exact mapped rendered text by character, line, or block and copies source text without Markdown decoration or soft-wrap newlines; cross-message copies include speaker labels. PTY-24 decodes the OSC 52 payload and verifies exact inclusive bytes after keyboard selection; Shift-drag remains available for native terminal selection. |
 
 ### Verification status for this addendum
 
 The current checked-in regular-test baseline is:
 
 ```text
-246 total tests; 245 passed; 1 authenticated live Copilot test ignored by default
+259 total tests; 258 passed; 1 authenticated live Copilot test ignored by default
 ```
 
 The regular baseline includes the reducer/effect, storage, rendering, SDK
@@ -221,14 +225,14 @@ adapter, deterministic UI, model-picker, queue/steering, liveness, and
 MAIN/SIDE tests. The ignored test is the authenticated
 `copilot::tests::live_copilot_streams_and_resumes_persisted_history`; it is not
 part of the regular count. It was run separately with
-`RQ_TUI_LIVE_COPILOT=1` and passed as LIVE-01. PTY-16 through PTY-25 were
+`RQ_TUI_LIVE_COPILOT=1` and passed as LIVE-01. PTY-16 through PTY-26 were
 captured from the current Bazel-built binary, with PTY-22/23 added by the
-automated compiled-binary smoke test and PTY-24/25 extending that same test.
+automated compiled-binary smoke test and PTY-24/25/26 extending that same test.
 
 ### Compiled PTY evidence
 
 Earlier records are kept for reproducibility and design context. The current
-pass is PTY-16 through PTY-25 in [`audit/pty-smoke.md`](audit/pty-smoke.md).
+pass is PTY-16 through PTY-26 in [`audit/pty-smoke.md`](audit/pty-smoke.md).
 
 The second compiled-binary audit used the Bazel-built binary and a controlled
 agent. It captured the following behaviors in a 100×28 tmux pane:
@@ -243,4 +247,5 @@ agent. It captured the following behaviors in a 100×28 tmux pane:
 The current pass adds active-turn cancellation, queue cancellation, steering,
 staged model selection, immediate SIDE exit, and oversized contextual-composer
 scrolling. PTY-25 adds wall-clock quiet-warning, stopping, cancellation, and
-post-deadline quiescence evidence.
+post-deadline quiescence evidence. PTY-26 adds a real terminal bracketed-paste
+sequence containing a literal newline.

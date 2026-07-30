@@ -559,6 +559,34 @@ impl ChatLayout {
         })
     }
 
+    pub fn point_for_message_offset(
+        &self,
+        message_id: &ChatMessageId,
+        byte_offset: usize,
+    ) -> Option<ChatPoint> {
+        let message = self.message(message_id)?;
+        let offset = normalize_boundary(&message.text, byte_offset.min(message.text.len()));
+        let block = message
+            .blocks
+            .iter()
+            .find(|block| block.source.contains(offset))
+            .or_else(|| {
+                message
+                    .blocks
+                    .iter()
+                    .find(|block| block.source.end == offset)
+            })
+            .or_else(|| {
+                message
+                    .blocks
+                    .iter()
+                    .min_by_key(|block| block.source.start.abs_diff(offset))
+            })?;
+        let point = ChatPoint::new(message_id.clone(), block.id, offset);
+        let normalized = self.normalize_point(&point)?;
+        self.locate(&normalized).map(|_| normalized)
+    }
+
     pub fn locate(&self, point: &ChatPoint) -> Option<CursorLocation> {
         let point = self.normalize_point(point)?;
         let mut boundary_fallback = None;

@@ -277,7 +277,7 @@ pub(crate) fn reanchor(
     Placement {
         annotation_id: annotation.id.clone(),
         version_id: version_id.to_owned(),
-        side: AnchorSide::New,
+        side: previous.side,
         line_start: (selected_start + 1) as i64,
         line_end: (selected_start + count) as i64,
         outdated: false,
@@ -452,6 +452,31 @@ mod tests {
             "new\nnewer\nbefore\ntarget\nafter\nend",
         );
         assert_eq!(placement.line_start, 4);
+        assert!(!placement.outdated);
+    }
+
+    #[test]
+    fn exact_reanchor_preserves_the_placement_side() {
+        let annotation = annotation("before\ntarget\nafter", 1, 1);
+        let previous = Placement {
+            annotation_id: "a".into(),
+            version_id: "v1".into(),
+            side: AnchorSide::Old,
+            line_start: 2,
+            line_end: 2,
+            outdated: false,
+            ambiguous: false,
+        };
+
+        let placement = reanchor(
+            &annotation,
+            &previous,
+            "v2",
+            "new\nbefore\ntarget\nafter\nend",
+        );
+
+        assert_eq!(placement.side, AnchorSide::Old);
+        assert_eq!((placement.line_start, placement.line_end), (3, 3));
         assert!(!placement.outdated);
     }
 

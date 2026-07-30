@@ -5,8 +5,10 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use crossterm::cursor::Show;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -23,8 +25,8 @@ use crate::annotations::{
     AnnotationRequest,
 };
 use crate::app::{
-    command_matches, AgentPhase, AppState, ChatEntry, ComposeTarget, DiffLayout, Effect, InputMode,
-    MarkdownPreview, ModelPickerStage, PendingPrune, PruneChoice, ReadyPrune, Screen,
+    command_matches, AgentPhase, AppState, ChatEntry, ComposeTarget, DiffLayout, Effect, Focus,
+    InputMode, MarkdownPreview, ModelPickerStage, PendingPrune, PruneChoice, ReadyPrune, Screen,
     VersionChoice,
 };
 use crate::chat_render::{render_markdown_mapped, CellSource, MappedMarkdown, MappedRow};
@@ -37,7 +39,7 @@ use crate::copilot::{
     start_agent, ActivityKind, AgentCommand, AgentEvent, AgentEventEnvelope, AgentRuntime,
     AgentSink, BridgeConfig, LaneEvent, Outbound, OutboundKind, PruneSessionOutcome,
 };
-use crate::diff::{DiffLine, LineKind};
+use crate::diff::{DiffFile, DiffLine, FileStatus, LineKind};
 use crate::domain::{
     AnnotationKind, AskMessage, BaseBranchSource, DeliveryState, PendingChat, Placement,
     ReviewContext, SessionRecord,
@@ -172,8 +174,21 @@ pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> R
     });
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+    if let Err(error) = execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    ) {
         disable_raw_mode().ok();
+        execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            Show
+        )
+        .ok();
         return Err(error.into());
     }
     let backend = CrosstermBackend::new(stdout);
@@ -183,6 +198,7 @@ pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> R
             disable_raw_mode().ok();
             execute!(
                 io::stdout(),
+                DisableBracketedPaste,
                 DisableMouseCapture,
                 LeaveAlternateScreen,
                 Show
@@ -198,6 +214,7 @@ pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> R
         disable_raw_mode().ok();
         execute!(
             io::stdout(),
+            DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen,
             Show
@@ -218,6 +235,7 @@ pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> R
     let raw_result = disable_raw_mode();
     let screen_result = execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
     );
@@ -270,6 +288,16 @@ fn run_loop<B: Backend>(
                         }
                     }
                 }
+                Event::Paste(text) => {
+                    let effects = state.handle_paste(&text);
+                    for effect in effects {
+                        if let Err(error) =
+                            handle_effect(state, storage, paths, bridge, effect.clone())
+                        {
+                            handle_effect_failure(state, &effect, &error);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -314,6 +342,21 @@ fn queue_outbound(
         format!("Outbound {} has not started yet", short_id(&outbound_id)),
     );
     Ok(outbound_id)
+}
+
+fn persist_correction(storage: &Storage, state: &AppState, outbound: &Outbound) -> Result<()> {
+    storage.enqueue_chat(&PendingChat {
+        id: outbound.id.clone(),
+        work_item_id: state.work_item.item.id.clone(),
+        text: outbound.text.clone(),
+        kind: "correction".into(),
+        lane: if state.side_active || state.side_starting {
+            "side".into()
+        } else {
+            "main".into()
+        },
+        created_at: now(),
+    })
 }
 
 fn push_outbound_entry(state: &mut AppState, entry: ChatEntry) {
@@ -495,6 +538,8 @@ pub(crate) fn handle_effect(
                         id: outbound.id.clone(),
                         work_item_id: state.work_item.item.id.clone(),
                         text: text.clone(),
+                        kind: "chat".into(),
+                        lane: "main".into(),
                         created_at: now(),
                     })?;
                 }
@@ -521,14 +566,17 @@ pub(crate) fn handle_effect(
         Effect::SteerChat(text) => {
             if !text.trim().is_empty() {
                 let outbound = Outbound::new(OutboundKind::Correction, text.clone());
+                let outbound_id = outbound.id.clone();
+                persist_correction(storage, state, &outbound)?;
                 bridge.send(AgentCommand::Steer(outbound))?;
+                state.pending_outbound_ids.insert(outbound_id.clone());
                 state.chat.push(ChatEntry {
                     id: uuid::Uuid::new_v4().to_string(),
                     role: "you · steer".into(),
                     text,
                     streaming: false,
                     annotation_id: None,
-                    outbound_id: None,
+                    outbound_id: Some(outbound_id),
                     error: None,
                 });
                 state.agent_progress.record(
@@ -583,6 +631,11 @@ pub(crate) fn handle_effect(
                 state.status =
                     "A SIDE conversation is already active or starting · use /main first".into();
             } else {
+                state.compose.clear();
+                state.compose_cursor = 0;
+                state.compose_scroll = 0;
+                state.compose_target = Some(ComposeTarget::Chat);
+                state.input_mode = InputMode::Normal;
                 let outbound = question.filter(|text| !text.trim().is_empty()).map(|text| {
                     let outbound = Outbound::new(OutboundKind::Chat, text.clone());
                     state.pending_side_entries.push(ChatEntry {
@@ -719,17 +772,15 @@ pub(crate) fn handle_effect(
                 current.text = Some(text.clone());
             }
             if annotation.submitted {
-                queue_outbound(
-                    state,
-                    bridge,
-                    Outbound::new(
-                        OutboundKind::Correction,
-                        format!(
-                            "Correction to submitted review annotation {}: {}",
-                            annotation_id, text
-                        ),
+                let outbound = Outbound::new(
+                    OutboundKind::Correction,
+                    format!(
+                        "Correction to submitted review annotation {}: {}",
+                        annotation_id, text
                     ),
-                )?;
+                );
+                persist_correction(storage, state, &outbound)?;
+                queue_outbound(state, bridge, outbound)?;
                 state.status = "Annotation updated; correction queued".into();
             } else {
                 state.status = "Annotation updated".into();
@@ -754,16 +805,14 @@ pub(crate) fn handle_effect(
             {
                 message.text = text.clone();
             }
-            queue_outbound(
-                state,
-                bridge,
-                Outbound::new(
-                    OutboundKind::Correction,
-                    format!(
-                        "Correction to ask annotation {annotation_id}, message {message_id}: {text}"
-                    ),
+            let outbound = Outbound::new(
+                OutboundKind::Correction,
+                format!(
+                    "Correction to ask annotation {annotation_id}, message {message_id}: {text}"
                 ),
-            )?;
+            );
+            persist_correction(storage, state, &outbound)?;
+            queue_outbound(state, bridge, outbound)?;
             state.status = if previous.sent {
                 "Ask message edited; correction queued".into()
             } else {
@@ -832,14 +881,12 @@ pub(crate) fn handle_effect(
                 Vec::new()
             };
             if annotation.submitted || annotation.delivery_state == DeliveryState::Sent {
-                queue_outbound(
-                    state,
-                    bridge,
-                    Outbound::new(
-                        OutboundKind::Correction,
-                        format!("Correction: review annotation {annotation_id} was deleted."),
-                    ),
-                )?;
+                let outbound = Outbound::new(
+                    OutboundKind::Correction,
+                    format!("Correction: review annotation {annotation_id} was deleted."),
+                );
+                persist_correction(storage, state, &outbound)?;
+                queue_outbound(state, bridge, outbound)?;
             }
             storage.delete_annotation(&annotation_id)?;
             state
@@ -999,7 +1046,11 @@ pub(crate) fn handle_effect(
         Effect::ResendPendingChat(chat) => {
             let outbound = Outbound {
                 id: chat.id.clone(),
-                kind: OutboundKind::Chat,
+                kind: if chat.kind == "correction" {
+                    OutboundKind::Correction
+                } else {
+                    OutboundKind::Chat
+                },
                 text: chat.text.clone(),
             };
             let outbound_id = queue_outbound(state, bridge, outbound)?;
@@ -1007,7 +1058,11 @@ pub(crate) fn handle_effect(
                 state,
                 ChatEntry {
                     id: uuid::Uuid::new_v4().to_string(),
-                    role: "you (resent)".into(),
+                    role: if chat.kind == "correction" {
+                        "you · correction (resent)".into()
+                    } else {
+                        "you (resent)".into()
+                    },
                     text: chat.text,
                     streaming: false,
                     annotation_id: None,
@@ -1017,7 +1072,14 @@ pub(crate) fn handle_effect(
             );
             state.pending_chats.retain(|pending| pending.id != chat.id);
             finish_recovery(state);
-            state.status = "Pending Chat prompt intentionally resent".into();
+            state.status = if chat.kind == "correction" {
+                format!(
+                    "Pending {} correction intentionally resent",
+                    chat.lane.to_uppercase()
+                )
+            } else {
+                "Pending Chat prompt intentionally resent".into()
+            };
         }
         Effect::DiscardPendingChat(id) => {
             storage.delete_queued_chat(&id)?;
@@ -1205,6 +1267,14 @@ pub(crate) fn handle_effect(
                         error: None,
                     },
                 );
+                state.screen = Screen::Chat;
+                state.focus = Focus::Chat;
+                state.input_mode = InputMode::Normal;
+                state.chat_autofollow = true;
+                state.chat_cursor = state.chat.len().saturating_sub(1);
+                state.chat_scroll = state
+                    .chat_total_rows
+                    .saturating_sub(state.chat_viewport_rows);
                 state.status = export_path.map_or_else(
                     || "Comment batch queued".into(),
                     |path| format!("Exported comments to {} · batch queued", path.display()),
@@ -1555,7 +1625,7 @@ fn open_version(
     state.sync_review_cursor_to_current_file();
     storage.mark_version_opened(version_id)?;
     if version.kind == crate::domain::VersionKind::Remote {
-        for stale in storage.unopened_remote_versions(repo_id, version_id)? {
+        for stale in storage.unopened_remote_versions_older_than(repo_id, version.version_num)? {
             if let Some(worktree) = stale.worktree_path {
                 git.remove_worktree(&repo.path, &worktree)?;
             }
@@ -2656,6 +2726,8 @@ pub(crate) fn handle_agent_event(
                         id: replacement_id.clone(),
                         work_item_id: state.work_item.item.id.clone(),
                         text: replacement_text.unwrap_or_default(),
+                        kind: "chat".into(),
+                        lane: "main".into(),
                         created_at: now(),
                     },
                 )?;
@@ -2814,11 +2886,10 @@ pub(crate) fn handle_agent_event(
                     state.pending_context = false;
                     None
                 }
-                OutboundKind::Chat => {
+                OutboundKind::Chat | OutboundKind::Correction => {
                     storage.delete_queued_chat(&outbound_id)?;
                     None
                 }
-                OutboundKind::Correction => None,
             };
             state.chat.push(ChatEntry {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -3511,8 +3582,13 @@ fn render_recovery(frame: &mut ratatui::Frame, state: &AppState) {
         } else {
             " "
         };
+        let label = if chat.kind == "correction" {
+            format!("{} correction", chat.lane.to_uppercase())
+        } else {
+            "queued Chat".into()
+        };
         items.push(ListItem::new(format!(
-            "{marker} queued Chat — {}",
+            "{marker} {label} — {}",
             chat.text.replace('\n', " ")
         )));
         next_index += 1;
@@ -3539,15 +3615,33 @@ fn render_recovery(frame: &mut ratatui::Frame, state: &AppState) {
             "{marker} accepted Work Item context"
         )));
     }
+    let area = frame.area();
+    let total = items.len();
+    let viewport = usize::from(area.height.saturating_sub(3)).max(1);
+    let start = state
+        .recovery_index
+        .saturating_add(1)
+        .saturating_sub(viewport)
+        .min(total.saturating_sub(viewport));
+    let end = (start + viewport).min(total);
+    let items = items
+        .into_iter()
+        .skip(start)
+        .take(viewport)
+        .collect::<Vec<_>>();
     frame.render_widget(
         List::new(items).block(
             Block::default()
-                .title("Delivery recovery — these messages may not have been delivered")
+                .title(format!(
+                    " Delivery recovery · may be undelivered · {}-{}/{} ",
+                    total.min(start + 1),
+                    end,
+                    total
+                ))
                 .borders(Borders::ALL),
         ),
-        frame.area(),
+        area,
     );
-    let area = frame.area();
     let footer = Rect::new(
         area.x.saturating_add(1),
         area.bottom().saturating_sub(2),
@@ -3866,7 +3960,9 @@ fn format_token_count(tokens: i64) -> String {
 }
 
 fn render_versions(frame: &mut ratatui::Frame, state: &AppState) {
-    let items = state
+    let area = frame.area();
+    let row_width = usize::from(area.width.saturating_sub(2));
+    let rows = state
         .versions
         .iter()
         .enumerate()
@@ -3885,19 +3981,63 @@ fn render_versions(frame: &mut ratatui::Frame, state: &AppState) {
                     format!("s{}", choice.version.version_num)
                 }
             };
-            ListItem::new(format!(
-                "{marker} {:<16} {:<5} {}  {} asks · {} comments",
-                choice.repo_name, prefix, choice.version.created_at, choice.asks, choice.comments
-            ))
+            let reviewed = choice
+                .version
+                .last_opened_at
+                .as_deref()
+                .map(|opened| format!("reviewed {opened}"))
+                .unwrap_or_else(|| "NEW · not reviewed".into());
+            let text = format!(
+                "{marker} {} · {prefix} · {reviewed} · {} asks · {} comments",
+                choice.repo_name, choice.asks, choice.comments
+            );
+            ListItem::new(truncate_terminal_line(&text, row_width)).style(
+                if index == state.version_index {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            )
         })
+        .collect::<Vec<_>>();
+    let total = rows.len();
+    let viewport = usize::from(area.height.saturating_sub(3)).max(1);
+    let start = state
+        .version_index
+        .saturating_add(1)
+        .saturating_sub(viewport)
+        .min(total.saturating_sub(viewport));
+    let end = (start + viewport).min(total);
+    let items = rows
+        .into_iter()
+        .skip(start)
+        .take(viewport)
         .collect::<Vec<_>>();
     frame.render_widget(
         List::new(items).block(
             Block::default()
-                .title("Version History")
+                .title(format!(
+                    " Version History · {}-{}/{} ",
+                    total.min(start + 1),
+                    end,
+                    total
+                ))
                 .borders(Borders::ALL),
         ),
-        frame.area(),
+        area,
+    );
+    frame.render_widget(
+        Paragraph::new("j/k select · Enter open · q/Esc back")
+            .style(Style::default().fg(Color::DarkGray)),
+        Rect::new(
+            area.x.saturating_add(1),
+            area.bottom().saturating_sub(2),
+            area.width.saturating_sub(2),
+            1,
+        ),
     );
 }
 
@@ -4052,25 +4192,43 @@ fn render_header(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
 }
 
 fn render_picker(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
-    let mut items = Vec::new();
+    let filtering = state.input_mode == InputMode::Search
+        && state.focus == crate::app::Focus::FilePicker
+        && !state.search.is_empty();
+    let mut rows: Vec<(ListItem<'static>, bool)> = Vec::new();
     for (repo_index, repo) in state.work_item.repos.iter().enumerate() {
-        let collapsed = state.collapsed_repos.contains(&repo.record.id);
-        items.push(ListItem::new(Line::styled(
-            format!(
-                "{} {} ({} files)",
-                if collapsed { "▸" } else { "▾" },
-                repo.record.name,
-                repo.diff.files.len()
-            ),
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
+        let collapsed = state.collapsed_repos.contains(&repo.record.id) && !filtering;
+        let selected = collapsed && repo_index == state.repo_index;
+        let activity = compact_repo_activity(repo.record.last_activity_at.as_deref());
+        let summary = format!(
+            "{} {} ({} files){}",
+            if collapsed { "▸" } else { "▾" },
+            repo.record.name,
+            repo.diff.files.len(),
+            activity
+                .as_deref()
+                .map(|activity| format!(" · {activity}"))
+                .unwrap_or_default()
+        );
+        rows.push((
+            ListItem::new(Line::styled(
+                format!("{} {summary}", if selected { "▶" } else { " " }),
+                if selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().add_modifier(Modifier::BOLD)
+                },
+            )),
+            selected,
+        ));
         if collapsed {
             continue;
         }
         for (file_index, file) in repo.diff.files.iter().enumerate() {
-            if state.input_mode == InputMode::Search
-                && state.focus == crate::app::Focus::FilePicker
-                && !state.search.is_empty()
+            if filtering
                 && !fuzzy_match(
                     &file.display_path.to_string_lossy().to_lowercase(),
                     &state.search.to_lowercase(),
@@ -4078,22 +4236,60 @@ fn render_picker(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             {
                 continue;
             }
-            let marker = if repo_index == state.repo_index && file_index == state.file_index {
-                "▶"
-            } else {
-                " "
-            };
-            items.push(ListItem::new(format!(
-                "{marker}  {}",
-                file.display_path.display()
-            )));
+            let selected = repo_index == state.repo_index && file_index == state.file_index;
+            rows.push((
+                ListItem::new(file_picker_line(
+                    file,
+                    selected,
+                    usize::from(area.width.saturating_sub(2)),
+                ))
+                .style(if selected {
+                    Style::default().bg(Color::DarkGray)
+                } else {
+                    Style::default()
+                }),
+                selected,
+            ));
         }
     }
     let focused = state.focus == crate::app::Focus::FilePicker;
+    let selected_row = rows.iter().position(|(_, selected)| *selected);
+    let viewport = usize::from(area.height.saturating_sub(1)).max(1);
+    let start = selected_row
+        .map(|selected| {
+            selected
+                .saturating_add(1)
+                .saturating_sub(viewport)
+                .min(rows.len().saturating_sub(viewport))
+        })
+        .unwrap_or(0);
+    let end = (start + viewport).min(rows.len());
+    let total = rows.len();
+    let items = rows
+        .into_iter()
+        .skip(start)
+        .take(viewport)
+        .map(|(item, _)| item)
+        .collect::<Vec<_>>();
+    let range = if total > viewport {
+        format!(" · {}-{}/{}", start + 1, end, total)
+    } else {
+        String::new()
+    };
+    let filter = if filtering {
+        format!(" · /{}", state.search)
+    } else {
+        String::new()
+    };
     frame.render_widget(
         List::new(items).block(
             Block::default()
-                .title(if focused { "▶ files" } else { "files" })
+                .title(format!(
+                    "{} files{}{}",
+                    if focused { "▶" } else { "" },
+                    range,
+                    filter,
+                ))
                 .border_style(Style::default().fg(if focused {
                     Color::Cyan
                 } else {
@@ -4103,6 +4299,77 @@ fn render_picker(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
         ),
         area,
     );
+}
+
+fn file_picker_line(file: &DiffFile, selected: bool, width: usize) -> Line<'static> {
+    let (badge, color) = match file.status {
+        FileStatus::Added => ("A", Color::Green),
+        FileStatus::Deleted => ("D", Color::Red),
+        FileStatus::Renamed => ("R", Color::Yellow),
+        FileStatus::Modified => ("M", Color::Blue),
+    };
+    let additions = file
+        .visible_lines()
+        .filter(|line| line.kind == LineKind::Addition)
+        .count();
+    let deletions = file
+        .visible_lines()
+        .filter(|line| line.kind == LineKind::Deletion)
+        .count();
+    let marker = if selected { "▶ " } else { "  " };
+    let badge = format!("{badge} ");
+    let counts = format!(" +{additions} -{deletions}");
+    let fixed_width = cell_width(marker) + cell_width(&badge) + cell_width(&counts);
+    let path = fit_terminal_text(
+        &file.display_path.to_string_lossy(),
+        width.saturating_sub(fixed_width),
+    );
+    let gap = " ".repeat(
+        width
+            .saturating_sub(fixed_width)
+            .saturating_sub(cell_width(&path)),
+    );
+    Line::from(vec![
+        Span::styled(
+            marker.to_owned(),
+            if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
+        ),
+        Span::styled(badge, Style::default().fg(color)),
+        Span::styled(
+            path,
+            if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
+        ),
+        Span::raw(gap),
+        Span::styled(counts, Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+fn compact_repo_activity(value: Option<&str>) -> Option<String> {
+    let timestamp = chrono::DateTime::parse_from_rfc3339(value?).ok()?;
+    let age = chrono::Utc::now()
+        .signed_duration_since(timestamp.with_timezone(&chrono::Utc))
+        .max(chrono::Duration::zero());
+    Some(if age.num_seconds() < 60 {
+        "now".into()
+    } else if age.num_minutes() < 60 {
+        format!("{}m", age.num_minutes())
+    } else if age.num_hours() < 24 {
+        format!("{}h", age.num_hours())
+    } else {
+        format!("{}d", age.num_days())
+    })
 }
 
 fn fuzzy_match(haystack: &str, needle: &str) -> bool {
@@ -4382,8 +4649,11 @@ fn render_compact_inline_composer(
 
     let mut marked = state.compose.clone();
     marked.insert(floor_grapheme_boundary(&marked, state.compose_cursor), '▏');
+    // `bordered_body` reserves one inner column for padding in addition to
+    // the two border cells, so wrap to the exact selectable content width.
+    let inner_width = area.width.saturating_sub(3).max(1) as usize;
     let display = format!("❯ {marked}");
-    let (rows, _, _) = wrapped_editor_lines(&display, display.len(), area.width.max(1) as usize);
+    let (rows, _, _) = wrapped_editor_lines(&display, display.len(), inner_width);
     let cursor_row = rows
         .iter()
         .position(|row| row.contains('▏'))
@@ -4394,52 +4664,58 @@ fn render_compact_inline_composer(
         .saturating_sub(editor_height)
         .min(rows.len().saturating_sub(editor_height));
     state.compose_scroll = scroll;
-    state.compose_wrap_width = area.width.max(1) as usize;
+    state.compose_wrap_width = inner_width;
 
     let title = format!(
-        "▶ {label} · INSERT · rows {}-{}/{}",
+        "▶ {label} · INSERT · {}-{}/{}",
         scroll + 1,
         (scroll + editor_height).min(rows.len()),
         rows.len()
     );
+    if area.height == 1 {
+        frame.render_widget(
+            Paragraph::new(bordered_top(&title, area.width as usize)).style(
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            area,
+        );
+        return true;
+    }
     frame.render_widget(
-        Paragraph::new(fit_terminal_text(&title, area.width as usize)).style(
+        Paragraph::new(bordered_top(&title, area.width as usize)).style(
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
         Rect::new(area.x, area.y, area.width, 1),
     );
-    let visible = rows
-        .into_iter()
-        .skip(scroll)
-        .take(editor_height)
-        .map(|row| Line::raw(fit_terminal_text(&row, area.width as usize)))
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(visible),
-        Rect::new(
-            area.x,
-            area.y + 1,
-            area.width,
-            area.height.saturating_sub(2).max(1),
-        ),
-    );
-    if area.height >= 2 {
+    if area.height > 2 {
+        let visible = rows
+            .into_iter()
+            .skip(scroll)
+            .take(editor_height)
+            .map(|row| Line::raw(bordered_body(&row, area.width as usize)))
+            .collect::<Vec<_>>();
         frame.render_widget(
-            Paragraph::new(fit_terminal_text(
-                "↑↓ move · Enter · Esc keep · ^C discard",
-                area.width as usize,
-            ))
-            .style(Style::default().fg(Color::Cyan)),
-            Rect::new(
-                area.x,
-                area.y + area.height.saturating_sub(1),
-                area.width,
-                1,
-            ),
+            Paragraph::new(visible),
+            Rect::new(area.x, area.y + 1, area.width, area.height - 2),
         );
     }
+    frame.render_widget(
+        Paragraph::new(bordered_bottom_label(
+            "↑↓ · Enter · Esc keep · ^C discard",
+            area.width as usize,
+        ))
+        .style(Style::default().fg(Color::Cyan)),
+        Rect::new(
+            area.x,
+            area.y + area.height.saturating_sub(1),
+            area.width,
+            1,
+        ),
+    );
     true
 }
 
@@ -4633,6 +4909,15 @@ fn bordered_bottom(width: usize) -> String {
     }
 }
 
+fn bordered_bottom_label(label: &str, width: usize) -> String {
+    if width < 2 {
+        return fit_terminal_text(label, width);
+    }
+    let inner = width.saturating_sub(2);
+    let label = fit_terminal_text(&format!("─ {label} "), inner);
+    format!("╰{label}╯")
+}
+
 fn fit_terminal_text(text: &str, width: usize) -> String {
     let mut result = String::new();
     let mut used = 0usize;
@@ -4656,7 +4941,10 @@ fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
         InputMode::Search => "SEARCH",
         InputMode::Compose => "INSERT",
     };
-    let content = match state.input_mode {
+    let content = if !state.pending_prefix.is_empty() {
+        state.status.clone()
+    } else {
+        match state.input_mode {
         InputMode::Command => "COMMAND  type to filter · Enter run · Esc cancel".into(),
         InputMode::Search => format!("/{:<width$}", state.search, width = area.width as usize),
         InputMode::Compose
@@ -4689,6 +4977,7 @@ fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             "{mode}  j/k move · h/l file · t files · v select · a ask · c comment · Tab chat · : command  {}",
             state.status
         ),
+        }
     };
     let progress = &state.agent_progress;
     let lane = visible_lane(state);
@@ -5098,13 +5387,13 @@ fn build_chat_layout(
                 .map(|cell| {
                     let width = cell.columns.end.saturating_sub(cell.columns.start).max(1);
                     match &cell.source {
-                        CellSource::Text(source) | CellSource::Decoration(source) => {
-                            ChatCell::source(
-                                SelectionSourceRange::new(source.start, source.end),
-                                width,
-                            )
+                        CellSource::Text(source) => ChatCell::source(
+                            SelectionSourceRange::new(source.start, source.end),
+                            width,
+                        ),
+                        CellSource::Decoration(_) | CellSource::Synthetic => {
+                            ChatCell::display_only(width)
                         }
-                        CellSource::Synthetic => ChatCell::display_only(width),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -5225,7 +5514,38 @@ fn render_chat_composer(frame: &mut ratatui::Frame, state: &mut AppState, area: 
         .compose_scroll
         .min(lines.len().saturating_sub(visible_rows));
 
+    let queued_edit_id = match state.compose_target.as_ref() {
+        Some(ComposeTarget::EditQueued(outbound_id)) => Some(short_id(outbound_id)),
+        _ => None,
+    };
     let (title, border_color) = match state.input_mode {
+        InputMode::Compose if queued_edit_id.is_some() => {
+            let id = queued_edit_id.unwrap_or_default();
+            let range = format!(
+                "{}-{}/{}",
+                state.compose_scroll + 1,
+                (state.compose_scroll + visible_rows).min(lines.len()),
+                lines.len()
+            );
+            (
+                if area.width < 60 {
+                    format!(" EDIT QUEUED {id} · {range} · Enter replace ")
+                } else {
+                    format!(
+                        " EDIT QUEUED {id} · rows {range} · ↑/↓ scroll · Enter replaces · Esc keeps "
+                    )
+                },
+                Color::Yellow,
+            )
+        }
+        InputMode::Compose if state.status.starts_with("Pasted ") => (
+            if area.width < 60 {
+                " PASTED MULTILINE · Enter send · Esc keep ".to_owned()
+            } else {
+                format!(" {} · Enter send · Esc keep ", state.status)
+            },
+            Color::Green,
+        ),
         InputMode::Compose if lines.len() > visible_rows => {
             let range = format!(
                 "{}-{}/{}",

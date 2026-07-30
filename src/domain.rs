@@ -39,6 +39,8 @@ pub(crate) struct PendingChat {
     pub(crate) id: String,
     pub(crate) work_item_id: String,
     pub(crate) text: String,
+    pub(crate) kind: String,
+    pub(crate) lane: String,
     pub(crate) created_at: String,
 }
 

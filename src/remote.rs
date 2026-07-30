@@ -295,7 +295,7 @@ impl<R: ProcessRunner> RemoteResolver<R> {
         };
         if created_new_version {
             if let Some(previous) = existing.as_ref() {
-                self.carry_forward_annotations(storage, &bare, previous, &version)?;
+                self.carry_forward_annotations(storage, &bare, &base_sha, previous, &version)?;
             }
         }
         if !created_new_version || existing.is_none() {
@@ -330,6 +330,7 @@ impl<R: ProcessRunner> RemoteResolver<R> {
         &self,
         storage: &Storage,
         bare: &Path,
+        base_sha: &str,
         previous: &Version,
         current: &Version,
     ) -> Result<()> {
@@ -357,12 +358,22 @@ impl<R: ProcessRunner> RemoteResolver<R> {
             .collect::<std::collections::HashMap<_, _>>();
 
         for (mut annotation, previous_placement) in storage.annotations_for_version(&previous.id)? {
+            let previous_path = annotation.file_path.clone();
             let renamed_to = rename_map.get(&annotation.file_path);
             if renamed_to.is_some() {
                 follow_rename(storage, &mut annotation, renamed_to.map(PathBuf::as_path))?;
             }
-            let content = fs::read_to_string(current_worktree.join(&annotation.file_path))
-                .unwrap_or_default();
+            let content = match previous_placement.side {
+                crate::domain::AnchorSide::Old => {
+                    let object = format!("{base_sha}:{}", previous_path.display());
+                    self.git_dir_stdout(bare, ["show", object.as_str()])
+                        .unwrap_or_default()
+                }
+                crate::domain::AnchorSide::New => {
+                    fs::read_to_string(current_worktree.join(&annotation.file_path))
+                        .unwrap_or_default()
+                }
+            };
             storage.upsert_placement(&reanchor(
                 &annotation,
                 &previous_placement,

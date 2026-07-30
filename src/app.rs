@@ -6,7 +6,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::annotations::anchor_from_diff;
 use crate::chat_selection::{
-    ChatCursor, ChatLayout, ChatPoint, ChatSelection, ChatSelectionMode, CopyPolicy, Movement,
+    ChatCursor, ChatLayout, ChatMessageId, ChatPoint, ChatSelection, ChatSelectionMode, CopyPolicy,
+    Movement,
 };
 use crate::copilot::{ModelOption, ModelSelection, PruneSessionOutcome};
 use crate::diff::{DiffFile, DiffSet, LineKind};
@@ -251,6 +252,11 @@ struct PreviewReturnState {
 struct ChatViewportState {
     focus: Focus,
     input_mode: InputMode,
+    input_return_mode: InputMode,
+    compose: String,
+    compose_cursor: usize,
+    compose_scroll: usize,
+    compose_target: Option<ComposeTarget>,
     chat_cursor: usize,
     chat_scroll: usize,
     chat_total_rows: usize,
@@ -708,7 +714,7 @@ impl AppState {
     }
 
     pub(crate) fn tick(&mut self, now: Instant) {
-        if matches!(self.pending_prefix.as_str(), "ctrl-w" | "preview-g")
+        if !self.pending_prefix.is_empty()
             && self.pending_prefix_started.is_some_and(|started| {
                 now.saturating_duration_since(started) >= Self::CTRL_W_TIMEOUT
             })
@@ -716,10 +722,10 @@ impl AppState {
             let prefix = self.pending_prefix.clone();
             self.pending_prefix.clear();
             self.pending_prefix_started = None;
-            self.status = if prefix == "preview-g" {
-                "Markdown preview prefix timed out · scroll unchanged".into()
-            } else {
-                "CTRL-W focus navigation timed out · focus unchanged".into()
+            self.status = match prefix.as_str() {
+                "preview-g" => "Markdown preview prefix timed out · scroll unchanged".into(),
+                "ctrl-w" => "CTRL-W focus navigation timed out · focus unchanged".into(),
+                _ => format!("KEY {prefix} timed out · no command was run"),
             };
         }
         // Queue depth is derived from the lane-visible transcript rather than
@@ -1156,6 +1162,11 @@ impl AppState {
         self.main_chat_viewport = Some(ChatViewportState {
             focus: self.focus,
             input_mode: self.input_mode,
+            input_return_mode: self.input_return_mode,
+            compose: self.compose.clone(),
+            compose_cursor: self.compose_cursor,
+            compose_scroll: self.compose_scroll,
+            compose_target: self.compose_target.clone(),
             chat_cursor: self.chat_cursor,
             chat_scroll: self.chat_scroll,
             chat_total_rows: self.chat_total_rows,
@@ -1173,6 +1184,11 @@ impl AppState {
         };
         self.focus = snapshot.focus;
         self.input_mode = snapshot.input_mode;
+        self.input_return_mode = snapshot.input_return_mode;
+        self.compose = snapshot.compose;
+        self.compose_cursor = snapshot.compose_cursor.min(self.compose.len());
+        self.compose_scroll = snapshot.compose_scroll;
+        self.compose_target = snapshot.compose_target;
         self.chat_cursor = snapshot.chat_cursor.min(self.chat.len().saturating_sub(1));
         self.chat_scroll = snapshot.chat_scroll;
         self.chat_total_rows = snapshot.chat_total_rows;
@@ -1448,8 +1464,15 @@ impl AppState {
             if let KeyCode::Char(character) = key.code {
                 return self.handle_prefix_key(character);
             }
+            let prefix = std::mem::take(&mut self.pending_prefix);
             self.pending_prefix.clear();
             self.pending_prefix_started = None;
+            self.status = if key.code == KeyCode::Esc {
+                format!("KEY {prefix} cancelled · no command was run")
+            } else {
+                format!("KEY {prefix} cancelled by a non-character key")
+            };
+            return Vec::new();
         }
         match key.code {
             KeyCode::Char(':') => {
@@ -1720,7 +1743,7 @@ impl AppState {
             {
                 return vec![Effect::ExpandContext { all: true }];
             }
-            KeyCode::Char(character @ ('g' | ']' | '[' | 'y' | 'd' | 'z' | ',')) => {
+            KeyCode::Char(character @ ('g' | ']' | '[' | 'y' | 'd' | 'z')) => {
                 return self.handle_prefix_key(character);
             }
             KeyCode::Char('q') => {
@@ -2207,6 +2230,9 @@ impl AppState {
     fn handle_prefix_key(&mut self, character: char) -> Vec<Effect> {
         let prefix = std::mem::take(&mut self.pending_prefix);
         self.pending_prefix_started = None;
+        if !prefix.is_empty() {
+            self.status = format!("KEY {prefix}{character} · command complete");
+        }
         match (prefix.as_str(), character) {
             ("g", 'g') => self.jump_top(),
             ("g", 'c') if self.input_mode == InputMode::Normal => {
@@ -2266,6 +2292,19 @@ impl AppState {
             ("", 'y') if self.input_mode == InputMode::Visual => return self.yank_current(),
             ("", start @ ('g' | ']' | '[' | 'y' | 'd' | 'z')) => {
                 self.pending_prefix = start.to_string();
+                self.pending_prefix_started = Some(Instant::now());
+                self.status = match start {
+                    'g' => "KEY g · waiting for g/c/r/m · Esc cancel".into(),
+                    ']' => "KEY ] · waiting for a · Esc cancel".into(),
+                    '[' => "KEY [ · waiting for a · Esc cancel".into(),
+                    'y' => "KEY y · waiting for y · Esc cancel".into(),
+                    'd' => "KEY d · waiting for d · Esc cancel".into(),
+                    'z' => "KEY z · waiting for a · Esc cancel".into(),
+                    _ => unreachable!(),
+                };
+            }
+            _ if !prefix.is_empty() => {
+                self.status = format!("Unknown key chord: {prefix}{character}");
             }
             _ => {}
         }
@@ -2626,6 +2665,18 @@ impl AppState {
     fn handle_search_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         if terminal_enter(&key) {
             self.input_mode = self.input_return_mode;
+            if self.focus == Focus::FilePicker {
+                self.status = if self.search.is_empty() {
+                    "File filter cleared".into()
+                } else {
+                    format!("File filter: {}", self.search)
+                };
+                return Vec::new();
+            }
+            if self.focus == Focus::Chat {
+                self.jump_to_chat_search(true, true);
+                return Vec::new();
+            }
             self.jump_to_search();
             return Vec::new();
         }
@@ -2636,8 +2687,12 @@ impl AppState {
             }
             KeyCode::Backspace => {
                 self.search.pop();
+                self.select_first_file_search_match();
             }
-            KeyCode::Char(character) => self.search.push(character),
+            KeyCode::Char(character) => {
+                self.search.push(character);
+                self.select_first_file_search_match();
+            }
             _ => {}
         }
         Vec::new()
@@ -2778,6 +2833,36 @@ impl AppState {
         }
     }
 
+    pub(crate) fn handle_paste(&mut self, text: &str) -> Vec<Effect> {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        match self.input_mode {
+            InputMode::Compose => {
+                self.insert_compose(&normalized);
+                let lines = normalized.lines().count().max(1);
+                self.status = format!(
+                    "Pasted {} bytes across {lines} line{} · review before submitting",
+                    normalized.len(),
+                    if lines == 1 { "" } else { "s" }
+                );
+            }
+            InputMode::Command => {
+                self.command
+                    .push_str(&normalized.replace(['\n', '\t'], " "));
+                self.command_index = 0;
+                self.command_scroll = 0;
+            }
+            InputMode::Search => {
+                self.search
+                    .push_str(normalized.lines().next().unwrap_or_default());
+                self.select_first_file_search_match();
+            }
+            _ => {
+                self.status = "Paste ignored in NORMAL mode · press i to edit first".into();
+            }
+        }
+        Vec::new()
+    }
+
     fn submit_compose(&mut self) -> Vec<Effect> {
         if self.compose.trim().is_empty() {
             self.status = "Enter text before submitting".into();
@@ -2793,6 +2878,48 @@ impl AppState {
         let selection = self.diff_selection();
         self.input_mode = InputMode::Normal;
         self.visual_anchor = None;
+        let slash_commands_enabled = matches!(
+            &target,
+            ComposeTarget::Chat
+                | ComposeTarget::Annotation(AnnotationKind::Ask)
+                | ComposeTarget::FollowUp(_)
+        );
+        if slash_commands_enabled {
+            let trimmed = text.trim();
+            let enter_chat = |state: &mut Self| {
+                state.screen = Screen::Chat;
+                state.focus = Focus::Chat;
+                state.input_mode = InputMode::Normal;
+                state.compose_target = Some(ComposeTarget::Chat);
+            };
+            if trimmed == "/side" {
+                enter_chat(self);
+                self.capture_main_chat_viewport();
+                return vec![Effect::StartSide(None)];
+            }
+            if let Some(question) = trimmed.strip_prefix("/side ") {
+                enter_chat(self);
+                self.capture_main_chat_viewport();
+                return vec![Effect::StartSide(Some(question.trim().to_owned()))];
+            }
+            if let Some(correction) = trimmed.strip_prefix("/steer ") {
+                let correction = correction.trim().to_owned();
+                return if self.agent_progress.phase.is_active()
+                    && self.agent_progress.active_outbound_id.is_some()
+                {
+                    vec![Effect::SteerChat(correction)]
+                } else {
+                    self.status =
+                        "No response is active; the correction was queued as a normal prompt"
+                            .into();
+                    vec![Effect::SendChat(correction)]
+                };
+            }
+            if matches!(trimmed, "/main" | "/side-exit") {
+                enter_chat(self);
+                return vec![Effect::ExitSide];
+            }
+        }
         match target {
             ComposeTarget::Annotation(kind) => {
                 vec![Effect::CreateAnnotation {
@@ -2825,30 +2952,7 @@ impl AppState {
                 vec![Effect::ReplaceQueued { outbound_id, text }]
             }
             ComposeTarget::Chat => {
-                let trimmed = text.trim();
-                if trimmed == "/side" {
-                    self.capture_main_chat_viewport();
-                    vec![Effect::StartSide(None)]
-                } else if let Some(question) = trimmed.strip_prefix("/side ") {
-                    self.capture_main_chat_viewport();
-                    vec![Effect::StartSide(Some(question.trim().to_owned()))]
-                } else if let Some(correction) = trimmed.strip_prefix("/steer ") {
-                    let correction = correction.trim().to_owned();
-                    if self.agent_progress.phase.is_active()
-                        && self.agent_progress.active_outbound_id.is_some()
-                    {
-                        vec![Effect::SteerChat(correction)]
-                    } else {
-                        self.status =
-                            "No response is active; the correction was queued as a normal prompt"
-                                .into();
-                        vec![Effect::SendChat(correction)]
-                    }
-                } else if matches!(trimmed, "/main" | "/side-exit") {
-                    vec![Effect::ExitSide]
-                } else {
-                    vec![Effect::SendChat(text)]
-                }
+                vec![Effect::SendChat(text)]
             }
             ComposeTarget::Context => {
                 self.context_draft = text;
@@ -3302,30 +3406,13 @@ impl AppState {
         }
     }
 
-    fn ensure_chat_visible(&mut self) {
-        self.chat_scroll = self
-            .chat_scroll
-            .min(self.chat_total_rows.saturating_sub(self.chat_viewport_rows));
-    }
-
     fn jump_to_search(&mut self) {
         let needle = self.search.to_lowercase();
         if needle.is_empty() {
             return;
         }
         if self.focus == Focus::Chat {
-            if let Some(index) = self
-                .chat
-                .iter()
-                .enumerate()
-                .skip(self.chat_cursor.saturating_add(1))
-                .find(|(_, message)| message.text.to_lowercase().contains(&needle))
-                .map(|(index, _)| index)
-            {
-                self.chat_autofollow = false;
-                self.chat_cursor = index;
-                self.ensure_chat_visible();
-            } else {
+            if !self.jump_to_chat_search(true, false) {
                 self.status = format!("Pattern not found: {}", self.search);
             }
             return;
@@ -3368,19 +3455,7 @@ impl AppState {
             return;
         }
         if self.focus == Focus::Chat {
-            if let Some(index) = self
-                .chat
-                .iter()
-                .enumerate()
-                .take(self.chat_cursor)
-                .filter(|(_, message)| message.text.to_lowercase().contains(&needle))
-                .map(|(index, _)| index)
-                .next_back()
-            {
-                self.chat_autofollow = false;
-                self.chat_cursor = index;
-                self.ensure_chat_visible();
-            } else {
+            if !self.jump_to_chat_search(false, false) {
                 self.status = format!("Pattern not found: {}", self.search);
             }
             return;
@@ -3416,6 +3491,117 @@ impl AppState {
         } else {
             self.status = format!("Pattern not found: {}", self.search);
         }
+    }
+
+    fn jump_to_chat_search(&mut self, forward: bool, include_current: bool) -> bool {
+        if self.search.is_empty() {
+            return false;
+        }
+        let Some(layout) = self.chat_layout.as_ref() else {
+            self.status = "Chat layout is not ready yet; render once and try again".into();
+            return false;
+        };
+        let current_message = self
+            .chat_navigation
+            .as_ref()
+            .and_then(|cursor| {
+                self.chat
+                    .iter()
+                    .position(|entry| entry.id == cursor.point.message_id.as_str())
+                    .map(|index| (index, cursor.point.byte_offset))
+            })
+            .unwrap_or((self.chat_cursor.min(self.chat.len().saturating_sub(1)), 0));
+        let mut found = None;
+        if forward {
+            for (index, entry) in self.chat.iter().enumerate().skip(current_message.0) {
+                let start = if index == current_message.0 {
+                    if include_current {
+                        current_message.1
+                    } else {
+                        next_grapheme_boundary(&entry.text, current_message.1)
+                    }
+                } else {
+                    0
+                };
+                if let Some(offset) = text_match_offset(&entry.text, &self.search, start, true) {
+                    found = Some((index, offset));
+                    break;
+                }
+            }
+            if found.is_none() {
+                for (index, entry) in self
+                    .chat
+                    .iter()
+                    .enumerate()
+                    .take(current_message.0.saturating_add(1))
+                {
+                    let end = if index == current_message.0 {
+                        current_message.1
+                    } else {
+                        entry.text.len()
+                    };
+                    if let Some(offset) =
+                        text_match_offset(&entry.text[..end], &self.search, 0, true)
+                    {
+                        found = Some((index, offset));
+                        break;
+                    }
+                }
+            }
+        } else {
+            for (index, entry) in self
+                .chat
+                .iter()
+                .enumerate()
+                .take(current_message.0.saturating_add(1))
+                .rev()
+            {
+                let end = if index == current_message.0 {
+                    current_message.1
+                } else {
+                    entry.text.len()
+                };
+                if let Some(offset) = text_match_offset(&entry.text, &self.search, end, false) {
+                    found = Some((index, offset));
+                    break;
+                }
+            }
+            if found.is_none() {
+                for (index, entry) in self.chat.iter().enumerate().skip(current_message.0).rev() {
+                    let start = if index == current_message.0 {
+                        current_message.1
+                    } else {
+                        0
+                    };
+                    let suffix = &entry.text[start..];
+                    if let Some(offset) =
+                        text_match_offset(suffix, &self.search, suffix.len(), false)
+                    {
+                        found = Some((index, start + offset));
+                        break;
+                    }
+                }
+            }
+        }
+        let Some((index, offset)) = found else {
+            return false;
+        };
+        let message_id = ChatMessageId::new(self.chat[index].id.clone());
+        let Some(point) = layout.point_for_message_offset(&message_id, offset) else {
+            self.status = "The match is Markdown decoration and has no selectable cell".into();
+            return false;
+        };
+        self.chat_navigation = Some(ChatCursor::new(point.clone()));
+        if self.input_mode == InputMode::Visual {
+            if let Some(selection) = self.chat_selection.as_mut() {
+                selection.extend_to(layout, &point);
+            }
+        }
+        self.chat_cursor = index;
+        self.chat_autofollow = false;
+        self.ensure_chat_navigation_visible();
+        self.status = format!("Match in message {}", index + 1);
+        true
     }
 
     fn annotation_under_cursor(&self) -> Option<&(Annotation, Placement)> {
@@ -3454,6 +3640,41 @@ impl AppState {
                 (0..repo.diff.files.len()).map(move |file_index| (repo_index, file_index))
             })
             .collect()
+    }
+
+    fn select_first_file_search_match(&mut self) {
+        if self.focus != Focus::FilePicker || self.search.is_empty() {
+            return;
+        }
+        let needle = self.search.to_lowercase();
+        let current_matches = self.current_file().is_some_and(|file| {
+            fuzzy_contains(&file.display_path.to_string_lossy().to_lowercase(), &needle)
+        });
+        if current_matches {
+            return;
+        }
+        let match_position =
+            self.work_item
+                .repos
+                .iter()
+                .enumerate()
+                .find_map(|(repo_index, repo)| {
+                    repo.diff
+                        .files
+                        .iter()
+                        .position(|file| {
+                            fuzzy_contains(
+                                &file.display_path.to_string_lossy().to_lowercase(),
+                                &needle,
+                            )
+                        })
+                        .map(|file_index| (repo_index, file_index))
+                });
+        if let Some((repo_index, file_index)) = match_position {
+            self.repo_index = repo_index;
+            self.file_index = file_index;
+            self.reset_file_position();
+        }
     }
 
     fn current_repo_collapsed(&self) -> bool {
@@ -3545,7 +3766,7 @@ impl AppState {
                     selection.copy(
                         layout,
                         CopyPolicy {
-                            include_speaker_labels: false,
+                            include_speaker_labels: true,
                         },
                     )
                 })
@@ -3649,6 +3870,33 @@ fn fuzzy_contains(haystack: &str, needle: &str) -> bool {
         }
     }
     expected.is_none()
+}
+
+fn text_match_offset(text: &str, needle: &str, boundary: usize, forward: bool) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let boundary = floor_grapheme_boundary(text, boundary.min(text.len()));
+    if needle.is_ascii() {
+        let needle = needle.as_bytes();
+        let bytes = text.as_bytes();
+        if forward {
+            return bytes[boundary..]
+                .windows(needle.len())
+                .position(|candidate| candidate.eq_ignore_ascii_case(needle))
+                .map(|offset| boundary + offset);
+        }
+        return bytes[..boundary]
+            .windows(needle.len())
+            .rposition(|candidate| candidate.eq_ignore_ascii_case(needle));
+    }
+    if forward {
+        text[boundary..]
+            .find(needle)
+            .map(|offset| boundary + offset)
+    } else {
+        text[..boundary].rfind(needle)
+    }
 }
 
 #[cfg(test)]
@@ -4188,6 +4436,31 @@ mod tests {
         app.tick(std::time::Instant::now());
         assert!(app.pending_prefix.is_empty());
         assert!(app.status.contains("timed out"));
+    }
+
+    #[test]
+    fn generic_key_prefixes_are_visible_cancellable_and_time_out() {
+        let mut app = state();
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(app.pending_prefix, "g");
+        assert!(app.pending_prefix_started.is_some());
+        assert!(app.status.contains("waiting for g/c/r/m"));
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.pending_prefix.is_empty());
+        assert!(app.status.contains("KEY g cancelled"));
+
+        app.handle_key(key(KeyCode::Char(']')));
+        app.pending_prefix_started =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        app.tick(std::time::Instant::now());
+        assert!(app.pending_prefix.is_empty());
+        assert!(app.status.contains("KEY ] timed out"));
+
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('x')));
+        assert!(app.pending_prefix.is_empty());
+        assert!(app.status.contains("Unknown key chord: gx"));
     }
 
     #[test]
