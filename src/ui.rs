@@ -7782,6 +7782,33 @@ mod tests {
             state.versions[state.version_index].version.id, snapshot.version.id,
             "the freshly pinned row must be selected when opening history"
         );
+        let snapshot_id = snapshot.version.id.clone();
+
+        assert!(state
+            .handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE))
+            .is_empty());
+        for character in "snapshot".chars() {
+            assert!(state
+                .handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .is_empty());
+        }
+        let effects = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        handle_effect(
+            &mut state,
+            &storage,
+            &paths(),
+            &agent,
+            effects.into_iter().next().unwrap(),
+        )
+        .unwrap();
+        let snapshots = state
+            .versions
+            .iter()
+            .filter(|choice| choice.version.kind == VersionKind::Snapshot)
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots.len(), 1, "unchanged trees reuse one snapshot");
+        assert_eq!(snapshots[0].version.id, snapshot_id);
+        assert!(state.status.contains("snapshot s1"));
 
         assert!(state
             .handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE))

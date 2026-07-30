@@ -193,8 +193,8 @@ pub(crate) fn create_local_annotation(
 }
 
 pub(crate) fn create_snapshot(storage: &Storage, git: &Git, repo: &Repo) -> Result<Version> {
-    let snapshot_number = storage
-        .versions_for_repo(&repo.id)?
+    let versions = storage.versions_for_repo(&repo.id)?;
+    let snapshot_number = versions
         .iter()
         .filter(|version| version.kind == VersionKind::Snapshot)
         .map(|version| version.version_num)
@@ -203,17 +203,33 @@ pub(crate) fn create_snapshot(storage: &Storage, git: &Git, repo: &Repo) -> Resu
         + 1;
     let id = format!("{}:snapshot:{snapshot_number}", repo.id);
     let commit = git.snapshot(&repo.path, &id)?;
-    let version = Version {
-        id,
-        repo_id: repo.id.clone(),
-        version_num: snapshot_number,
-        kind: VersionKind::Snapshot,
-        created_at: now(),
-        head_sha: commit,
-        worktree_path: None,
-        last_opened_at: Some(now()),
+    let tree = git.tree_id(&repo.path, &commit)?;
+    let existing = versions
+        .into_iter()
+        .filter(|version| version.kind == VersionKind::Snapshot)
+        .find(|version| {
+            version.head_sha == commit
+                || git
+                    .tree_id(&repo.path, &version.head_sha)
+                    .is_ok_and(|existing_tree| existing_tree == tree)
+        });
+    let version = if let Some(existing) = existing {
+        git.delete_snapshot_ref(&repo.path, &id)?;
+        existing
+    } else {
+        let version = Version {
+            id,
+            repo_id: repo.id.clone(),
+            version_num: snapshot_number,
+            kind: VersionKind::Snapshot,
+            created_at: now(),
+            head_sha: commit,
+            worktree_path: None,
+            last_opened_at: Some(now()),
+        };
+        storage.upsert_version(&version)?;
+        version
     };
-    storage.upsert_version(&version)?;
     let working_tree_id = format!("{}:working-tree", repo.id);
     for (annotation, placement) in storage.annotations_for_version(&working_tree_id)? {
         storage.upsert_placement(&Placement {

@@ -164,6 +164,10 @@ impl<R: CommandRunner> Git<R> {
         Ok(commit)
     }
 
+    pub(crate) fn tree_id(&self, repo: &Path, commit: &str) -> Result<String> {
+        self.git_stdout(repo, ["rev-parse", &format!("{commit}^{{tree}}")])
+    }
+
     pub(crate) fn materialize_worktree(
         &self,
         repo: &Path,
