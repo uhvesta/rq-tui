@@ -2512,7 +2512,7 @@ mod tests {
             TuiHarness::from_unified_diff("narrow-files", workflow_diff(), 40, 9).unwrap();
         harness.key(key(KeyCode::Char('t'))).unwrap();
         let frame = harness.render().unwrap();
-        assert!(frame.contains("▶ files"));
+        assert!(frame.contains("❯ files"));
         assert!(frame.contains("src/lib.rs"));
         assert!(!frame.contains("unified"));
     }
@@ -2528,7 +2528,7 @@ mod tests {
         );
         let frame = harness.render().unwrap();
 
-        assert!(frame.contains("╭─ ▶ Ask · INSERT"), "{frame}");
+        assert!(frame.contains("╭─ ❯ Ask · INSERT"), "{frame}");
         assert!(frame.contains("╰─ ↑↓ · Enter"), "{frame}");
         assert!(frame.contains('/'), "{frame}");
         assert_eq!(harness.state.compose_wrap_width, 37);
@@ -3216,7 +3216,7 @@ mod tests {
             harness.key(key(KeyCode::Down)).unwrap();
         }
         let scrolled = harness.render().unwrap();
-        assert!(scrolled.contains("▶ :"));
+        assert!(scrolled.contains("❯ :"));
         harness.key(key(KeyCode::Tab)).unwrap();
         assert!(harness.render().unwrap().contains(":"));
         harness.key(key(KeyCode::Esc)).unwrap();
@@ -3232,7 +3232,7 @@ mod tests {
         }
         let compact_frame = compact.render().unwrap();
         assert!(
-            compact_frame.contains("▶ :"),
+            compact_frame.contains("❯ :"),
             "selected command must remain visible:\n{compact_frame}"
         );
         assert!(compact_frame.contains("COPILOT"));
@@ -3295,7 +3295,7 @@ mod tests {
         harness.key(key(KeyCode::Enter)).unwrap();
         let queue = harness.render().unwrap();
         assert!(queue.contains("Copilot queue · 2 pending · background FIFO"));
-        assert!(queue.contains("▶ #1"));
+        assert!(queue.contains("❯ #1"));
         assert!(queue.contains("  #2"));
         assert!(queue.contains("first background question"));
         assert!(queue.contains("second queued follow-up"));

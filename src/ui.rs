@@ -4031,7 +4031,7 @@ fn render_recovery(frame: &mut ratatui::Frame, state: &AppState) {
         .enumerate()
         .map(|(index, message)| {
             let marker = if index == state.recovery_index {
-                "▶"
+                "❯"
             } else {
                 " "
             };
@@ -4045,7 +4045,7 @@ fn render_recovery(frame: &mut ratatui::Frame, state: &AppState) {
     let mut next_index = state.pending_asks.len();
     for chat in &state.pending_chats {
         let marker = if next_index == state.recovery_index {
-            "▶"
+            "❯"
         } else {
             " "
         };
@@ -4062,7 +4062,7 @@ fn render_recovery(frame: &mut ratatui::Frame, state: &AppState) {
     }
     if !state.pending_comment_ids.is_empty() {
         let marker = if next_index == state.recovery_index {
-            "▶"
+            "❯"
         } else {
             " "
         };
@@ -4074,7 +4074,7 @@ fn render_recovery(frame: &mut ratatui::Frame, state: &AppState) {
     }
     if state.pending_context {
         let marker = if next_index == state.recovery_index {
-            "▶"
+            "❯"
         } else {
             " "
         };
@@ -4178,7 +4178,7 @@ fn render_context_editor(frame: &mut ratatui::Frame, state: &AppState) {
                     format!(
                         "{}{}: ",
                         if editor.selected_field() == *field {
-                            "▶ "
+                            "❯ "
                         } else {
                             "  "
                         },
@@ -4456,7 +4456,7 @@ fn render_model_picker(frame: &mut ratatui::Frame, state: &AppState) {
         .take(viewport)
         .map(|(index, row)| {
             let selected = index == state.model_picker_index;
-            ListItem::new(format!("{} {row}", if selected { "▶" } else { " " })).style(
+            ListItem::new(format!("{} {row}", if selected { "❯" } else { " " })).style(
                 if selected {
                     Style::default()
                         .fg(Color::Cyan)
@@ -4546,7 +4546,7 @@ fn render_versions(frame: &mut ratatui::Frame, state: &AppState) {
         .enumerate()
         .map(|(index, choice)| {
             let marker = if index == state.version_index {
-                "▶"
+                "❯"
             } else {
                 " "
             };
@@ -4631,7 +4631,7 @@ fn render_prune(frame: &mut ratatui::Frame, state: &AppState) {
         .enumerate()
         .map(|(index, item)| {
             let cursor = if index == state.prune_index {
-                "▶"
+                "❯"
             } else {
                 " "
             };
@@ -4786,7 +4786,7 @@ fn render_picker(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
         );
         rows.push((
             ListItem::new(Line::styled(
-                format!("{} {summary}", if selected { "▶" } else { " " }),
+                format!("{} {summary}", if selected { "❯" } else { " " }),
                 if selected {
                     Style::default()
                         .fg(Color::Cyan)
@@ -4860,7 +4860,7 @@ fn render_picker(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             Block::default()
                 .title(format!(
                     "{} files{}{}",
-                    if focused { "▶" } else { "" },
+                    if focused { "❯" } else { "" },
                     range,
                     filter,
                 ))
@@ -4883,7 +4883,7 @@ fn file_picker_line(file: &DiffFile, selected: bool, width: usize) -> Line<'stat
         FileStatus::Modified => ("M", Color::Blue),
     };
     let (additions, deletions) = file.change_counts();
-    let marker = if selected { "▶ " } else { "  " };
+    let marker = if selected { "❯ " } else { "  " };
     let badge = format!("{badge} ");
     let counts = format!(" +{additions} -{deletions}");
     let fixed_width = cell_width(marker) + cell_width(&badge) + cell_width(&counts);
@@ -5274,7 +5274,7 @@ fn render_compact_inline_composer(
     state.compose_wrap_width = inner_width;
 
     let title = format!(
-        "▶ {label} · INSERT · {}-{}/{}",
+        "❯ {label} · INSERT · {}-{}/{}",
         scroll + 1,
         (scroll + editor_height).min(rows.len()),
         rows.len()
@@ -5857,7 +5857,7 @@ fn render_command_palette_area(
             let selected = index == state.command_index;
             Line::from(vec![
                 Span::styled(
-                    if selected { " ▶ " } else { "   " },
+                    if selected { " ❯ " } else { "   " },
                     Style::default().fg(if selected {
                         Color::Cyan
                     } else {
@@ -6147,7 +6147,7 @@ fn chat_window_lines(state: &AppState, start_row: usize, end_row: usize) -> Vec<
                 Line::styled(
                     format!(
                         "{}{} · {lane}{marker}",
-                        if cursor_message { "▶ " } else { "  " },
+                        if cursor_message { "❯ " } else { "  " },
                         message.role
                     ),
                     Style::default()
@@ -6981,7 +6981,7 @@ fn render_queue(frame: &mut ratatui::Frame, state: &AppState) {
             };
             let text = entry.text.replace('\n', " ↵ ");
             let preview = text.chars().take(visible_width).collect::<String>();
-            let marker = if index == state.scroll { "▶" } else { " " };
+            let marker = if index == state.scroll { "❯" } else { " " };
             ListItem::new(format!(
                 "{marker} #{:<3} {status:<6} {lane:<4} {}  {preview}",
                 index + 1,
@@ -7093,7 +7093,7 @@ fn unified_line(
     let mut spans = vec![Span::styled(
         format!(
             "{}{:>5} {} ",
-            if selected { "▶" } else { " " },
+            if selected { "❯" } else { " " },
             number,
             marker
         ),
@@ -7126,7 +7126,7 @@ fn split_line(
     let selected = selection.is_some();
     let number = line.new_line.or(line.old_line).unwrap_or(0);
     let mut spans = vec![Span::styled(
-        format!("{}{:>4} ", if selected { "▶" } else { " " }, number),
+        format!("{}{:>4} ", if selected { "❯" } else { " " }, number),
         gutter_style(line.kind),
     )];
     spans.extend(highlight_spans_with_search(
@@ -7381,7 +7381,7 @@ mod tests {
         assert!(content.contains("demo — Review"));
         assert!(content.contains("Focus: files → diff"));
         assert!(content.contains("unified · ln "));
-        assert!(!content.contains("▶ unified"));
+        assert!(!content.contains("❯ unified"));
         assert!(content.contains("a ask"));
     }
 
@@ -7717,7 +7717,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Version History · 1-3/3"));
-        assert!(rendered.contains("▶ repo · s1"));
+        assert!(rendered.contains("❯ repo · s1"));
         assert!(rendered.contains("s1"));
         assert!(rendered.contains("1 asks · 1 comments"));
         assert!(rendered.contains("v0"));
