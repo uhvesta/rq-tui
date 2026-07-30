@@ -1100,11 +1100,24 @@ impl AppState {
         let was_visual = self.input_mode == InputMode::Visual;
         let mut stream = self.review_stream();
         stream.set_cursor(self.review_cursor);
+        let previous_cursor = stream.cursor();
         stream.move_by(movement, self.viewport_height.max(1));
         self.review_cursor = stream.cursor();
         let row = stream.current().cloned();
         if let Some(row) = row.as_ref() {
             self.sync_source_from_review_row(row);
+        }
+        if previous_cursor == self.review_cursor && origin == (self.repo_index, self.file_index) {
+            self.status = match movement {
+                StreamMovement::Up
+                | StreamMovement::HalfPageUp
+                | StreamMovement::PageUp
+                | StreamMovement::First => "Already at top".into(),
+                StreamMovement::Down
+                | StreamMovement::HalfPageDown
+                | StreamMovement::PageDown
+                | StreamMovement::Last => "Already at bottom".into(),
+            };
         }
         if was_visual && origin != (self.repo_index, self.file_index) {
             self.clear_visual_selection();
@@ -1838,7 +1851,11 @@ impl AppState {
                     "Cancellation was requested from Agent Status; waiting for the SDK idle event",
                     )
                 }
-                _ => Vec::new(),
+                _ => {
+                    self.status =
+                        "Agent Status: j/k scroll · f/b page · g/G ends · s stop · q close".into();
+                    Vec::new()
+                }
             };
         }
         if self.screen == Screen::Queue {
@@ -1933,7 +1950,12 @@ impl AppState {
                         "INSERT · editing queued prompt · Enter replaces it atomically".into();
                     Vec::new()
                 }
-                _ => Vec::new(),
+                _ => {
+                    self.status =
+                        "Queue: j/k scroll · f/b page · e edit · d cancel · s stop · q close"
+                            .into();
+                    Vec::new()
+                }
             };
         }
         if self.screen == Screen::ModelPicker {
@@ -2050,8 +2072,16 @@ impl AppState {
             {
                 self.move_review_visual_horizontal(true);
             }
-            KeyCode::Char('h') if self.focus == Focus::Diff => self.previous_file(),
-            KeyCode::Char('l') if self.focus == Focus::Diff => self.next_file(),
+            KeyCode::Char('h') if self.focus == Focus::Diff => {
+                if !self.previous_file() {
+                    self.status = "Already at first file".into();
+                }
+            }
+            KeyCode::Char('l') if self.focus == Focus::Diff => {
+                if !self.next_file() {
+                    self.status = "Already at last file".into();
+                }
+            }
             KeyCode::Char('h') if self.focus == Focus::FilePicker => self.collapse_current_repo(),
             KeyCode::Char('l') if self.focus == Focus::FilePicker => self.expand_current_repo(),
             KeyCode::Char('G') => self.jump_bottom(),
@@ -3869,7 +3899,11 @@ impl AppState {
 
     fn move_down(&mut self, amount: usize) {
         match self.focus {
-            Focus::FilePicker => self.next_file_by(amount),
+            Focus::FilePicker => {
+                if !self.next_file_by(amount) {
+                    self.status = "Already at last file".into();
+                }
+            }
             Focus::Chat => {
                 if self.input_mode == InputMode::Visual {
                     for _ in 0..amount {
@@ -3893,11 +3927,18 @@ impl AppState {
                 }
             }
             _ => {
+                let previous_cursor = self.cursor;
                 let last = self.current_line_count().saturating_sub(1);
                 self.cursor = cmp::min(last, self.cursor.saturating_add(amount));
                 self.sync_review_visual_column();
                 self.sync_review_cursor_to_current_source();
                 self.ensure_cursor_visible();
+                if self.screen == Screen::Review
+                    && self.input_mode == InputMode::Visual
+                    && previous_cursor == self.cursor
+                {
+                    self.status = "Already at bottom".into();
+                }
             }
         }
     }
@@ -3905,8 +3946,8 @@ impl AppState {
     fn move_up(&mut self, amount: usize) {
         match self.focus {
             Focus::FilePicker => {
-                for _ in 0..amount {
-                    self.previous_file();
+                if !self.previous_file_by(amount) {
+                    self.status = "Already at first file".into();
                 }
             }
             Focus::Chat => {
@@ -3930,15 +3971,23 @@ impl AppState {
                 }
             }
             _ => {
+                let previous_cursor = self.cursor;
                 self.cursor = self.cursor.saturating_sub(amount);
                 self.sync_review_visual_column();
                 self.sync_review_cursor_to_current_source();
                 self.ensure_cursor_visible();
+                if self.screen == Screen::Review
+                    && self.input_mode == InputMode::Visual
+                    && previous_cursor == self.cursor
+                {
+                    self.status = "Already at top".into();
+                }
             }
         }
     }
 
-    fn next_file_by(&mut self, amount: usize) {
+    fn next_file_by(&mut self, amount: usize) -> bool {
+        let origin = (self.repo_index, self.file_index);
         for _ in 0..amount {
             if self.current_repo_collapsed() {
                 if let Some(next_repo) = (self.repo_index + 1..self.work_item.repos.len())
@@ -3963,27 +4012,36 @@ impl AppState {
             }
         }
         self.reset_file_position();
+        origin != (self.repo_index, self.file_index)
     }
 
-    fn next_file(&mut self) {
-        self.next_file_by(1);
+    fn next_file(&mut self) -> bool {
+        self.next_file_by(1)
     }
 
-    fn previous_file(&mut self) {
-        if !self.current_repo_collapsed() && self.file_index > 0 {
-            self.file_index -= 1;
-        } else if let Some(previous_repo) = (0..self.repo_index)
-            .rev()
-            .find(|index| self.repo_is_visible(*index))
-        {
-            self.repo_index = previous_repo;
-            self.file_index = self.work_item.repos[previous_repo]
-                .diff
-                .files
-                .len()
-                .saturating_sub(1);
+    fn previous_file(&mut self) -> bool {
+        self.previous_file_by(1)
+    }
+
+    fn previous_file_by(&mut self, amount: usize) -> bool {
+        let origin = (self.repo_index, self.file_index);
+        for _ in 0..amount {
+            if !self.current_repo_collapsed() && self.file_index > 0 {
+                self.file_index -= 1;
+            } else if let Some(previous_repo) = (0..self.repo_index)
+                .rev()
+                .find(|index| self.repo_is_visible(*index))
+            {
+                self.repo_index = previous_repo;
+                self.file_index = self.work_item.repos[previous_repo]
+                    .diff
+                    .files
+                    .len()
+                    .saturating_sub(1);
+            }
         }
         self.reset_file_position();
+        origin != (self.repo_index, self.file_index)
     }
 
     fn reset_file_position(&mut self) {
@@ -4445,12 +4503,16 @@ impl AppState {
         let was_visual = self.input_mode == InputMode::Visual;
         let mut stream = self.review_stream();
         stream.set_cursor(self.review_cursor);
+        let previous_cursor = stream.cursor();
         let target = stream.jump_annotation(forward);
         let Some(target) = target else {
             self.status = "No annotations".into();
             return;
         };
         self.review_cursor = target;
+        if target == previous_cursor {
+            self.status = "Already at the only annotation".into();
+        }
         if let Some(row) = stream.current() {
             self.sync_source_from_review_row(row);
         }
@@ -5595,6 +5657,42 @@ mod tests {
         }
         assert!(idle.handle_key(key(KeyCode::Enter)).is_empty());
         assert!(idle.status.contains("No active Copilot response"));
+    }
+
+    #[test]
+    fn review_boundary_keys_report_when_the_cursor_cannot_move() {
+        let mut top = state();
+        top.review_cursor = 0;
+        top.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(top.status, "Already at top");
+
+        let mut bottom = state();
+        bottom.review_cursor = bottom.review_stream().rows().len().saturating_sub(1);
+        bottom.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(bottom.status, "Already at bottom");
+
+        let mut first_file = state();
+        first_file.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(first_file.status, "Already at first file");
+
+        let mut last_file = state();
+        last_file.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(last_file.status, "Already at last file");
+    }
+
+    #[test]
+    fn agent_overlays_explain_unsupported_keys() {
+        let mut status = state();
+        status.screen = Screen::AgentStatus;
+        status.handle_key(key(KeyCode::Char('x')));
+        assert!(status.status.contains("Agent Status:"));
+        assert!(status.status.contains("j/k scroll"));
+
+        let mut queue = state();
+        queue.screen = Screen::Queue;
+        queue.handle_key(key(KeyCode::Char('x')));
+        assert!(queue.status.contains("Queue:"));
+        assert!(queue.status.contains("e edit"));
     }
 
     #[test]
