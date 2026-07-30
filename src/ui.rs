@@ -27,7 +27,11 @@ use crate::app::{
     command_matches, AgentPhase, AppState, ChatEntry, ComposeTarget, DiffLayout, Effect, InputMode,
     ModelPickerStage, PruneChoice, Screen, VersionChoice,
 };
-use crate::chat_render::render_markdown;
+use crate::chat_render::{render_markdown_mapped, CellSource, MappedMarkdown, MappedRow};
+use crate::chat_selection::{
+    BlockId, ChatBlock, ChatCell, ChatLayout, ChatMessage, ChatRow, RowBreak,
+    SourceRange as SelectionSourceRange,
+};
 use crate::config::AppPaths;
 use crate::copilot::{
     start_agent, ActivityKind, AgentCommand, AgentEvent, AgentEventEnvelope, AgentRuntime,
@@ -356,6 +360,7 @@ pub(crate) fn handle_effect(
                         .or_default()
                         .push(message.clone());
                     state.chat.push(ChatEntry {
+                        id: uuid::Uuid::new_v4().to_string(),
                         role: "you".into(),
                         text: message.text.clone(),
                         streaming: false,
@@ -388,6 +393,7 @@ pub(crate) fn handle_effect(
                 let outbound = Outbound::new(OutboundKind::Chat, text.clone());
                 let outbound_id = queue_outbound(state, bridge, outbound)?;
                 let entry = ChatEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
                     role: "you".into(),
                     text: text.clone(),
                     streaming: false,
@@ -415,6 +421,7 @@ pub(crate) fn handle_effect(
                 let outbound = Outbound::new(OutboundKind::Correction, text.clone());
                 bridge.send(AgentCommand::Steer(outbound))?;
                 state.chat.push(ChatEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
                     role: "you · steer".into(),
                     text,
                     streaming: false,
@@ -444,6 +451,7 @@ pub(crate) fn handle_effect(
                 let outbound = question.filter(|text| !text.trim().is_empty()).map(|text| {
                     let outbound = Outbound::new(OutboundKind::Chat, text.clone());
                     state.pending_side_entries.push(ChatEntry {
+                        id: uuid::Uuid::new_v4().to_string(),
                         role: "you".into(),
                         text,
                         streaming: false,
@@ -533,6 +541,7 @@ pub(crate) fn handle_effect(
                 );
                 let outbound_id = outbound.id.clone();
                 state.chat.push(ChatEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
                     role: "you".into(),
                     text,
                     streaming: false,
@@ -774,6 +783,7 @@ pub(crate) fn handle_effect(
                 ),
             )?;
             state.chat.push(ChatEntry {
+                id: uuid::Uuid::new_v4().to_string(),
                 role: "you (resent)".into(),
                 text: message.text.clone(),
                 streaming: false,
@@ -806,6 +816,7 @@ pub(crate) fn handle_effect(
                 ),
             )?;
             state.chat.push(ChatEntry {
+                id: uuid::Uuid::new_v4().to_string(),
                 role: "comments (resent)".into(),
                 text: export.structured_session_message(),
                 streaming: false,
@@ -951,6 +962,7 @@ pub(crate) fn handle_effect(
                     ),
                 )?;
                 state.chat.push(ChatEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
                     role: "comments".into(),
                     text: export.structured_session_message(),
                     streaming: false,
@@ -1062,8 +1074,15 @@ pub(crate) fn handle_effect(
             Err(error) => state.status = error.to_string(),
         },
         Effect::Yank(text) => {
-            copy_to_clipboard(&text)?;
-            state.status = format!("Yanked {} bytes", text.len());
+            state.status = match copy_to_clipboard(&text)? {
+                ClipboardDelivery::Native(program) => {
+                    format!("Copied {} bytes with {program}", text.len())
+                }
+                ClipboardDelivery::Osc52 => format!(
+                    "Sent {} bytes via OSC 52; terminal confirmation unavailable",
+                    text.len()
+                ),
+            };
         }
     }
     Ok(())
@@ -1403,19 +1422,24 @@ fn prune_work_item(
     Ok(())
 }
 
-fn copy_to_clipboard(text: &str) -> Result<()> {
-    if copy_with_native_clipboard(text).is_ok() {
-        return Ok(());
+enum ClipboardDelivery {
+    Native(&'static str),
+    Osc52,
+}
+
+fn copy_to_clipboard(text: &str) -> Result<ClipboardDelivery> {
+    if let Ok(program) = copy_with_native_clipboard(text) {
+        return Ok(ClipboardDelivery::Native(program));
     }
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     let sequence = format!("\u{1b}]52;c;{encoded}\u{7}");
     io::stdout().write_all(sequence.as_bytes())?;
     io::stdout().flush()?;
-    Ok(())
+    Ok(ClipboardDelivery::Osc52)
 }
 
-fn copy_with_native_clipboard(text: &str) -> Result<()> {
-    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+fn copy_with_native_clipboard(text: &str) -> Result<&'static str> {
+    let candidates: &[(&'static str, &[&str])] = if cfg!(target_os = "macos") {
         &[("pbcopy", &[])]
     } else {
         &[
@@ -1437,7 +1461,7 @@ fn copy_with_native_clipboard(text: &str) -> Result<()> {
             .take()
             .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
         if wrote && child.wait().is_ok_and(|status| status.success()) {
-            return Ok(());
+            return Ok(program);
         }
     }
     anyhow::bail!("no native clipboard backend accepted the text")
@@ -1711,6 +1735,7 @@ pub(crate) fn handle_agent_envelope(
             state.side_session_id = Some(side_id.clone());
             state.chat_scroll = 0;
             state.chat_autofollow = true;
+            state.reset_chat_semantics();
             state.agent_progress.record(
                 AgentPhase::Idle,
                 format!("SIDE {} ready", short_id(&side_id)),
@@ -1741,6 +1766,7 @@ pub(crate) fn handle_agent_envelope(
             state.side_session_id = None;
             state.chat_scroll = 0;
             state.chat_autofollow = true;
+            state.reset_chat_semantics();
             for id in state.side_outbound_ids.drain() {
                 state.pending_outbound_ids.remove(&id);
             }
@@ -1778,6 +1804,7 @@ pub(crate) fn handle_agent_envelope(
             }
             state.side_starting = false;
             state.side_active = false;
+            state.reset_chat_semantics();
             state.agent_progress.queue_depth = 0;
             state.agent_progress.record(
                 AgentPhase::Failed,
@@ -1794,6 +1821,7 @@ pub(crate) fn handle_agent_envelope(
             state.pending_side_entries.clear();
             state.side_starting = false;
             state.side_active = false;
+            state.reset_chat_semantics();
             state.agent_progress.queue_depth = 0;
             state.agent_progress.record(
                 AgentPhase::Idle,
@@ -1899,6 +1927,7 @@ pub(crate) fn handle_agent_event(
                 state.chat = history
                     .into_iter()
                     .map(|entry| ChatEntry {
+                        id: uuid::Uuid::new_v4().to_string(),
                         role: entry.role,
                         text: entry.text,
                         streaming: false,
@@ -2034,6 +2063,7 @@ pub(crate) fn handle_agent_event(
                 OutboundKind::Chat | OutboundKind::Correction => None,
             };
             state.chat.push(ChatEntry {
+                id: uuid::Uuid::new_v4().to_string(),
                 role: "copilot".into(),
                 text: first_delta,
                 streaming: true,
@@ -3341,7 +3371,7 @@ fn render_chat(
         ])
         .split(frame.area());
 
-    let (mut lines, ranges) = chat_lines(state, width, highlighter);
+    let mut lines = chat_lines(state, width, highlighter);
     if lines.is_empty() {
         lines.push(Line::styled(
             "No session messages yet. The composer is always available below.",
@@ -3358,11 +3388,21 @@ fn render_chat(
         state.chat_scroll = state.chat_scroll.min(max_scroll);
     }
     if state.input_mode == InputMode::Visual {
-        if let Some((start, end)) = ranges.get(state.chat_cursor).copied() {
-            if start < state.chat_scroll {
-                state.chat_scroll = start;
-            } else if end >= state.chat_scroll + viewport_rows {
-                state.chat_scroll = end.saturating_add(1).saturating_sub(viewport_rows);
+        if let Some(location) = state
+            .chat_layout
+            .as_ref()
+            .zip(state.chat_navigation.as_ref())
+            .and_then(|(layout, cursor)| layout.locate(&cursor.point))
+        {
+            let row = state
+                .chat_display_rows
+                .get(location.row)
+                .copied()
+                .unwrap_or(location.row);
+            if row < state.chat_scroll {
+                state.chat_scroll = row;
+            } else if row >= state.chat_scroll + viewport_rows {
+                state.chat_scroll = row + 1 - viewport_rows;
             }
         }
     }
@@ -3391,18 +3431,23 @@ fn render_chat(
 }
 
 fn chat_lines(
-    state: &AppState,
+    state: &mut AppState,
     width: usize,
     highlighter: &mut dyn Highlighter,
-) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
+) -> Vec<Line<'static>> {
+    let body_width = width.saturating_sub(2).max(1);
+    let mapped = state
+        .chat
+        .iter()
+        .map(|message| render_markdown_mapped(&message.text, body_width, highlighter))
+        .collect::<Vec<_>>();
+    if let Some(layout) = build_chat_layout(&state.chat, &mapped, body_width) {
+        state.set_chat_layout(layout, chat_display_rows(&state.chat, &mapped));
+    }
     let mut lines = Vec::new();
-    let mut ranges = Vec::with_capacity(state.chat.len());
-    for (index, message) in state.chat.iter().enumerate() {
-        let start = lines.len();
-        let selected = index == state.chat_cursor
-            || state.chat_visual_anchor.is_some_and(|anchor| {
-                anchor.min(state.chat_cursor) <= index && index <= anchor.max(state.chat_cursor)
-            });
+    let mut layout_row = 0usize;
+    for (index, (message, mapped_message)) in state.chat.iter().zip(mapped.iter()).enumerate() {
+        let cursor_message = index == state.chat_cursor;
         let stopped = message
             .error
             .as_deref()
@@ -3435,7 +3480,7 @@ fn chat_lines(
             Line::styled(
                 format!(
                     "{}{} · {lane}{marker}",
-                    if selected { "▶ " } else { "  " },
+                    if cursor_message { "▶ " } else { "  " },
                     message.role
                 ),
                 Style::default()
@@ -3446,23 +3491,18 @@ fn chat_lines(
                     })
                     .add_modifier(Modifier::BOLD),
             )
-            .style(if selected {
+            .style(if cursor_message {
                 Style::default().bg(Color::Rgb(40, 50, 65))
             } else {
                 Style::default()
             }),
         );
-        let body_width = width.saturating_sub(2).max(1);
-        let body = render_markdown(&message.text, body_width, highlighter);
-        lines.extend(body.into_iter().map(|line| {
+        for row in &mapped_message.rows {
             let mut spans = vec![Span::raw("  ")];
-            spans.extend(line.spans);
-            Line::from(spans).style(if selected {
-                Style::default().bg(Color::Rgb(40, 50, 65))
-            } else {
-                Style::default()
-            })
-        }));
+            spans.extend(project_mapped_row(row, layout_row, state));
+            lines.push(Line::from(spans));
+            layout_row = layout_row.saturating_add(1);
+        }
         if let Some(error) = &message.error {
             lines.push(Line::styled(
                 if stopped {
@@ -3474,9 +3514,132 @@ fn chat_lines(
             ));
         }
         lines.push(Line::from(""));
-        ranges.push((start, lines.len().saturating_sub(1)));
     }
-    (lines, ranges)
+    lines
+}
+
+fn chat_display_rows(entries: &[ChatEntry], mapped: &[MappedMarkdown]) -> Vec<usize> {
+    let mut display_row = 0usize;
+    let mut result = Vec::new();
+    for (entry, rendered) in entries.iter().zip(mapped) {
+        display_row = display_row.saturating_add(1); // message header
+        result.extend((0..rendered.rows.len()).map(|row| display_row.saturating_add(row)));
+        display_row = display_row.saturating_add(rendered.rows.len());
+        if entry.error.is_some() {
+            display_row = display_row.saturating_add(1);
+        }
+        display_row = display_row.saturating_add(1); // message spacer
+    }
+    result
+}
+
+fn build_chat_layout(
+    entries: &[ChatEntry],
+    mapped: &[MappedMarkdown],
+    width: usize,
+) -> Option<ChatLayout> {
+    let messages = entries
+        .iter()
+        .map(|entry| ChatMessage {
+            id: entry.id.clone().into(),
+            speaker: Some(entry.role.clone()),
+            text: entry.text.clone(),
+            blocks: vec![ChatBlock {
+                id: BlockId(0),
+                source: SelectionSourceRange::new(0, entry.text.len()),
+            }],
+        })
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    for (entry, rendered) in entries.iter().zip(mapped) {
+        for (index, row) in rendered.rows.iter().enumerate() {
+            let cells = row
+                .cells
+                .iter()
+                .map(|cell| {
+                    let width = cell.columns.end.saturating_sub(cell.columns.start).max(1);
+                    match &cell.source {
+                        CellSource::Text(source) | CellSource::Decoration(source) => {
+                            ChatCell::source(
+                                SelectionSourceRange::new(source.start, source.end),
+                                width,
+                            )
+                        }
+                        CellSource::Synthetic => ChatCell::display_only(width),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let break_after = mapped_row_break(&entry.text, &rendered.rows, index);
+            rows.push(ChatRow::new(
+                entry.id.clone(),
+                BlockId(0),
+                cells,
+                break_after,
+            ));
+        }
+    }
+    ChatLayout::new(width, messages, rows).ok()
+}
+
+fn mapped_row_break(text: &str, rows: &[MappedRow], index: usize) -> RowBreak {
+    let Some(current) = rows.get(index) else {
+        return RowBreak::End;
+    };
+    let Some(next) = rows.get(index.saturating_add(1)) else {
+        return RowBreak::End;
+    };
+    let current_end = current.cells.iter().filter_map(mapped_cell_end).max();
+    let next_start = next.cells.iter().filter_map(mapped_cell_start).min();
+    if let (Some(end), Some(start)) = (current_end, next_start) {
+        if end <= start && text.get(end..start).is_some_and(|gap| gap.contains('\n')) {
+            return RowBreak::Hard;
+        }
+    }
+    RowBreak::Soft
+}
+
+fn mapped_cell_start(cell: &crate::chat_render::MappedCell) -> Option<usize> {
+    match &cell.source {
+        CellSource::Text(source) | CellSource::Decoration(source) => Some(source.start),
+        CellSource::Synthetic => None,
+    }
+}
+
+fn mapped_cell_end(cell: &crate::chat_render::MappedCell) -> Option<usize> {
+    match &cell.source {
+        CellSource::Text(source) | CellSource::Decoration(source) => Some(source.end),
+        CellSource::Synthetic => None,
+    }
+}
+
+fn project_mapped_row(row: &MappedRow, layout_row: usize, state: &AppState) -> Vec<Span<'static>> {
+    let mut column = 0usize;
+    let mut output = Vec::new();
+    for span in &row.line.spans {
+        for character in span.content.chars() {
+            let text = character.to_string();
+            let width = Span::raw(text.clone()).width().max(1);
+            let selected = state
+                .chat_selection
+                .as_ref()
+                .zip(state.chat_layout.as_ref())
+                .is_some_and(|(selection, layout)| {
+                    row.cells.iter().enumerate().any(|(cell_index, cell)| {
+                        cell.columns.start < column.saturating_add(width)
+                            && cell.columns.end > column
+                            && selection.contains_cell(layout, layout_row, cell_index)
+                    })
+                });
+            let style = if selected {
+                span.style.bg(Color::Rgb(40, 50, 65))
+            } else {
+                span.style
+            };
+            output.push(Span::styled(text, style));
+            column = column.saturating_add(width);
+        }
+    }
+    output
 }
 
 fn chat_composer_height(state: &AppState, width: usize, terminal_height: u16) -> u16 {
@@ -3520,13 +3683,14 @@ fn render_chat_composer(frame: &mut ratatui::Frame, state: &mut AppState, area: 
             Color::Yellow,
         ),
         InputMode::Visual => {
-            let anchor = state.chat_visual_anchor.unwrap_or(state.chat_cursor);
+            let kind = match state.chat_selection_mode() {
+                Some(crate::chat_selection::ChatSelectionMode::Character) => "CHAR",
+                Some(crate::chat_selection::ChatSelectionMode::Line) => "LINE",
+                Some(crate::chat_selection::ChatSelectionMode::Block) => "BLOCK",
+                None => "SELECT",
+            };
             (
-                format!(
-                    " VISUAL  messages {}-{} · y copy · Esc normal ",
-                    anchor.min(state.chat_cursor) + 1,
-                    anchor.max(state.chat_cursor) + 1
-                ),
+                format!(" VISUAL {kind} · h/l/j/k move · y copy · Esc normal "),
                 Color::Magenta,
             )
         }

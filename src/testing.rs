@@ -1321,11 +1321,75 @@ mod tests {
         type_text(&mut chat, "hello");
         chat.key(key(KeyCode::Enter)).unwrap();
         chat.stream_next_response(&["streamed ", "answer"]).unwrap();
+        chat.render().unwrap();
+        chat.key(key(KeyCode::Char('g'))).unwrap();
+        chat.key(key(KeyCode::Char('g'))).unwrap();
         chat.key(key(KeyCode::Char('v'))).unwrap();
-        chat.key(key(KeyCode::Char('k'))).unwrap();
-        assert!(chat.render().unwrap().contains("VISUAL  messages 1-2"));
+        chat.key(key(KeyCode::Char('G'))).unwrap();
+        assert!(chat.render().unwrap().contains("VISUAL CHAR"));
         chat.key(key(KeyCode::Char('y'))).unwrap();
-        assert_eq!(chat.last_yank(), Some("hello\nstreamed answer"));
+        assert_eq!(chat.last_yank(), Some("hello\n\nstreamed answer"));
+    }
+
+    #[test]
+    fn chat_page_keys_extend_semantic_selection_across_wrap_resize_and_streaming() {
+        let mut harness =
+            TuiHarness::from_unified_diff("semantic-pages", workflow_diff(), 42, 14).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(
+            &mut harness,
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau",
+        );
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.render().unwrap();
+        harness.key(key(KeyCode::Char('g'))).unwrap();
+        harness.key(key(KeyCode::Char('g'))).unwrap();
+        harness.key(key(KeyCode::Char('v'))).unwrap();
+        harness.key(key(KeyCode::PageDown)).unwrap();
+        assert_eq!(harness.mode(), "VISUAL");
+        assert!(harness.selected_cell_count().unwrap() > 8);
+
+        harness.resize(68, 18);
+        assert!(harness.selected_cell_count().unwrap() > 8);
+        harness
+            .stream_next_response(&["streamed endpoint must not move the selection"])
+            .unwrap();
+        harness.key(key(KeyCode::Char('y'))).unwrap();
+        assert!(harness
+            .last_yank()
+            .is_some_and(|text| text.starts_with("alpha beta gamma")));
+    }
+
+    #[test]
+    fn chat_semantic_modes_map_markdown_code_and_unicode_without_message_wide_highlighting() {
+        let mut harness =
+            TuiHarness::from_unified_diff("semantic-modes", workflow_diff(), 52, 18).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(
+            &mut harness,
+            "## café 👩\u{200d}💻\n```rust\nfn main() { println!(\"漢字\"); }\n```",
+        );
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.render().unwrap();
+        harness.key(key(KeyCode::Char('g'))).unwrap();
+        harness.key(key(KeyCode::Char('g'))).unwrap();
+
+        harness.key(key(KeyCode::Char('V'))).unwrap();
+        assert!(harness.render().unwrap().contains("VISUAL LINE"));
+        assert!(harness.selected_cell_count().unwrap() > 2);
+        harness.key(key(KeyCode::Char('y'))).unwrap();
+        assert_eq!(harness.last_yank(), Some("## café 👩\u{200d}💻"));
+
+        harness
+            .key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL))
+            .unwrap();
+        harness.key(key(KeyCode::Char('j'))).unwrap();
+        let frame = harness.render().unwrap();
+        assert!(frame.contains("VISUAL BLOCK"));
+        assert!(frame.contains("fn main()"));
+        assert!(harness.selected_cell_count().unwrap() > 1);
     }
 
     #[test]

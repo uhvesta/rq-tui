@@ -1,6 +1,7 @@
 pub(crate) mod annotations;
 pub(crate) mod app;
 pub(crate) mod chat_render;
+pub(crate) mod chat_selection;
 pub(crate) mod cli;
 pub(crate) mod config;
 pub(crate) mod copilot;

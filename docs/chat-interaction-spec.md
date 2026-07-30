@@ -226,10 +226,10 @@ validated to the standard above.
 | Review-side messages inline and navigable | Code-anchored Ask threads exist, but general Chat remains a separate full-screen destination rather than a navigable Review conversation rail. |
 | Clear route from Chat back to Review | `Tab → Review` is shown in Chat and `gc`/`gr` are named Chat/Review destinations. Review-integrated general-chat navigation remains open. |
 | Always-visible focus during `Ctrl-W` navigation | Focus breadcrumb, focused-pane titles/color, arrow/letter chords, cancellation, and invalid-destination feedback are visible. A timed chord expiry remains open. |
-| Line/character/block selection in Chat | Chat Visual currently selects whole messages. Exact rendered-text selection is not implemented. |
-| Reliable arbitrary-text copy | Shift-drag is only a terminal workaround. Built-in copy lacks fine-grained selection and cannot currently prove that OSC 52 was consumed. |
+| Line/character/block selection in Chat | Character, line, and block modes operate on source-mapped rendered cells and pass deterministic Markdown, code, Unicode, wrap, resize, streaming, and cross-message tests. Compiled-terminal evidence remains to be recaptured. |
+| Reliable arbitrary-text copy | Built-in Visual copy is fine-grained and omits Markdown decoration and soft-wrap newlines. Native copy and OSC 52 fallback exist, but deterministic injection of total clipboard failure and terminal confirmation of OSC 52 consumption remain open. |
 | Composer that fits and scrolls all content | Dynamic wrapped-row sizing, visual-row cursor movement, capped independent scrolling, and cancellation precedence pass deterministic tests; PTY-21 validates an oversized contextual composer. |
-| Chat scrolling after content exceeds the viewport | Rendered-row scrolling exists in deterministic tests; mouse, selection-plus-streaming, resize, and compiled-terminal workflows remain incomplete. |
+| Chat scrolling after content exceeds the viewport | Rendered-row and mouse scrolling exist. Selection-plus-streaming and resize/reflow pass deterministic tests; compiled-terminal workflows remain to be recaptured. |
 | Background questions rather than a blocked UI | FIFO queueing and selected waiting-prompt cancellation are visible and PTY-validated. Queue editing, SDK-native queue introspection, and durable restart recovery remain open. |
 | Explicit steering versus queueing | `/steer`/`:steer` use immediate delivery during an active turn, report fallback when idle, and retain visible timeline/transcript evidence; PTY-17 validates the active path. |
 | Staged model → thinking → context picker | The runtime capability-driven model, reasoning, and context stages are persisted and compiled-PTY validated. Additional SDK model-specific option kinds are not currently exposed. |
@@ -237,11 +237,11 @@ validated to the standard above.
 | See tool calls, skills, subagents, and progress | Typed activity exists, but coverage of all SDK event shapes, durable expansion/details, and quiet-state correctness remains incomplete. |
 | Never wonder whether Copilot is stuck | Progress exposes phase, elapsed time, last-event age, operation detail, queue depth, outbound ID, and durable activity. Quiet/retry/disconnect states are deterministic; broader real-world event-shape coverage remains prudent. |
 | `/side` isolation and prompt return to MAIN | Deterministic, compiled-PTY, and authenticated tests cover isolation, active interruption, MAIN restoration, and SDK-session deletion attempts; deletion failure remains visibly attached to MAIN status/progress. |
-| Generic Copilot abstraction for exhaustive tests | A controlled agent, full effect harness, snapshot gallery, and script driver cover partial streaming/deltas/completion/abort/failure, queueing/cancellation, steering, model stages, SIDE, resize, and Unicode. Exact rendered-text selection and clipboard-failure injection remain open. |
+| Generic Copilot abstraction for exhaustive tests | A controlled agent, full effect harness, snapshot gallery, and script driver cover partial streaming/deltas/completion/abort/failure, queueing/cancellation, steering, model stages, SIDE, resize, Unicode, and exact rendered-text selection. Clipboard-failure injection remains open. |
 | Screenshot/mock render for agent inspection | `ui-snapshot all` exposes review, ask, command, composer, quiet, queue, side, model, markdown, and tiny states; `ui-script` creates operation-specific reproducible frames. An image artifact is optional rather than required for inspection. |
-| Markdown-quality terminal rendering | Semantic Markdown and fenced syntax highlighting exist, but selection/copy mappings, links, tables, nested structures, and collapsed activity blocks remain incomplete. |
+| Markdown-quality terminal rendering | Semantic Markdown, fenced syntax highlighting, and source-to-rendered selection/copy mappings exist. Links, tables, nested structures, and collapsed activity blocks remain incomplete. |
 | Complete Copilot SDK feature audit and Rust/Go parity decision | [`copilot-sdk-audit.md`](copilot-sdk-audit.md) checks all 21 requested pages against SDK 1.0.8 and records application wiring, optional scope, and remaining gaps. |
-| Codex/Claude-like interaction quality | Several surface patterns were copied, but editor-grade selection, explicit focus, composer navigation, conversation rail integration, and interruption semantics remain below that bar. |
+| Codex/Claude-like interaction quality | Editor-grade Chat selection, explicit focus, composer navigation, and interruption semantics are implemented and deterministic. Conversation integration and several terminal-polish details remain below that bar. |
 
 ### 9.1 Original v2 requirements still open
 

@@ -75,6 +75,7 @@ pub(crate) struct MappedMarkdown {
 /// the returned rows owned so a caller can cache them and scroll by rendered
 /// row rather than by message. Fenced code is handed to the application's
 /// existing syntax highlighter one source line at a time.
+#[cfg(test)]
 pub(crate) fn render_markdown(
     text: &str,
     width: usize,

@@ -70,8 +70,8 @@ Review in normal mode.
 Chat deliberately has explicit modes so the input state is never ambiguous:
 
 - `NORMAL`: read and navigate the transcript; press `i` to edit, `:` for the
-  command palette, `/` for search, `v` for message selection, and `j/k` or
-  page movement to scroll.
+  command palette, `/` for search, and `h/j/k/l`, word, line, page, or
+  document motions to navigate rendered text.
 - `INSERT`: edit the sticky composer. `Enter`, `Ctrl-J`, `Ctrl-M`, or `Ctrl-S`
   submits; `Shift-Enter` inserts a newline. `Esc` returns to normal mode and
   preserves a Chat draft. During an active response, the first `Ctrl-C` stops
@@ -81,11 +81,11 @@ Chat deliberately has explicit modes so the input state is never ambiguous:
   scrolls the list, `Tab` completes, `Enter` runs, and `Esc` cancels.
 - `SEARCH`: `/` searches the focused transcript or diff; `Enter` accepts and
   `Esc` cancels.
-- `VISUAL`: in a diff, `v` selects source rows. Chat currently selects whole
-  messages as an interim behavior; editor-grade character-wise, line-wise,
-  and block-wise rendered-text selection is specified but not yet implemented
-  in [`docs/chat-interaction-spec.md`](docs/chat-interaction-spec.md). `y`
-  copies the current selection and `Esc` returns to normal mode.
+- `VISUAL`: in a diff, `v` selects source rows. In Chat, `v`, `V`, and
+  `Ctrl-V` select rendered text character-wise, line-wise, and block-wise.
+  Selection remains attached to source text across Markdown wrapping,
+  terminal resize, and streaming updates. `y` copies the exact semantic
+  selection and `Esc` returns to normal mode.
 
 Chat scrolling is based on rendered terminal rows, including wrapped Markdown
 and long single messages, rather than skipping from message to message. `G`
@@ -281,7 +281,6 @@ The current requirement matrix and Copilot SDK feature matrix are in
 pseudo-terminal evidence is recorded in
 [`docs/audit/pty-smoke.md`](docs/audit/pty-smoke.md).
 The remaining interaction requirements—including Review-integrated
-conversation navigation, explicit pane focus, `Ctrl-W` chord feedback, exact
-rendered-text selection/copy, and complete deterministic acceptance states—are
-tracked in
+conversation navigation, timed focus-chord expiry, richer Markdown structures,
+clipboard failure injection, and compiled-terminal selection evidence—are tracked in
 [`docs/chat-interaction-spec.md`](docs/chat-interaction-spec.md).

@@ -14,7 +14,7 @@ Evidence abbreviations:
 - `PTY-xx` refers to [`audit/pty-smoke.md`](audit/pty-smoke.md).
 - Other test names identify their Rust module directly.
 
-Current-evidence boundary: the deterministic harness baseline is 104 regular
+Current-evidence boundary: the deterministic harness baseline is 124 regular
 tests passing with 1 authenticated live test ignored by default. The ignored
 stream/resume test was also run explicitly against the installed Copilot CLI
 and passed. PTY-16 through PTY-21 are current compiled-binary evidence; earlier
@@ -43,7 +43,8 @@ PTY references remain useful historical records.
 | P1 | Narrow command/Ask overlays leaked fragments of underlying panes, making their borders and content ambiguous. | Compact terminals use full-width cleared modal surfaces; the 40×12 adversarial reproductions are clean. |
 | P1 | Review focus and advertised `Ctrl-W` arrow chords were not visibly reliable. | The header and focused pane titles show focus, arrows and letter chords share one path, and unavailable destinations report an explicit status. `app::tests::ctrl_w_then_plain_direction_moves_focus_as_documented`. |
 | P1 | Wide CJK/emoji text wrapped by character count and clipped terminal cells. | Markdown wrapping now uses Ratatui's terminal-cell width, and snapshot extraction omits wide-character continuation cells. `chat_render::tests::wide_unicode_wraps_by_terminal_cells_without_clipping`. |
-| P1 | Lagged/closed SDK subscriptions, stale deltas, and resumed pending work could strand or corrupt the local active turn. | Lagged/closed streams fail active and queued work visibly instead of hanging; resumed in-flight turns receive a synthetic local outbound; pre-turn stale events are quarantined. Corresponding `copilot::tests::*` race tests pass. |
+| P1 | Lagged/closed SDK subscriptions, stale deltas, and resumed pending work could strand or corrupt the local active turn. | Lagged/closed streams fail active and queued work visibly instead of hanging; resumed in-flight turns receive a synthetic local outbound; a dispatched prompt binds through its matching `user.message` event before descendants are accepted, so late events from an older chain cannot complete the new turn. Corresponding `copilot::tests::*` race tests and LIVE-01 pass. |
+| P1 | SDK control calls could wait forever without a diagnosable operation boundary. | Startup, session create/resume, history, model, steering, delivery, fork, compaction, abort, disconnect, deletion, and shutdown calls now carry named 15-second async timeouts. The SDK worker remains on its own OS thread so even a CLI-side synchronous startup stall cannot block input or rendering. |
 | P1 | The checked-in Bzlmod lock was incomplete for strict consumers and the root alias could not analyze under `bazel test //...`. | The lockfile is refreshed, CI/release use `--lockfile_mode=error`, package visibility admits only the root alias, and the full aggregate Bazel gate passes. |
 
 ## Requirement traceability
@@ -108,7 +109,7 @@ PTY references remain useful historical records.
 | V-15 | File/repo/version/screen/layout transitions clear or preserve predictably | Working end-to-end for file/screen/layout; partially working for version | File/screen/layout tests pass. Old-version switching lacks full workflow coverage. |
 | V-16 | Normal `a`/`c` uses current code line | Working end-to-end | Normal Ask and Comment workflows. |
 | V-17 | Binary/empty/deleted/renamed/fold cases fail safely | Working end-to-end | `WF::binary_empty_and_renamed_files_have_explicit_safe_behavior`, deleted-line workflow, and fold/mixed-side workflow. |
-| V-18 | Chat Visual selects visible meaningful text | Partially working | Chat Visual currently selects and yanks whole messages. Character-wise, line-wise, and block-wise rendered-text selection are not implemented; see [`chat-interaction-spec.md`](chat-interaction-spec.md). |
+| V-18 | Chat Visual selects visible meaningful text | Working in deterministic tests | `v`, `V`, and `Ctrl-V` select mapped rendered text by character, line, and block. Source-based endpoints survive Markdown wrapping, resize/reflow, Unicode, fenced code, and streaming updates; `WF::chat_semantic_modes_map_markdown_code_and_unicode_without_message_wide_highlighting` and `WF::chat_page_keys_extend_semantic_selection_across_wrap_resize_and_streaming`. Compiled-terminal evidence remains to be recaptured. |
 | V-19 | Footer exposes Visual actions | Working end-to-end | Frame assertions and PTY-02. |
 | V-20 | Composer cancellation restores prior mode without stale draft | Working end-to-end | `WF::cancel_restores_visual_selection_without_stale_draft`. |
 
@@ -203,14 +204,14 @@ matrix so that new evidence is not confused with the earlier PTY run.
 | T-09 | `/side` isolated ephemeral conversation and `/main` restoration | Working in deterministic, compiled-PTY, and authenticated paths | `WF::side_conversation_is_visibly_isolated_and_main_transcript_is_restored`; PTY-20 returned from an active SIDE turn promptly, and LIVE-01 exercised real SIDE creation and SDK deletion. |
 | T-10 | Deterministic state gallery for visual inspection | Working as headless command paths | `ui-snapshot --state all` exercises review, ask, command, composer, quiet, queue, side, model, markdown, and tiny states through the production renderer. `ui-script` drives resize, input, stream events, and snapshots. Gallery output is terminal text, not a committed image artifact. |
 | T-11 | Copilot SDK decoupled behind a testable agent interface | Working for deterministic tests | `TuiHarness` uses a fake agent and injected lane/activity events; the production bridge remains the only path that starts the real Copilot CLI. |
-| T-12 | Mouse wheel scrolling and exact terminal text selection | Partially working | The TUI handles wheel events for Chat/diff scrolling. Built-in Visual mode selects whole messages, not rendered lines or characters. Shift-drag is a terminal-emulator workaround rather than completion of the requested behavior; see [`chat-interaction-spec.md`](chat-interaction-spec.md). |
+| T-12 | Mouse wheel scrolling and exact terminal text selection | Working in deterministic tests; compiled PTY pending | The TUI handles wheel events for Chat/diff scrolling. Built-in Chat Visual mode now selects exact mapped rendered text by character, line, or block and copies source text without Markdown decoration or soft-wrap newlines. Shift-drag remains available for native terminal selection; compiled-terminal selection evidence remains to be recaptured. |
 
 ### Verification status for this addendum
 
 The current checked-in regular-test baseline is:
 
 ```text
-104 regular tests passed; 1 authenticated live Copilot test ignored by default
+124 regular tests passed; 1 authenticated live Copilot test ignored by default
 ```
 
 The regular baseline includes the reducer/effect, storage, rendering, SDK
