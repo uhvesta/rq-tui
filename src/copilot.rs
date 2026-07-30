@@ -3,10 +3,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -25,11 +26,17 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
+use crate::domain::EphemeralSessionRecord;
+use crate::storage::{now, Storage};
+
 const SIDE_BOUNDARY: &str = "Side conversation boundary.\n\
 Everything before this boundary is inherited MAIN history and is reference context only, not the \
 current task. Answer only the side question below. Do not continue plans or instructions from MAIN. \
 This SIDE conversation is ephemeral and read-only; do not modify files or workspace state.";
 const SDK_CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
+const SIDE_LEASE_TTL: Duration = Duration::from_secs(30);
+const SIDE_LEASE_HEARTBEAT: Duration = Duration::from_secs(5);
+const SIDE_CLEANUP_RETRY: Duration = Duration::from_secs(30);
 
 fn apply_side_boundary(outbound: &mut Outbound) {
     outbound.text = format!("{SIDE_BOUNDARY}\n\nSide question:\n{}", outbound.text);
@@ -39,6 +46,7 @@ fn apply_side_boundary(outbound: &mut Outbound) {
 pub(crate) struct BridgeConfig {
     pub(crate) work_item_id: String,
     pub(crate) session_root: PathBuf,
+    pub(crate) database_path: PathBuf,
     pub(crate) existing_session_id: Option<String>,
     pub(crate) model: String,
     /// Optional runtime-approved thinking level selected after the model.
@@ -408,6 +416,10 @@ pub(crate) enum AgentEvent {
     /// Legacy one-stage acknowledgement retained for existing callers.
     ModelChanged(String),
     Compacted,
+    OrphanSideCleanup {
+        session_id: String,
+        cleanup_warning: Option<String>,
+    },
     Error(String),
     Stopped,
 }
@@ -1365,10 +1377,308 @@ struct SessionSlot {
 }
 
 struct SideSession {
+    operation_id: String,
     id: String,
     parent_id: String,
     slot: SessionSlot,
     boundary_sent: bool,
+}
+
+struct EphemeralLeaseGuard<'a> {
+    ledger: &'a Storage,
+    work_item_id: &'a str,
+    owner_id: &'a str,
+    owned: Cell<bool>,
+}
+
+struct LeaseHeartbeat {
+    owned: Arc<AtomicBool>,
+    lost: Arc<AtomicBool>,
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl LeaseHeartbeat {
+    fn start(database_path: PathBuf, work_item_id: String, owner_id: String, owned: bool) -> Self {
+        let owned = Arc::new(AtomicBool::new(owned));
+        let lost = Arc::new(AtomicBool::new(false));
+        let worker_owned = Arc::clone(&owned);
+        let worker_lost = Arc::clone(&lost);
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let ledger = match Storage::open(&database_path) {
+                Ok(ledger) => ledger,
+                Err(_) => {
+                    worker_owned.store(false, Ordering::Release);
+                    worker_lost.store(true, Ordering::Release);
+                    return;
+                }
+            };
+            loop {
+                match stopped.recv_timeout(SIDE_LEASE_HEARTBEAT) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                if !worker_owned.load(Ordering::Acquire) {
+                    continue;
+                }
+                if !matches!(
+                    ledger
+                        .renew_ephemeral_session_lease(&work_item_id, &owner_id, wall_clock_ms(),),
+                    Ok(true)
+                ) {
+                    worker_owned.store(false, Ordering::Release);
+                    worker_lost.store(true, Ordering::Release);
+                }
+            }
+        });
+        Self {
+            owned,
+            lost,
+            stop: Some(stop),
+            thread: Some(thread),
+        }
+    }
+
+    fn set_owned(&self, owned: bool) {
+        self.owned.store(owned, Ordering::Release);
+        if owned {
+            self.lost.store(false, Ordering::Release);
+        }
+    }
+
+    fn take_lost(&self) -> bool {
+        self.lost.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl Drop for LeaseHeartbeat {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop.send(()).ok();
+        }
+        if let Some(thread) = self.thread.take() {
+            thread.join().ok();
+        }
+    }
+}
+
+impl EphemeralLeaseGuard<'_> {
+    fn set_owned(&self, owned: bool) {
+        self.owned.set(owned);
+    }
+}
+
+impl Drop for EphemeralLeaseGuard<'_> {
+    fn drop(&mut self) {
+        if self.owned.get() {
+            self.ledger
+                .release_ephemeral_session_lease(self.work_item_id, self.owner_id)
+                .ok();
+        }
+    }
+}
+
+fn wall_clock_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+fn side_session_name(operation_id: &str) -> String {
+    format!("rq-tui-side:{operation_id}")
+}
+
+fn short_session_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+fn ephemeral_record(
+    config: &BridgeConfig,
+    owner_id: &str,
+    operation_id: &str,
+    parent_id: Option<String>,
+    side_id: Option<String>,
+    state: &str,
+    created_at: String,
+) -> EphemeralSessionRecord {
+    EphemeralSessionRecord {
+        operation_id: operation_id.to_owned(),
+        work_item_id: config.work_item_id.clone(),
+        owner_id: owner_id.to_owned(),
+        parent_id,
+        side_id,
+        state: state.to_owned(),
+        last_error: None,
+        created_at,
+        updated_at: now(),
+    }
+}
+
+fn save_ephemeral_record(ledger: &Storage, record: &EphemeralSessionRecord) -> Result<()> {
+    if ledger.record_ephemeral_session(record)? {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "SIDE cleanup ownership changed for operation {}",
+            record.operation_id
+        )
+    }
+}
+
+fn clear_ephemeral_record(ledger: &Storage, record: &EphemeralSessionRecord) -> Result<()> {
+    if ledger.delete_ephemeral_session(&record.operation_id, &record.owner_id)? {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "SIDE cleanup ownership changed before operation {} could be cleared",
+            record.operation_id
+        )
+    }
+}
+
+fn retryable_cleanup_state(state: &str) -> bool {
+    matches!(state, "cleanup_pending" | "deleting")
+}
+
+#[async_trait]
+trait SideCleanupBackend {
+    async fn reconcile_side_id(&self, operation_id: &str) -> Result<Option<String>>;
+    async fn delete_session_if_present(&self, session_id: &str) -> Result<()>;
+}
+
+#[async_trait]
+impl SideCleanupBackend for Client {
+    async fn reconcile_side_id(&self, operation_id: &str) -> Result<Option<String>> {
+        let expected_name = side_session_name(operation_id);
+        let sessions =
+            sdk_call("Copilot SIDE reconciliation", self.rpc().sessions().list()).await?;
+        Ok(sessions.sessions.into_iter().find_map(|session| {
+            (session.get("name").and_then(serde_json::Value::as_str)
+                == Some(expected_name.as_str()))
+            .then(|| {
+                session
+                    .get("sessionId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .flatten()
+        }))
+    }
+
+    async fn delete_session_if_present(&self, session_id: &str) -> Result<()> {
+        let id = SessionId::new(session_id);
+        if sdk_call(
+            "Copilot SIDE existence check",
+            self.get_session_metadata(&id),
+        )
+        .await?
+        .is_none()
+        {
+            return Ok(());
+        }
+        match delete_session_with_timeout(self, session_id).await {
+            Ok(()) => Ok(()),
+            Err(delete_error) => {
+                if sdk_call(
+                    "Copilot SIDE deletion verification",
+                    self.get_session_metadata(&id),
+                )
+                .await?
+                .is_none()
+                {
+                    Ok(())
+                } else {
+                    Err(delete_error)
+                }
+            }
+        }
+    }
+}
+
+async fn cleanup_ephemeral_record<B: SideCleanupBackend + Sync>(
+    backend: &B,
+    ledger: &Storage,
+    mut record: EphemeralSessionRecord,
+) -> (String, Option<String>) {
+    let label = record
+        .side_id
+        .clone()
+        .unwrap_or_else(|| record.operation_id.clone());
+    if record.side_id.is_none() {
+        match backend.reconcile_side_id(&record.operation_id).await {
+            Ok(Some(side_id)) => record.side_id = Some(side_id),
+            Ok(None) => {
+                let message =
+                    "SIDE fork outcome is still unresolved; cleanup will retry in the background and on restart"
+                        .to_owned();
+                record.state = "cleanup_pending".into();
+                record.last_error = Some(message.clone());
+                record.updated_at = now();
+                save_ephemeral_record(ledger, &record).ok();
+                return (label, Some(message));
+            }
+            Err(error) => {
+                let message = format!("Could not reconcile an interrupted SIDE fork: {error}");
+                record.state = "cleanup_pending".into();
+                record.last_error = Some(message.clone());
+                record.updated_at = now();
+                save_ephemeral_record(ledger, &record).ok();
+                return (label, Some(message));
+            }
+        }
+    }
+
+    record.state = "deleting".into();
+    record.last_error = None;
+    record.updated_at = now();
+    if let Err(error) = save_ephemeral_record(ledger, &record) {
+        return (
+            label,
+            Some(format!(
+                "Could not durably mark the SIDE session for deletion: {error}"
+            )),
+        );
+    }
+    let side_id = record
+        .side_id
+        .as_deref()
+        .expect("reconciled cleanup record has a SIDE id");
+    if !matches!(
+        ledger.renew_ephemeral_session_lease(
+            &record.work_item_id,
+            &record.owner_id,
+            wall_clock_ms(),
+        ),
+        Ok(true)
+    ) {
+        return (
+            side_id.to_owned(),
+            Some(format!(
+                "SIDE {side_id} cleanup ownership changed before deletion; the stale worker did not call the SDK delete API"
+            )),
+        );
+    }
+    if let Err(error) = backend.delete_session_if_present(side_id).await {
+        let message = format!("Could not delete orphaned SIDE {side_id}: {error}");
+        record.state = "cleanup_pending".into();
+        record.last_error = Some(message.clone());
+        record.updated_at = now();
+        save_ephemeral_record(ledger, &record).ok();
+        return (side_id.to_owned(), Some(message));
+    }
+    match clear_ephemeral_record(ledger, &record) {
+        Ok(()) => (side_id.to_owned(), None),
+        Err(error) => (
+            side_id.to_owned(),
+            Some(format!(
+                "SIDE {side_id} was deleted, but its cleanup ledger could not be cleared: {error}"
+            )),
+        ),
+    }
 }
 
 async fn worker(
@@ -1378,6 +1688,30 @@ async fn worker(
     current_lane: Arc<std::sync::Mutex<AgentLane>>,
 ) -> Result<()> {
     let main_events = EventPublisher::new(raw_events, AgentLane::Main);
+    let ledger = Storage::open(&config.database_path)
+        .context("cannot open the SIDE session cleanup ledger")?;
+    let owner_id = Uuid::new_v4().to_string();
+    let now_ms = wall_clock_ms();
+    let stale_before_ms =
+        now_ms.saturating_sub(SIDE_LEASE_TTL.as_millis().try_into().unwrap_or(i64::MAX));
+    let mut has_side_lease = ledger.claim_ephemeral_session_lease(
+        &config.work_item_id,
+        &owner_id,
+        now_ms,
+        stale_before_ms,
+    )?;
+    let lease_guard = EphemeralLeaseGuard {
+        ledger: &ledger,
+        work_item_id: &config.work_item_id,
+        owner_id: &owner_id,
+        owned: Cell::new(has_side_lease),
+    };
+    let lease_heartbeat = LeaseHeartbeat::start(
+        config.database_path.clone(),
+        config.work_item_id.clone(),
+        owner_id.clone(),
+        has_side_lease,
+    );
     let cli = find_copilot_cli().context(
         "cannot locate the Copilot CLI; set COPILOT_CLI_PATH or install `copilot` on PATH",
     )?;
@@ -1391,6 +1725,19 @@ async fn worker(
         .env
         .push(("COPILOT_PLUGIN_DIR_ONLY".into(), "true".into()));
     let client = sdk_call("Copilot client startup", Client::start(options)).await?;
+    let mut orphan_cleanup_results = Vec::new();
+    if has_side_lease {
+        for record in ledger.ephemeral_sessions(&config.work_item_id)? {
+            main_events.activity(
+                None,
+                AgentActivity::other(format!(
+                    "Cleaning interrupted SIDE {}…",
+                    short_session_id(record.side_id.as_deref().unwrap_or(&record.operation_id))
+                )),
+            );
+            orphan_cleanup_results.push(cleanup_ephemeral_record(&client, &ledger, record).await);
+        }
+    }
     let boot = sdk_call(
         "Copilot session create/resume",
         create_or_resume_session(&client, &config, &main_events),
@@ -1417,6 +1764,21 @@ async fn worker(
         resumed: boot.resumed,
         resume_warning: boot.resume_warning,
     });
+    if !has_side_lease {
+        main_events.emit(AgentEvent::OrphanSideCleanup {
+            session_id: "lease".into(),
+            cleanup_warning: Some(
+                "Another rq-tui process owns SIDE lifecycle cleanup for this Work Item; MAIN is available, and /side will unlock here when that lease expires"
+                    .into(),
+            ),
+        });
+    }
+    for (session_id, cleanup_warning) in orphan_cleanup_results {
+        main_events.emit(AgentEvent::OrphanSideCleanup {
+            session_id,
+            cleanup_warning,
+        });
+    }
 
     let mut main = SessionSlot {
         subscription: session.subscribe(),
@@ -1429,6 +1791,9 @@ async fn worker(
     let mut side_queue = VecDeque::new();
     let mut controls = VecDeque::new();
     let mut active = resumed_active;
+    let mut lease_tick = tokio::time::interval(SIDE_LEASE_HEARTBEAT);
+    lease_tick.tick().await;
+    let mut next_cleanup_retry = Instant::now() + SIDE_CLEANUP_RETRY;
     if let Some(active) = &active {
         main_events.activity(
             Some(active.outbound.id.clone()),
@@ -1448,24 +1813,105 @@ async fn worker(
                                 None,
                                 AgentActivity::other("A SIDE session is already active; exit it before starting another"),
                             );
+                        } else if !has_side_lease {
+                            side_requested = false;
+                            side_queue.clear();
+                            main_events.lifecycle(LaneEvent::SideFailed {
+                                message: "Cannot start SIDE because another rq-tui process owns SIDE lifecycle cleanup for this Work Item"
+                                    .into(),
+                            });
                         } else {
+                            if !matches!(
+                                ledger.renew_ephemeral_session_lease(
+                                    &config.work_item_id,
+                                    &owner_id,
+                                    wall_clock_ms(),
+                                ),
+                                Ok(true)
+                            ) {
+                                has_side_lease = false;
+                                lease_guard.set_owned(false);
+                                lease_heartbeat.set_owned(false);
+                                side_requested = false;
+                                side_queue.clear();
+                                main_events.lifecycle(LaneEvent::SideFailed {
+                                    message: "SIDE lifecycle ownership changed before fork; MAIN is unchanged and cleanup remains with the current owner"
+                                        .into(),
+                                });
+                                continue;
+                            }
                             let parent_id = main.session.id().to_string();
+                            let operation_id = Uuid::new_v4().to_string();
+                            let created_at = now();
+                            let mut record = ephemeral_record(
+                                &config,
+                                &owner_id,
+                                &operation_id,
+                                Some(parent_id.clone()),
+                                None,
+                                "intent",
+                                created_at.clone(),
+                            );
+                            if let Err(error) = save_ephemeral_record(&ledger, &record) {
+                                side_requested = false;
+                                side_queue.clear();
+                                main_events.lifecycle(LaneEvent::SideFailed {
+                                    message: format!(
+                                        "Could not durably prepare SIDE cleanup; no fork was created: {error}"
+                                    ),
+                                });
+                                continue;
+                            }
                             main_events.activity(
                                 None,
-                                AgentActivity::other("Creating ephemeral SIDE fork from MAIN…"),
+                                AgentActivity::other(
+                                    "SIDE cleanup intent saved · creating ephemeral fork from MAIN…",
+                                ),
                             );
                             match tokio::time::timeout(
                                 SDK_CONTROL_TIMEOUT,
                                 client.rpc().sessions().fork(SessionsForkRequest {
                                     session_id: SessionId::new(parent_id.clone()),
                                     to_event_id: None,
-                                    name: None,
+                                    name: Some(side_session_name(&operation_id)),
                                 }),
                             )
                             .await
                             {
                                 Ok(Ok(result)) => {
                                     let side_id = result.session_id.to_string();
+                                    if !matches!(
+                                        ledger.renew_ephemeral_session_lease(
+                                            &config.work_item_id,
+                                            &owner_id,
+                                            wall_clock_ms(),
+                                        ),
+                                        Ok(true)
+                                    ) {
+                                        has_side_lease = false;
+                                        lease_guard.set_owned(false);
+                                        lease_heartbeat.set_owned(false);
+                                        side_requested = false;
+                                        side_queue.clear();
+                                        main_events.lifecycle(LaneEvent::SideFailed {
+                                            message: "SIDE fork completed after lifecycle ownership changed; it was not activated and the current owner will reconcile it"
+                                                .into(),
+                                        });
+                                        continue;
+                                    }
+                                    record.side_id = Some(side_id.clone());
+                                    record.state = "opening".into();
+                                    record.updated_at = now();
+                                    if let Err(error) = save_ephemeral_record(&ledger, &record) {
+                                        side_requested = false;
+                                        side_queue.clear();
+                                        main_events.lifecycle(LaneEvent::SideFailed {
+                                            message: format!(
+                                                "SIDE cleanup ownership changed before the fork id could be bound: {error}. The stale worker will not delete it; the current owner will reconcile the named fork"
+                                            ),
+                                        });
+                                        continue;
+                                    }
                                     let lane = AgentLane::Side {
                                         id: side_id.clone(),
                                     };
@@ -1483,6 +1929,42 @@ async fn worker(
                                     .await
                                     {
                                         Ok(Ok(session)) => {
+                                            if !matches!(
+                                                ledger.renew_ephemeral_session_lease(
+                                                    &config.work_item_id,
+                                                    &owner_id,
+                                                    wall_clock_ms(),
+                                                ),
+                                                Ok(true)
+                                            ) {
+                                                has_side_lease = false;
+                                                lease_guard.set_owned(false);
+                                                lease_heartbeat.set_owned(false);
+                                                disconnect_session(&session).await.ok();
+                                                side_requested = false;
+                                                side_queue.clear();
+                                                main_events.lifecycle(LaneEvent::SideFailed {
+                                                    message: "SIDE opened after lifecycle ownership changed; it was disconnected without entering the UI and the current owner will clean it"
+                                                        .into(),
+                                                });
+                                                continue;
+                                            }
+                                            record.state = "active".into();
+                                            record.last_error = None;
+                                            record.updated_at = now();
+                                            if let Err(error) =
+                                                save_ephemeral_record(&ledger, &record)
+                                            {
+                                                disconnect_session(&session).await.ok();
+                                                side_requested = false;
+                                                side_queue.clear();
+                                                main_events.lifecycle(LaneEvent::SideFailed {
+                                                    message: format!(
+                                                        "SIDE was disconnected because activation ownership changed: {error}. The stale worker will not delete it; the current owner retains cleanup responsibility"
+                                                    ),
+                                                });
+                                                continue;
+                                            }
                                             if let Some(outbound) = outbound {
                                                 side_queue.push_front(outbound);
                                             }
@@ -1492,6 +1974,7 @@ async fn worker(
                                                     true
                                                 });
                                             side = Some(SideSession {
+                                                operation_id,
                                                 id: side_id.clone(),
                                                 parent_id: parent_id.clone(),
                                                 slot: SessionSlot {
@@ -1524,19 +2007,36 @@ async fn worker(
                                         Ok(Err(error)) => {
                                             side_requested = false;
                                             side_queue.clear();
+                                            let (_, cleanup_warning) =
+                                                cleanup_ephemeral_record(&client, &ledger, record)
+                                                    .await;
                                             main_events.lifecycle(LaneEvent::SideFailed {
-                                                message: format!(
-                                                    "SIDE fork was created but could not be opened: {error}"
+                                                message: cleanup_warning.map_or_else(
+                                                    || format!(
+                                                        "SIDE fork could not be opened and was deleted: {error}"
+                                                    ),
+                                                    |cleanup| format!(
+                                                        "SIDE fork could not be opened: {error}. {cleanup}"
+                                                    ),
                                                 ),
                                             })
                                         }
                                         Err(_) => {
                                             side_requested = false;
                                             side_queue.clear();
+                                            let (_, cleanup_warning) =
+                                                cleanup_ephemeral_record(&client, &ledger, record)
+                                                    .await;
                                             main_events.lifecycle(LaneEvent::SideFailed {
-                                                message: format!(
-                                                    "SIDE fork {side_id} was created, but opening it exceeded {} seconds",
-                                                    SDK_CONTROL_TIMEOUT.as_secs()
+                                                message: cleanup_warning.map_or_else(
+                                                    || format!(
+                                                        "SIDE fork {side_id} opening exceeded {} seconds; the fork was deleted",
+                                                        SDK_CONTROL_TIMEOUT.as_secs()
+                                                    ),
+                                                    |cleanup| format!(
+                                                        "SIDE fork {side_id} opening exceeded {} seconds. {cleanup}",
+                                                        SDK_CONTROL_TIMEOUT.as_secs()
+                                                    ),
                                                 ),
                                             })
                                         }
@@ -1545,17 +2045,46 @@ async fn worker(
                                 Ok(Err(error)) => {
                                     side_requested = false;
                                     side_queue.clear();
+                                    record.state = "cleanup_pending".into();
+                                    record.last_error = Some(format!(
+                                        "Fork RPC returned an error before confirming whether SIDE was created: {error}"
+                                    ));
+                                    record.updated_at = now();
+                                    save_ephemeral_record(&ledger, &record)?;
+                                    let (_, cleanup_warning) =
+                                        cleanup_ephemeral_record(&client, &ledger, record).await;
                                     main_events.lifecycle(LaneEvent::SideFailed {
-                                        message: format!("Could not create SIDE fork: {error}"),
+                                        message: cleanup_warning.map_or_else(
+                                            || format!(
+                                                "SIDE fork returned an error and the named fork was deleted: {error}"
+                                            ),
+                                            |cleanup| format!(
+                                                "Could not confirm SIDE creation: {error}. {cleanup}"
+                                            ),
+                                        ),
                                     })
                                 }
                                 Err(_) => {
                                     side_requested = false;
                                     side_queue.clear();
+                                    record.state = "cleanup_pending".into();
+                                    record.last_error = Some(
+                                        "Fork RPC timed out before returning a SIDE id".into(),
+                                    );
+                                    record.updated_at = now();
+                                    save_ephemeral_record(&ledger, &record)?;
+                                    let (_, cleanup_warning) =
+                                        cleanup_ephemeral_record(&client, &ledger, record).await;
                                     main_events.lifecycle(LaneEvent::SideFailed {
-                                        message: format!(
-                                            "SIDE creation exceeded {} seconds and was cancelled; MAIN is unchanged",
-                                            SDK_CONTROL_TIMEOUT.as_secs()
+                                        message: cleanup_warning.map_or_else(
+                                            || format!(
+                                                "SIDE creation exceeded {} seconds; no fork remained after reconciliation",
+                                                SDK_CONTROL_TIMEOUT.as_secs()
+                                            ),
+                                            |cleanup| format!(
+                                                "SIDE creation exceeded {} seconds. {cleanup}",
+                                                SDK_CONTROL_TIMEOUT.as_secs()
+                                            ),
                                         ),
                                     })
                                 }
@@ -1569,16 +2098,39 @@ async fn worker(
                             };
                             let side_events = main_events.on_lane(lane);
                             let side_id = side_session.id.clone();
+                            let mut cleanup_record = ephemeral_record(
+                                &config,
+                                &owner_id,
+                                &side_session.operation_id,
+                                Some(side_session.parent_id.clone()),
+                                Some(side_id.clone()),
+                                "cleanup_pending",
+                                now(),
+                            );
+                            if let Some(existing) = ledger
+                                .ephemeral_sessions(&config.work_item_id)?
+                                .into_iter()
+                                .find(|record| record.operation_id == side_session.operation_id)
+                            {
+                                cleanup_record.created_at = existing.created_at;
+                            }
+                            let prepare_warning = save_ephemeral_record(&ledger, &cleanup_record)
+                                .err()
+                                .map(|error| {
+                                    format!(
+                                        "Could not durably mark SIDE cleanup as pending: {error}"
+                                    )
+                                });
                             disconnect_session(&side_session.slot.session).await.ok();
-                            let cleanup_warning =
-                                delete_session_with_timeout(&client, &side_id)
-                                    .await
-                                    .err()
-                                    .map(|error| {
-                                        format!(
-                                            "SIDE closed, but its on-disk session could not be deleted: {error}"
-                                        )
-                                    });
+                            let (_, delete_warning) =
+                                cleanup_ephemeral_record(&client, &ledger, cleanup_record).await;
+                            let cleanup_warning = match (prepare_warning, delete_warning) {
+                                (Some(prepare), Some(delete)) => {
+                                    Some(format!("{prepare}. {delete}"))
+                                }
+                                (Some(warning), None) | (None, Some(warning)) => Some(warning),
+                                (None, None) => None,
+                            };
                             side_events.lifecycle(LaneEvent::SideExited {
                                 parent_id: side_session.parent_id,
                                 side_id,
@@ -1784,6 +2336,118 @@ async fn worker(
             }
         }
         tokio::select! {
+            _ = lease_tick.tick() => {
+                if has_side_lease {
+                    if lease_heartbeat.take_lost() {
+                        has_side_lease = false;
+                        lease_guard.set_owned(false);
+                        lease_heartbeat.set_owned(false);
+                        if let Some(side_session) = side.take() {
+                            let lane = AgentLane::Side {
+                                id: side_session.id.clone(),
+                            };
+                            abort_session(&side_session.slot.session).await.ok();
+                            disconnect_session(&side_session.slot.session).await.ok();
+                            let message = "SIDE closed because this process lost its lifecycle lease; its durable cleanup record was retained for the current owner";
+                            fail_active(
+                                &mut active,
+                                message.into(),
+                                &main_events.on_lane(lane.clone()),
+                            );
+                            fail_queue(
+                                &mut side_queue,
+                                message,
+                                &main_events.on_lane(lane.clone()),
+                            );
+                            main_events.on_lane(lane).lifecycle(LaneEvent::SideExited {
+                                parent_id: side_session.parent_id,
+                                side_id: side_session.id,
+                                cleanup_warning: Some(message.into()),
+                            });
+                            active_lane = AgentLane::Main;
+                            set_current_lane(&current_lane, active_lane.clone());
+                        }
+                        side_requested = false;
+                        main_events.activity(
+                            None,
+                            AgentActivity::other(
+                                "SIDE lifecycle lease lost · MAIN remains available · /side will unlock after lease recovery",
+                            ),
+                        );
+                    } else if Instant::now() >= next_cleanup_retry
+                        && active.is_none()
+                        && main_queue.is_empty()
+                        && side.is_none()
+                    {
+                        next_cleanup_retry = Instant::now() + SIDE_CLEANUP_RETRY;
+                        let pending_cleanup = ledger
+                            .ephemeral_sessions(&config.work_item_id)?
+                            .into_iter()
+                            .filter(|record| retryable_cleanup_state(&record.state))
+                            .collect::<Vec<_>>();
+                        if !pending_cleanup.is_empty() {
+                            main_events.activity(
+                                None,
+                                AgentActivity::other(format!(
+                                    "Retrying {} interrupted SIDE cleanup operation(s)…",
+                                    pending_cleanup.len()
+                                )),
+                            );
+                        }
+                        for record in pending_cleanup {
+                            let (session_id, cleanup_warning) =
+                                cleanup_ephemeral_record(&client, &ledger, record).await;
+                            main_events.emit(AgentEvent::OrphanSideCleanup {
+                                session_id,
+                                cleanup_warning,
+                            });
+                        }
+                    }
+                } else {
+                    let now_ms = wall_clock_ms();
+                    let stale_before_ms = now_ms.saturating_sub(
+                        SIDE_LEASE_TTL
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(i64::MAX),
+                    );
+                    if ledger.claim_ephemeral_session_lease(
+                        &config.work_item_id,
+                        &owner_id,
+                        now_ms,
+                        stale_before_ms,
+                    )? {
+                        has_side_lease = true;
+                        lease_guard.set_owned(true);
+                        lease_heartbeat.set_owned(true);
+                        next_cleanup_retry = Instant::now() + SIDE_CLEANUP_RETRY;
+                        main_events.activity(
+                            None,
+                            AgentActivity::other(
+                                "SIDE lifecycle lease acquired · reconciling interrupted sessions…",
+                            ),
+                        );
+                        let mut cleanup_had_warning = false;
+                        for record in ledger.ephemeral_sessions(&config.work_item_id)? {
+                            let (session_id, cleanup_warning) =
+                                cleanup_ephemeral_record(&client, &ledger, record).await;
+                            cleanup_had_warning |= cleanup_warning.is_some();
+                            main_events.emit(AgentEvent::OrphanSideCleanup {
+                                session_id,
+                                cleanup_warning,
+                            });
+                        }
+                        if !cleanup_had_warning {
+                            main_events.activity(
+                                None,
+                                AgentActivity::other(
+                                    "SIDE lifecycle ready · /side is available",
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 match command {
@@ -2192,6 +2856,23 @@ async fn worker(
 
     if let Some(side) = side {
         disconnect_session(&side.slot.session).await.ok();
+        if has_side_lease {
+            let record = ephemeral_record(
+                &config,
+                &owner_id,
+                &side.operation_id,
+                Some(side.parent_id),
+                Some(side.id),
+                "cleanup_pending",
+                now(),
+            );
+            let (session_id, cleanup_warning) =
+                cleanup_ephemeral_record(&client, &ledger, record).await;
+            main_events.emit(AgentEvent::OrphanSideCleanup {
+                session_id,
+                cleanup_warning,
+            });
+        }
     }
     disconnect_session(&main.session).await.ok();
     sdk_call("Copilot client shutdown", client.stop())
@@ -3201,12 +3882,13 @@ fn find_copilot_cli() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::env;
     use std::path::PathBuf;
-    use std::sync::{mpsc, Arc};
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use anyhow::Result;
     use github_copilot_sdk::handler::PermissionHandler;
     use github_copilot_sdk::hooks::{HookContext, HookEvent, PreToolUseInput, SessionHooks};
     use github_copilot_sdk::{
@@ -3214,12 +3896,178 @@ mod tests {
     };
 
     use super::{
-        create_config, enqueue_message, handle_session_event, history_entries, model_option,
-        register_sdk_message_root, resume_config, resumed_active_from_history, ActiveOutbound,
-        ActivityKind, AgentCommand, AgentEvent, AgentLane, AgentRuntime, AgentSink, BridgeConfig,
+        cleanup_ephemeral_record, create_config, enqueue_message, handle_session_event,
+        history_entries, model_option, now, register_sdk_message_root, resume_config,
+        resumed_active_from_history, retryable_cleanup_state, ActiveOutbound, ActivityKind,
+        AgentCommand, AgentEvent, AgentLane, AgentRuntime, AgentSink, BridgeConfig,
         ControlledAgent, CopilotBridge, EventPublisher, HistoryEntry, LaneEvent, Outbound,
         OutboundKind, ProgressHooks, ReadOnlyPermissionHandler,
     };
+    use crate::domain::{EphemeralSessionRecord, WorkItem};
+    use crate::storage::Storage;
+
+    #[derive(Default)]
+    struct FakeSideCleanup {
+        named_sessions: Mutex<HashMap<String, String>>,
+        deleted_sessions: Mutex<Vec<String>>,
+        delete_error: Mutex<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::SideCleanupBackend for FakeSideCleanup {
+        async fn reconcile_side_id(&self, operation_id: &str) -> Result<Option<String>> {
+            Ok(self
+                .named_sessions
+                .lock()
+                .unwrap()
+                .get(operation_id)
+                .cloned())
+        }
+
+        async fn delete_session_if_present(&self, session_id: &str) -> Result<()> {
+            if let Some(error) = self.delete_error.lock().unwrap().clone() {
+                anyhow::bail!(error);
+            }
+            self.deleted_sessions
+                .lock()
+                .unwrap()
+                .push(session_id.to_owned());
+            Ok(())
+        }
+    }
+
+    fn cleanup_storage() -> (Storage, WorkItem) {
+        let storage = Storage::in_memory().unwrap();
+        let item = WorkItem {
+            id: "cleanup-work".into(),
+            name: "cleanup".into(),
+            workspace_root: PathBuf::from("/cleanup"),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            last_opened_at: None,
+        };
+        storage.upsert_work_item(&item).unwrap();
+        assert!(storage
+            .claim_ephemeral_session_lease(&item.id, "owner-1", 1_000, 0)
+            .unwrap());
+        (storage, item)
+    }
+
+    fn cleanup_record(item: &WorkItem, side_id: Option<&str>) -> EphemeralSessionRecord {
+        EphemeralSessionRecord {
+            operation_id: "operation-1".into(),
+            work_item_id: item.id.clone(),
+            owner_id: "owner-1".into(),
+            parent_id: Some("main-1".into()),
+            side_id: side_id.map(str::to_owned),
+            state: "cleanup_pending".into(),
+            last_error: None,
+            created_at: "1".into(),
+            updated_at: "1".into(),
+        }
+    }
+
+    #[test]
+    fn orphan_cleanup_reconciles_named_fork_and_clears_ledger() {
+        let (storage, item) = cleanup_storage();
+        let record = cleanup_record(&item, None);
+        assert!(storage.record_ephemeral_session(&record).unwrap());
+        let backend = FakeSideCleanup::default();
+        backend
+            .named_sessions
+            .lock()
+            .unwrap()
+            .insert(record.operation_id.clone(), "side-1".into());
+
+        let (session_id, warning) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(cleanup_ephemeral_record(&backend, &storage, record));
+
+        assert_eq!(session_id, "side-1");
+        assert!(warning.is_none());
+        assert_eq!(
+            backend.deleted_sessions.lock().unwrap().as_slice(),
+            ["side-1"]
+        );
+        assert!(storage.ephemeral_sessions(&item.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unresolved_fork_intent_is_never_discarded_after_one_empty_reconciliation() {
+        let (storage, item) = cleanup_storage();
+        let record = cleanup_record(&item, None);
+        assert!(storage.record_ephemeral_session(&record).unwrap());
+        let backend = FakeSideCleanup::default();
+
+        let (_, warning) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(cleanup_ephemeral_record(&backend, &storage, record));
+
+        assert!(warning
+            .as_deref()
+            .is_some_and(|message| message.contains("still unresolved")));
+        let retained = storage.ephemeral_sessions(&item.id).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].state, "cleanup_pending");
+        assert!(backend.deleted_sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_side_deletion_remains_durable_for_next_startup() {
+        let (storage, item) = cleanup_storage();
+        let record = cleanup_record(&item, Some("side-1"));
+        assert!(storage.record_ephemeral_session(&record).unwrap());
+        let backend = FakeSideCleanup::default();
+        *backend.delete_error.lock().unwrap() = Some("controlled delete failure".into());
+
+        let (_, warning) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(cleanup_ephemeral_record(&backend, &storage, record));
+
+        assert!(warning
+            .as_deref()
+            .is_some_and(|message| message.contains("controlled delete failure")));
+        let retained = storage.ephemeral_sessions(&item.id).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].state, "cleanup_pending");
+        assert!(retained[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("controlled delete failure")));
+    }
+
+    #[test]
+    fn stale_cleanup_owner_never_calls_external_delete() {
+        let (storage, item) = cleanup_storage();
+        let mut record = cleanup_record(&item, Some("side-1"));
+        record.state = "deleting".into();
+        assert!(storage.record_ephemeral_session(&record).unwrap());
+        assert!(storage
+            .claim_ephemeral_session_lease(&item.id, "owner-2", 2_000, 1_500)
+            .unwrap());
+        let backend = FakeSideCleanup::default();
+
+        let (_, warning) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(cleanup_ephemeral_record(&backend, &storage, record));
+
+        assert!(warning
+            .as_deref()
+            .is_some_and(|message| message.contains("ownership changed")));
+        assert!(backend.deleted_sessions.lock().unwrap().is_empty());
+        assert_eq!(
+            storage.ephemeral_sessions(&item.id).unwrap()[0].owner_id,
+            "owner-2"
+        );
+    }
+
+    #[test]
+    fn interrupted_deleting_state_is_retryable_without_restart() {
+        assert!(retryable_cleanup_state("cleanup_pending"));
+        assert!(retryable_cleanup_state("deleting"));
+        assert!(!retryable_cleanup_state("active"));
+        assert!(!retryable_cleanup_state("opening"));
+    }
 
     #[test]
     fn outbound_queue_types_are_sendable() {
@@ -3280,6 +4128,7 @@ mod tests {
         let config = BridgeConfig {
             work_item_id: "work-item".into(),
             session_root: PathBuf::from("."),
+            database_path: PathBuf::from("review.db"),
             existing_session_id: Some("previous".into()),
             model: "controlled-fast".into(),
             reasoning_effort: Some("high".into()),
@@ -4181,9 +5030,11 @@ mod tests {
             "set RQ_TUI_LIVE_COPILOT=1 to acknowledge this networked test"
         );
         let model = env::var("RQ_TUI_LIVE_MODEL").unwrap_or_else(|_| "gpt-5".into());
+        let live_state = tempfile::tempdir().expect("live test state directory");
         let config = BridgeConfig {
             work_item_id: format!("live-test-{}", uuid::Uuid::new_v4()),
             session_root: env::current_dir().expect("current directory"),
+            database_path: live_state.path().join("review.db"),
             existing_session_id: None,
             model,
             reasoning_effort: None,
@@ -4191,6 +5042,17 @@ mod tests {
             skill_directories: Vec::new(),
             plugin_directories: Vec::new(),
         };
+        let storage = Storage::open(&config.database_path).expect("live test storage");
+        storage
+            .upsert_work_item(&WorkItem {
+                id: config.work_item_id.clone(),
+                name: "live Copilot test".into(),
+                workspace_root: config.session_root.clone(),
+                created_at: now(),
+                updated_at: now(),
+                last_opened_at: Some(now()),
+            })
+            .expect("seed live test Work Item");
         let bridge = CopilotBridge::start(config.clone());
         let session_id = wait_for_session(&bridge, false);
         let prompt = "Write the integers 1 through 30, separated by spaces, then write \

@@ -22,6 +22,19 @@ pub(crate) struct SessionRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct EphemeralSessionRecord {
+    pub(crate) operation_id: String,
+    pub(crate) work_item_id: String,
+    pub(crate) owner_id: String,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) side_id: Option<String>,
+    pub(crate) state: String,
+    pub(crate) last_error: Option<String>,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PendingChat {
     pub(crate) id: String,
     pub(crate) work_item_id: String,

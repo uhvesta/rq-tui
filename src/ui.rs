@@ -134,6 +134,7 @@ pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> R
     let bridge = start_agent(BridgeConfig {
         work_item_id: state.work_item.item.id.clone(),
         session_root: state.work_item.session_root.clone(),
+        database_path: paths.database.clone(),
         existing_session_id,
         model,
         reasoning_effort: state.reasoning_effort.clone(),
@@ -2044,6 +2045,14 @@ pub(crate) fn handle_agent_envelope(
             state.status = "SIDE creation cancelled · MAIN is unchanged".into();
         }
         LaneEvent::Agent(agent_event) => {
+            let fatal_side = matches!(&agent_event, AgentEvent::Error(_) | AgentEvent::Stopped)
+                && (state.side_active || state.side_starting);
+            if fatal_side {
+                restore_main_surface(state);
+                handle_agent_event(state, storage, agent_event)?;
+                state.status = format!("MAIN restored · {}", state.status);
+                return Ok(());
+            }
             let lane_is_visible = match &lane {
                 crate::copilot::AgentLane::Main => !state.side_active,
                 crate::copilot::AgentLane::Side { id } => {
@@ -2749,6 +2758,31 @@ pub(crate) fn handle_agent_event(
             state.status = format!("Model changed to {model}");
         }
         AgentEvent::Compacted => state.status = "Session compacted".into(),
+        AgentEvent::OrphanSideCleanup {
+            session_id,
+            cleanup_warning,
+        } => {
+            if let Some(warning) = cleanup_warning {
+                state.agent_progress.record(
+                    AgentPhase::Failed,
+                    "SIDE cleanup needs attention",
+                    warning.clone(),
+                    None,
+                );
+                state.status = format!("MAIN ready · SIDE cleanup warning: {warning}");
+            } else {
+                state.agent_progress.record(
+                    AgentPhase::Idle,
+                    format!("Cleaned interrupted SIDE {}", short_id(&session_id)),
+                    "The stale ephemeral session was deleted; MAIN was not changed",
+                    None,
+                );
+                state.status = format!(
+                    "MAIN ready · interrupted SIDE {} cleaned",
+                    short_id(&session_id)
+                );
+            }
+        }
         AgentEvent::Error(error) => {
             state.agent_connected = false;
             state.agent_activity = "Disconnected".into();
@@ -2770,12 +2804,19 @@ pub(crate) fn handle_agent_event(
             state.status = format!("Copilot unavailable: {error}");
         }
         AgentEvent::Stopped => {
+            let cleanup_warning = (state.agent_progress.summary == "SIDE cleanup needs attention")
+                .then(|| state.agent_progress.detail.clone());
             state.agent_connected = false;
             state.agent_activity = "Disconnected".into();
             state.agent_progress.record(
                 AgentPhase::Disconnected,
                 "Copilot worker stopped",
-                "No SDK event stream is active",
+                cleanup_warning
+                    .as_ref()
+                    .map(|warning| {
+                        format!("No SDK event stream is active · SIDE cleanup warning: {warning}")
+                    })
+                    .unwrap_or_else(|| "No SDK event stream is active".into()),
                 None,
             );
             for message in state
@@ -2787,7 +2828,15 @@ pub(crate) fn handle_agent_event(
                 message.streaming = false;
                 message.error = Some("worker stopped".into());
             }
-            state.status = "Copilot worker stopped · restart to resume the session".into();
+            state.status = cleanup_warning
+                .map(|warning| {
+                    format!(
+                        "Copilot worker stopped · SIDE cleanup warning: {warning} · restart to resume"
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "Copilot worker stopped · restart to resume the session".into()
+                });
         }
     }
     Ok(())
@@ -5092,6 +5141,53 @@ mod tests {
     }
 
     #[test]
+    fn orphan_side_cleanup_is_explicit_without_changing_main_state() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+        state.agent_connected = true;
+        state.chat = vec![ChatEntry {
+            id: "main".into(),
+            role: "you".into(),
+            text: "keep MAIN".into(),
+            streaming: false,
+            annotation_id: None,
+            outbound_id: None,
+            error: None,
+        }];
+
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::OrphanSideCleanup {
+                session_id: "side-session".into(),
+                cleanup_warning: None,
+            },
+        )
+        .unwrap();
+        assert!(state.status.contains("side-ses"));
+        assert!(state.status.contains("cleaned"));
+        assert_eq!(state.chat[0].text, "keep MAIN");
+        assert!(state.agent_connected);
+
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::OrphanSideCleanup {
+                session_id: "side-session".into(),
+                cleanup_warning: Some("retry pending".into()),
+            },
+        )
+        .unwrap();
+        assert!(state.status.contains("retry pending"));
+        assert_eq!(state.chat[0].text, "keep MAIN");
+        assert!(state.agent_connected);
+
+        handle_agent_event(&mut state, &storage, AgentEvent::Stopped).unwrap();
+        assert!(state.status.contains("retry pending"));
+        assert!(state.agent_progress.detail.contains("retry pending"));
+    }
+
+    #[test]
     fn hidden_main_stream_updates_parked_transcript_without_moving_side() {
         let storage = Storage::in_memory().unwrap();
         let mut state = state_for_ui();
@@ -5148,7 +5244,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_lane_disconnect_is_globally_visible_and_settles_both_transcripts() {
+    fn fatal_side_events_restore_main_and_settle_its_transcript() {
         let storage = Storage::in_memory().unwrap();
         let mut state = state_for_ui();
         state.agent_connected = true;
@@ -5187,15 +5283,25 @@ mod tests {
         .unwrap();
 
         assert!(!state.agent_connected);
+        assert!(!state.side_active);
+        assert!(state.main_chat.is_none());
+        assert_eq!(state.chat[0].text, "main partial");
         assert!(state.status.contains("event stream closed"));
         assert_eq!(state.chat[0].error.as_deref(), Some("connection lost"));
-        assert_eq!(
-            state.main_chat.as_ref().unwrap()[0].error.as_deref(),
-            Some("connection lost")
-        );
 
-        state.chat[0].streaming = true;
-        state.chat[0].error = None;
+        state.agent_connected = true;
+        state.side_active = true;
+        state.side_session_id = Some("side-session".into());
+        state.main_chat = Some(std::mem::take(&mut state.chat));
+        state.chat.push(ChatEntry {
+            id: "side-stream-2".into(),
+            role: "copilot".into(),
+            text: "another side partial".into(),
+            streaming: true,
+            annotation_id: None,
+            outbound_id: Some("side-outbound-2".into()),
+            error: None,
+        });
         state.main_chat.as_mut().unwrap()[0].streaming = true;
         state.main_chat.as_mut().unwrap()[0].error = None;
         handle_agent_envelope(
@@ -5210,11 +5316,33 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(!state.side_active);
+        assert!(state.main_chat.is_none());
         assert_eq!(state.chat[0].error.as_deref(), Some("worker stopped"));
-        assert_eq!(
-            state.main_chat.as_ref().unwrap()[0].error.as_deref(),
-            Some("worker stopped")
-        );
+
+        state.side_starting = true;
+        state.pending_side_entries.push(ChatEntry {
+            id: "pending-side".into(),
+            role: "you".into(),
+            text: "never opened".into(),
+            streaming: false,
+            annotation_id: None,
+            outbound_id: Some("pending-side-outbound".into()),
+            error: None,
+        });
+        handle_agent_envelope(
+            &mut state,
+            &storage,
+            AgentEventEnvelope {
+                lane: AgentLane::Main,
+                event: LaneEvent::Agent(AgentEvent::Error("startup failed".into())),
+                activity: None,
+            },
+        )
+        .unwrap();
+        assert!(!state.side_starting);
+        assert!(state.pending_side_entries.is_empty());
+        assert!(state.status.contains("MAIN restored"));
     }
 
     #[test]

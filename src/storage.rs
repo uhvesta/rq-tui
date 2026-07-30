@@ -7,12 +7,14 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 
 use crate::domain::{
     AnchorSide, Annotation, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState,
-    PendingChat, Placement, Repo, ReviewContext, SessionRecord, Version, VersionKind, WorkItem,
+    EphemeralSessionRecord, PendingChat, Placement, Repo, ReviewContext, SessionRecord, Version,
+    VersionKind, WorkItem,
 };
 
 const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
 const MIGRATION_2: &str = include_str!("../migrations/0002_placement_side.sql");
 const MIGRATION_3: &str = include_str!("../migrations/0003_chat_outbox.sql");
+const MIGRATION_4: &str = include_str!("../migrations/0004_ephemeral_sessions.sql");
 
 pub(crate) struct Storage {
     connection: Connection,
@@ -97,7 +99,12 @@ impl Storage {
                 applied_at TEXT NOT NULL
             );",
         )?;
-        for (version, sql) in [(1, MIGRATION_1), (2, MIGRATION_2), (3, MIGRATION_3)] {
+        for (version, sql) in [
+            (1, MIGRATION_1),
+            (2, MIGRATION_2),
+            (3, MIGRATION_3),
+            (4, MIGRATION_4),
+        ] {
             let applied = tx
                 .query_row(
                     "SELECT 1 FROM schema_migrations WHERE version = ?1",
@@ -525,6 +532,147 @@ impl Storage {
                 },
             )
             .optional()?)
+    }
+
+    pub(crate) fn record_ephemeral_session(
+        &self,
+        session: &EphemeralSessionRecord,
+    ) -> Result<bool> {
+        Ok(self.connection.execute(
+            "INSERT INTO ephemeral_sessions(
+                operation_id, work_item_id, owner_id, parent_id, side_id,
+                state, last_error, created_at, updated_at
+             )
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+             WHERE EXISTS (
+                SELECT 1
+                FROM ephemeral_session_leases
+                WHERE work_item_id = ?2 AND owner_id = ?3
+             )
+             ON CONFLICT(operation_id) DO UPDATE SET
+                work_item_id = excluded.work_item_id,
+                owner_id = excluded.owner_id,
+                parent_id = excluded.parent_id,
+                side_id = excluded.side_id,
+                state = excluded.state,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at
+             WHERE ephemeral_sessions.owner_id = excluded.owner_id",
+            params![
+                session.operation_id,
+                session.work_item_id,
+                session.owner_id,
+                session.parent_id,
+                session.side_id,
+                session.state,
+                session.last_error,
+                session.created_at,
+                session.updated_at
+            ],
+        )? == 1)
+    }
+
+    pub(crate) fn ephemeral_sessions(
+        &self,
+        work_item_id: &str,
+    ) -> Result<Vec<EphemeralSessionRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT operation_id, work_item_id, owner_id, parent_id, side_id,
+                    state, last_error, created_at, updated_at
+             FROM ephemeral_sessions
+             WHERE work_item_id = ?1
+             ORDER BY created_at, operation_id",
+        )?;
+        let rows = statement.query_map([work_item_id], |row| {
+            Ok(EphemeralSessionRecord {
+                operation_id: row.get(0)?,
+                work_item_id: row.get(1)?,
+                owner_id: row.get(2)?,
+                parent_id: row.get(3)?,
+                side_id: row.get(4)?,
+                state: row.get(5)?,
+                last_error: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub(crate) fn delete_ephemeral_session(
+        &self,
+        operation_id: &str,
+        owner_id: &str,
+    ) -> Result<bool> {
+        Ok(self.connection.execute(
+            "DELETE FROM ephemeral_sessions
+             WHERE operation_id = ?1 AND owner_id = ?2",
+            params![operation_id, owner_id],
+        )? == 1)
+    }
+
+    pub(crate) fn claim_ephemeral_session_lease(
+        &self,
+        work_item_id: &str,
+        owner_id: &str,
+        heartbeat_ms: i64,
+        stale_before_ms: i64,
+    ) -> Result<bool> {
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO ephemeral_session_leases(work_item_id, owner_id, heartbeat_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(work_item_id) DO UPDATE SET
+                owner_id = excluded.owner_id,
+                heartbeat_ms = excluded.heartbeat_ms
+             WHERE ephemeral_session_leases.owner_id = excluded.owner_id
+                OR ephemeral_session_leases.heartbeat_ms < ?4",
+            params![work_item_id, owner_id, heartbeat_ms, stale_before_ms],
+        )?;
+        let claimed = tx.query_row(
+            "SELECT owner_id = ?2
+             FROM ephemeral_session_leases
+             WHERE work_item_id = ?1",
+            params![work_item_id, owner_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if claimed {
+            tx.execute(
+                "UPDATE ephemeral_sessions
+                 SET owner_id = ?2, updated_at = ?3
+                 WHERE work_item_id = ?1",
+                params![work_item_id, owner_id, now()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(claimed)
+    }
+
+    pub(crate) fn renew_ephemeral_session_lease(
+        &self,
+        work_item_id: &str,
+        owner_id: &str,
+        heartbeat_ms: i64,
+    ) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE ephemeral_session_leases
+             SET heartbeat_ms = ?3
+             WHERE work_item_id = ?1 AND owner_id = ?2",
+            params![work_item_id, owner_id, heartbeat_ms],
+        )? == 1)
+    }
+
+    pub(crate) fn release_ephemeral_session_lease(
+        &self,
+        work_item_id: &str,
+        owner_id: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM ephemeral_session_leases
+             WHERE work_item_id = ?1 AND owner_id = ?2",
+            params![work_item_id, owner_id],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn enqueue_chat(&self, chat: &PendingChat) -> Result<()> {
@@ -1351,10 +1499,10 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    use super::Storage;
+    use super::{Storage, MIGRATION_1, MIGRATION_2, MIGRATION_3};
     use crate::domain::{
         AnchorSide, Annotation, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState,
-        PendingChat, Placement, Repo, Version, VersionKind, WorkItem,
+        EphemeralSessionRecord, PendingChat, Placement, Repo, Version, VersionKind, WorkItem,
     };
 
     #[test]
@@ -1367,17 +1515,19 @@ mod tests {
                  WHERE type IN ('table', 'index')
                    AND name IN (
                      'work_items', 'sessions', 'repos', 'contexts', 'versions',
-                     'chat_outbox',
+                     'chat_outbox', 'ephemeral_sessions',
+                     'ephemeral_session_leases',
                      'annotations', 'placements', 'ask_messages', 'settings',
                      'versions_repo_version', 'placements_version',
                      'annotations_repo_submitted', 'ask_messages_annotation_seq',
-                     'work_items_last_opened', 'chat_outbox_work_item_created'
+                     'work_items_last_opened', 'chat_outbox_work_item_created',
+                     'ephemeral_sessions_work_item_created'
                    )",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 16);
+        assert_eq!(count, 19);
     }
 
     #[test]
@@ -1405,12 +1555,59 @@ mod tests {
         let count: i64 = storage
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2, 3)",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2, 3, 4)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn schema_three_database_upgrades_side_cleanup_ledger_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("review.db");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        for (version, sql) in [(1, MIGRATION_1), (2, MIGRATION_2), (3, MIGRATION_3)] {
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, 'now')",
+                    [version],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let storage = Storage::open(&database).unwrap();
+        let migration_applied: i64 = storage
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 4",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let tables: i64 = storage
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table'
+                   AND name IN ('ephemeral_sessions', 'ephemeral_session_leases')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_applied, 1);
+        assert_eq!(tables, 2);
     }
 
     #[test]
@@ -1462,6 +1659,174 @@ mod tests {
         );
         storage.delete_queued_chat(&replacement.id).unwrap();
         assert!(storage.pending_chats(&item.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ephemeral_session_ledger_survives_until_cleanup_acknowledgement() {
+        let storage = Storage::in_memory().unwrap();
+        let item = WorkItem {
+            id: "work-side".into(),
+            name: "demo".into(),
+            workspace_root: PathBuf::from("/tmp/demo"),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            last_opened_at: None,
+        };
+        storage.upsert_work_item(&item).unwrap();
+        assert!(storage
+            .claim_ephemeral_session_lease(&item.id, "owner-1", 1_000, 0)
+            .unwrap());
+        let side = EphemeralSessionRecord {
+            operation_id: "operation-1".into(),
+            work_item_id: item.id.clone(),
+            owner_id: "owner-1".into(),
+            parent_id: None,
+            side_id: None,
+            state: "intent".into(),
+            last_error: None,
+            created_at: "1".into(),
+            updated_at: "1".into(),
+        };
+
+        assert!(storage.record_ephemeral_session(&side).unwrap());
+        assert_eq!(
+            storage.ephemeral_sessions(&item.id).unwrap(),
+            vec![side.clone()]
+        );
+
+        let updated = EphemeralSessionRecord {
+            parent_id: Some("main-1".into()),
+            side_id: Some("side-1".into()),
+            state: "active".into(),
+            updated_at: "2".into(),
+            ..side.clone()
+        };
+        assert!(storage.record_ephemeral_session(&updated).unwrap());
+        assert_eq!(
+            storage.ephemeral_sessions(&item.id).unwrap(),
+            vec![updated.clone()]
+        );
+
+        assert!(storage
+            .delete_ephemeral_session(&updated.operation_id, &updated.owner_id)
+            .unwrap());
+        assert!(storage.ephemeral_sessions(&item.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ephemeral_session_lease_prevents_live_cross_process_cleanup() {
+        let storage = Storage::in_memory().unwrap();
+        let item = WorkItem {
+            id: "work-lease".into(),
+            name: "demo".into(),
+            workspace_root: PathBuf::from("/tmp/demo"),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            last_opened_at: None,
+        };
+        storage.upsert_work_item(&item).unwrap();
+        assert!(storage
+            .claim_ephemeral_session_lease(&item.id, "old-owner", 1, 0)
+            .unwrap());
+        let stale_record = EphemeralSessionRecord {
+            operation_id: "leased-operation".into(),
+            work_item_id: item.id.clone(),
+            owner_id: "old-owner".into(),
+            parent_id: Some("main".into()),
+            side_id: Some("side".into()),
+            state: "active".into(),
+            last_error: None,
+            created_at: "1".into(),
+            updated_at: "1".into(),
+        };
+        assert!(storage.record_ephemeral_session(&stale_record).unwrap());
+
+        assert!(storage
+            .claim_ephemeral_session_lease(&item.id, "owner-a", 1_000, 2)
+            .unwrap());
+        assert!(!storage.record_ephemeral_session(&stale_record).unwrap());
+        assert!(!storage
+            .delete_ephemeral_session(&stale_record.operation_id, "old-owner")
+            .unwrap());
+        let adopted = storage.ephemeral_sessions(&item.id).unwrap();
+        assert_eq!(adopted[0].owner_id, "owner-a");
+        assert!(!storage
+            .claim_ephemeral_session_lease(&item.id, "owner-b", 1_001, 999)
+            .unwrap());
+        assert!(storage
+            .renew_ephemeral_session_lease(&item.id, "owner-a", 1_002)
+            .unwrap());
+        assert!(storage
+            .claim_ephemeral_session_lease(&item.id, "owner-b", 2_000, 1_500)
+            .unwrap());
+        assert!(!storage
+            .renew_ephemeral_session_lease(&item.id, "owner-a", 2_001)
+            .unwrap());
+
+        storage
+            .release_ephemeral_session_lease(&item.id, "owner-a")
+            .unwrap();
+        assert!(!storage
+            .claim_ephemeral_session_lease(&item.id, "owner-a", 2_002, 1_999)
+            .unwrap());
+        storage
+            .release_ephemeral_session_lease(&item.id, "owner-b")
+            .unwrap();
+        assert!(storage
+            .claim_ephemeral_session_lease(&item.id, "owner-a", 2_003, 2_002)
+            .unwrap());
+    }
+
+    #[test]
+    fn independent_connections_fence_the_previous_side_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("review.db");
+        let first = Storage::open(&database).unwrap();
+        let item = WorkItem {
+            id: "work-two-processes".into(),
+            name: "demo".into(),
+            workspace_root: PathBuf::from("/tmp/demo"),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            last_opened_at: None,
+        };
+        first.upsert_work_item(&item).unwrap();
+        assert!(first
+            .claim_ephemeral_session_lease(&item.id, "owner-a", 1_000, 0)
+            .unwrap());
+        let record = EphemeralSessionRecord {
+            operation_id: "operation".into(),
+            work_item_id: item.id.clone(),
+            owner_id: "owner-a".into(),
+            parent_id: Some("main".into()),
+            side_id: Some("side".into()),
+            state: "opening".into(),
+            last_error: None,
+            created_at: "1".into(),
+            updated_at: "1".into(),
+        };
+        assert!(first.record_ephemeral_session(&record).unwrap());
+
+        let second = Storage::open(&database).unwrap();
+        assert!(!second
+            .claim_ephemeral_session_lease(&item.id, "owner-b", 1_001, 999)
+            .unwrap());
+        assert!(second
+            .claim_ephemeral_session_lease(&item.id, "owner-b", 2_000, 1_500)
+            .unwrap());
+        assert!(!first.record_ephemeral_session(&record).unwrap());
+        let stale_new_intent = EphemeralSessionRecord {
+            operation_id: "stale-new-operation".into(),
+            side_id: None,
+            state: "intent".into(),
+            ..record.clone()
+        };
+        assert!(!first.record_ephemeral_session(&stale_new_intent).unwrap());
+        assert!(!first
+            .delete_ephemeral_session(&record.operation_id, "owner-a")
+            .unwrap());
+        let adopted = second.ephemeral_sessions(&item.id).unwrap();
+        assert_eq!(adopted[0].owner_id, "owner-b");
     }
 
     #[test]

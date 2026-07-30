@@ -144,7 +144,13 @@ messages stay in that lane.
 `/main` or `/side-exit` closes SIDE, discards its transcript, and restores the
 unchanged MAIN transcript. The equivalent command-palette forms are
 `:side [question]` and `:main`. A second SIDE cannot be created until the
-current one is exited.
+current one is exited. SIDE creation is recorded durably before the SDK fork:
+if rq-tui exits during fork, open, or deletion, the next owning process
+reconciles the named fork and retries bounded cleanup in the background
+without ever treating it as MAIN. A per-Work-Item lease with an independent
+heartbeat and fenced storage transitions prevents concurrent rq-tui processes from
+deleting each other's live SIDE; MAIN remains usable while lease recovery and
+cleanup progress are shown in the agent timeline.
 
 ## Skills and plugins
 
