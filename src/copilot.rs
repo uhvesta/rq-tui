@@ -1751,7 +1751,10 @@ impl SessionHooks for ProgressHooks {
                 detail: None,
             },
             HookEvent::PostToolUseFailure { input, .. } => AgentActivity {
-                kind: ActivityKind::Retry,
+                // PostToolUseFailure is an observation hook. This handler
+                // does not return a retry decision, so reporting Retry here
+                // would claim work that the SDK never scheduled.
+                kind: ActivityKind::Failure,
                 label: format!("Hook: {} failed", input.tool_name),
                 tool: Some(input.tool_name),
                 detail: Some(input.error),
@@ -4465,18 +4468,47 @@ fn handle_session_event(
             let tool = event
                 .data
                 .get("toolName")
+                .or_else(|| event.data.get("tool_name"))
                 .and_then(|value| value.as_str())
+                .or_else(|| {
+                    event
+                        .data
+                        .get("toolDescription")
+                        .or_else(|| event.data.get("tool_description"))
+                        .and_then(|description| description.get("name"))
+                        .and_then(|value| value.as_str())
+                })
+                .or_else(|| {
+                    event
+                        .data
+                        .get("toolCallId")
+                        .or_else(|| event.data.get("tool_call_id"))
+                        .and_then(|value| value.as_str())
+                })
                 .unwrap_or("tool");
-            send_activity(
-                active,
-                AgentActivity {
-                    kind: ActivityKind::ToolComplete,
-                    label: format!("Finished {tool}"),
-                    tool: Some(tool.into()),
-                    detail: None,
-                },
-                events,
-            );
+            if let Some(detail) = tool_completion_failure_detail(&event.data) {
+                send_activity(
+                    active,
+                    AgentActivity {
+                        kind: ActivityKind::Failure,
+                        label: format!("Failed {tool}"),
+                        tool: Some(tool.into()),
+                        detail: Some(detail),
+                    },
+                    events,
+                );
+            } else {
+                send_activity(
+                    active,
+                    AgentActivity {
+                        kind: ActivityKind::ToolComplete,
+                        label: format!("Finished {tool}"),
+                        tool: Some(tool.into()),
+                        detail: None,
+                    },
+                    events,
+                );
+            }
         }
         "skill.invoked" => {
             let skill = event
@@ -4719,6 +4751,65 @@ fn register_sdk_message_root(active: &mut ActiveOutbound, message_id: String) {
     // SDK-assigned IDs are trusted roots. Some CLI versions use this exact ID
     // as a parent while others expose it via `user.message.interactionId`.
     active.accepted_event_ids.insert(message_id);
+}
+
+/// Return a user-facing diagnostic for a failed tool completion.
+///
+/// The pinned SDK models the normal completion wire shape with `success` and
+/// `error`, but raw events can also carry MCP's `result.isError` marker. Keep
+/// both camelCase and snake_case spellings here because this boundary consumes
+/// the CLI's untyped JSON event envelope rather than the generated Rust DTO.
+fn tool_completion_failure_detail(data: &serde_json::Value) -> Option<String> {
+    let mut details = Vec::new();
+
+    if let Some(error) = data.get("error") {
+        if let Some(message) = error.as_str() {
+            if !message.is_empty() {
+                details.push(message.to_owned());
+            }
+        } else if let Some(message) = error.get("message").and_then(|value| value.as_str()) {
+            if !message.is_empty() {
+                if let Some(code) = error.get("code").and_then(|value| value.as_str()) {
+                    details.push(format!("{code}: {message}"));
+                } else {
+                    details.push(message.to_owned());
+                }
+            }
+        }
+    }
+
+    let result = data.get("result");
+    let result_is_error = result
+        .and_then(|result| result.get("isError").or_else(|| result.get("is_error")))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if result_is_error {
+        if let Some(message) = result
+            .and_then(|result| {
+                result
+                    .get("detailedContent")
+                    .or_else(|| result.get("detailed_content"))
+            })
+            .and_then(|value| value.as_str())
+            .filter(|message| !message.is_empty())
+        {
+            details.push(message.to_owned());
+        } else if let Some(message) = result
+            .and_then(|result| result.get("content"))
+            .and_then(|value| value.as_str())
+            .filter(|message| !message.is_empty())
+        {
+            details.push(message.to_owned());
+        } else {
+            details.push("tool result marked as an error".into());
+        }
+    }
+
+    if data.get("success").and_then(|value| value.as_bool()) == Some(false) && details.is_empty() {
+        details.push("tool execution reported success=false".into());
+    }
+
+    (!details.is_empty()).then(|| details.join("; "))
 }
 
 fn background_tasks_are_running(background_tasks: Option<&serde_json::Value>) -> bool {
@@ -5135,7 +5226,9 @@ mod tests {
 
     use anyhow::Result;
     use github_copilot_sdk::handler::PermissionHandler;
-    use github_copilot_sdk::hooks::{HookContext, HookEvent, PreToolUseInput, SessionHooks};
+    use github_copilot_sdk::hooks::{
+        HookContext, HookEvent, PostToolUseFailureInput, PreToolUseInput, SessionHooks,
+    };
     use github_copilot_sdk::{
         PermissionRequestData, PermissionRequestKind, RequestId, SessionEvent, SessionId,
     };
@@ -6755,6 +6848,144 @@ mod tests {
                 && activity.kind == ActivityKind::ToolProgress
                 && activity.tool.as_deref() == Some("run_skill")
                 && activity.detail.as_deref() == Some("Running security-review skill")
+        ));
+    }
+
+    #[test]
+    fn raw_tool_completion_error_is_typed_as_failure_with_sdk_diagnostics() {
+        let (sender, receiver) = mpsc::channel();
+        let publisher = EventPublisher::new(sender, AgentLane::Main);
+        let mut active = active();
+        handle_session_event(
+            event(
+                "tool.execution_complete",
+                serde_json::json!({
+                    "toolName": "read_file",
+                    "success": false,
+                    "error": {
+                        "code": "E_PERMISSION",
+                        "message": "permission denied"
+                    }
+                }),
+            ),
+            &mut active,
+            &publisher,
+        );
+
+        let envelope = receiver.recv().expect("tool failure activity");
+        assert!(matches!(
+            envelope,
+            super::AgentEventEnvelope {
+                lane: AgentLane::Main,
+                activity: Some(ref activity),
+                ..
+            } if activity.kind == ActivityKind::Failure
+                && activity.label == "Failed read_file"
+                && activity.tool.as_deref() == Some("read_file")
+                && activity.detail.as_deref() == Some("E_PERMISSION: permission denied")
+        ));
+    }
+
+    #[test]
+    fn raw_tool_completion_result_error_is_typed_as_failure_with_result_details() {
+        let (sender, receiver) = mpsc::channel();
+        let publisher = EventPublisher::new(sender, AgentLane::Main);
+        let mut active = active();
+        handle_session_event(
+            event(
+                "tool.execution_complete",
+                serde_json::json!({
+                    "toolName": "search",
+                    "success": true,
+                    "result": {
+                        "isError": true,
+                        "content": "search backend unavailable"
+                    }
+                }),
+            ),
+            &mut active,
+            &publisher,
+        );
+
+        let envelope = receiver.recv().expect("result error activity");
+        assert!(matches!(
+            envelope,
+            super::AgentEventEnvelope {
+                lane: AgentLane::Main,
+                activity: Some(ref activity),
+                ..
+            } if activity.kind == ActivityKind::Failure
+                && activity.label == "Failed search"
+                && activity.tool.as_deref() == Some("search")
+                && activity.detail.as_deref() == Some("search backend unavailable")
+        ));
+    }
+
+    #[test]
+    fn raw_successful_tool_completion_remains_tool_complete() {
+        let (sender, receiver) = mpsc::channel();
+        let publisher = EventPublisher::new(sender, AgentLane::Main);
+        let mut active = active();
+        handle_session_event(
+            event(
+                "tool.execution_complete",
+                serde_json::json!({
+                    "toolName": "read_file",
+                    "success": true,
+                    "result": {"content": "file contents"}
+                }),
+            ),
+            &mut active,
+            &publisher,
+        );
+
+        let envelope = receiver.recv().expect("tool completion activity");
+        assert!(matches!(
+            envelope,
+            super::AgentEventEnvelope {
+                lane: AgentLane::Main,
+                activity: Some(ref activity),
+                ..
+            } if activity.kind == ActivityKind::ToolComplete
+                && activity.label == "Finished read_file"
+                && activity.tool.as_deref() == Some("read_file")
+                && activity.detail.is_none()
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_failure_is_failure_when_no_retry_is_scheduled() {
+        let (sender, receiver) = mpsc::channel();
+        let hooks = ProgressHooks {
+            events: EventPublisher::new(sender, AgentLane::Main),
+        };
+        hooks
+            .on_hook(HookEvent::PostToolUseFailure {
+                input: PostToolUseFailureInput {
+                    session_id: "session".into(),
+                    timestamp: 0.0,
+                    working_directory: PathBuf::from("."),
+                    tool_name: "run_command".into(),
+                    tool_args: serde_json::json!({"command": "false"}),
+                    error: "exit status 1".into(),
+                },
+                ctx: HookContext {
+                    session_id: SessionId::new("session"),
+                },
+            })
+            .await;
+
+        let envelope = receiver.recv().expect("hook failure activity");
+        assert!(matches!(
+            envelope,
+            super::AgentEventEnvelope {
+                lane: AgentLane::Main,
+                activity: Some(ref activity),
+                ..
+            } if activity.kind == ActivityKind::Failure
+                && activity.label == "Hook: run_command failed"
+                && activity.tool.as_deref() == Some("run_command")
+                && activity.detail.as_deref() == Some("exit status 1")
         ));
     }
 
