@@ -8,7 +8,7 @@ use crate::annotations::anchor_from_diff;
 use crate::chat_selection::{
     ChatCursor, ChatLayout, ChatPoint, ChatSelection, ChatSelectionMode, CopyPolicy, Movement,
 };
-use crate::copilot::{ModelOption, ModelSelection};
+use crate::copilot::{ModelOption, ModelSelection, PruneSessionOutcome};
 use crate::diff::{DiffFile, DiffSet, LineKind};
 use crate::domain::{
     AnchorSide, Annotation, AnnotationKind, AskMessage, DeliveryState, PendingChat, Placement,
@@ -182,6 +182,20 @@ pub(crate) enum Effect {
     Preview,
     PreviewBrowser,
     Yank(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingPrune {
+    pub(crate) request_id: String,
+    pub(crate) work_item_ids: Vec<String>,
+    pub(crate) export_first: bool,
+    pub(crate) skipped_current: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadyPrune {
+    pub(crate) request_id: String,
+    pub(crate) outcomes: Vec<PruneSessionOutcome>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -578,6 +592,8 @@ pub(crate) struct AppState {
     pub(crate) version_index: usize,
     pub(crate) prune_items: Vec<PruneChoice>,
     pub(crate) prune_index: usize,
+    pub(crate) pending_prune: Option<PendingPrune>,
+    pub(crate) ready_prune: Option<ReadyPrune>,
     pub(crate) settings_index: usize,
     pub(crate) should_quit: bool,
     pub(crate) viewport_height: usize,
@@ -673,6 +689,8 @@ impl AppState {
             version_index: 0,
             prune_items: Vec::new(),
             prune_index: 0,
+            pending_prune: None,
+            ready_prune: None,
             settings_index: 0,
             should_quit: false,
             viewport_height: 20,

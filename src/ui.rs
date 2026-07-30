@@ -25,7 +25,8 @@ use crate::annotations::{
 };
 use crate::app::{
     command_matches, AgentPhase, AppState, ChatEntry, ComposeTarget, DiffLayout, Effect, InputMode,
-    MarkdownPreview, ModelPickerStage, PruneChoice, Screen, VersionChoice,
+    MarkdownPreview, ModelPickerStage, PendingPrune, PruneChoice, ReadyPrune, Screen,
+    VersionChoice,
 };
 use crate::chat_render::{render_markdown_mapped, CellSource, MappedMarkdown, MappedRow};
 use crate::chat_selection::{
@@ -35,7 +36,7 @@ use crate::chat_selection::{
 use crate::config::AppPaths;
 use crate::copilot::{
     start_agent, ActivityKind, AgentCommand, AgentEvent, AgentEventEnvelope, AgentRuntime,
-    AgentSink, BridgeConfig, LaneEvent, Outbound, OutboundKind,
+    AgentSink, BridgeConfig, LaneEvent, Outbound, OutboundKind, PruneSessionOutcome,
 };
 use crate::diff::{DiffLine, LineKind};
 use crate::domain::{
@@ -245,6 +246,7 @@ fn run_loop<B: Backend>(
             };
             handle_agent_envelope(state, storage, event)?;
         }
+        finish_ready_prune(state, storage, paths)?;
         state.tick(std::time::Instant::now());
         terminal.draw(|frame| render(frame, state, highlighter))?;
         if event::poll(std::time::Duration::from_millis(100))? {
@@ -890,17 +892,44 @@ pub(crate) fn handle_effect(
             state.status = format!("{} reviewed Work Items", state.prune_items.len());
         }
         Effect::PruneWorkItems { ids, export_first } => {
-            for id in &ids {
-                prune_work_item(storage, paths, id, export_first)?;
+            if state.pending_prune.is_some() {
+                state.status =
+                    "A prune is already deleting Copilot sessions; wait for its result".into();
+                return Ok(());
             }
-            state.prune_items.retain(|item| !ids.contains(&item.id));
-            state.prune_index = state
-                .prune_index
-                .min(state.prune_items.len().saturating_sub(1));
-            state.status = format!(
-                "Pruned {} Work Item(s); Copilot transcripts remain in the CLI session store",
-                ids.len()
-            );
+            let current_id = &state.work_item.item.id;
+            let skipped_current = ids.iter().filter(|id| *id == current_id).count();
+            let eligible = ids
+                .into_iter()
+                .filter(|id| id != current_id)
+                .collect::<Vec<_>>();
+            if eligible.is_empty() {
+                state.status =
+                    "The open Work Item cannot be pruned; switch to another Work Item first".into();
+                return Ok(());
+            }
+            let request_id = uuid::Uuid::new_v4().to_string();
+            bridge.send(AgentCommand::PruneSessions {
+                request_id: request_id.clone(),
+                work_item_ids: eligible.clone(),
+            })?;
+            state.pending_prune = Some(PendingPrune {
+                request_id,
+                work_item_ids: eligible.clone(),
+                export_first,
+                skipped_current,
+            });
+            state.status = if skipped_current == 0 {
+                format!(
+                    "Deleting Copilot sessions for {} Work Item(s)… local history is unchanged",
+                    eligible.len()
+                )
+            } else {
+                format!(
+                    "Deleting Copilot sessions for {} Work Item(s)… skipped the open Work Item",
+                    eligible.len()
+                )
+            };
         }
         Effect::ResendPendingAsk(message) => {
             let annotation = storage
@@ -1578,6 +1607,99 @@ fn set_session_link(link: &std::path::Path, target: &std::path::Path) -> Result<
     Ok(())
 }
 
+pub(crate) fn finish_ready_prune(
+    state: &mut AppState,
+    storage: &Storage,
+    paths: &AppPaths,
+) -> Result<()> {
+    let Some(ready) = state.ready_prune.take() else {
+        return Ok(());
+    };
+    let Some(pending) = state.pending_prune.take() else {
+        return Ok(());
+    };
+    if ready.request_id != pending.request_id {
+        state.pending_prune = Some(pending);
+        return Ok(());
+    }
+
+    let mut pruned = Vec::new();
+    let mut failures = Vec::new();
+    for work_item_id in &pending.work_item_ids {
+        let outcome = ready
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.work_item_id == *work_item_id);
+        match outcome {
+            Some(outcome) if outcome.error.is_none() => {
+                match prune_work_item(storage, paths, work_item_id, pending.export_first) {
+                    Ok(()) => pruned.push(work_item_id.clone()),
+                    Err(error) => failures.push(format!(
+                        "{}: Copilot sessions are gone, but local cleanup failed and can be retried: {error}",
+                        work_item_id
+                    )),
+                }
+            }
+            Some(outcome) => failures.push(format!(
+                "{}: {}",
+                work_item_id,
+                outcome.error.as_deref().unwrap_or("session cleanup failed")
+            )),
+            None => failures.push(format!(
+                "{work_item_id}: Copilot worker returned no cleanup result; local history was retained"
+            )),
+        }
+    }
+
+    state
+        .prune_items
+        .retain(|item| !pruned.iter().any(|id| id == &item.id));
+    state.prune_index = state
+        .prune_index
+        .min(state.prune_items.len().saturating_sub(1));
+    let failed = failures.len();
+    let skipped = pending.skipped_current;
+    if failed == 0 {
+        state.agent_progress.record(
+            AgentPhase::Idle,
+            "Prune complete",
+            format!(
+                "Deleted Copilot sessions and local history for {} Work Item(s)",
+                pruned.len()
+            ),
+            None,
+        );
+        state.status = if skipped == 0 {
+            format!(
+                "Pruned {} Work Item(s) · Copilot sessions and local history deleted",
+                pruned.len()
+            )
+        } else {
+            format!(
+                "Pruned {} Work Item(s) · skipped the open Work Item",
+                pruned.len()
+            )
+        };
+    } else {
+        let detail = failures.join(" · ");
+        state
+            .agent_progress
+            .record(AgentPhase::Failed, "Prune incomplete", detail.clone(), None);
+        state.status = format!(
+            "Pruned {} · failed {} · retained failed local history{} · {}",
+            pruned.len(),
+            failed,
+            if skipped == 0 {
+                String::new()
+            } else {
+                format!(" · skipped open {skipped}")
+            },
+            detail
+        );
+    }
+    Ok(())
+}
+
 fn prune_work_item(
     storage: &Storage,
     paths: &AppPaths,
@@ -2233,6 +2355,15 @@ pub(crate) fn handle_agent_envelope(
             state.status = "SIDE creation cancelled · MAIN is unchanged".into();
         }
         LaneEvent::Agent(agent_event) => {
+            if matches!(
+                &agent_event,
+                AgentEvent::PruneSessionsStarted { .. }
+                    | AgentEvent::PruneSessionProgress { .. }
+                    | AgentEvent::PruneSessionsComplete { .. }
+            ) {
+                handle_agent_event(state, storage, agent_event)?;
+                return Ok(());
+            }
             let fatal_side = matches!(&agent_event, AgentEvent::Error(_) | AgentEvent::Stopped)
                 && (state.side_active || state.side_starting);
             if fatal_side {
@@ -2354,6 +2485,25 @@ fn restore_main_surface(state: &mut AppState) {
         state.pending_outbound_ids.remove(&id);
     }
     state.reset_chat_semantics();
+}
+
+fn fail_pending_prune(state: &mut AppState, message: String) {
+    let Some(pending) = state.pending_prune.as_ref() else {
+        return;
+    };
+    if state.ready_prune.is_none() {
+        state.ready_prune = Some(ReadyPrune {
+            request_id: pending.request_id.clone(),
+            outcomes: pending
+                .work_item_ids
+                .iter()
+                .map(|work_item_id| PruneSessionOutcome {
+                    work_item_id: work_item_id.clone(),
+                    error: Some(message.clone()),
+                })
+                .collect(),
+        });
+    }
 }
 
 pub(crate) fn handle_agent_event(
@@ -2971,7 +3121,81 @@ pub(crate) fn handle_agent_event(
                 );
             }
         }
+        AgentEvent::PruneSessionsStarted {
+            request_id,
+            work_items,
+        } => {
+            if state
+                .pending_prune
+                .as_ref()
+                .is_some_and(|pending| pending.request_id == request_id)
+            {
+                state.agent_progress.record(
+                    AgentPhase::Tool,
+                    "Deleting Copilot sessions",
+                    format!(
+                        "Cleanup started for {work_items} Work Item(s); local history is still intact"
+                    ),
+                    None,
+                );
+                state.status =
+                    format!("Copilot session cleanup started for {work_items} Work Item(s)…");
+            }
+        }
+        AgentEvent::PruneSessionProgress {
+            request_id,
+            work_item_id,
+            label,
+            completed,
+            total,
+        } => {
+            if state
+                .pending_prune
+                .as_ref()
+                .is_some_and(|pending| pending.request_id == request_id)
+            {
+                let detail = if total == 0 {
+                    format!("{work_item_id} · {label}")
+                } else {
+                    format!("{work_item_id} · {label} · {completed}/{total}")
+                };
+                state.agent_progress.record(
+                    AgentPhase::Tool,
+                    "Deleting Copilot sessions",
+                    detail.clone(),
+                    None,
+                );
+                state.status = detail;
+            }
+        }
+        AgentEvent::PruneSessionsComplete {
+            request_id,
+            outcomes,
+        } => {
+            if state
+                .pending_prune
+                .as_ref()
+                .is_some_and(|pending| pending.request_id == request_id)
+            {
+                state.ready_prune = Some(ReadyPrune {
+                    request_id,
+                    outcomes,
+                });
+                state.agent_progress.record(
+                    AgentPhase::Tool,
+                    "Copilot session cleanup finished",
+                    "Finalizing local Work Item history cleanup",
+                    None,
+                );
+                state.status =
+                    "Copilot session cleanup finished · finalizing local history…".into();
+            }
+        }
         AgentEvent::Error(error) => {
+            fail_pending_prune(
+                state,
+                format!("Copilot worker failed during prune: {error}"),
+            );
             state.agent_connected = false;
             state.agent_activity = "Disconnected".into();
             state.agent_progress.record(
@@ -2992,6 +3216,10 @@ pub(crate) fn handle_agent_event(
             state.status = format!("Copilot unavailable: {error}");
         }
         AgentEvent::Stopped => {
+            fail_pending_prune(
+                state,
+                "Copilot worker stopped before prune completion; local history was retained".into(),
+            );
             let cleanup_warning = (state.agent_progress.summary == "SIDE cleanup needs attention")
                 .then(|| state.agent_progress.detail.clone());
             state.agent_connected = false;
@@ -5326,9 +5554,9 @@ mod tests {
     use ratatui::Terminal;
 
     use super::{
-        handle_agent_envelope, handle_agent_event, handle_effect, handle_effect_failure,
-        load_ui_preferences, markdown_to_html, open_browser_preview, parse_review_context, render,
-        run_clipboard_candidate, table_cells,
+        finish_ready_prune, handle_agent_envelope, handle_agent_event, handle_effect,
+        handle_effect_failure, load_ui_preferences, markdown_to_html, open_browser_preview,
+        parse_review_context, render, run_clipboard_candidate, table_cells,
     };
     use crate::app::{
         tests_support::state_for_ui, ChatEntry, DiffLayout, Effect, Focus, MarkdownPreview, Screen,
@@ -5336,8 +5564,9 @@ mod tests {
     use crate::config::AppPaths;
     use crate::copilot::{
         AgentCommand, AgentEvent, AgentEventEnvelope, AgentLane, AgentSink, HistoryEntry,
-        LaneEvent, OutboundKind,
+        LaneEvent, OutboundKind, PruneSessionOutcome,
     };
+    use crate::domain::WorkItem;
     use crate::highlight::PlainHighlighter;
     use crate::storage::Storage;
 
@@ -5850,6 +6079,90 @@ mod tests {
             [AgentCommand::Send(_)]
         ));
         assert_eq!(state.pending_outbound_ids.len(), 1);
+    }
+
+    #[test]
+    fn prune_rejects_the_open_work_item_without_agent_or_local_calls() {
+        let storage = Storage::in_memory().unwrap();
+        let agent = FakeAgent::default();
+        let mut state = state_for_ui();
+        storage.upsert_work_item(&state.work_item.item).unwrap();
+        let current_id = state.work_item.item.id.clone();
+
+        handle_effect(
+            &mut state,
+            &storage,
+            &paths(),
+            &agent,
+            Effect::PruneWorkItems {
+                ids: vec![current_id.clone()],
+                export_first: false,
+            },
+        )
+        .unwrap();
+
+        assert!(agent.commands.lock().unwrap().is_empty());
+        assert!(storage.work_item_by_id(&current_id).unwrap().is_some());
+        assert!(state.pending_prune.is_none());
+        assert!(state.status.contains("open Work Item cannot be pruned"));
+    }
+
+    #[test]
+    fn prune_completion_applies_each_work_item_independently() {
+        let storage = Storage::in_memory().unwrap();
+        let agent = FakeAgent::default();
+        let mut state = state_for_ui();
+        storage.upsert_work_item(&state.work_item.item).unwrap();
+        for id in ["prune-ok", "prune-failed"] {
+            storage
+                .upsert_work_item(&WorkItem {
+                    id: id.into(),
+                    name: id.into(),
+                    workspace_root: PathBuf::from(format!("/{id}")),
+                    created_at: "1".into(),
+                    updated_at: "1".into(),
+                    last_opened_at: Some("1".into()),
+                })
+                .unwrap();
+        }
+
+        handle_effect(
+            &mut state,
+            &storage,
+            &paths(),
+            &agent,
+            Effect::PruneWorkItems {
+                ids: vec!["prune-ok".into(), "prune-failed".into()],
+                export_first: false,
+            },
+        )
+        .unwrap();
+        let request_id = state.pending_prune.as_ref().unwrap().request_id.clone();
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::PruneSessionsComplete {
+                request_id,
+                outcomes: vec![
+                    PruneSessionOutcome {
+                        work_item_id: "prune-ok".into(),
+                        error: None,
+                    },
+                    PruneSessionOutcome {
+                        work_item_id: "prune-failed".into(),
+                        error: Some("controlled SDK failure".into()),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        finish_ready_prune(&mut state, &storage, &paths()).unwrap();
+
+        assert!(storage.work_item_by_id("prune-ok").unwrap().is_none());
+        assert!(storage.work_item_by_id("prune-failed").unwrap().is_some());
+        assert!(state.status.contains("Pruned 1"));
+        assert!(state.status.contains("failed 1"));
+        assert!(state.status.contains("controlled SDK failure"));
     }
 
     #[test]

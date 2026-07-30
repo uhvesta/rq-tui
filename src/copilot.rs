@@ -338,7 +338,19 @@ pub(crate) enum AgentCommand {
     /// Legacy one-stage model switch retained while callers migrate to
     /// `SelectModel`.
     SetModel(String),
+    /// Delete every persisted Copilot session associated with reviewed Work
+    /// Items before their local history is pruned.
+    PruneSessions {
+        request_id: String,
+        work_item_ids: Vec<String>,
+    },
     Shutdown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PruneSessionOutcome {
+    pub(crate) work_item_id: String,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -419,6 +431,21 @@ pub(crate) enum AgentEvent {
     OrphanSideCleanup {
         session_id: String,
         cleanup_warning: Option<String>,
+    },
+    PruneSessionsStarted {
+        request_id: String,
+        work_items: usize,
+    },
+    PruneSessionProgress {
+        request_id: String,
+        work_item_id: String,
+        label: String,
+        completed: usize,
+        total: usize,
+    },
+    PruneSessionsComplete {
+        request_id: String,
+        outcomes: Vec<PruneSessionOutcome>,
     },
     Error(String),
     Stopped,
@@ -1076,6 +1103,34 @@ impl AgentSink for ControlledAgent {
                 Duration::ZERO,
                 AgentEvent::ModelChanged(model),
             ),
+            AgentCommand::PruneSessions {
+                request_id,
+                work_item_ids,
+            } => {
+                self.schedule_agent(
+                    AgentLane::Main,
+                    Duration::ZERO,
+                    AgentEvent::PruneSessionsStarted {
+                        request_id: request_id.clone(),
+                        work_items: work_item_ids.len(),
+                    },
+                );
+                let outcomes = work_item_ids
+                    .into_iter()
+                    .map(|work_item_id| PruneSessionOutcome {
+                        work_item_id,
+                        error: None,
+                    })
+                    .collect();
+                self.schedule_agent(
+                    AgentLane::Main,
+                    Duration::ZERO,
+                    AgentEvent::PruneSessionsComplete {
+                        request_id,
+                        outcomes,
+                    },
+                );
+            }
             AgentCommand::Shutdown => {
                 self.schedule_agent(AgentLane::Main, Duration::ZERO, AgentEvent::Stopped)
             }
@@ -1681,6 +1736,140 @@ async fn cleanup_ephemeral_record<B: SideCleanupBackend + Sync>(
     }
 }
 
+fn copilot_session_state_hint(session_id: &str) -> String {
+    let root = env::var_os("COPILOT_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".copilot")));
+    root.map(|root| {
+        root.join("session-state")
+            .join(session_id)
+            .display()
+            .to_string()
+    })
+    .unwrap_or_else(|| format!("<COPILOT_HOME>/session-state/{session_id}"))
+}
+
+async fn prune_remote_sessions<B, F>(
+    backend: &B,
+    ledger: &Storage,
+    owner_id: &str,
+    work_item_id: &str,
+    mut progress: F,
+) -> PruneSessionOutcome
+where
+    B: SideCleanupBackend + Sync,
+    F: FnMut(String, usize, usize),
+{
+    let fail = |error: String| PruneSessionOutcome {
+        work_item_id: work_item_id.to_owned(),
+        error: Some(error),
+    };
+    let now_ms = wall_clock_ms();
+    let stale_before_ms =
+        now_ms.saturating_sub(SIDE_LEASE_TTL.as_millis().try_into().unwrap_or(i64::MAX));
+    match ledger.claim_ephemeral_session_lease(work_item_id, owner_id, now_ms, stale_before_ms) {
+        Ok(true) => {}
+        Ok(false) => {
+            return fail(
+                "another rq-tui process is using this Work Item; local history was retained".into(),
+            )
+        }
+        Err(error) => {
+            return fail(format!(
+                "could not acquire the Work Item cleanup lease: {error}"
+            ))
+        }
+    }
+    let lease = EphemeralLeaseGuard {
+        ledger,
+        work_item_id,
+        owner_id,
+        owned: Cell::new(true),
+    };
+
+    let persistent = match ledger.sessions_for_work_item(work_item_id) {
+        Ok(sessions) => sessions,
+        Err(error) => return fail(format!("could not enumerate Copilot sessions: {error}")),
+    };
+    let ephemeral = match ledger.ephemeral_sessions(work_item_id) {
+        Ok(sessions) => sessions,
+        Err(error) => return fail(format!("could not enumerate SIDE sessions: {error}")),
+    };
+    let total = persistent.len() + ephemeral.len();
+    progress(
+        format!("Collected {total} Copilot session record(s)"),
+        0,
+        total,
+    );
+    let mut completed = 0;
+
+    for record in ephemeral {
+        if !matches!(
+            ledger.renew_ephemeral_session_lease(work_item_id, owner_id, wall_clock_ms()),
+            Ok(true)
+        ) {
+            return fail(
+                "Work Item cleanup ownership changed; no further SDK deletions were attempted"
+                    .into(),
+            );
+        }
+        let label = record
+            .side_id
+            .clone()
+            .unwrap_or_else(|| format!("SIDE operation {}", record.operation_id));
+        progress(format!("Deleting {label}"), completed, total);
+        let (_, warning) = cleanup_ephemeral_record(backend, ledger, record).await;
+        if let Some(warning) = warning {
+            return fail(warning);
+        }
+        completed += 1;
+        progress("SIDE deletion confirmed".into(), completed, total);
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for session in persistent {
+        if !seen.insert(session.id.clone()) {
+            continue;
+        }
+        if !matches!(
+            ledger.renew_ephemeral_session_lease(work_item_id, owner_id, wall_clock_ms()),
+            Ok(true)
+        ) {
+            return fail(
+                "Work Item cleanup ownership changed; no further SDK deletions were attempted"
+                    .into(),
+            );
+        }
+        progress(
+            format!("Deleting Copilot session {}", short_session_id(&session.id)),
+            completed,
+            total,
+        );
+        if let Err(error) = backend.delete_session_if_present(&session.id).await {
+            return fail(format!(
+                "could not delete Copilot session {}: {error}. Local fallback path: {}",
+                short_session_id(&session.id),
+                copilot_session_state_hint(&session.id)
+            ));
+        }
+        completed += 1;
+        progress(
+            format!(
+                "Deletion confirmed for Copilot session {}",
+                short_session_id(&session.id)
+            ),
+            completed,
+            total,
+        );
+    }
+    drop(lease);
+    PruneSessionOutcome {
+        work_item_id: work_item_id.to_owned(),
+        error: None,
+    }
+}
+
 async fn worker(
     config: BridgeConfig,
     mut commands: UnboundedReceiver<AgentCommand>,
@@ -1807,6 +1996,41 @@ async fn worker(
         if active.is_none() {
             if let Some(control) = controls.pop_front() {
                 match control {
+                    AgentCommand::PruneSessions {
+                        request_id,
+                        work_item_ids,
+                    } => {
+                        main_events.emit(AgentEvent::PruneSessionsStarted {
+                            request_id: request_id.clone(),
+                            work_items: work_item_ids.len(),
+                        });
+                        let mut outcomes = Vec::with_capacity(work_item_ids.len());
+                        for work_item_id in work_item_ids {
+                            let progress_request = request_id.clone();
+                            let progress_item = work_item_id.clone();
+                            let outcome = prune_remote_sessions(
+                                &client,
+                                &ledger,
+                                &owner_id,
+                                &work_item_id,
+                                |label, completed, total| {
+                                    main_events.emit(AgentEvent::PruneSessionProgress {
+                                        request_id: progress_request.clone(),
+                                        work_item_id: progress_item.clone(),
+                                        label,
+                                        completed,
+                                        total,
+                                    });
+                                },
+                            )
+                            .await;
+                            outcomes.push(outcome);
+                        }
+                        main_events.emit(AgentEvent::PruneSessionsComplete {
+                            request_id,
+                            outcomes,
+                        });
+                    }
                     AgentCommand::StartSide { outbound } => {
                         if side.is_some() {
                             main_events.activity(
@@ -2751,6 +2975,17 @@ async fn worker(
                         } else {
                             controls.push_front(AgentCommand::ExitSide);
                         }
+                    }
+                    AgentCommand::PruneSessions { .. } => {
+                        controls.push_back(command);
+                        main_events.activity(
+                            active.as_ref().map(|turn| turn.outbound.id.clone()),
+                            AgentActivity::other(if active.is_some() {
+                                "Work Item prune queued until the current response is idle"
+                            } else {
+                                "Starting Work Item session cleanup…"
+                            }),
+                        );
                     }
                     AgentCommand::Fork
                     | AgentCommand::Compact(_)
@@ -3897,13 +4132,13 @@ mod tests {
 
     use super::{
         cleanup_ephemeral_record, create_config, enqueue_message, handle_session_event,
-        history_entries, model_option, now, register_sdk_message_root, resume_config,
-        resumed_active_from_history, retryable_cleanup_state, ActiveOutbound, ActivityKind,
-        AgentCommand, AgentEvent, AgentLane, AgentRuntime, AgentSink, BridgeConfig,
+        history_entries, model_option, now, prune_remote_sessions, register_sdk_message_root,
+        resume_config, resumed_active_from_history, retryable_cleanup_state, ActiveOutbound,
+        ActivityKind, AgentCommand, AgentEvent, AgentLane, AgentRuntime, AgentSink, BridgeConfig,
         ControlledAgent, CopilotBridge, EventPublisher, HistoryEntry, LaneEvent, Outbound,
         OutboundKind, ProgressHooks, ReadOnlyPermissionHandler,
     };
-    use crate::domain::{EphemeralSessionRecord, WorkItem};
+    use crate::domain::{EphemeralSessionRecord, SessionRecord, WorkItem};
     use crate::storage::Storage;
 
     #[derive(Default)]
@@ -4059,6 +4294,50 @@ mod tests {
             storage.ephemeral_sessions(&item.id).unwrap()[0].owner_id,
             "owner-2"
         );
+    }
+
+    #[test]
+    fn prune_deletes_inactive_main_forks_and_reports_progress() {
+        let (storage, item) = cleanup_storage();
+        storage
+            .activate_session(&SessionRecord {
+                id: "main-parent".into(),
+                work_item_id: item.id.clone(),
+                parent_id: None,
+                active: true,
+                created_at: "1".into(),
+            })
+            .unwrap();
+        storage
+            .activate_session(&SessionRecord {
+                id: "main-fork".into(),
+                work_item_id: item.id.clone(),
+                parent_id: Some("main-parent".into()),
+                active: true,
+                created_at: "2".into(),
+            })
+            .unwrap();
+        let backend = FakeSideCleanup::default();
+        let mut progress = Vec::new();
+
+        let outcome = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(prune_remote_sessions(
+                &backend,
+                &storage,
+                "owner-1",
+                &item.id,
+                |label, completed, total| progress.push((label, completed, total)),
+            ));
+
+        assert!(outcome.error.is_none());
+        assert_eq!(
+            backend.deleted_sessions.lock().unwrap().as_slice(),
+            ["main-parent", "main-fork"]
+        );
+        assert!(progress
+            .iter()
+            .any(|(_, completed, total)| *completed == 2 && *total == 2));
     }
 
     #[test]

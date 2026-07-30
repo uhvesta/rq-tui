@@ -534,6 +534,25 @@ impl Storage {
             .optional()?)
     }
 
+    pub(crate) fn sessions_for_work_item(&self, work_item_id: &str) -> Result<Vec<SessionRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, work_item_id, parent_id, active, created_at
+             FROM sessions
+             WHERE work_item_id = ?1
+             ORDER BY created_at, id",
+        )?;
+        let rows = statement.query_map([work_item_id], |row| {
+            Ok(SessionRecord {
+                id: row.get(0)?,
+                work_item_id: row.get(1)?,
+                parent_id: row.get(2)?,
+                active: row.get::<_, i64>(3)? != 0,
+                created_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub(crate) fn record_ephemeral_session(
         &self,
         session: &EphemeralSessionRecord,
@@ -1502,7 +1521,8 @@ mod tests {
     use super::{Storage, MIGRATION_1, MIGRATION_2, MIGRATION_3};
     use crate::domain::{
         AnchorSide, Annotation, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState,
-        EphemeralSessionRecord, PendingChat, Placement, Repo, Version, VersionKind, WorkItem,
+        EphemeralSessionRecord, PendingChat, Placement, Repo, SessionRecord, Version, VersionKind,
+        WorkItem,
     };
 
     #[test]
@@ -1528,6 +1548,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 19);
+    }
+
+    #[test]
+    fn session_enumeration_keeps_inactive_parents_and_active_forks() {
+        let storage = Storage::in_memory().unwrap();
+        let item = WorkItem {
+            id: "session-history".into(),
+            name: "session history".into(),
+            workspace_root: PathBuf::from("/session-history"),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            last_opened_at: Some("1".into()),
+        };
+        storage.upsert_work_item(&item).unwrap();
+        storage
+            .activate_session(&SessionRecord {
+                id: "main-parent".into(),
+                work_item_id: item.id.clone(),
+                parent_id: None,
+                active: true,
+                created_at: "1".into(),
+            })
+            .unwrap();
+        storage
+            .activate_session(&SessionRecord {
+                id: "main-fork".into(),
+                work_item_id: item.id.clone(),
+                parent_id: Some("main-parent".into()),
+                active: true,
+                created_at: "2".into(),
+            })
+            .unwrap();
+
+        let sessions = storage.sessions_for_work_item(&item.id).unwrap();
+
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| (session.id.as_str(), session.active))
+                .collect::<Vec<_>>(),
+            [("main-parent", false), ("main-fork", true)]
+        );
+        assert_eq!(sessions[1].parent_id.as_deref(), Some("main-parent"));
     }
 
     #[test]
