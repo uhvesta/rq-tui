@@ -66,11 +66,13 @@ initializes the TUI.
 ## Review and Chat
 
 Review mode is the diff workspace. `j/k`, `gg/G`, page and half-page movement
-navigate the focused pane; `h/l` changes files; `-` or `,e` opens the file
-picker; `v` selects rows; `a` asks a grounded question; and `c` records a
-local comment. `y`/`yy` first use the native clipboard and fall back to OSC 52.
-`Tab` toggles Review/Chat, while `gc` always opens Chat and `gr` always opens
-Review in normal mode.
+navigate the focused pane; `h/l` changes files; `t` toggles the file tree;
+`v` selects rows; `a` asks a grounded question; and `c` records a local
+comment. Unified is the default layout, while `:diff split` keeps the
+old/new side-by-side view. In both layouts, asks and comments are full-width
+inline blocks—there is no annotation rail. `y`/`yy` first use the native
+clipboard and fall back to OSC 52. `Tab` toggles Review/Chat, while `gc`
+always opens Chat and `gr` always opens Review in normal mode.
 
 Chat deliberately has explicit modes so the input state is never ambiguous:
 
@@ -81,9 +83,9 @@ Chat deliberately has explicit modes so the input state is never ambiguous:
   submits; `Shift-Enter` inserts a newline. `Esc` returns to normal mode and
   preserves a Chat draft. During an active response, the first `Ctrl-C` stops
   Copilot and preserves the draft; while idle, `Ctrl-C` discards it.
-- `COMMAND`: the palette is a modal overlay and the sticky bar says
-  `COMMAND MODE ACTIVE`. `↑/↓` changes the selected suggestion, `PgUp/PgDn`
-  scrolls the list, `Tab` completes, `Enter` runs, and `Esc` cancels.
+- `COMMAND`: the palette is the only active input surface. `↑/↓` changes the
+  selected suggestion, `PgUp/PgDn` scrolls the actual visible page, `Tab`
+  completes, `Enter` runs, and `Esc` cancels.
 - `SEARCH`: `/` searches the focused transcript or diff; `Enter` accepts and
   `Esc` cancels.
 - `VISUAL`: in a diff, `v` selects source rows. In Chat, `v`, `V`, and
@@ -280,12 +282,10 @@ aarch64, macOS x86_64, and macOS aarch64. Tags matching `v*` publish a
 compressed binary and SHA-256 file for each of those four targets through
 GitHub Actions. Windows is intentionally not part of the matrix.
 
-The current requirement matrix and Copilot SDK feature matrix are in
+The authoritative product contract is
+[`docs/spec-v2-consolidated.md`](docs/spec-v2-consolidated.md). Historical
+implementation and Copilot SDK audit trails are in
 [`docs/behavioral-audit.md`](docs/behavioral-audit.md) and
 [`docs/copilot-sdk-audit.md`](docs/copilot-sdk-audit.md). Current compiled
 pseudo-terminal evidence is recorded in
 [`docs/audit/pty-smoke.md`](docs/audit/pty-smoke.md).
-The remaining interaction requirements—including Review-integrated
-conversation navigation, timed focus-chord expiry, richer Markdown structures,
-clipboard failure injection, and compiled-terminal selection evidence—are tracked in
-[`docs/chat-interaction-spec.md`](docs/chat-interaction-spec.md).

@@ -43,15 +43,14 @@ pub(crate) enum Focus {
     FilePicker,
     #[default]
     Diff,
-    AnnotationRail,
     Chat,
     InlineAsk,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum DiffLayout {
-    #[default]
     Split,
+    #[default]
     Unified,
 }
 
@@ -428,6 +427,7 @@ pub(crate) struct AppState {
     pub(crate) command: String,
     pub(crate) command_index: usize,
     pub(crate) command_scroll: usize,
+    pub(crate) command_viewport_rows: usize,
     pub(crate) search: String,
     pub(crate) compose: String,
     pub(crate) compose_cursor: usize,
@@ -470,11 +470,11 @@ pub(crate) struct AppState {
     pub(crate) model_picker_index: usize,
     pub(crate) pending_model_selection: Option<ModelSelection>,
     pub(crate) pending_prefix: String,
+    pub(crate) pending_prefix_started: Option<Instant>,
     pub(crate) pending_asks: Vec<AskMessage>,
     pub(crate) pending_comment_ids: Vec<String>,
     pub(crate) pending_context: bool,
     pub(crate) recovery_index: usize,
-    pub(crate) annotation_index: usize,
     pub(crate) deleted_annotation: Option<(Annotation, Vec<Placement>, Vec<AskMessage>)>,
     pub(crate) versions: Vec<VersionChoice>,
     pub(crate) version_index: usize,
@@ -486,6 +486,8 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
+    const CTRL_W_TIMEOUT: Duration = Duration::from_millis(1_500);
+
     pub(crate) fn new(work_item: ResolvedWorkItem) -> Self {
         Self {
             work_item,
@@ -493,7 +495,7 @@ impl AppState {
             previous_screen: Screen::Review,
             input_mode: InputMode::Normal,
             focus: Focus::Diff,
-            layout: DiffLayout::Split,
+            layout: DiffLayout::Unified,
             picker_open: false,
             repo_index: 0,
             file_index: 0,
@@ -507,6 +509,7 @@ impl AppState {
             command: String::new(),
             command_index: 0,
             command_scroll: 0,
+            command_viewport_rows: 7,
             search: String::new(),
             compose: String::new(),
             compose_cursor: 0,
@@ -548,11 +551,11 @@ impl AppState {
             model_picker_index: 0,
             pending_model_selection: None,
             pending_prefix: String::new(),
+            pending_prefix_started: None,
             pending_asks: Vec::new(),
             pending_comment_ids: Vec::new(),
             pending_context: false,
             recovery_index: 0,
-            annotation_index: 0,
             deleted_annotation: None,
             versions: Vec::new(),
             version_index: 0,
@@ -569,6 +572,18 @@ impl AppState {
             .repos
             .get(self.repo_index)
             .map(|repo| &repo.diff)
+    }
+
+    pub(crate) fn tick(&mut self, now: Instant) {
+        if self.pending_prefix == "ctrl-w"
+            && self.pending_prefix_started.is_some_and(|started| {
+                now.saturating_duration_since(started) >= Self::CTRL_W_TIMEOUT
+            })
+        {
+            self.pending_prefix.clear();
+            self.pending_prefix_started = None;
+            self.status = "CTRL-W focus navigation timed out · focus unchanged".into();
+        }
     }
 
     pub(crate) fn current_file(&self) -> Option<&DiffFile> {
@@ -756,6 +771,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        self.tick(Instant::now());
         match self.input_mode {
             InputMode::Command => return self.handle_command_key(key),
             InputMode::Search => return self.handle_search_key(key),
@@ -860,6 +876,7 @@ impl AppState {
                 KeyCode::Up => return self.handle_prefix_key('k'),
                 KeyCode::Esc => {
                     self.pending_prefix.clear();
+                    self.pending_prefix_started = None;
                     self.status = "CTRL-W focus navigation cancelled".into();
                     return Vec::new();
                 }
@@ -874,6 +891,7 @@ impl AppState {
                 return self.handle_prefix_key(character);
             }
             self.pending_prefix.clear();
+            self.pending_prefix_started = None;
         }
         match key.code {
             KeyCode::Char(':') => {
@@ -890,12 +908,18 @@ impl AppState {
                 self.search.clear();
             }
             KeyCode::Tab if self.input_mode == InputMode::Normal => self.toggle_review_chat(),
-            KeyCode::Char('-') => {
+            KeyCode::Char('t') if self.screen == Screen::Review => {
                 self.picker_open = !self.picker_open;
                 self.focus = if self.picker_open {
                     Focus::FilePicker
                 } else {
                     Focus::Diff
+                };
+                self.clear_visual_selection();
+                self.status = if self.picker_open {
+                    "File tree opened · Focus: files → diff".into()
+                } else {
+                    "File tree closed · Focus: diff".into()
                 };
             }
             KeyCode::Char('j') | KeyCode::Down => self.move_down(1),
@@ -963,9 +987,6 @@ impl AppState {
                 self.picker_open = false;
                 self.focus = Focus::Diff;
                 self.clear_visual_selection();
-            }
-            KeyCode::Enter if self.focus == Focus::AnnotationRail => {
-                self.focus = Focus::Diff;
             }
             KeyCode::Enter if self.screen == Screen::Review => {
                 if let Some((kind, annotation_id)) = self
@@ -1087,6 +1108,7 @@ impl AppState {
             KeyCode::PageUp => self.move_up(self.viewport_height),
             _ => {
                 self.pending_prefix.clear();
+                self.pending_prefix_started = None;
             }
         }
         Vec::new()
@@ -1366,6 +1388,7 @@ impl AppState {
 
     fn handle_prefix_key(&mut self, character: char) -> Vec<Effect> {
         let prefix = std::mem::take(&mut self.pending_prefix);
+        self.pending_prefix_started = None;
         match (prefix.as_str(), character) {
             ("g", 'g') => self.jump_top(),
             ("g", 'c') if self.input_mode == InputMode::Normal => {
@@ -1379,33 +1402,8 @@ impl AppState {
                 self.clear_visual_selection();
             }
             ("g", 'm') => return vec![Effect::Preview],
-            ("ctrl-w", 'h') => {
-                self.focus = Focus::FilePicker;
-                self.picker_open = true;
-                self.clear_visual_selection();
-                self.status = "Focus: files".into();
-            }
-            ("ctrl-w", 'l') => {
-                if self.layout == DiffLayout::Split {
-                    self.focus = Focus::AnnotationRail;
-                    self.status = "Focus: annotations".into();
-                } else {
-                    self.focus = Focus::Diff;
-                    self.status = "No pane to the right in unified layout".into();
-                }
-                self.clear_visual_selection();
-            }
-            ("ctrl-w", 'j') => {
-                self.screen = Screen::Chat;
-                self.focus = Focus::Chat;
-                self.clear_visual_selection();
-                self.status = "Focus: chat transcript".into();
-            }
-            ("ctrl-w", 'k') => {
-                self.screen = Screen::Review;
-                self.focus = Focus::Diff;
-                self.clear_visual_selection();
-                self.status = "Focus: review diff".into();
+            ("ctrl-w", direction @ ('h' | 'j' | 'k' | 'l')) => {
+                self.move_review_focus(direction);
             }
             ("]", 'a') => self.jump_annotation(true),
             ("[", 'a') => self.jump_annotation(false),
@@ -1426,16 +1424,8 @@ impl AppState {
                     self.status = "Toggled annotation fold".into();
                 }
             }
-            (",", 'e') => {
-                self.picker_open = !self.picker_open;
-                self.focus = if self.picker_open {
-                    Focus::FilePicker
-                } else {
-                    Focus::Diff
-                };
-            }
             ("", 'y') if self.input_mode == InputMode::Visual => return self.yank_current(),
-            ("", start @ ('g' | ']' | '[' | 'y' | 'd' | 'z' | ',')) => {
+            ("", start @ ('g' | ']' | '[' | 'y' | 'd' | 'z')) => {
                 self.pending_prefix = start.to_string();
             }
             _ => {}
@@ -1539,6 +1529,9 @@ impl AppState {
         main_entries
             .chain(side_entries)
             .filter_map(|entry| {
+                if entry.role == "copilot" {
+                    return None;
+                }
                 let id = entry.outbound_id.as_ref()?;
                 self.pending_outbound_ids.contains(id).then(|| {
                     (
@@ -1594,6 +1587,7 @@ impl AppState {
             KeyCode::Char('b') => self.move_up(self.viewport_height),
             KeyCode::Char('w') => {
                 self.pending_prefix = "ctrl-w".into();
+                self.pending_prefix_started = Some(Instant::now());
                 self.status = "CTRL-W · h/j/k/l or arrows · Esc cancel".into();
             }
             KeyCode::Char('h') if self.pending_prefix == "ctrl-w" => {
@@ -1611,7 +1605,10 @@ impl AppState {
             KeyCode::Char('j' | 'm') => {
                 return self.handle_normal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             }
-            _ => self.pending_prefix.clear(),
+            _ => {
+                self.pending_prefix.clear();
+                self.pending_prefix_started = None;
+            }
         }
         Vec::new()
     }
@@ -1671,29 +1668,32 @@ impl AppState {
             }
             KeyCode::Down => {
                 let count = command_matches(&self.command).len();
+                let page = self.command_viewport_rows.max(1);
                 if count > 0 {
                     self.command_index = cmp::min(
                         count.saturating_sub(1),
                         self.command_index.saturating_add(1),
                     );
-                    if self.command_index >= self.command_scroll + 7 {
-                        self.command_scroll = self.command_index + 1 - 7;
+                    if self.command_index >= self.command_scroll + page {
+                        self.command_scroll = self.command_index + 1 - page;
                     }
                 }
                 Vec::new()
             }
             KeyCode::PageUp => {
-                self.command_index = self.command_index.saturating_sub(7);
+                let page = self.command_viewport_rows.max(1);
+                self.command_index = self.command_index.saturating_sub(page);
                 self.command_scroll = self.command_scroll.min(self.command_index);
                 Vec::new()
             }
             KeyCode::PageDown => {
                 let count = command_matches(&self.command).len();
+                let page = self.command_viewport_rows.max(1);
                 self.command_index = cmp::min(
                     count.saturating_sub(1),
-                    self.command_index.saturating_add(7),
+                    self.command_index.saturating_add(page),
                 );
-                self.command_scroll = self.command_index.saturating_sub(6);
+                self.command_scroll = self.command_index.saturating_sub(page.saturating_sub(1));
                 Vec::new()
             }
             KeyCode::Tab => {
@@ -1956,11 +1956,13 @@ impl AppState {
             (Some("diff"), Some("split")) => {
                 self.layout = DiffLayout::Split;
                 self.clear_visual_selection();
+                self.status = "Diff layout: split · annotations remain inline".into();
                 Vec::new()
             }
             (Some("diff"), Some("unified")) => {
                 self.layout = DiffLayout::Unified;
                 self.clear_visual_selection();
+                self.status = "Diff layout: unified".into();
                 Vec::new()
             }
             (Some("diff"), Some("expand")) => {
@@ -2164,13 +2166,41 @@ impl AppState {
         self.clear_visual_selection();
     }
 
+    fn move_review_focus(&mut self, direction: char) {
+        if self.screen != Screen::Review {
+            self.status = "CTRL-W only moves Review windows · use Tab/gc/gr for Chat".into();
+            return;
+        }
+        match (self.focus, direction) {
+            (Focus::Diff | Focus::InlineAsk, 'h') => {
+                self.picker_open = true;
+                self.focus = Focus::FilePicker;
+                self.status = "Focus: files → diff".into();
+            }
+            (Focus::FilePicker, 'l') => {
+                self.focus = Focus::Diff;
+                self.status = "Focus: files → diff".into();
+            }
+            (Focus::FilePicker, 'h') => {
+                self.status = "No window to the left".into();
+            }
+            (Focus::Diff | Focus::InlineAsk, 'l') => {
+                self.status = "No window to the right · use Tab or gc for Chat".into();
+            }
+            (_, 'j') => {
+                self.status = "No window below".into();
+            }
+            (_, 'k') => {
+                self.status = "No window above".into();
+            }
+            _ => {}
+        }
+        self.clear_visual_selection();
+    }
+
     fn move_down(&mut self, amount: usize) {
         match self.focus {
             Focus::FilePicker => self.next_file_by(amount),
-            Focus::AnnotationRail => {
-                self.annotation_index = self.annotation_index.saturating_add(amount);
-                self.jump_to_rail_annotation();
-            }
             Focus::Chat => {
                 if !self.move_chat_semantic(Movement::Down) {
                     let max_scroll = self.chat_total_rows.saturating_sub(self.chat_viewport_rows);
@@ -2197,10 +2227,6 @@ impl AppState {
                 for _ in 0..amount {
                     self.previous_file();
                 }
-            }
-            Focus::AnnotationRail => {
-                self.annotation_index = self.annotation_index.saturating_sub(amount);
-                self.jump_to_rail_annotation();
             }
             Focus::Chat => {
                 if !self.move_chat_semantic(Movement::Up) {
@@ -2566,34 +2592,6 @@ impl AppState {
                 .unwrap_or(*positions.last().expect("not empty"))
         };
         (self.repo_index, self.file_index, self.cursor) = target;
-        self.ensure_cursor_visible();
-    }
-
-    fn jump_to_rail_annotation(&mut self) {
-        let Some(repo) = self.work_item.repos.get(self.repo_index) else {
-            return;
-        };
-        let Some(file) = repo.diff.files.get(self.file_index) else {
-            return;
-        };
-        let positions = self
-            .annotations
-            .iter()
-            .filter(|(annotation, _)| {
-                annotation.repo_id == repo.record.id && annotation.file_path == file.display_path
-            })
-            .filter_map(|(_, placement)| {
-                file.visible_lines().position(|line| {
-                    placement_line(line, Some(placement.side)).map(|number| number as i64)
-                        == Some(placement.line_start)
-                })
-            })
-            .collect::<Vec<_>>();
-        if positions.is_empty() {
-            return;
-        }
-        self.annotation_index = self.annotation_index.min(positions.len() - 1);
-        self.cursor = positions[self.annotation_index];
         self.ensure_cursor_visible();
     }
 
@@ -3045,20 +3043,41 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         app.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(app.screen, Screen::Chat);
-        assert_eq!(app.focus, Focus::Chat);
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.focus, Focus::FilePicker);
+        assert!(app.status.contains("No window below"));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
-        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Right));
         assert_eq!(app.screen, Screen::Review);
         assert_eq!(app.focus, Focus::Diff);
-        assert!(app.status.contains("Focus: review diff"));
 
-        app.layout = DiffLayout::Unified;
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         app.handle_key(key(KeyCode::Right));
         assert_eq!(app.focus, Focus::Diff);
-        assert!(app.status.contains("No pane to the right"));
+        assert!(app.status.contains("No window to the right"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.pending_prefix_started =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        app.tick(std::time::Instant::now());
+        assert!(app.pending_prefix.is_empty());
+        assert!(app.status.contains("timed out"));
+    }
+
+    #[test]
+    fn t_is_the_only_direct_file_tree_toggle() {
+        let mut app = state();
+        assert!(!app.picker_open);
+        app.handle_key(key(KeyCode::Char('t')));
+        assert!(app.picker_open);
+        assert_eq!(app.focus, Focus::FilePicker);
+        app.handle_key(key(KeyCode::Char('t')));
+        assert!(!app.picker_open);
+        assert_eq!(app.focus, Focus::Diff);
+
+        app.handle_key(key(KeyCode::Char('-')));
+        assert!(!app.picker_open);
     }
 
     #[test]

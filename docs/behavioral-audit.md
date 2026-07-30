@@ -14,7 +14,7 @@ Evidence abbreviations:
 - `PTY-xx` refers to [`audit/pty-smoke.md`](audit/pty-smoke.md).
 - Other test names identify their Rust module directly.
 
-Current-evidence boundary: the deterministic harness baseline is 124 regular
+Current-evidence boundary: the deterministic harness baseline is 126 regular
 tests passing with 1 authenticated live test ignored by default. The ignored
 stream/resume test was also run explicitly against the installed Copilot CLI
 and passed. PTY-16 through PTY-21 are current compiled-binary evidence; earlier
@@ -37,11 +37,11 @@ PTY references remain useful historical records.
 | P1 | Split mode highlighted only the cursor, not the Visual range. | Every selected canonical row now styles its applicable old/new cell. `WF::file_switch_clears_visual_mode_and_split_unified_render_selection`. |
 | P1 | Visual `y` was unreachable as a one-key action. | Visual `y` executes immediately; `yy` remains Normal-mode yank. `WF::visual_yank_preserves_source_order_across_addition_and_context`. |
 | P1 | `Ctrl-w h/j/k/l` required Control on the second key, contrary to the documented sequence. | A plain second direction is accepted. `app::tests::ctrl_w_then_plain_direction_moves_focus_as_documented`. |
-| P1 | File-picker Enter and annotation-rail indexing were misleading. | Enter accepts the current file; rail movement is scoped to annotations in the displayed file. `app::tests::picker_enter_accepts_the_current_file_and_returns_focus_to_diff`. |
+| P1 | File-tree and annotation navigation exposed obsolete third-pane behavior. | `t` is the sole direct file-tree toggle, Enter accepts the current file, and the annotation rail/focus target is removed. Both diff layouts render annotations as full-width inline blocks. |
 | P1 | Command entry and annotation composition were confined to the bottom status line. | Commands render in a top palette; annotation composers render beside the selected range and remain usable in narrow terminals. `WF::narrow_terminal_keeps_selection_composer_and_top_palette_visible`, PTY-03/08. |
 | P1 | Export could retain an unrelated previous status after successfully queueing a batch. | Export now always reports the queued batch and optional written path. `WF::comment_export_queues_one_batch_and_acknowledges_delivery`. |
 | P1 | Narrow command/Ask overlays leaked fragments of underlying panes, making their borders and content ambiguous. | Compact terminals use full-width cleared modal surfaces; the 40×12 adversarial reproductions are clean. |
-| P1 | Review focus and advertised `Ctrl-W` arrow chords were not visibly reliable. | The header and focused pane titles show focus, arrows and letter chords share one path, and unavailable destinations report an explicit status. `app::tests::ctrl_w_then_plain_direction_moves_focus_as_documented`. |
+| P1 | Review focus and advertised `Ctrl-W` arrow chords were not visibly reliable. | The header and focused pane titles show focus, arrows and letter chords share one path, unavailable destinations report an explicit status, Chat is excluded from the two-window ring, and incomplete chords visibly expire after 1.5 seconds. `app::tests::ctrl_w_then_plain_direction_moves_focus_as_documented`. |
 | P1 | Wide CJK/emoji text wrapped by character count and clipped terminal cells. | Markdown wrapping now uses Ratatui's terminal-cell width, and snapshot extraction omits wide-character continuation cells. `chat_render::tests::wide_unicode_wraps_by_terminal_cells_without_clipping`. |
 | P1 | Lagged/closed SDK subscriptions, stale deltas, and resumed pending work could strand or corrupt the local active turn. | Lagged/closed streams fail active and queued work visibly instead of hanging; resumed in-flight turns receive a synthetic local outbound; a dispatched prompt binds through its matching `user.message` event before descendants are accepted, so late events from an older chain cannot complete the new turn. Corresponding `copilot::tests::*` race tests and LIVE-01 pass. |
 | P1 | SDK control calls could wait forever without a diagnosable operation boundary. | Startup, session create/resume, history, model, steering, delivery, fork, compaction, abort, disconnect, deletion, and shutdown calls now carry named 15-second async timeouts. The SDK worker remains on its own OS thread so even a CLI-side synchronous startup stall cannot block input or rendering. |
@@ -69,7 +69,7 @@ PTY references remain useful historical records.
 | R-16 | Comment persists locally and does not contact Copilot until export | Working end-to-end | `WF::normal_and_visual_comments_persist_without_contacting_agent`; PTY-04. |
 | R-17 | `:fork` child session becomes active | Partially working | Command, queued control sequencing, SDK call, and storage handling exist; no authenticated fork smoke test. |
 | R-18 | Structured local context generation, editing, acceptance, persistence | Partially working | Parser/editor/effects and controlled-agent shape exist; no complete attach/restart workflow test. |
-| R-19 | Split and unified review layouts with inline/rail annotations | Working end-to-end | `WF::file_switch_clears_visual_mode_and_split_unified_render_selection`; PTY-01/04/08. |
+| R-19 | Split and unified review layouts with inline annotations and no rail | Working in deterministic tests | Unified is the default. Both layouts retain one diff cursor and render Comment/Ask content inline; split blocks span both columns. `WF::file_switch_clears_visual_mode_and_split_unified_render_selection` and `WF::normal_and_visual_comments_persist_without_contacting_agent`. Navigation through individual block rows remains a follow-up. |
 | R-20 | Multi-repo grouped file/folder picker ordered by activity | Partially working | Repo grouping, collapse/expand, fuzzy filtering, and Enter work; folder hierarchy and complete activity-order workflow are absent. |
 | R-21 | Full Chat panel with streaming, queue/activity/usage, model/session controls | Partially working | Streaming, queue/activity, usage, scrolling, composer, model capability picker, steering, and status paths are covered by deterministic `WF::*` tests. Durable queue recovery across process restart and character-wise terminal selection remain gaps. |
 | R-22 | Top command palette with autocomplete and execution | Working end-to-end | `WF::narrow_terminal_keeps_selection_composer_and_top_palette_visible`; PTY-08. |
@@ -211,7 +211,7 @@ matrix so that new evidence is not confused with the earlier PTY run.
 The current checked-in regular-test baseline is:
 
 ```text
-124 regular tests passed; 1 authenticated live Copilot test ignored by default
+126 regular tests passed; 1 authenticated live Copilot test ignored by default
 ```
 
 The regular baseline includes the reducer/effect, storage, rendering, SDK

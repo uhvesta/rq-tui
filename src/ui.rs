@@ -213,6 +213,7 @@ fn run_loop<B: Backend>(
             };
             handle_agent_envelope(state, storage, event)?;
         }
+        state.tick(std::time::Instant::now());
         terminal.draw(|frame| render(frame, state, highlighter))?;
         if event::poll(std::time::Duration::from_millis(100))? {
             match event::read()? {
@@ -2902,7 +2903,6 @@ fn render_header(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let focus = match state.focus {
         crate::app::Focus::FilePicker => "files",
         crate::app::Focus::Diff => "diff",
-        crate::app::Focus::AnnotationRail => "annotations",
         crate::app::Focus::Chat => "chat",
         crate::app::Focus::InlineAsk => "inline ask",
     };
@@ -3024,39 +3024,13 @@ fn render_split(
     area: Rect,
     highlighter: &mut dyn Highlighter,
 ) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(36),
-            Constraint::Percentage(36),
-            Constraint::Percentage(28),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
-    let rows = split_rows(state);
-    let start = state.scroll.min(rows.len());
-    let end = (start + area.height as usize).min(rows.len());
-    let old = rows[start..end]
-        .iter()
-        .map(|(index, old, _)| {
-            split_line(
-                old.as_ref(),
-                state.current_file().map(|file| file.path()),
-                old.is_some() && diff_row_selected(state, *index),
-                highlighter,
-            )
-        })
-        .collect::<Vec<_>>();
-    let new = rows[start..end]
-        .iter()
-        .map(|(index, _, new)| {
-            split_line(
-                new.as_ref(),
-                state.current_file().map(|file| file.path()),
-                new.is_some() && diff_row_selected(state, *index),
-                highlighter,
-            )
-        })
-        .collect::<Vec<_>>();
     let focused = state.focus == crate::app::Focus::Diff;
     let diff_border = Style::default().fg(if focused {
         Color::Cyan
@@ -3064,24 +3038,168 @@ fn render_split(
         Color::DarkGray
     });
     frame.render_widget(
-        Paragraph::new(old).block(
-            Block::default()
-                .title(if focused { "▶ - old" } else { "- old" })
-                .border_style(diff_border)
-                .borders(Borders::RIGHT),
-        ),
-        columns[0],
+        Paragraph::new(if focused { "▶ - old" } else { "- old" })
+            .style(diff_border.add_modifier(Modifier::BOLD)),
+        Rect::new(columns[0].x, columns[0].y, columns[0].width, 1),
     );
     frame.render_widget(
-        Paragraph::new(new).block(
+        Paragraph::new(if focused { "▶ + new" } else { "+ new" })
+            .style(diff_border.add_modifier(Modifier::BOLD)),
+        Rect::new(columns[1].x, columns[1].y, columns[1].width, 1),
+    );
+    if area.height == 1 {
+        return;
+    }
+
+    let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+    let body_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(body);
+    let rows = split_rows(state);
+    let start = state.scroll.min(rows.len());
+    let current_repo_id = state
+        .work_item
+        .repos
+        .get(state.repo_index)
+        .map(|repo| repo.record.id.as_str())
+        .unwrap_or_default();
+    let current_file = state.current_file();
+    let path = current_file.map(|file| file.path());
+    let mut old_lines = Vec::new();
+    let mut new_lines = Vec::new();
+    let mut inline_blocks = Vec::new();
+    for (index, old, new) in rows.into_iter().skip(start) {
+        if old_lines.len() >= body.height as usize {
+            break;
+        }
+        old_lines.push(split_line(
+            old.as_ref(),
+            path,
+            old.is_some() && diff_row_selected(state, index),
+            highlighter,
+        ));
+        new_lines.push(split_line(
+            new.as_ref(),
+            path,
+            new.is_some() && diff_row_selected(state, index),
+            highlighter,
+        ));
+
+        let Some(source_line) = old.as_ref().or(new.as_ref()) else {
+            continue;
+        };
+        for (annotation, placement) in &state.annotations {
+            let belongs_here = current_file.is_some_and(|file| {
+                annotation.repo_id == current_repo_id
+                    && annotation.file_path == file.display_path
+                    && placement_line(source_line, placement.side)
+                        .is_some_and(|line| placement.line_start == line as i64)
+            });
+            if !belongs_here || old_lines.len() >= body.height as usize {
+                continue;
+            }
+            let marker = if placement.outdated {
+                "!"
+            } else if placement.ambiguous {
+                "≈"
+            } else {
+                ""
+            };
+            let kind = match annotation.kind {
+                AnnotationKind::Ask => "Ask",
+                AnnotationKind::Comment => "Comment",
+            };
+            let side = match placement.side {
+                AnchorSide::Old => "L",
+                AnchorSide::New => "R",
+            };
+            let title = format!(
+                " {marker}{kind} · {} {side}{} ",
+                annotation.file_path.display(),
+                placement.line_start
+            );
+            let body_text = if state.collapsed_annotations.contains(&annotation.id) {
+                match annotation.kind {
+                    AnnotationKind::Ask => "▸ Ask thread collapsed".into(),
+                    AnnotationKind::Comment => format!(
+                        "▸ {}",
+                        annotation.text.as_deref().unwrap_or("Comment collapsed")
+                    ),
+                }
+            } else {
+                match annotation.kind {
+                    AnnotationKind::Comment => {
+                        format!("❯ {}", annotation.text.as_deref().unwrap_or_default())
+                    }
+                    AnnotationKind::Ask => state
+                        .ask_threads
+                        .get(&annotation.id)
+                        .map(|thread| {
+                            thread
+                                .iter()
+                                .map(|message| {
+                                    let speaker = if message.role == "assistant" {
+                                        "🤖"
+                                    } else {
+                                        "❯"
+                                    };
+                                    format!("{speaker} {}", message.text)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .filter(|thread| !thread.is_empty())
+                        .unwrap_or_else(|| "⏺ Ask queued · waiting for Copilot".into()),
+                }
+            };
+            let inner_width = body.width.saturating_sub(4).max(1) as usize;
+            let block_lines = wrapped_editor_lines(&body_text, body_text.len(), inner_width).0;
+            let block_height = (block_lines.len() + 2)
+                .min(body.height as usize - old_lines.len())
+                .max(1);
+            let offset = old_lines.len();
+            old_lines.extend((0..block_height).map(|_| Line::from("")));
+            new_lines.extend((0..block_height).map(|_| Line::from("")));
+            inline_blocks.push((offset, block_height, title, block_lines));
+        }
+    }
+    old_lines.truncate(body.height as usize);
+    new_lines.truncate(body.height as usize);
+    frame.render_widget(
+        Paragraph::new(old_lines).block(
             Block::default()
-                .title(if focused { "▶ + new" } else { "+ new" })
                 .border_style(diff_border)
                 .borders(Borders::RIGHT),
         ),
-        columns[1],
+        body_columns[0],
     );
-    render_annotation_rail(frame, state, columns[2]);
+    frame.render_widget(Paragraph::new(new_lines), body_columns[1]);
+    for (offset, height, title, lines) in inline_blocks {
+        let block_area = Rect::new(
+            body.x,
+            body.y + offset as u16,
+            body.width,
+            height.min(body.height as usize - offset) as u16,
+        );
+        frame.render_widget(Clear, block_area);
+        frame.render_widget(
+            Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<_>>())
+                .block(
+                    Block::default()
+                        .title(title)
+                        .title_style(
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .border_style(Style::default().fg(Color::Cyan))
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: false }),
+            block_area,
+        );
+    }
 }
 
 fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
@@ -3122,7 +3240,7 @@ fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             )
         }
         _ => format!(
-            "{mode}  j/k move · h/l file · v select · a ask · c comment · Tab chat · : command  {}",
+            "{mode}  j/k move · h/l file · t files · v select · a ask · c comment · Tab chat · : command  {}",
             state.status
         ),
     };
@@ -3152,7 +3270,7 @@ fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     );
 }
 
-fn render_command_palette(frame: &mut ratatui::Frame, state: &AppState) {
+fn render_command_palette(frame: &mut ratatui::Frame, state: &mut AppState) {
     let area = frame.area();
     let compact = area.width < 60 || area.height < 16;
     let width = if compact {
@@ -3173,6 +3291,15 @@ fn render_command_palette(frame: &mut ratatui::Frame, state: &AppState) {
     );
     let matches = command_matches(&state.command);
     let visible_rows = height.saturating_sub(4) as usize;
+    state.command_viewport_rows = visible_rows.max(1);
+    if state.command_index < state.command_scroll {
+        state.command_scroll = state.command_index;
+    } else if state.command_index >= state.command_scroll + state.command_viewport_rows {
+        state.command_scroll = state
+            .command_index
+            .saturating_add(1)
+            .saturating_sub(state.command_viewport_rows);
+    }
     let start = state
         .command_scroll
         .min(matches.len().saturating_sub(visible_rows));
@@ -3218,18 +3345,23 @@ fn render_command_palette(frame: &mut ratatui::Frame, state: &AppState) {
             .add_modifier(Modifier::BOLD),
     )];
     lines.extend(suggestions);
-    lines.push(Line::styled(
+    let selected_number = if matches.is_empty() {
+        0
+    } else {
+        state.command_index.min(matches.len() - 1) + 1
+    };
+    let help = if compact {
         format!(
-            "  ↑/↓ select · PgUp/PgDn scroll · Tab complete · Enter run · Esc cancel   {}/{}",
-            if matches.is_empty() {
-                0
-            } else {
-                state.command_index.min(matches.len() - 1) + 1
-            },
+            "  ↑/↓ Pg · Tab complete · Enter · Esc   {selected_number}/{}",
             matches.len()
-        ),
-        Style::default().fg(Color::DarkGray),
-    ));
+        )
+    } else {
+        format!(
+            "  ↑/↓ select · PgUp/PgDn scroll · Tab complete · Enter run · Esc cancel   {selected_number}/{}",
+            matches.len()
+        )
+    };
+    lines.push(Line::styled(help, Style::default().fg(Color::DarkGray)));
     frame.render_widget(Clear, palette);
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -3354,7 +3486,11 @@ fn render_chat(
     highlighter: &mut dyn Highlighter,
 ) {
     let width = frame.area().width.saturating_sub(4).max(1) as usize;
-    let composer_height = chat_composer_height(state, width, frame.area().height);
+    let composer_height = if state.input_mode == InputMode::Command {
+        0
+    } else {
+        chat_composer_height(state, width, frame.area().height)
+    };
     let progress_height = if frame.area().width < 60 {
         5
     } else if frame.area().height >= 14 {
@@ -3427,7 +3563,9 @@ fn render_chat(
         vertical[0],
     );
     render_agent_progress(frame, state, vertical[1]);
-    render_chat_composer(frame, state, vertical[2]);
+    if composer_height > 0 {
+        render_chat_composer(frame, state, vertical[2]);
+    }
 }
 
 fn chat_lines(
@@ -3669,6 +3807,15 @@ fn render_chat_composer(frame: &mut ratatui::Frame, state: &mut AppState, area: 
         .min(lines.len().saturating_sub(visible_rows));
 
     let (title, border_color) = match state.input_mode {
+        InputMode::Compose if lines.len() > visible_rows => (
+            format!(
+                " INSERT · rows {}-{}/{} · ↑/↓ scroll · Enter send · Esc keep ",
+                state.compose_scroll + 1,
+                (state.compose_scroll + visible_rows).min(lines.len()),
+                lines.len()
+            ),
+            Color::Green,
+        ),
         InputMode::Compose => (
             " INSERT · Enter send · Shift-Enter newline · Esc keep draft · Ctrl-C stop/discard "
                 .to_owned(),
@@ -4082,76 +4229,6 @@ fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
-fn render_annotation_rail(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
-    let Some(repo) = state.work_item.repos.get(state.repo_index) else {
-        return;
-    };
-    let Some(file) = state.current_file() else {
-        return;
-    };
-    let rows = state
-        .annotations
-        .iter()
-        .filter(|(annotation, _)| {
-            annotation.repo_id == repo.record.id && annotation.file_path == file.display_path
-        })
-        .map(|(annotation, placement)| {
-            let marker = if placement.outdated {
-                "!"
-            } else if placement.ambiguous {
-                "≈"
-            } else {
-                "▸"
-            };
-            let kind = match annotation.kind {
-                AnnotationKind::Ask => "a",
-                AnnotationKind::Comment => "c",
-            };
-            let text = if annotation.kind == AnnotationKind::Ask {
-                state
-                    .ask_threads
-                    .get(&annotation.id)
-                    .and_then(|thread| thread.last())
-                    .map(|message| format!("{}: {}", message.role, message.text.replace('\n', " ")))
-                    .unwrap_or_else(|| "(ask queued)".into())
-            } else {
-                annotation
-                    .text
-                    .as_deref()
-                    .unwrap_or_default()
-                    .replace('\n', " ")
-            };
-            ListItem::new(format!(
-                "{marker} [{kind}] ln {}-{} {text}",
-                placement.line_start, placement.line_end
-            ))
-        })
-        .collect::<Vec<_>>();
-    let rows = if rows.is_empty() {
-        vec![ListItem::new("No annotations")]
-    } else {
-        rows
-    };
-    let focused = state.focus == crate::app::Focus::AnnotationRail;
-    frame.render_widget(
-        List::new(rows).block(
-            Block::default()
-                .title(if focused {
-                    "▶ ask / comments (this file)"
-                } else {
-                    "ask / comments (this file)"
-                })
-                .title_style(Style::default().fg(if focused {
-                    Color::Cyan
-                } else {
-                    Color::DarkGray
-                }))
-                .borders(Borders::NONE),
-        ),
-        area,
-    );
-}
-
 fn visible_diff_lines(
     state: &AppState,
     highlighter: &mut dyn Highlighter,
@@ -4439,7 +4516,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains("demo — Review"));
-        assert!(content.contains("+ new"));
+        assert!(content.contains("unified"));
         assert!(content.contains("a ask"));
     }
 

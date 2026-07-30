@@ -961,6 +961,12 @@ pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Re
                 line_number + 1
             ),
         }
+        if command != "snapshot" {
+            harness
+                .draw()
+                .map(|_| ())
+                .with_context(|| format!("line {}: render after {raw_line:?}", line_number + 1))?;
+        }
     }
 
     emit_snapshot(&mut harness, "final", &mut output);
@@ -1082,7 +1088,7 @@ mod tests {
         harness.key(key(KeyCode::Char('j'))).unwrap();
         harness.key(key(KeyCode::Char('j'))).unwrap();
         assert_eq!(harness.mode(), "VISUAL");
-        assert!(harness.selected_cell_count().unwrap() > 100);
+        assert!(harness.selected_cell_count().unwrap() > 0);
         harness.key(key(KeyCode::Char('a'))).unwrap();
         assert!(harness.render().unwrap().contains("new lines 10-12"));
         type_text(&mut harness, "Explain this range");
@@ -1113,6 +1119,13 @@ mod tests {
         assert_eq!(annotation.text.as_deref(), Some("Keep this local"));
         assert!(normal.agent_commands().is_empty());
         assert!(normal.render().unwrap().contains("Keep this local"));
+        normal.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut normal, "diff split");
+        normal.key(key(KeyCode::Enter)).unwrap();
+        let split = normal.render().unwrap();
+        assert!(split.contains("Comment · src/lib.rs"));
+        assert!(split.contains("Keep this local"));
+        assert!(!split.contains("ask / comments (this file)"));
 
         let mut visual = TuiHarness::from_unified_diff("visual", workflow_diff(), 110, 28).unwrap();
         visual.key(key(KeyCode::Char('j'))).unwrap();
@@ -1542,16 +1555,29 @@ mod tests {
         harness.key(key(KeyCode::Char(':'))).unwrap();
         let initial = harness.render().unwrap();
         assert!(initial.contains("COMMAND MODE · Command palette"));
-        assert!(initial.contains("COMMAND MODE ACTIVE"));
         assert!(initial.contains("↑/↓ select"));
+        assert!(!initial.contains("Type a message"));
 
         for _ in 0..12 {
             harness.key(key(KeyCode::Down)).unwrap();
         }
         let scrolled = harness.render().unwrap();
-        assert!(scrolled.contains(":snapshot") || scrolled.contains(":generate-context"));
+        assert!(scrolled.contains("▶ :"));
         harness.key(key(KeyCode::Tab)).unwrap();
         assert!(harness.render().unwrap().contains(":"));
+
+        let mut compact =
+            TuiHarness::from_unified_diff("compact commands", workflow_diff(), 42, 9).unwrap();
+        compact.key(key(KeyCode::Char(':'))).unwrap();
+        compact.render().unwrap();
+        for _ in 0..7 {
+            compact.key(key(KeyCode::Down)).unwrap();
+        }
+        let compact_frame = compact.render().unwrap();
+        assert!(
+            compact_frame.contains("▶ :"),
+            "selected command must remain visible:\n{compact_frame}"
+        );
     }
 
     #[test]
@@ -1583,6 +1609,31 @@ mod tests {
         let queue = harness.render().unwrap();
         assert!(queue.contains("1 pending"));
         assert!(!queue.contains("second queued follow-up"));
+    }
+
+    #[test]
+    fn queue_selection_ignores_the_active_assistant_stream_entry() {
+        let mut harness =
+            TuiHarness::from_unified_diff("active queue", workflow_diff(), 72, 20).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "first prompt");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.start_next_response("partial answer").unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "second prompt");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "queue");
+        harness.key(key(KeyCode::Enter)).unwrap();
+
+        let queued_id = harness.state.queue_entry_ids()[1].0.clone();
+        harness.key(key(KeyCode::Down)).unwrap();
+        harness.key(key(KeyCode::Char('d'))).unwrap();
+        assert!(harness
+            .agent_commands()
+            .iter()
+            .any(|command| command.contains("CancelQueued") && command.contains(&queued_id)));
     }
 
     #[test]
