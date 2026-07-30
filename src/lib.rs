@@ -4,6 +4,8 @@ pub(crate) mod chat_render;
 pub(crate) mod chat_selection;
 pub(crate) mod cli;
 pub(crate) mod config;
+#[allow(dead_code)] // Bounded model slice; UI/storage integration follows separately.
+pub(crate) mod context_editor;
 pub(crate) mod copilot;
 pub(crate) mod diff;
 pub(crate) mod domain;
