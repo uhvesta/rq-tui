@@ -1,5 +1,25 @@
 # Compiled-binary pseudo-terminal record
 
+## Bazel-owned regression test
+
+The repository now includes a dependency-free PTY smoke test that runs the
+compiled `//:rq-tui` binary through a real POSIX pseudo-terminal. It creates a
+temporary Git fixture, enables the deterministic controlled agent, sets and
+changes the terminal window size, sends real terminal key bytes, verifies the
+visible command-mode indicator, and requires a zero exit status, alternate
+screen cleanup, and no panic text:
+
+```sh
+bazel test //:pty_smoke_test --lockfile_mode=error --test_output=streamed
+```
+
+It is also part of the root `//:rq_tui_tests` suite. The helper uses only the
+Python 3 standard library (`pty`, `termios`, `fcntl`, and `select`) and is
+intentionally limited to macOS and Linux. It does not require Copilot, `gh`,
+network access, or credentials. The test is a terminal smoke check rather than
+a pixel-golden test; the deterministic `ui-script` and `ui-snapshot` commands
+remain the detailed renderer inspection tools.
+
 This file contains both the current 2026-07-30 compiled-binary pass and the
 earlier records that exposed foundational terminal defects.
 
