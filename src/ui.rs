@@ -1286,12 +1286,37 @@ pub(crate) fn handle_effect(
                 },
                 text: chat.text.clone(),
             };
-            let outbound_id = queue_outbound(state, bridge, outbound)?;
+            let outbound_id = if chat.lane == "side" && !state.side_active && !state.side_starting {
+                let outbound_id = outbound.id.clone();
+                bridge.send(AgentCommand::StartSide {
+                    outbound: Some(outbound),
+                })?;
+                state.side_starting = true;
+                state.pending_outbound_ids.insert(outbound_id.clone());
+                state.side_outbound_ids.insert(outbound_id.clone());
+                state.agent_progress.queue_depth =
+                    state.agent_progress.queue_depth.saturating_add(1);
+                state.agent_progress.record_queued(
+                    "Recreating SIDE for isolated recovery",
+                    format!(
+                        "Outbound {} will never be delivered to MAIN",
+                        short_id(&outbound_id)
+                    ),
+                );
+                outbound_id
+            } else {
+                if chat.lane != "main" && chat.lane != "side" {
+                    anyhow::bail!("pending Chat has invalid lane {}", chat.lane);
+                }
+                queue_outbound(state, bridge, outbound)?
+            };
             push_outbound_entry(
                 state,
                 ChatEntry {
                     id: uuid::Uuid::new_v4().to_string(),
-                    role: if chat.kind == "correction" {
+                    role: if chat.lane == "side" {
+                        "you · SIDE (resent)".into()
+                    } else if chat.kind == "correction" {
                         "you · correction (resent)".into()
                     } else {
                         "you (resent)".into()
@@ -1305,7 +1330,9 @@ pub(crate) fn handle_effect(
             );
             state.pending_chats.retain(|pending| pending.id != chat.id);
             finish_recovery(state);
-            state.status = if chat.kind == "correction" {
+            state.status = if chat.lane == "side" {
+                "Pending SIDE message is being retried in a new isolated SIDE session".into()
+            } else if chat.kind == "correction" {
                 format!(
                     "Pending {} correction intentionally resent",
                     chat.lane.to_uppercase()
@@ -7881,6 +7908,53 @@ mod tests {
             .find(|entry| entry.outbound_id.as_deref() == Some(steering_id.as_str()))
             .and_then(|entry| entry.error.as_deref())
             .is_some_and(|error| error.contains("steering failed")));
+    }
+
+    #[test]
+    fn side_recovery_recreates_side_and_never_routes_the_message_to_main() {
+        let storage = Storage::in_memory().unwrap();
+        let agent = FakeAgent::default();
+        let mut state = state_for_ui();
+        storage.upsert_work_item(&state.work_item.item).unwrap();
+        let pending = PendingChat {
+            id: "side-recovery".into(),
+            work_item_id: state.work_item.item.id.clone(),
+            text: "private SIDE correction".into(),
+            kind: "correction".into(),
+            lane: "side".into(),
+            created_at: now(),
+        };
+        storage.enqueue_chat(&pending).unwrap();
+        state.pending_chats.push(pending.clone());
+        state.screen = Screen::Recovery;
+
+        handle_effect(
+            &mut state,
+            &storage,
+            &paths(),
+            &agent,
+            Effect::ResendPendingChat(pending),
+        )
+        .unwrap();
+
+        let commands = agent.commands.lock().unwrap();
+        assert!(matches!(
+            commands.as_slice(),
+            [AgentCommand::StartSide {
+                outbound: Some(outbound)
+            }] if outbound.id == "side-recovery"
+                && outbound.text == "private SIDE correction"
+        ));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, AgentCommand::Send(_))));
+        assert!(state.side_starting);
+        assert!(state.side_outbound_ids.contains("side-recovery"));
+        assert!(state
+            .pending_side_entries
+            .iter()
+            .any(|entry| entry.outbound_id.as_deref() == Some("side-recovery")));
+        assert!(state.status.contains("isolated SIDE"));
     }
 
     #[test]
