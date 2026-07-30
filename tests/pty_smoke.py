@@ -246,6 +246,39 @@ def main() -> int:
             child.send(b"q")
             child.wait_for_since("NORMAL", before_return, timeout=4)
 
+            # Exercise the compiled Chat bottom stack at the supported minimum:
+            # the long composer must remain bordered, COMMAND mode must keep a
+            # sticky input plus local completions, and Esc must restore the
+            # preserved draft.
+            child.send(b"\t")
+            child.wait_for("Chat", timeout=4)
+            set_size(child.master, 42, 9)
+            child.read(0.3)
+            child.send(
+                b"i"
+                b"a long compiled PTY draft that wraps and scrolls without clipping"
+            )
+            child.wait_for("INSERT", timeout=4)
+            child.wait_for("rows", timeout=4)
+            before_keep = len(child.output)
+            child.send(b"\x1b")
+            child.wait_for_since("NORMAL", before_keep, timeout=4)
+            child.read(0.2)
+            before_command = len(child.output)
+            child.send(b":")
+            child.wait_for_since("COMMAND COMPLETIONS", before_command, timeout=4)
+            child.wait_for_since("COMMAND MODE ACTIVE", before_command, timeout=4)
+            child.wait_for_since("COPILOT MAIN", before_command, timeout=4)
+            child.wait_for_since("B held", before_command, timeout=4)
+            before_close = len(child.output)
+            child.send(b"\x1b")
+            child.wait_for_since("NORMAL", before_close, timeout=4)
+            before_discard = len(child.output)
+            child.send(b"\x03")
+            child.wait_for_since("Type a message", before_discard, timeout=4)
+            set_size(child.master, 72, 18)
+            child.read(0.3)
+
             # ':' must visibly enter command mode before the quit command is
             # submitted; this catches input routing regressions as well as exit.
             child.send(b":")
@@ -270,7 +303,10 @@ def main() -> int:
         finally:
             child.close()
 
-    print("PTY_SMOKE_OK: entry resize prune-progress command-mode clean-exit no-panic")
+    print(
+        "PTY_SMOKE_OK: entry resize prune-progress chat-composer "
+        "command-mode clean-exit no-panic"
+    )
     return 0
 
 

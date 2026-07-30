@@ -83,9 +83,10 @@ Chat deliberately has explicit modes so the input state is never ambiguous:
   submits; `Shift-Enter` inserts a newline. `Esc` returns to normal mode and
   preserves a Chat draft. During an active response, the first `Ctrl-C` stops
   Copilot and preserves the draft; while idle, `Ctrl-C` discards it.
-- `COMMAND`: the palette is the only active input surface. `↑/↓` changes the
-  selected suggestion, `PgUp/PgDn` scrolls the actual visible page, `Tab`
-  completes, `Enter` runs, and `Esc` cancels.
+- `COMMAND`: the sticky input remains visible and a bounded completion list
+  opens directly above it. `↑/↓` wraps through suggestions, `PgUp/PgDn`
+  scrolls the visible page, `Home/End` jumps, `Tab` completes, `Enter` runs,
+  and `Esc` cancels while preserving the prior Chat draft.
 - `SEARCH`: `/` searches the focused transcript or diff; `Enter` accepts and
   `Esc` cancels.
 - `VISUAL`: in a diff, `v` selects source rows. In Chat, `v`, `V`, and
@@ -96,8 +97,9 @@ Chat deliberately has explicit modes so the input state is never ambiguous:
 
 Chat scrolling is based on rendered terminal rows, including wrapped Markdown
 and long single messages, rather than skipping from message to message. `G`
-returns to the latest content and resumes live-following. The application owns
-mouse wheel events for Chat and diff scrolling. To select and copy arbitrary
+returns to the latest content and resumes live-following. Mouse wheel events
+route through the active surface, including Chat/diff scrolling, command
+completion, and the multiline composer. To select and copy arbitrary
 terminal text with the terminal emulator, hold `Shift` while dragging; the
 terminal then receives the selection gesture instead of the TUI.
 

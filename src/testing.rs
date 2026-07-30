@@ -1976,6 +1976,25 @@ mod tests {
     }
 
     #[test]
+    fn exact_minimum_chat_keeps_the_sticky_composer_border_intact() {
+        let mut harness =
+            TuiHarness::from_unified_diff("minimum-chat", workflow_diff(), 40, 9).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(
+            &mut harness,
+            "a long chat draft that wraps and scrolls at the supported minimum",
+        );
+
+        let frame = harness.render().unwrap();
+        assert!(frame.contains("INSERT"));
+        assert!(frame.contains("rows "));
+        let bottom = frame.lines().last().unwrap_or_default();
+        assert!(bottom.starts_with('└'), "{frame}");
+        assert!(bottom.ends_with('┘'), "{frame}");
+    }
+
+    #[test]
     fn composers_never_wrap_inside_flags_keycaps_or_zwj_families() {
         let text = "clusters 🇺🇸 1\u{fe0f}\u{20e3} 👨\u{200d}👩\u{200d}👧\u{200d}👦";
         let mut chat =
@@ -2273,15 +2292,22 @@ mod tests {
     }
 
     #[test]
-    fn command_palette_is_scrollable_selectable_and_unmistakably_modal() {
+    fn command_palette_is_scrollable_selectable_and_keeps_the_sticky_composer() {
         let mut harness =
             TuiHarness::from_unified_diff("commands", workflow_diff(), 92, 22).unwrap();
         harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "preserved draft");
+        harness.key(key(KeyCode::Esc)).unwrap();
         harness.key(key(KeyCode::Char(':'))).unwrap();
         let initial = harness.render().unwrap();
-        assert!(initial.contains("COMMAND MODE · Command palette"));
-        assert!(initial.contains("↑/↓ select"));
+        assert!(initial.contains("COMMAND COMPLETIONS"));
+        assert!(initial.contains("COMMAND MODE ACTIVE"));
+        assert!(initial.contains("draft 15 bytes held"));
+        assert!(initial.contains("↑/↓ wrap"));
+        assert!(initial.contains(":█"));
         assert!(!initial.contains("Type a message"));
+        assert!(!initial.contains("preserved draft"));
 
         for _ in 0..12 {
             harness.key(key(KeyCode::Down)).unwrap();
@@ -2290,9 +2316,12 @@ mod tests {
         assert!(scrolled.contains("▶ :"));
         harness.key(key(KeyCode::Tab)).unwrap();
         assert!(harness.render().unwrap().contains(":"));
+        harness.key(key(KeyCode::Esc)).unwrap();
+        assert!(harness.render().unwrap().contains("preserved draft"));
 
         let mut compact =
             TuiHarness::from_unified_diff("compact commands", workflow_diff(), 42, 9).unwrap();
+        compact.key(key(KeyCode::Tab)).unwrap();
         compact.key(key(KeyCode::Char(':'))).unwrap();
         compact.render().unwrap();
         for _ in 0..7 {
@@ -2303,6 +2332,19 @@ mod tests {
             compact_frame.contains("▶ :"),
             "selected command must remain visible:\n{compact_frame}"
         );
+        assert!(compact_frame.contains("COPILOT"));
+
+        let mut long =
+            TuiHarness::from_unified_diff("long command", workflow_diff(), 42, 9).unwrap();
+        long.key(key(KeyCode::Tab)).unwrap();
+        long.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(
+            &mut long,
+            "steer this correction must keep its trailing cursor visible",
+        );
+        let long_frame = long.render().unwrap();
+        assert!(long_frame.contains('…'));
+        assert!(long_frame.contains("trailing cursor visible█"));
 
         let mut escape =
             TuiHarness::from_unified_diff("command escape", workflow_diff(), 80, 12).unwrap();
@@ -2515,6 +2557,33 @@ mod tests {
     }
 
     #[test]
+    fn minimum_model_picker_keeps_confirmation_and_cancel_controls_visible() {
+        let mut harness =
+            TuiHarness::from_unified_diff("minimum-model", workflow_diff(), 40, 9).unwrap();
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "model");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness
+            .inject_agent_event(AgentEvent::ModelsListed(vec![ModelOption {
+                id: "compact-model".into(),
+                name: "Compact Model".into(),
+                supported_reasoning_efforts: vec!["high".into()],
+                default_reasoning_effort: Some("high".into()),
+                max_context_tokens: Some(128_000),
+                context_tiers: vec![ContextTierOption {
+                    id: "default".into(),
+                    max_context_tokens: Some(128_000),
+                }],
+            }]))
+            .unwrap();
+
+        let frame = harness.render().unwrap();
+        assert!(frame.contains("↑/↓ select"));
+        assert!(frame.contains("Enter next"));
+        assert!(frame.contains("Esc cancel"));
+    }
+
+    #[test]
     fn review_ask_composer_expands_wraps_and_scrolls_without_overflow() {
         let mut harness =
             TuiHarness::from_unified_diff("ask-composer", workflow_diff(), 48, 18).unwrap();
@@ -2717,6 +2786,21 @@ mod tests {
         assert!(diagnostics.contains("Running security-review skill"));
         assert!(diagnostics.contains("last SDK event"));
         assert!(diagnostics.contains("outbound id"));
+
+        let mut standard =
+            TuiHarness::from_unified_diff("standard-liveness", workflow_diff(), 72, 18).unwrap();
+        standard.key(key(KeyCode::Tab)).unwrap();
+        standard
+            .inject_activity(
+                ActivityKind::Other,
+                "running review skill: exhaustive audit",
+                None,
+                Some("ui-script injection".into()),
+            )
+            .unwrap();
+        let standard_frame = standard.render().unwrap();
+        assert!(standard_frame.contains("running review skill: exhaustive audit"));
+        assert!(standard_frame.contains("· q0"));
     }
 
     #[test]

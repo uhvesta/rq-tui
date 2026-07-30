@@ -17,7 +17,7 @@ Evidence abbreviations:
 Current-evidence boundary: the deterministic harness baseline is 234 regular
 tests passing with 1 authenticated live test ignored by default. The ignored
 stream/resume test was also run explicitly against the installed Copilot CLI
-and passed. PTY-16 through PTY-22 are current compiled-binary evidence; earlier
+and passed. PTY-16 through PTY-23 are current compiled-binary evidence; earlier
 PTY references remain useful historical records.
 
 ## Findings remediated during this audit
@@ -195,25 +195,25 @@ matrix so that new evidence is not confused with the earlier PTY run.
 
 | ID | Behavior | Current classification | Evidence / limitation |
 |---|---|---|---|
-| T-01 | Chat has explicit NORMAL, INSERT, COMMAND, SEARCH, and VISUAL modes with visible mode text | Working in deterministic frames | `testing::tests::command_palette_is_scrollable_selectable_and_unmistakably_modal`, `testing::tests::sticky_chat_composer_wraps_edits_preserves_and_explicitly_discards_drafts`, and the `ui-snapshot` gallery. |
-| T-02 | Command palette selection and scrolling | Working in the deterministic harness and compiled PTY | Up/down selection, PageUp/PageDown, Tab completion, modal title/footer, and visible selection are covered by `WF::command_palette_is_scrollable_selectable_and_unmistakably_modal` and PTY-12. |
+| T-01 | Chat has explicit NORMAL, INSERT, COMMAND, SEARCH, and VISUAL modes with visible mode text | Working in deterministic frames and compiled PTY | `testing::tests::command_palette_is_scrollable_selectable_and_keeps_the_sticky_composer`, `testing::tests::sticky_chat_composer_wraps_edits_preserves_and_explicitly_discards_drafts`, PTY-23, and the `ui-snapshot` gallery. |
+| T-02 | Command palette selection and scrolling | Working in the deterministic harness and compiled PTY | Composer-local completions retain the sticky input and preserved draft; Up/Down wrap, PageUp/PageDown, Home/End, Tab completion, mouse wheel routing, narrow text-tail scrolling, and visible selection are covered by deterministic tests plus PTY-12/23. |
 | T-03 | Chat scrolling by rendered rows, including wrapped single messages | Working in the deterministic harness | `WF::chat_scrolls_by_rendered_rows_and_pauses_live_following`; no separate mouse-drag selection automation exists. |
-| T-04 | Sticky multiline composer with wrapping, independent scroll, editing, preserved drafts, and explicit discard | Working in the deterministic harness and compiled PTY | `WF::sticky_chat_composer_wraps_edits_preserves_and_explicitly_discards_drafts`; PTY-21 exercised a 21-row contextual composer and its independent row-range scroll. |
+| T-04 | Sticky multiline composer with wrapping, independent scroll, editing, preserved drafts, and explicit discard | Working in the deterministic harness and compiled PTY | `WF::sticky_chat_composer_wraps_edits_preserves_and_explicitly_discards_drafts`; exact-minimum tests keep the bottom border intact; PTY-21 exercised a 21-row contextual composer and PTY-23 exercised the 42×9 Chat composer. |
 | T-05 | Cancel draft versus cancel active Copilot turn | Working in the deterministic harness and compiled PTY | Draft preservation/discard and deterministic abort/reusable-session paths pass. PTY-18 stopped an active response while preserving the draft in Insert mode. |
 | T-06 | Markdown semantics in Chat and fenced-code rendering | Working in deterministic frames | `chat_render::*`, `markdown::*`, and `WF::markdown_history_and_minimum_terminal_state_have_inspectable_frames`; the source-mapped terminal renderer covers headings, lists, task lists, nested blockquotes, emphasis, inline code, safe link affordances, pipe tables, wrapping, blank lines, and syntax-highlighted fences. Browser output shares safe inline parsing, rejects executable URL schemes, and renders aligned tables. |
 | T-07 | Lazy cached syntax highlighting for diff lines and fenced code | Working in unit tests and deterministic frames | `highlight::tests::recognizes_common_languages`, `highlight::tests::highlights_only_requested_lines_and_reuses_cache`, and `chat_render::tests::highlights_fenced_code_with_a_language_specific_synthetic_path`. |
-| T-08 | Durable Copilot progress, quiet warning, tool/skill visibility, and `:agent-status` timeline | Working in the deterministic harness and compiled PTY | The renderer and overlay expose lane, phase, elapsed time, last event, queue, outbound ID, operation detail, quiet diagnostics, and timeline. Tool, skill, subagent, hook, retry, and error activity are typed and visible. PTY-17 captured active, queued, and immediate-steering progress. |
+| T-08 | Durable Copilot progress, quiet warning, tool/skill visibility, and `:agent-status` timeline | Working in the deterministic harness and compiled PTY | The renderer and overlay expose lane, phase, elapsed time, last event, queue, outbound ID, operation detail, quiet diagnostics, and timeline. Width-bounded headlines cannot consume the tool/skill detail row at standard terminal sizes. Tool, skill, subagent, hook, retry, and error activity are typed and visible. PTY-17 captured active, queued, and immediate-steering progress. |
 | T-09 | `/side` isolated ephemeral conversation and `/main` restoration | Working in deterministic, compiled-PTY, and authenticated paths | `WF::side_conversation_is_visibly_isolated_and_main_transcript_is_restored`; PTY-20 returned from an active SIDE turn promptly, and LIVE-01 exercised real SIDE creation and SDK deletion. |
 | T-10 | Deterministic state gallery for visual inspection | Working as headless command paths | `ui-snapshot --state all` exercises review, ask, command, composer, quiet, queue, side, model, markdown, and tiny states through the production renderer. `ui-script` drives resize, input, stream events, and snapshots. Gallery output is terminal text, not a committed image artifact. |
 | T-11 | Copilot SDK decoupled behind a testable agent interface | Working for deterministic tests | `TuiHarness` uses a fake agent and injected lane/activity events; the production bridge remains the only path that starts the real Copilot CLI. |
-| T-12 | Mouse wheel scrolling and exact terminal text selection | Working in deterministic tests; compiled PTY pending | The TUI handles wheel events for Chat/diff scrolling. Built-in Chat Visual mode now selects exact mapped rendered text by character, line, or block and copies source text without Markdown decoration or soft-wrap newlines. Shift-drag remains available for native terminal selection; compiled-terminal selection evidence remains to be recaptured. |
+| T-12 | Mouse wheel scrolling and exact terminal text selection | Working in deterministic tests; compiled PTY pending | Wheel events route through the active mode, so they scroll Chat/diff, command completions, and the multiline composer rather than a hidden underlying surface. Built-in Chat Visual mode selects exact mapped rendered text by character, line, or block and copies source text without Markdown decoration or soft-wrap newlines. Shift-drag remains available for native terminal selection; compiled-terminal selection evidence remains to be recaptured. |
 
 ### Verification status for this addendum
 
 The current checked-in regular-test baseline is:
 
 ```text
-237 regular tests passed; 1 authenticated live Copilot test ignored by default
+241 regular tests passed; 1 authenticated live Copilot test ignored by default
 ```
 
 The regular baseline includes the reducer/effect, storage, rendering, SDK
@@ -221,14 +221,14 @@ adapter, deterministic UI, model-picker, queue/steering, liveness, and
 MAIN/SIDE tests. The ignored test is the authenticated
 `copilot::tests::live_copilot_streams_and_resumes_persisted_history`; it is not
 part of the regular count. It was run separately with
-`RQ_TUI_LIVE_COPILOT=1` and passed as LIVE-01. PTY-16 through PTY-22 were
-captured from the current Bazel-built binary, with PTY-22 added by the
+`RQ_TUI_LIVE_COPILOT=1` and passed as LIVE-01. PTY-16 through PTY-23 were
+captured from the current Bazel-built binary, with PTY-22/23 added by the
 automated compiled-binary smoke test.
 
 ### Compiled PTY evidence
 
 Earlier records are kept for reproducibility and design context. The current
-pass is PTY-16 through PTY-22 in [`audit/pty-smoke.md`](audit/pty-smoke.md).
+pass is PTY-16 through PTY-23 in [`audit/pty-smoke.md`](audit/pty-smoke.md).
 
 The second compiled-binary audit used the Bazel-built binary and a controlled
 agent. It captured the following behaviors in a 100×28 tmux pane:

@@ -1297,18 +1297,6 @@ impl AppState {
         self.handle_normal_key(key)
     }
 
-    pub(crate) fn scroll_chat_or_diff(&mut self, delta: i32) {
-        let amount = delta.unsigned_abs() as usize;
-        if self.screen == Screen::Chat {
-            self.focus = Focus::Chat;
-        }
-        if delta < 0 {
-            self.move_up(amount);
-        } else {
-            self.move_down(amount);
-        }
-    }
-
     fn handle_normal_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         if self.screen == Screen::Preview {
             return self.handle_preview_key(key);
@@ -2522,8 +2510,15 @@ impl AppState {
             KeyCode::Up => {
                 let count = command_matches(&self.command).len();
                 if count > 0 {
-                    self.command_index = self.command_index.saturating_sub(1);
-                    self.command_scroll = self.command_scroll.min(self.command_index);
+                    if self.command_index == 0 {
+                        self.command_index = count - 1;
+                        self.command_scroll = self
+                            .command_index
+                            .saturating_sub(self.command_viewport_rows.saturating_sub(1));
+                    } else {
+                        self.command_index -= 1;
+                        self.command_scroll = self.command_scroll.min(self.command_index);
+                    }
                 }
                 Vec::new()
             }
@@ -2531,14 +2526,26 @@ impl AppState {
                 let count = command_matches(&self.command).len();
                 let page = self.command_viewport_rows.max(1);
                 if count > 0 {
-                    self.command_index = cmp::min(
-                        count.saturating_sub(1),
-                        self.command_index.saturating_add(1),
-                    );
-                    if self.command_index >= self.command_scroll + page {
+                    self.command_index = (self.command_index + 1) % count;
+                    if self.command_index == 0 {
+                        self.command_scroll = 0;
+                    } else if self.command_index >= self.command_scroll + page {
                         self.command_scroll = self.command_index + 1 - page;
                     }
                 }
+                Vec::new()
+            }
+            KeyCode::Home => {
+                self.command_index = 0;
+                self.command_scroll = 0;
+                Vec::new()
+            }
+            KeyCode::End => {
+                let count = command_matches(&self.command).len();
+                self.command_index = count.saturating_sub(1);
+                self.command_scroll = self
+                    .command_index
+                    .saturating_sub(self.command_viewport_rows.saturating_sub(1));
                 Vec::new()
             }
             KeyCode::PageUp => {
@@ -3718,6 +3725,30 @@ mod tests {
         }
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.layout, DiffLayout::Unified);
+    }
+
+    #[test]
+    fn command_palette_wraps_and_supports_home_and_end() {
+        let mut app = state();
+        app.input_mode = InputMode::Command;
+        app.command_viewport_rows = 4;
+        let count = super::command_matches("").len();
+
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.command_index, count - 1);
+        assert_eq!(app.command_scroll, count - 4);
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.command_index, 0);
+        assert_eq!(app.command_scroll, 0);
+
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.command_index, count - 1);
+        assert_eq!(app.command_scroll, count - 4);
+
+        app.handle_key(key(KeyCode::Home));
+        assert_eq!(app.command_index, 0);
+        assert_eq!(app.command_scroll, 0);
     }
 
     #[test]

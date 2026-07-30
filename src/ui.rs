@@ -5,8 +5,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use crossterm::cursor::Show;
-use crossterm::event::MouseEventKind;
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -262,16 +261,33 @@ fn run_loop<B: Backend>(
                         }
                     }
                 }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => state.scroll_chat_or_diff(-3),
-                    MouseEventKind::ScrollDown => state.scroll_chat_or_diff(3),
-                    _ => {}
-                },
+                Event::Mouse(mouse) => {
+                    for effect in mouse_scroll_effects(state, mouse.kind) {
+                        if let Err(error) =
+                            handle_effect(state, storage, paths, bridge, effect.clone())
+                        {
+                            handle_effect_failure(state, &effect, &error);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
     }
     Ok(())
+}
+
+fn mouse_scroll_effects(state: &mut AppState, kind: MouseEventKind) -> Vec<Effect> {
+    let code = match kind {
+        MouseEventKind::ScrollUp => KeyCode::Up,
+        MouseEventKind::ScrollDown => KeyCode::Down,
+        _ => return Vec::new(),
+    };
+    let mut effects = Vec::new();
+    for _ in 0..3 {
+        effects.extend(state.handle_key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+    effects
 }
 
 fn queue_outbound(
@@ -3382,7 +3398,7 @@ pub(crate) fn render(
         Screen::ModelPicker => render_model_picker(frame, state),
         Screen::Preview => render_markdown_preview(frame, state, highlighter),
     }
-    if state.input_mode == InputMode::Command {
+    if state.input_mode == InputMode::Command && state.screen != Screen::Chat {
         render_command_palette(frame, state);
     }
 }
@@ -3805,9 +3821,17 @@ fn render_model_picker(frame: &mut ratatui::Frame, state: &AppState) {
         frame.area(),
     );
     let area = frame.area();
+    let footer = if area.width < 60 {
+        "↑/↓ select · Enter next · Esc cancel".to_owned()
+    } else {
+        format!("{subtitle} · ↑/↓ select · Enter next · Esc cancel")
+    };
     frame.render_widget(
-        Paragraph::new(format!("{subtitle} · ↑/↓ select · Enter next · Esc cancel"))
-            .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(fit_terminal_text(
+            &footer,
+            area.width.saturating_sub(2) as usize,
+        ))
+        .style(Style::default().fg(Color::DarkGray)),
         Rect::new(
             area.x.saturating_add(1),
             area.bottom().saturating_sub(2),
@@ -4697,8 +4721,18 @@ fn render_command_palette(frame: &mut ratatui::Frame, state: &mut AppState) {
         width,
         height,
     );
+    render_command_palette_area(frame, state, palette, true);
+}
+
+fn render_command_palette_area(
+    frame: &mut ratatui::Frame,
+    state: &mut AppState,
+    palette: Rect,
+    show_input: bool,
+) {
     let matches = command_matches(&state.command);
-    let visible_rows = height.saturating_sub(4) as usize;
+    let chrome_rows = if show_input { 4 } else { 3 };
+    let visible_rows = palette.height.saturating_sub(chrome_rows) as usize;
     state.command_viewport_rows = visible_rows.max(1);
     if state.command_index < state.command_scroll {
         state.command_scroll = state.command_index;
@@ -4746,26 +4780,30 @@ fn render_command_palette(frame: &mut ratatui::Frame, state: &mut AppState) {
             })
         })
         .collect::<Vec<_>>();
-    let mut lines = vec![Line::styled(
-        format!("  :{}█", state.command),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )];
+    let mut lines = Vec::new();
+    if show_input {
+        lines.push(Line::styled(
+            format!("  :{}█", state.command),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     lines.extend(suggestions);
     let selected_number = if matches.is_empty() {
         0
     } else {
         state.command_index.min(matches.len() - 1) + 1
     };
+    let compact = palette.width < 60;
     let help = if compact {
         format!(
-            "  ↑/↓ Pg · Tab complete · Enter · Esc   {selected_number}/{}",
+            " ↑/↓ Pg · Home/End · Enter · Esc  {selected_number}/{}",
             matches.len()
         )
     } else {
         format!(
-            "  ↑/↓ select · PgUp/PgDn scroll · Tab complete · Enter run · Esc cancel   {selected_number}/{}",
+            " ↑/↓ wrap · PgUp/PgDn · Home/End · Tab complete · Enter run · Esc cancel  {selected_number}/{}",
             matches.len()
         )
     };
@@ -4774,7 +4812,11 @@ fn render_command_palette(frame: &mut ratatui::Frame, state: &mut AppState) {
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
-                .title(" COMMAND MODE · Command palette ")
+                .title(if show_input {
+                    " COMMAND MODE · Command palette "
+                } else {
+                    " COMMAND COMPLETIONS "
+                })
                 .title_style(
                     Style::default()
                         .fg(Color::Cyan)
@@ -4794,22 +4836,47 @@ fn render_chat(
 ) {
     let width = frame.area().width.saturating_sub(4).max(1) as usize;
     let composer_height = if state.input_mode == InputMode::Command {
-        0
+        3
     } else {
         chat_composer_height(state, width, frame.area().height)
     };
-    let progress_height = if frame.area().width < 60 {
+    let progress_height = if state.input_mode == InputMode::Command && frame.area().height < 14 {
+        1
+    } else if state.input_mode == InputMode::Command || frame.area().height < 12 {
+        3
+    } else if frame.area().width < 60 {
         5
     } else if frame.area().height >= 14 {
         4
     } else {
         3
     };
+    let minimum_chat = if state.input_mode == InputMode::Command && frame.area().height < 14 {
+        1
+    } else {
+        3
+    };
+    let command_height = if state.input_mode == InputMode::Command {
+        let desired = (command_matches(&state.command).len().min(5) as u16)
+            .saturating_add(3)
+            .clamp(4, 8);
+        desired.min(
+            frame
+                .area()
+                .height
+                .saturating_sub(progress_height)
+                .saturating_sub(composer_height)
+                .saturating_sub(minimum_chat),
+        )
+    } else {
+        0
+    };
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(3),
+            Constraint::Min(minimum_chat),
             Constraint::Length(progress_height),
+            Constraint::Length(command_height),
             Constraint::Length(composer_height),
         ])
         .split(frame.area());
@@ -4869,9 +4936,14 @@ fn render_chat(
             .scroll((state.chat_scroll.min(u16::MAX as usize) as u16, 0)),
         vertical[0],
     );
-    render_agent_progress(frame, state, vertical[1]);
+    if progress_height > 0 {
+        render_agent_progress(frame, state, vertical[1]);
+    }
+    if command_height > 0 {
+        render_command_palette_area(frame, state, vertical[2], false);
+    }
     if composer_height > 0 {
-        render_chat_composer(frame, state, vertical[2]);
+        render_chat_composer(frame, state, vertical[3]);
     }
 }
 
@@ -5129,7 +5201,23 @@ fn render_chat_composer(frame: &mut ratatui::Frame, state: &mut AppState, area: 
             Color::Green,
         ),
         InputMode::Command => (
-            " COMMAND MODE ACTIVE ↑ USE PALETTE · Esc cancel ".to_owned(),
+            if area.width < 60 {
+                if state.compose.is_empty() {
+                    " COMMAND MODE ACTIVE · Esc cancel ".to_owned()
+                } else {
+                    format!(
+                        " COMMAND MODE ACTIVE · draft {}B held ",
+                        state.compose.len()
+                    )
+                }
+            } else if state.compose.is_empty() {
+                " COMMAND MODE ACTIVE ↑ USE PALETTE · Esc cancel ".to_owned()
+            } else {
+                format!(
+                    " COMMAND MODE ACTIVE ↑ USE PALETTE · draft {} bytes held · Esc restores ",
+                    state.compose.len()
+                )
+            },
             Color::Cyan,
         ),
         InputMode::Search => (
@@ -5153,7 +5241,15 @@ fn render_chat_composer(frame: &mut ratatui::Frame, state: &mut AppState, area: 
             Color::DarkGray,
         ),
     };
-    let display = if state.input_mode == InputMode::Search {
+    let display = if state.input_mode == InputMode::Command {
+        let command = terminal_text_tail(&state.command, inner_width.saturating_sub(2));
+        vec![Line::styled(
+            format!(":{command}█"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]
+    } else if state.input_mode == InputMode::Search {
         vec![Line::styled(
             format!("/{}█", state.search),
             Style::default().fg(Color::Yellow),
@@ -5240,6 +5336,30 @@ fn wrapped_editor_lines(text: &str, cursor: usize, width: usize) -> (Vec<String>
     (lines, cursor_row, cursor_col)
 }
 
+fn terminal_text_tail(text: &str, width: usize) -> String {
+    if cell_width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let available = width.saturating_sub(1);
+    let graphemes = grapheme_indices(text)
+        .map(|(_, grapheme)| grapheme)
+        .collect::<Vec<_>>();
+    let mut used = 0usize;
+    let mut start = graphemes.len();
+    for (index, grapheme) in graphemes.iter().enumerate().rev() {
+        let grapheme_width = cell_width(grapheme);
+        if used.saturating_add(grapheme_width) > available {
+            break;
+        }
+        used = used.saturating_add(grapheme_width);
+        start = index;
+    }
+    format!("…{}", graphemes[start..].concat())
+}
+
 fn visible_lane(state: &AppState) -> &'static str {
     if state.side_active {
         "SIDE"
@@ -5279,27 +5399,46 @@ fn render_agent_progress(frame: &mut ratatui::Frame, state: &AppState, area: Rec
         Color::DarkGray
     };
     let compact = area.width < 60;
+    let headline = if compact {
+        format!(
+            " COPILOT {lane} {state_marker} {} · q{} · SDK {}",
+            progress.phase.label(),
+            progress.queue_depth,
+            format_duration(age),
+        )
+    } else if area.width < 90 {
+        format!(
+            " COPILOT {lane} {state_marker} {} {} · SDK {} · event #{} · q{}",
+            progress.phase.label(),
+            format_duration(progress.elapsed()),
+            format_duration(age),
+            progress.event_count,
+            progress.queue_depth,
+        )
+    } else {
+        format!(
+            " COPILOT {lane} {state_marker} {} {} · last SDK event {} · event #{} · queue {} ",
+            progress.phase.label(),
+            format_duration(progress.elapsed()),
+            format_duration(age),
+            progress.event_count,
+            progress.queue_depth,
+        )
+    };
     let mut lines = vec![Line::from(vec![Span::styled(
-        if compact {
-            format!(
-                " COPILOT {lane} {state_marker} {} {} · event {} · q{}",
-                progress.phase.label(),
-                format_duration(progress.elapsed()),
-                format_duration(age),
-                progress.queue_depth,
-            )
-        } else {
-            format!(
-                " COPILOT {lane} {state_marker} {} {} · last SDK event {} · event #{} · queue {} ",
-                progress.phase.label(),
-                format_duration(progress.elapsed()),
-                format_duration(age),
-                progress.event_count,
-                progress.queue_depth,
-            )
-        },
+        fit_terminal_text(&headline, area.width.saturating_sub(2) as usize),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )])];
+    if area.height == 1 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                fit_terminal_text(&headline, area.width as usize),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )),
+            area,
+        );
+        return;
+    }
     if area.height > 1 {
         lines.push(Line::styled(
             if warning {
@@ -5622,18 +5761,18 @@ mod tests {
     use std::sync::Mutex;
 
     use anyhow::Result;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
     use super::{
         finish_ready_prune, handle_agent_envelope, handle_agent_event, handle_effect,
-        handle_effect_failure, load_ui_preferences, markdown_to_html, open_browser_preview,
-        parse_review_context, render, run_clipboard_candidate, table_cells,
+        handle_effect_failure, load_ui_preferences, markdown_to_html, mouse_scroll_effects,
+        open_browser_preview, parse_review_context, render, run_clipboard_candidate, table_cells,
     };
     use crate::app::{
-        tests_support::state_for_ui, AgentPhase, ChatEntry, DiffLayout, Effect, Focus,
-        MarkdownPreview, PendingPrune, PruneChoice, ReadyPrune, Screen,
+        tests_support::state_for_ui, AgentPhase, ChatEntry, ComposeTarget, DiffLayout, Effect,
+        Focus, InputMode, MarkdownPreview, PendingPrune, PruneChoice, ReadyPrune, Screen,
     };
     use crate::config::AppPaths;
     use crate::copilot::{
@@ -6153,6 +6292,31 @@ mod tests {
             [AgentCommand::Send(_)]
         ));
         assert_eq!(state.pending_outbound_ids.len(), 1);
+    }
+
+    #[test]
+    fn mouse_wheel_routes_through_the_active_command_or_composer_mode() {
+        let mut state = state_for_ui();
+        state.screen = Screen::Chat;
+        state.focus = Focus::Chat;
+        state.chat_scroll = 5;
+        state.input_mode = InputMode::Command;
+        state.command_viewport_rows = 2;
+
+        assert!(mouse_scroll_effects(&mut state, MouseEventKind::ScrollDown).is_empty());
+        assert_eq!(state.command_index, 3);
+        assert_eq!(state.chat_scroll, 5);
+
+        state.input_mode = InputMode::Compose;
+        state.compose_target = Some(ComposeTarget::Chat);
+        state.compose = "one\ntwo\nthree\nfour".into();
+        state.compose_cursor = state.compose.len();
+        state.compose_wrap_width = 40;
+        let end = state.compose_cursor;
+
+        assert!(mouse_scroll_effects(&mut state, MouseEventKind::ScrollUp).is_empty());
+        assert!(state.compose_cursor < end);
+        assert_eq!(state.chat_scroll, 5);
     }
 
     #[test]

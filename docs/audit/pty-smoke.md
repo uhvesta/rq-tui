@@ -40,6 +40,7 @@ Agent: `RQ_TUI_CONTROLLED_AGENT=1`
 | PTY-20 | Enter SIDE, start a controlled stream, then submit `/main` | SIDE teardown interrupted the active turn and restored MAIN in about one second without waiting for natural completion. |
 | PTY-21 | Open Ask with content wrapping to 21 visual rows | The box capped safely inside the viewport, displayed `lines 9-21/21`, and Up scrolled it to `lines 1-13/21`; no text crossed the border. |
 | PTY-22 | Seed an older review, then drive the Bazel-built binary through resize, Visual mode, `:prune`, select/delete, return, and clean exit in a real PTY | The open Work Item rendered as `OPEN(disabled)`, the older Work Item completed typed remote/local cleanup, the prune screen retained the sticky Copilot progress surface, SQLite retained only the open review, return to Review completed before the next command, and alternate-screen cleanup succeeded without panic. |
+| PTY-23 | Enter Chat in the Bazel-built binary, resize to 42×9, type a long draft, open/cancel command completion, discard the restored draft, resize, and exit | The minimum viewport kept the expanding composer inside its borders, displayed the internal row viewport, rendered composer-local `COMMAND COMPLETIONS`, `COMMAND MODE ACTIVE`, compact `COPILOT MAIN` liveness, and the held-draft byte label, restored the draft on Esc, and remained responsive through cleanup and exit. |
 
 ## Current authenticated Copilot pass
 
