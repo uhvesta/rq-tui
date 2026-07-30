@@ -208,8 +208,10 @@ to inspect or snapshot in a test harness.
 
 For multi-step inspection, the hidden `ui-script` command reads a deterministic
 script from stdin. Commands include `key`, `type`, `resize`, `stream`,
-`stream-start`, `stream-delta`, `stream-complete`, `stream-abort`, `fail`, and
-`snapshot`:
+`stream-start`, `stream-delta`, `stream-complete`, `stream-abort`, `fail`,
+`history`, typed `activity`, `models`, `quiet`, `disconnect`, `side-start`,
+`side-exit`, and `snapshot`. The final dump includes exact yank bytes and
+captured effects:
 
 ```sh
 printf '%s\n' \

@@ -850,6 +850,14 @@ fn parse_key_spec(spec: &str) -> Result<KeyEvent> {
 ///   stream-complete   complete the active response
 ///   stream-abort      abort the active response
 ///   fail <message>    fail the oldest queued response before it starts
+///   history <role> <text> load one persisted transcript entry
+///   activity <kind> <label> inject intent/reasoning/tool-start/tool-progress/
+///                     tool-complete/retry/other durable SDK activity
+///   models            inject deterministic model capabilities
+///   quiet <seconds>   backdate active progress for quiet/warning rendering
+///   disconnect <text> inject a visible SDK disconnect/error
+///   side-start        complete deterministic SIDE creation
+///   side-exit         complete deterministic SIDE teardown
 ///   snapshot [label]  render the current frame into the output now
 pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Result<String> {
     let (name, diff) = ui_script_fixture(fixture)?;
@@ -880,7 +888,14 @@ pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Re
         let (command, raw_argument) = line.split_once(' ').unwrap_or((line, ""));
         let argument = if matches!(
             command,
-            "type" | "stream" | "stream-start" | "stream-delta" | "fail"
+            "type"
+                | "stream"
+                | "stream-start"
+                | "stream-delta"
+                | "fail"
+                | "history"
+                | "activity"
+                | "disconnect"
         ) {
             raw_argument
         } else {
@@ -948,6 +963,74 @@ pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Re
                     .fail_next_response(argument)
                     .with_context(|| format!("line {}: {raw_line:?}", line_number + 1))?;
             }
+            "history" => {
+                let (role, text) = argument
+                    .split_once(' ')
+                    .context("history requires <role> <text>")?;
+                harness.inject_agent_event(AgentEvent::HistoryLoaded(vec![HistoryEntry {
+                    role: role.to_owned(),
+                    text: text.to_owned(),
+                }]))?;
+            }
+            "activity" => {
+                let (kind, label) = argument
+                    .split_once(' ')
+                    .context("activity requires <kind> <label>")?;
+                let kind = match kind {
+                    "intent" => ActivityKind::Intent,
+                    "reasoning" => ActivityKind::Reasoning,
+                    "tool-start" => ActivityKind::ToolStart,
+                    "tool-progress" => ActivityKind::ToolProgress,
+                    "tool-complete" => ActivityKind::ToolComplete,
+                    "retry" => ActivityKind::Retry,
+                    "other" | "skill" | "subagent" => ActivityKind::Other,
+                    _ => anyhow::bail!(
+                        "activity kind must be intent, reasoning, tool-start, tool-progress, tool-complete, retry, skill, subagent, or other"
+                    ),
+                };
+                let tool = matches!(
+                    kind,
+                    ActivityKind::ToolStart
+                        | ActivityKind::ToolProgress
+                        | ActivityKind::ToolComplete
+                )
+                .then(|| "deterministic-tool".to_owned());
+                harness.inject_activity(kind, label, tool, Some("ui-script injection".into()))?;
+            }
+            "models" => {
+                harness.inject_agent_event(AgentEvent::ModelsListed(vec![ModelOption {
+                    id: "script-model".into(),
+                    name: "Script Model".into(),
+                    supported_reasoning_efforts: vec!["low".into(), "high".into()],
+                    default_reasoning_effort: Some("high".into()),
+                    max_context_tokens: Some(128_000),
+                    context_tiers: vec![
+                        ContextTierOption {
+                            id: "default".into(),
+                            max_context_tokens: Some(128_000),
+                        },
+                        ContextTierOption {
+                            id: "long_context".into(),
+                            max_context_tokens: Some(256_000),
+                        },
+                    ],
+                }]))?;
+            }
+            "quiet" => {
+                let seconds = argument
+                    .parse::<u64>()
+                    .context("quiet requires an integer number of seconds")?;
+                harness.backdate_agent_progress(std::time::Duration::from_secs(seconds));
+            }
+            "disconnect" => {
+                harness.inject_agent_event(AgentEvent::Error(argument.to_owned()))?;
+            }
+            "side-start" => {
+                harness.inject_side_started("script-main", "script-side")?;
+            }
+            "side-exit" => {
+                harness.inject_side_exited("script-main", "script-side")?;
+            }
             "snapshot" => {
                 let label = if argument.is_empty() {
                     format!("line {}", line_number + 1)
@@ -957,7 +1040,7 @@ pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Re
                 emit_snapshot(&mut harness, &label, &mut output);
             }
             other => anyhow::bail!(
-                "line {}: unknown ui-script command {other:?} (use key, type, resize, stream*, fail, or snapshot)",
+                "line {}: unknown ui-script command {other:?} (use key, type, resize, stream*, fail, history, activity, models, quiet, disconnect, side-*, or snapshot)",
                 line_number + 1
             ),
         }
@@ -982,6 +1065,8 @@ pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Re
         harness.state.compose_scroll
     ));
     output.push_str(&format!("chat_scroll: {}\n", harness.chat_scroll()));
+    output.push_str(&format!("last_yank: {:?}\n", harness.last_yank()));
+    output.push_str(&format!("effects: {:?}\n", harness.captured_effects()));
     output.push_str(&format!("agent_commands: {:?}\n", harness.agent_commands()));
     Ok(output)
 }
@@ -1042,6 +1127,31 @@ mod tests {
         let frame = harness.render().unwrap();
         assert!(frame.contains("fixture — Review"));
         assert!(frame.contains("new"));
+    }
+
+    #[test]
+    fn ui_script_exposes_models_activity_quiet_history_and_exact_effects() {
+        let output = super::run_ui_script(
+            "unicode",
+            84,
+            22,
+            "key Tab\n\
+             history assistant **restored** `history`\n\
+             activity tool-start searching repository\n\
+             quiet 30\n\
+             snapshot activity\n\
+             key :\n\
+             type model\n\
+             key Enter\n\
+             models\n\
+             snapshot models\n",
+        )
+        .unwrap();
+        assert!(output.contains("restored"));
+        assert!(output.contains("searching repository"));
+        assert!(output.contains("Script Model"));
+        assert!(output.contains("last_yank:"));
+        assert!(output.contains("effects:"));
     }
 
     #[test]
