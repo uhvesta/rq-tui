@@ -2709,31 +2709,35 @@ async fn worker(
             orphan_cleanup_results.push(cleanup_ephemeral_record(&client, &ledger, record).await);
         }
     }
-    let boot = sdk_call(
+    let SessionBoot {
+        session,
+        resumed,
+        mut resume_warning,
+    } = sdk_call(
         "Copilot session create/resume",
         create_or_resume_session(&client, &config, &main_events, &ledger),
     )
     .await?;
-    let session = boot.session;
     let mut resumed_active = None;
-    if boot.resumed {
+    if resumed {
         match sdk_call("Copilot history reload", session.get_events()).await {
             Ok(history) => {
                 resumed_active = resumed_active_from_history(&history, session.id());
                 main_events.emit(AgentEvent::HistoryLoaded(history_entries(&history)));
             }
             Err(error) => {
-                main_events.activity(
-                    None,
-                    AgentActivity::other(format!("Could not restore timeline: {error}")),
+                let warning = format!(
+                    "Session resumed, but its conversation history could not be restored: {error}"
                 );
+                main_events.activity(None, AgentActivity::other(warning.clone()));
+                resume_warning = Some(warning);
             }
         }
     }
     main_events.emit(AgentEvent::SessionReady {
         session_id: session.id().to_string(),
-        resumed: boot.resumed,
-        resume_warning: boot.resume_warning,
+        resumed,
+        resume_warning,
     });
     if !has_side_lease {
         main_events.emit(AgentEvent::OrphanSideCleanup {

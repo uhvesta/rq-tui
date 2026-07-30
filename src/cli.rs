@@ -1,3 +1,4 @@
+use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
@@ -82,6 +83,7 @@ pub(crate) struct ReviewArgs {
 }
 
 pub(crate) fn run_review(args: ReviewArgs, paths: AppPaths) -> Result<()> {
+    require_interactive_terminal(io_is_interactive())?;
     let storage = Storage::open(&paths.database)?;
     let workspace = args.path.as_deref().map(resolve_invocation_path);
     let resolved = match (args.path.as_deref(), args.prs.is_empty()) {
@@ -117,6 +119,19 @@ pub(crate) fn run_review(args: ReviewArgs, paths: AppPaths) -> Result<()> {
         (None, true) => unreachable!("clap requires a target"),
     };
     crate::ui::run(AppState::new(resolved), &storage, &paths)
+}
+
+fn io_is_interactive() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+fn require_interactive_terminal(interactive: bool) -> Result<()> {
+    if !interactive {
+        bail!(
+            "interactive review requires a TTY on stdin and stdout; use `rq-tui doctor` or `rq-tui history` for non-interactive CLI operation"
+        );
+    }
+    Ok(())
 }
 
 fn resolve_invocation_path(path: &std::path::Path) -> PathBuf {
@@ -190,11 +205,19 @@ fn command_version(program: &str, args: &[&str]) -> Result<String> {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command};
+    use super::{require_interactive_terminal, Cli, Command};
 
     #[test]
     fn incomplete_review_is_rejected_before_tui_startup() {
         assert!(Cli::try_parse_from(["rq-tui", "review"]).is_err());
+    }
+
+    #[test]
+    fn review_rejects_non_interactive_terminal_before_tui_startup() {
+        let error = require_interactive_terminal(false).unwrap_err().to_string();
+        assert!(error.contains("requires a TTY"));
+        assert!(error.contains("doctor"));
+        assert!(require_interactive_terminal(true).is_ok());
     }
 
     #[test]

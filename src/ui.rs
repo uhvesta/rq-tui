@@ -55,12 +55,6 @@ use crate::terminal_text::{cell_width, floor_grapheme_boundary, grapheme_indices
 use crate::work_item::{combine_resolved, resolve_local};
 
 fn load_ui_preferences(state: &mut AppState, storage: &Storage, paths: &AppPaths) -> Result<()> {
-    state.reasoning_effort = storage
-        .setting("model.reasoning_effort")?
-        .filter(|value| !value.trim().is_empty());
-    state.context_tier = storage
-        .setting("model.context_tier")?
-        .filter(|value| !value.trim().is_empty());
     state.expand_step = storage
         .setting("diff.expand_step")?
         .and_then(|value| value.parse::<usize>().ok())
@@ -82,6 +76,50 @@ fn load_ui_preferences(state: &mut AppState, storage: &Storage, paths: &AppPaths
     };
     state.cache_directory = paths.prs.display().to_string();
     state.storage_path = paths.database.display().to_string();
+    Ok(())
+}
+
+fn work_item_model_key(work_item_id: &str, field: &str) -> String {
+    format!("work_item.{work_item_id}.model{field}")
+}
+
+fn load_model_preferences(state: &mut AppState, storage: &Storage) -> Result<()> {
+    let work_item_id = &state.work_item.item.id;
+    state.model = storage
+        .setting(&work_item_model_key(work_item_id, ""))?
+        .or(storage.setting("model")?)
+        .unwrap_or_else(|| "gpt-5".to_owned());
+    state.reasoning_effort = storage
+        .setting(&work_item_model_key(work_item_id, ".reasoning_effort"))?
+        .or(storage.setting("model.reasoning_effort")?)
+        .filter(|value| !value.trim().is_empty());
+    state.context_tier = storage
+        .setting(&work_item_model_key(work_item_id, ".context_tier"))?
+        .or(storage.setting("model.context_tier")?)
+        .filter(|value| !value.trim().is_empty());
+    Ok(())
+}
+
+fn persist_model_preferences(
+    state: &AppState,
+    storage: &Storage,
+    selection: &crate::copilot::ModelSelection,
+) -> Result<()> {
+    let work_item_id = &state.work_item.item.id;
+    for (field, value) in [
+        ("", selection.model_id.as_str()),
+        (
+            ".reasoning_effort",
+            selection.reasoning_effort.as_deref().unwrap_or(""),
+        ),
+        (
+            ".context_tier",
+            selection.context_tier.as_deref().unwrap_or(""),
+        ),
+    ] {
+        storage.set_setting(&work_item_model_key(work_item_id, field), value)?;
+        storage.set_setting(&format!("model{field}"), value)?;
+    }
     Ok(())
 }
 
@@ -127,10 +165,8 @@ pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> R
         state.status =
             format!("{pending_deliveries} outbound message(s) may not have been delivered");
     }
-    let model = storage
-        .setting("model")?
-        .unwrap_or_else(|| "gpt-5".to_owned());
-    state.model = model.clone();
+    load_model_preferences(&mut state, storage)?;
+    let model = state.model.clone();
     load_ui_preferences(&mut state, storage, paths)?;
     let existing_session_id = storage
         .active_session(&state.work_item.item.id)?
@@ -305,7 +341,7 @@ fn run_loop<B: Backend>(
     Ok(())
 }
 
-fn mouse_scroll_effects(state: &mut AppState, kind: MouseEventKind) -> Vec<Effect> {
+pub(crate) fn mouse_scroll_effects(state: &mut AppState, kind: MouseEventKind) -> Vec<Effect> {
     let code = match kind {
         MouseEventKind::ScrollUp => KeyCode::Up,
         MouseEventKind::ScrollDown => KeyCode::Down,
@@ -1192,9 +1228,15 @@ pub(crate) fn handle_effect(
             );
         }
         Effect::SetModel(model) => {
-            storage.set_setting("model", &model)?;
-            storage.set_setting("model.reasoning_effort", "")?;
-            storage.set_setting("model.context_tier", "")?;
+            persist_model_preferences(
+                state,
+                storage,
+                &crate::copilot::ModelSelection {
+                    model_id: model.clone(),
+                    reasoning_effort: None,
+                    context_tier: None,
+                },
+            )?;
             bridge.send(AgentCommand::SetModel(model.clone()))?;
             state.model = model.clone();
             state.reasoning_effort = None;
@@ -3171,15 +3213,7 @@ pub(crate) fn handle_agent_event(
             };
         }
         AgentEvent::ModelSelectionChanged(selection) => {
-            storage.set_setting("model", &selection.model_id)?;
-            storage.set_setting(
-                "model.reasoning_effort",
-                selection.reasoning_effort.as_deref().unwrap_or(""),
-            )?;
-            storage.set_setting(
-                "model.context_tier",
-                selection.context_tier.as_deref().unwrap_or(""),
-            )?;
+            persist_model_preferences(state, storage, &selection)?;
             state.model = selection.model_id.clone();
             state.reasoning_effort = selection.reasoning_effort.clone();
             state.context_tier = selection.context_tier.clone();
@@ -3814,6 +3848,7 @@ fn truncate_terminal_line(text: &str, max_cells: usize) -> String {
 }
 
 fn render_model_picker(frame: &mut ratatui::Frame, state: &AppState) {
+    let compact = frame.area().width < 60;
     let (step, title, subtitle, rows) = match state.model_picker_stage {
         ModelPickerStage::Model => (
             1,
@@ -3832,10 +3867,14 @@ fn render_model_picker(frame: &mut ratatui::Frame, state: &AppState) {
                     } else {
                         model.supported_reasoning_efforts.join("/")
                     };
-                    format!(
-                        "{:<24} {:<24} · context {context} · {efforts}",
-                        model.name, model.id
-                    )
+                    if compact {
+                        format!("{} [{}] · {context} · {efforts}", model.name, model.id)
+                    } else {
+                        format!(
+                            "{:<24} {:<24} · context {context} · {efforts}",
+                            model.name, model.id
+                        )
+                    }
                 })
                 .collect::<Vec<_>>(),
         ),
@@ -5144,30 +5183,43 @@ fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 .review_selection_mode()
                 .map(|mode| mode.label())
                 .unwrap_or("SELECT");
-            let side = state
-                .review_selection_side()
-                .map(|side| side.as_str())
-                .unwrap_or("none");
-            let viewport = if state.review_horizontal_scroll > 0 {
+            if area.width < 60 {
                 format!(
-                    " · view cols {}-{}",
-                    state.review_horizontal_scroll + 1,
-                    state.review_horizontal_scroll + state.review_content_width,
+                    "VISUAL {visual} · {}-{} · y copy · Esc clear",
+                    start + 1,
+                    end + 1,
                 )
             } else {
-                String::new()
-            };
+                let side = state
+                    .review_selection_side()
+                    .map(|side| side.as_str())
+                    .unwrap_or("none");
+                let viewport = if state.review_horizontal_scroll > 0 {
+                    format!(
+                        " · view cols {}-{}",
+                        state.review_horizontal_scroll + 1,
+                        state.review_horizontal_scroll + state.review_content_width,
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "VISUAL {visual} · rows {}-{} · cols {}-{} · side {side}{} · a ask · c comment · y yank · Esc clear",
+                    start + 1,
+                    end + 1,
+                    state.review_visual_anchor_column.min(state.review_visual_column) + 1,
+                    state.review_visual_anchor_column.max(state.review_visual_column) + 1,
+                    viewport,
+                )
+            }
+        }
+        _ if state.status.is_empty() => {
             format!(
-                "VISUAL {visual} · rows {}-{} · cols {}-{} · side {side}{} · a ask · c comment · y yank · Esc clear",
-                start + 1,
-                end + 1,
-                state.review_visual_anchor_column.min(state.review_visual_column) + 1,
-                state.review_visual_anchor_column.max(state.review_visual_column) + 1,
-                viewport,
+                "{mode}  j/k move · h/l file · t files · v select · a ask · c comment · Tab chat · : command"
             )
         }
         _ => format!(
-            "{mode}  j/k move · h/l file · t files · v select · a ask · c comment · Tab chat · : command  {}",
+            "{mode} · {} · j/k move · h/l file · t files · v select · a ask · c comment · Tab chat · : command",
             state.status
         ),
         }
@@ -5285,7 +5337,16 @@ fn render_command_palette_area(
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    lines.extend(suggestions);
+    if suggestions.is_empty() {
+        lines.push(Line::styled(
+            "   No matching commands",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    } else {
+        lines.extend(suggestions);
+    }
     let selected_number = if matches.is_empty() {
         0
     } else {
@@ -6146,11 +6207,10 @@ fn render_agent_status(frame: &mut ratatui::Frame, state: &AppState) {
             ),
         ]
     };
-    let now = std::time::Instant::now();
     lines.extend(progress.timeline.iter().skip(state.scroll).map(|entry| {
         let text = format!(
             "{:>7} ago · {}",
-            format_duration(now.saturating_duration_since(entry.at)),
+            format_duration(progress.timeline_age(entry.at)),
             entry.label
         );
         if compact {
@@ -6417,9 +6477,9 @@ mod tests {
 
     use super::{
         copy_to_clipboard_with_writer, finish_ready_prune, handle_agent_envelope,
-        handle_agent_event, handle_effect, handle_effect_failure, load_ui_preferences,
-        markdown_to_html, mouse_scroll_effects, open_browser_preview, parse_review_context, render,
-        run_clipboard_candidate, table_cells,
+        handle_agent_event, handle_effect, handle_effect_failure, load_model_preferences,
+        load_ui_preferences, markdown_to_html, mouse_scroll_effects, open_browser_preview,
+        parse_review_context, render, run_clipboard_candidate, table_cells,
     };
     use crate::app::{
         tests_support::state_for_ui, AgentPhase, ChatEntry, ComposeTarget, DiffLayout, Effect,
@@ -6428,7 +6488,7 @@ mod tests {
     use crate::config::AppPaths;
     use crate::copilot::{
         AgentCommand, AgentEvent, AgentEventEnvelope, AgentLane, AgentSink, HistoryEntry,
-        LaneEvent, OutboundKind, PruneSessionOutcome,
+        LaneEvent, ModelSelection, OutboundKind, PruneSessionOutcome,
     };
     use crate::domain::WorkItem;
     use crate::highlight::PlainHighlighter;
@@ -6528,6 +6588,77 @@ mod tests {
         assert_eq!(restarted.markdown_preview, MarkdownPreview::Browser);
         assert_eq!(restarted.cache_directory, "/tmp/rq-tui-test/cache/prs");
         assert_eq!(restarted.storage_path, "/tmp/rq-tui-test/data/db");
+    }
+
+    #[test]
+    fn model_preferences_are_scoped_to_each_work_item() {
+        let storage = Storage::in_memory().unwrap();
+        let mut first = state_for_ui();
+        first.work_item.item.id = "first-work-item".into();
+        handle_agent_event(
+            &mut first,
+            &storage,
+            AgentEvent::ModelSelectionChanged(ModelSelection {
+                model_id: "deep".into(),
+                reasoning_effort: Some("high".into()),
+                context_tier: Some("long_context".into()),
+            }),
+        )
+        .unwrap();
+
+        let mut second = state_for_ui();
+        second.work_item.item.id = "second-work-item".into();
+        handle_agent_event(
+            &mut second,
+            &storage,
+            AgentEvent::ModelSelectionChanged(ModelSelection {
+                model_id: "fast".into(),
+                reasoning_effort: Some("low".into()),
+                context_tier: Some("default".into()),
+            }),
+        )
+        .unwrap();
+
+        let mut restarted_first = state_for_ui();
+        restarted_first.work_item.item.id = "first-work-item".into();
+        load_model_preferences(&mut restarted_first, &storage).unwrap();
+        assert_eq!(restarted_first.model, "deep");
+        assert_eq!(restarted_first.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            restarted_first.context_tier.as_deref(),
+            Some("long_context")
+        );
+
+        let mut restarted_second = state_for_ui();
+        restarted_second.work_item.item.id = "second-work-item".into();
+        load_model_preferences(&mut restarted_second, &storage).unwrap();
+        assert_eq!(restarted_second.model, "fast");
+        assert_eq!(restarted_second.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(restarted_second.context_tier.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn resumed_session_history_failure_remains_a_visible_warning() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+        storage.upsert_work_item(&state.work_item.item).unwrap();
+        let warning =
+            "Session resumed, but its conversation history could not be restored: timed out";
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::SessionReady {
+                session_id: "resumed-session".into(),
+                resumed: true,
+                resume_warning: Some(warning.into()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.status, warning);
+        assert_eq!(state.agent_progress.detail, warning);
+        assert!(state.agent_connected);
+        assert!(state.chat.is_empty());
     }
 
     #[test]

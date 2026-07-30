@@ -26,6 +26,14 @@ sh_test(
 )
 
 sh_test(
+    name = "non_tty_cli_test",
+    srcs = ["tests/non_tty_cli_test.sh"],
+    data = [":rq-tui"],
+    deps = ["@rules_shell//shell/runfiles"],
+    visibility = ["//visibility:private"],
+)
+
+sh_test(
     name = "pty_smoke_test",
     srcs = ["tests/pty_smoke_test.sh"],
     data = [
@@ -42,6 +50,7 @@ test_suite(
     name = "rq_tui_tests",
     tests = [
         ":bootstrap_bazelisk_test",
+        ":non_tty_cli_test",
         ":pty_smoke_test",
         "//src:clippy_test",
         "//src:rq_tui_tests",

@@ -10,7 +10,7 @@ use ratatui::style::Color;
 use ratatui::Terminal;
 use tempfile::TempDir;
 
-use crate::app::{AppState, Effect, InputMode, Screen};
+use crate::app::{AppState, ChatEntry, Effect, InputMode, Screen};
 use crate::config::AppPaths;
 use crate::copilot::{
     deterministic_outbound_ids, ActivityKind, AgentActivity, AgentCommand, AgentEvent,
@@ -106,6 +106,9 @@ impl TuiHarness {
         let paths = fixture_paths(temp.path());
         let storage = Storage::open(&paths.database)?;
         seed_storage(&storage, &state)?;
+        let mut state = state;
+        let display_now = state.agent_progress.last_event_at;
+        state.agent_progress.freeze_display_clock(display_now);
         Ok(Self {
             state,
             storage,
@@ -202,6 +205,41 @@ impl TuiHarness {
             }
         }
         Ok(descriptions)
+    }
+
+    pub fn paste(&mut self, text: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.state.handle_paste(text).is_empty(),
+            "paste unexpectedly emitted an effect"
+        );
+        Ok(())
+    }
+
+    pub fn mouse_scroll(&mut self, up: bool) -> Result<()> {
+        let kind = if up {
+            crossterm::event::MouseEventKind::ScrollUp
+        } else {
+            crossterm::event::MouseEventKind::ScrollDown
+        };
+        anyhow::ensure!(
+            crate::ui::mouse_scroll_effects(&mut self.state, kind).is_empty(),
+            "mouse scrolling unexpectedly emitted an effect"
+        );
+        Ok(())
+    }
+
+    pub fn append_history(&mut self, role: impl Into<String>, text: impl Into<String>) {
+        self.state.chat.push(ChatEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: role.into(),
+            text: text.into(),
+            streaming: false,
+            annotation_id: None,
+            outbound_id: None,
+            error: None,
+        });
+        self.state.chat_cursor = self.state.chat.len().saturating_sub(1);
+        self.state.chat_autofollow = true;
     }
 
     /// Starts, but deliberately does not complete, the oldest fake-agent turn.
@@ -366,6 +404,8 @@ impl TuiHarness {
             state.screen = Screen::Recovery;
             state.status = "Outbound delivery is uncertain; resend or discard explicitly".into();
         }
+        let display_now = state.agent_progress.last_event_at;
+        state.agent_progress.freeze_display_clock(display_now);
         self.state = state;
         Ok(())
     }
@@ -495,6 +535,7 @@ impl TuiHarness {
 
     pub fn backdate_agent_progress(&mut self, age: std::time::Duration) {
         let now = std::time::Instant::now();
+        self.state.agent_progress.freeze_display_clock(now);
         self.state.agent_progress.last_event_at = now.checked_sub(age).unwrap_or(now);
         self.state.agent_progress.turn_started_at = Some(now.checked_sub(age).unwrap_or(now));
     }
@@ -957,6 +998,28 @@ fn parse_key_spec(spec: &str) -> Result<KeyEvent> {
     Ok(KeyEvent::new(code, modifiers))
 }
 
+fn decode_script_text(text: &str) -> Result<String> {
+    let mut decoded = String::new();
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+        let escaped = characters
+            .next()
+            .context("trailing backslash in scripted text")?;
+        decoded.push(match escaped {
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            '\\' => '\\',
+            other => anyhow::bail!("unsupported scripted escape \\{other}"),
+        });
+    }
+    Ok(decoded)
+}
+
 /// Runs a plain-text action script against a named diff fixture and returns
 /// every requested snapshot plus a final state/debug dump. Intended as the
 /// entry point subagents drive over `rq-tui ui-script` without needing to
@@ -966,6 +1029,8 @@ fn parse_key_spec(spec: &str) -> Result<KeyEvent> {
 ///   key <spec>       press one key; spec is `[C-][S-][A-]<name-or-char>`,
 ///                     e.g. `a`, `Enter`, `C-w`, `S-Tab`, `C-c`
 ///   type <text>       press every remaining character on the line in order
+///   paste <text>      inject one terminal paste event without submitting
+///   mouse <up|down>   inject one three-row mouse-wheel event
 ///   resize <w> <h>    change terminal dimensions
 ///   stream <text>     deliver and complete a single-chunk fake-agent response
 ///   stream-start [main|side] <text>
@@ -974,7 +1039,8 @@ fn parse_key_spec(spec: &str) -> Result<KeyEvent> {
 ///   stream-complete   complete the active response
 ///   stream-abort      abort the active response
 ///   fail <message>    fail the oldest queued response before it starts
-///   history <role> <text> load one persisted transcript entry
+///   history <role> <text> load a one-entry persisted-history snapshot
+///   history-append <role> <text> append one deterministic transcript entry
 ///   activity <kind> <label> inject intent/reasoning/tool-start/tool-progress/
 ///                     tool-complete/retry/other durable SDK activity
 ///   models            inject deterministic model capabilities
@@ -1015,11 +1081,13 @@ pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Re
         let argument = if matches!(
             command,
             "type"
+                | "paste"
                 | "stream"
                 | "stream-start"
                 | "stream-delta"
                 | "fail"
                 | "history"
+                | "history-append"
                 | "activity"
                 | "disconnect"
         ) {
@@ -1045,6 +1113,20 @@ pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Re
                         .with_context(|| format!("line {}: {raw_line:?}", line_number + 1))?;
                 }
             }
+            "paste" => {
+                let pasted = decode_script_text(argument)?;
+                harness
+                    .paste(&pasted)
+                    .with_context(|| format!("line {}: {raw_line:?}", line_number + 1))?;
+            }
+            "mouse" => match argument {
+                "up" => harness.mouse_scroll(true)?,
+                "down" => harness.mouse_scroll(false)?,
+                _ => anyhow::bail!(
+                    "line {}: mouse requires up or down, got {argument:?}",
+                    line_number + 1
+                ),
+            },
             "resize" => {
                 let mut parts = argument.split_whitespace();
                 let w: u16 = parts
@@ -1111,6 +1193,12 @@ pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Re
                     role: role.to_owned(),
                     text: text.to_owned(),
                 }]))?;
+            }
+            "history-append" => {
+                let (role, text) = argument
+                    .split_once(' ')
+                    .context("history-append requires <role> <text>")?;
+                harness.append_history(role, text);
             }
             "activity" => {
                 let (kind, label) = argument
@@ -1183,7 +1271,7 @@ pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Re
                 emit_snapshot(&mut harness, &label, &mut output);
             }
             other => anyhow::bail!(
-                "line {}: unknown ui-script command {other:?} (use key, type, resize, stream*, fail, history, activity, models, quiet, disconnect, side-*, or snapshot)",
+                "line {}: unknown ui-script command {other:?} (use key, type, paste, mouse, resize, stream*, fail, history*, activity, models, quiet, disconnect, side-*, or snapshot)",
                 line_number + 1
             ),
         }
@@ -1722,7 +1810,37 @@ mod tests {
     }
 
     #[test]
+    fn ui_script_supports_paste_mouse_and_appendable_history() {
+        let output = super::run_ui_script(
+            "default",
+            80,
+            20,
+            "key Tab\n\
+             key i\n\
+             paste first pasted line\\nsecond pasted line\n\
+             snapshot pasted\n\
+             key C-c\n\
+             history-append assistant first restored response\n\
+             history-append assistant second restored response\n\
+             mouse up\n\
+             snapshot history\n",
+        )
+        .unwrap();
+
+        assert!(output.contains("first pasted line"));
+        assert!(output.contains("second pasted line"));
+        assert!(output.contains("first restored response"));
+        assert!(output.contains("second restored response"));
+        assert!(output.contains("Pasted 36 bytes across 2 lines"));
+    }
+
+    #[test]
     fn ui_snapshots_are_byte_deterministic_across_independent_runs() {
+        let first_review = super::render_ui_scenario("review", 80, 18).unwrap();
+        let second_review = super::render_ui_scenario("review", 80, 18).unwrap();
+        assert_eq!(first_review, second_review);
+        assert!(first_review.contains("CONNECTING 0ms"));
+
         let first = super::render_ui_scenario("queue", 100, 28).unwrap();
         let second = super::render_ui_scenario("queue", 100, 28).unwrap();
         assert_eq!(first, second);
@@ -2052,6 +2170,13 @@ mod tests {
         assert!(block.render().unwrap().contains("VISUAL BLOCK"));
         block.key(key(KeyCode::Char('y'))).unwrap();
         assert_eq!(block.last_yank(), Some("fn\n  "));
+
+        let mut compact =
+            TuiHarness::from_unified_diff("review-compact-visual", workflow_diff(), 40, 9).unwrap();
+        compact.key(key(KeyCode::Char('v'))).unwrap();
+        let compact_frame = compact.render().unwrap();
+        assert!(compact_frame.contains("VISUAL CHAR"));
+        assert!(compact_frame.contains("y copy · Esc clear"));
     }
 
     #[test]
@@ -2137,7 +2262,7 @@ mod tests {
         let end = harness.render().unwrap();
         assert!(end.contains("END"), "{end}");
         assert!(end.contains('‹'));
-        assert!(end.contains("view cols"));
+        assert!(harness.state.review_horizontal_scroll > 0);
 
         harness.key(key(KeyCode::Char('0'))).unwrap();
         let start = harness.render().unwrap();
@@ -2751,6 +2876,17 @@ mod tests {
         );
         assert!(compact_frame.contains("COPILOT"));
 
+        let mut empty =
+            TuiHarness::from_unified_diff("empty commands", workflow_diff(), 42, 12).unwrap();
+        empty.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut empty, "not-a-real-command");
+        let empty_frame = empty.render().unwrap();
+        assert!(empty_frame.contains("No matching commands"));
+        empty.key(key(KeyCode::Esc)).unwrap();
+        let closed = empty.render().unwrap();
+        assert!(closed.contains("Command palette closed"));
+        assert!(!closed.contains("NORMAL · NORMAL"));
+
         let mut long =
             TuiHarness::from_unified_diff("long command", workflow_diff(), 42, 9).unwrap();
         long.key(key(KeyCode::Tab)).unwrap();
@@ -2770,7 +2906,7 @@ mod tests {
         escape.key(key(KeyCode::Esc)).unwrap();
         assert_eq!(escape.mode(), "NORMAL");
         assert!(!escape.status().contains("COMMAND mode"));
-        assert!(escape.status().contains("command palette closed"));
+        assert!(escape.status().contains("Command palette closed"));
     }
 
     #[test]
@@ -2959,6 +3095,29 @@ mod tests {
     }
 
     #[test]
+    fn model_picker_is_explicitly_main_scoped_while_side_is_active() {
+        let mut harness =
+            TuiHarness::from_unified_diff("side-model", workflow_diff(), 90, 20).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "/side isolated model context");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness
+            .inject_side_started("main-session", "side-session")
+            .unwrap();
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "model");
+        harness.key(key(KeyCode::Enter)).unwrap();
+
+        assert_ne!(harness.state.screen, crate::app::Screen::ModelPicker);
+        assert!(harness.status().contains("MAIN-scoped"));
+        assert!(!harness
+            .agent_commands()
+            .iter()
+            .any(|command| command == "ListModels"));
+    }
+
+    #[test]
     fn model_picker_skips_capability_stages_the_runtime_does_not_offer() {
         let mut harness =
             TuiHarness::from_unified_diff("fixed-model", workflow_diff(), 100, 24).unwrap();
@@ -3010,6 +3169,8 @@ mod tests {
             .unwrap();
 
         let frame = harness.render().unwrap();
+        assert!(frame.contains("Compact Model"));
+        assert!(frame.contains("compact-model"));
         assert!(frame.contains("↑/↓ select"));
         assert!(frame.contains("Enter next"));
         assert!(frame.contains("Esc cancel"));

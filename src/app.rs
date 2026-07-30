@@ -349,6 +349,7 @@ pub(crate) struct AgentProgress {
     pub(crate) event_count: usize,
     pub(crate) queue_depth: usize,
     pub(crate) timeline: VecDeque<AgentTimelineEntry>,
+    display_now: Option<Instant>,
 }
 
 impl Default for AgentProgress {
@@ -367,6 +368,7 @@ impl Default for AgentProgress {
                 at: now,
                 label: "Starting Copilot SDK session".into(),
             }]),
+            display_now: None,
         }
     }
 }
@@ -409,7 +411,7 @@ impl AgentProgress {
 
     pub(crate) fn elapsed(&self) -> Duration {
         self.turn_started_at
-            .map(|started| started.elapsed())
+            .map(|started| self.now().saturating_duration_since(started))
             .unwrap_or_default()
     }
 
@@ -439,7 +441,19 @@ impl AgentProgress {
     }
 
     pub(crate) fn last_event_age(&self) -> Duration {
-        self.last_event_at.elapsed()
+        self.now().saturating_duration_since(self.last_event_at)
+    }
+
+    pub(crate) fn timeline_age(&self, at: Instant) -> Duration {
+        self.now().saturating_duration_since(at)
+    }
+
+    pub(crate) fn freeze_display_clock(&mut self, now: Instant) {
+        self.display_now = Some(now);
+    }
+
+    fn now(&self) -> Instant {
+        self.display_now.unwrap_or_else(Instant::now)
     }
 }
 
@@ -2912,7 +2926,7 @@ impl AppState {
                 self.status = if self.input_mode == InputMode::Visual {
                     "VISUAL · command palette closed · selection preserved".into()
                 } else {
-                    "NORMAL · command palette closed".into()
+                    "Command palette closed".into()
                 };
                 Vec::new()
             }
@@ -3401,6 +3415,11 @@ impl AppState {
                 )]
             }
             (Some("main" | "side-exit"), _) => vec![Effect::ExitSide],
+            (Some("model"), _) if self.side_active => {
+                self.status =
+                    "Model changes are MAIN-scoped · return with /main before using :model".into();
+                Vec::new()
+            }
             (Some("model"), Some(model)) => vec![Effect::SetModel(model.to_owned())],
             (Some("model"), None) => {
                 self.open_overlay(Screen::ModelPicker);
