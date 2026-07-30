@@ -515,10 +515,13 @@ ambiguously-re-anchored block (§2.4); `e` re-pins it.
 
 Entering INSERT on a block's prompt row (`i`, or automatically when you
 press `a`/`c` on a fresh Visual selection) lets you type; `Esc` returns to
-NORMAL without leaving the diff. Ask follow-ups obey the same queueing/
-steering/cancellation model as Chat (§7.5) — a follow-up sent while another
-ask is streaming shows a queued state directly in the block, not a modal
-spinner.
+NORMAL without leaving the diff and keeps the non-empty draft block visible
+in place, labeled `draft`; `i` resumes that exact draft. `Ctrl-C` while no
+agent turn is being stopped explicitly discards the draft and removes the
+draft-only block, restoring the exact prior Review/Visual selection. Ask
+follow-ups obey the same queueing/steering/cancellation model as Chat
+(§7.5) — a follow-up sent while another ask is streaming shows a queued
+state directly in the block, not a modal spinner.
 
 *(This section replaces the original spec's §3.2 split-view rail and
 generalizes its §3.3 unified-view inline-fold-block treatment — that
@@ -622,11 +625,12 @@ Snapshots appear alongside remote versions for local repos.
 
 ### 3.10 Prune — Review History
 `:prune` opens a **review-history** view scoped to things you actually
-reviewed (rows in SQLite with at least one open event or annotation) — it
-does not crawl the cache dir listing every fetched artifact. Ordered oldest
-last-reviewed first. Versions that were fetched but never opened are garbage
-by definition and their worktrees are deleted automatically once a newer
-version has been reviewed — no prompt, they never appear here.
+reviewed (Work Items with non-null `last_opened_at`, or with at least one
+annotation) — it does not crawl the cache dir listing every fetched
+artifact. Ordered oldest last-reviewed first. Versions that were fetched
+but never opened are garbage by definition and their worktrees are deleted
+automatically once a newer version has been reviewed — no prompt, they
+never appear here.
 ```
 ┌─ Prune — reviewed items (oldest first) ────────────────────────────────────────────────────────┐
 │ [x] acme/api-server#301   merged 3w ago    last reviewed 3w ago    412 MB   3 versions · 14 annot │
@@ -695,10 +699,17 @@ shown in the status bar alongside the focus breadcrumb (§4.2). Three modes:
   inline ask/comment blocks, §3.4), scrolling up through chat history,
   jumping between panes, folding, searching. Single keys are commands
   (`j/k`, `]a`, `yy`, `t`, `gm`, `Tab`, …), and it's the launch point for the
-  other modes: `i` (or starting to type in an input context) enters INSERT,
+  other modes: `i` enters INSERT when the focused surface has a resumable
+  input (`Chat`, an existing inline prompt/draft, or an editable field),
   `v`/`V`/`Ctrl-V` enter VISUAL (character/line/block), `:` opens the
   command palette. Yanking whole units without a selection (`yy` — current
   diff line or current chat message) happens directly from NORMAL.
+  Printable text never implicitly enters INSERT from NORMAL: this prevents
+  command keys from becoming accidental draft text. Commands that create
+  fresh input enter INSERT synchronously themselves: `a`/`c` in the diff,
+  `/` for search, `:` for the command palette, and `e` on an editable
+  annotation/context field. The triggering key and any terminal input
+  already buffered after it are processed against the new mode in order.
 - **INSERT** — typing text into an input: the chat composer, an inline ask
   follow-up, a comment body, a context-editor field, search input. Keys are
   literal (including `Tab`). `Esc` returns to NORMAL. Mode toggles like
@@ -1012,12 +1023,20 @@ closed (§2.6), selection clears with an explicit status message.
 
 - The Chat and contextual Ask/Comment composers grow according to
   **wrapped visual rows**, not only explicit newline count.
-- Both composers have a safe height cap and independently scroll to keep
-  the insertion cursor visible.
+- Both composers cap their visible editor body at one third of the terminal
+  height, with a minimum three-row bordered box and a maximum twelve-row
+  bordered box. Contextual composers embedded in a smaller Review viewport
+  use the smaller available height. Content beyond that cap scrolls inside
+  the rectangle to keep the insertion cursor visible; it never overflows
+  through the border or pushes the status/progress stack off-screen.
 - `Up`/`Down` move through wrapped visual rows, including within a single
   long logical line.
 - The current internal row range is visible when content exceeds the cap.
-- `Esc` leaves Insert mode and preserves a Chat draft.
+- `Esc` leaves Insert mode and preserves a non-empty draft. In Chat the
+  sticky composer remains labeled `draft`; in Review the inline draft block
+  remains at its anchor and `i` resumes it. `Ctrl-C`, when it is not first
+  needed to stop an active response, discards that preserved draft
+  explicitly.
 - With an active Copilot response, the first `Ctrl-C` stops the response
   and preserves the draft; a subsequent `Ctrl-C` may discard the draft.
 - Contextual Ask/Comment cancellation returns to the exact prior
@@ -1211,6 +1230,19 @@ CREATE TABLE ask_messages (
   UNIQUE (annotation_id, seq)
 );
 
+-- Durable MAIN/SIDE composer outbox. Rows exist only while delivery is
+-- pending or ambiguous; acknowledged transcript history belongs to the
+-- persisted Copilot SDK session and is restored by resuming that session,
+-- rather than being duplicated into SQLite.
+CREATE TABLE chat_outbox (
+  id            TEXT PRIMARY KEY,
+  work_item_id  TEXT NOT NULL REFERENCES work_items(id),
+  text          TEXT NOT NULL,
+  kind          TEXT NOT NULL DEFAULT 'chat', -- 'chat' | 'correction'
+  lane          TEXT NOT NULL DEFAULT 'main', -- 'main' | 'side'
+  created_at    TEXT NOT NULL
+);
+
 -- App-level settings (model, ask tool scope, global base branch default, etc.)
 CREATE TABLE settings (
   key           TEXT PRIMARY KEY,
@@ -1218,11 +1250,11 @@ CREATE TABLE settings (
 );
 ```
 
-*(Changed from v2: `placements.side` is a new column — with the split
-old|new diff layout gone, unified rows need an explicit `old`/`new` tag to
-know which side's line numbers a given annotation's `line_start`/`line_end`
-refer to, since a single gutter column now shows either number depending on
-row type, §3.3.)*
+*(Changed from v2: `placements.side` is a new column. Unified rows need an
+explicit `old`/`new` tag to know which side's line numbers a given
+annotation's `line_start`/`line_end` refer to, since a single gutter column
+shows either number depending on row type. Split remains available and uses
+the same placement record, §3.2/§3.3.)*
 
 Indexes worth adding early: `versions(repo_id, version_num)`,
 `placements(version_id)`, `annotations(repo_id, submitted)`,
@@ -1366,10 +1398,10 @@ that reason.
               │  │ INLINE ││ INLINE ││ PRE- ││ PALETTE]│                              │
               │  │ BLOCK] ││ BLOCK] ││ VIEW]││autocomp.│                              │
               │  │ read-  ││ local  ││opens ││ runs :  │                              │
-              │  │ only,  ││ note,  ││browser││commands │                              │
+              │  │ only,  ││ note,  ││inline ││commands │                              │
               │  │ queued,││ no     ││        ││ (:diff expand, :model, :settings,     │
               │  │ inline ││ reply  ││        ││  :export, :versions, :snapshot,       │
-              │  │ reply  ││ until  ││        ││  :prune, :generate-context, :side,    │
+              │  │ reply  ││ until  ││overlay ││  :prune, :generate-context, :side,    │
               │  │ (§3.4) ││ export ││        ││  :main, :fork, :steer)                │
               │  └───┬────┘└───┬────┘└──┬─────┘└────┬────┘                             │
               │      │         │        │            │ resolves to one of:              │
@@ -1479,3 +1511,332 @@ that reason.
   someone actually accumulates more than one or two forks.
 - Clipboard-failure injection and native-backend detection across the
   target terminals (§7.3, §7.9) — exact backend list to test against.
+
+---
+
+## 13. Pre-Implementation Review Prompt
+
+This document went through several edit passes (an initial consolidation
+pass, then three rounds of owner corrections to diff-layout, window
+navigation, and scope). Before anyone starts implementing against it, run
+one adversarial review pass to catch anything those passes missed. Paste
+the block below to a fresh reviewing agent that has not seen the drafting
+history — it should read as a cold, independent audit, not a rubber stamp:
+
+```
+You are reviewing a from-scratch specification for a terminal code-review
+tool, before implementation starts. Read the whole document first:
+  /Users/avestabarzegar/agentmax/rq-tui/docs/spec-v2-consolidated.md
+
+Do not implement anything. Do not edit the spec yourself. Produce a
+findings report only — the owner decides what to fix.
+
+Check for, in order of what would hurt most if missed:
+
+1. Internal contradictions. This doc was revised in place several times
+   (diff layout was briefly "unified only" then restored to split+unified;
+   the Ctrl-w window set was briefly 3 windows including Chat, then cut
+   back to 2). Grep for residue: stale mockups, tables, or prose sentences
+   that still describe a rejected design. Cross-check every keybinding
+   table against the prose that explains it, and every ASCII mockup
+   against the section that describes what it depicts.
+2. Underspecified areas — anywhere a competent engineer could reasonably
+   build two different, incompatible things from the same paragraph. Name
+   the ambiguity and the two readings, don't just flag "this is vague."
+3. Scope violations against §1's explicit scope note: does anything in
+   this document redesign diff-pane navigation (h/l file move, j/k line
+   move including through inline blocks, o/O fold expand, gg/G, / search)
+   when that was explicitly declared out of scope and already correct?
+4. Completeness against the document's own stated sources (see "Document
+   status" at the top): does everything substantive from the original v2
+   spec and from chat-interaction-spec.md actually appear here, or did
+   something get silently dropped during consolidation?
+5. Data-model gaps: does every UI behavior described actually have a
+   corresponding column/table in §8, and does every §8 column get used by
+   something described elsewhere? (E.g. `placements.side`, `sessions.
+   ephemeral` — confirm both the schema and the behavior that needs them
+   are both present and consistent.)
+6. Whether the §12 Open Items list is still accurate — anything resolved
+   by a later section that's still listed as open, or vice versa.
+
+Report format: a numbered list, most-severe first. Each finding: exact
+section/line reference, what's wrong, and (for contradictions) which of
+the two conflicting statements looks like the intended final one, based on
+context. If you find nothing in a category, say so briefly — don't pad the
+report. Do not touch any file under
+/Users/avestabarzegar/agentmax/rq-tui-harness-fix (an unrelated,
+in-progress bug-fix effort lives there) or run any git commands.
+```
+
+---
+
+## 14. Observed Jank — 2026-07-30 build audit (fix list)
+
+This section is a standalone work list produced by a live audit of the
+Bazel-built binary (`bazel build //:rq-tui`, branch `abarzega/tui-wip`,
+commit `c5684cb`+WIP) on macOS, driven through tmux panes (140×40 and
+130×38) against local single-repo fixtures with a real, authenticated
+Copilot session, plus the deterministic `ui-snapshot` gallery. A reader
+should be able to fix any item below without reading anything else: each
+finding carries its own repro, the expected behavior with its spec
+section, and what actually happened.
+
+**How the audit environment was built** (reusable for regression checks):
+
+```sh
+# fixture: any git repo with working-tree changes; for fold testing use a
+# ~200-line committed file with edits near the top AND bottom so a large
+# unchanged gap sits between hunks:
+python3 -c "print('\n'.join('pub fn f%d() -> u32 { %d }' % (i,i) for i in range(200)))" > src/big.rs
+git add -A && git commit -m base   # then edit lines ~5 and ~190
+
+tmux new-session -d -s audit -x 130 -y 38 \
+  "cd <fixture> && RQ_TUI_DATA_DIR=<tmp>/data RQ_TUI_CACHE_DIR=<tmp>/cache \
+   <bazel-bin>/src/rq-tui review ."
+tmux send-keys -t audit j          # drive keys
+tmux capture-pane -t audit -p      # observe frames
+```
+
+Findings marked **[verified]** were reproduced twice (independent tester
+agent + a second controlled reproduction); unmarked ones were observed
+once and are stated with their exact repro so they can be re-confirmed
+in-place. Severity: **P1** breaks a spec'd workflow, **P2** wrong but
+usable, **P3** polish.
+
+### 14.1 P1 — broken workflows
+
+- **J1. Fold-row expansion keys `o`/`O` are dead — silent no-op.**
+  [verified] Repro: open the big-file fixture; a fold row
+  `··· 173 unchanged lines ··· (o expand 10 · O expand all)` renders
+  between hunks; put the cursor on it; press `o`, then `O`. Expected
+  (§9): `o` expands 10 more context lines toward the approach direction,
+  `O` expands the whole gap. Actual: nothing changes — no expansion, no
+  status-line feedback of any kind (which additionally violates §4.2's
+  "never silently no-ops" principle). `:diff expand` works and is the
+  current workaround, which suggests the expansion machinery exists and
+  only the key routing on fold rows is broken.
+
+- **J2. Keystrokes are dropped/misrouted while an inline composer opens.**
+  [verified, controlled repro] Repro: in the diff, press `a` (or `c`) and
+  begin typing immediately (within ~0.5s). Expected (§3.4, §4.1): `a`/`c`
+  drop you into INSERT; everything typed lands in the composer. Actual:
+  keys typed before the composer finishes opening are consumed by NORMAL
+  mode — typing `reply with exactly the word pineapple…` immediately
+  after `a` produced a composer containing only `ctly the word
+  pineapple…` (the first 14 characters were interpreted as NORMAL-mode
+  commands, i.e. they may have *executed arbitrary bindings*, not just
+  vanished). With a 1.5s pause after `a`, the identical input arrives
+  intact. This is a mode-transition race: the reducer should treat the
+  transition into INSERT as synchronous with the keypress that requested
+  it, or buffer input during the transition. Any fast typist hits this on
+  every single ask/comment.
+
+- **J3. `:generate-context` never presents the editable draft buffer.**
+  Repro: in a local Work Item run `:generate-context`; the screen shows
+  "Generate Context — drafting…" / "Waiting for the read-only agent…" and
+  agent prose begins, but after 30+s no Title/What/Why/How/
+  Considerations/Alternatives fields ever appear; after closing the
+  waiting screen with `q` the status bar says "Context draft ready; edit
+  or accept it" — yet there is no editor to interact with anywhere.
+  Expected (§2.7, §3.9): the drafted structure is shown in an editable
+  buffer (`e` edit field, `a` accept & attach, `r` regenerate, `q`
+  discard) before being attached. The generation appears to complete;
+  the presentation/route into the §3.9 editor screen is what's missing
+  or mis-wired.
+
+- **J4. Pinned snapshots don't appear in the Version History Picker.**
+  [verified] Repro: `:snapshot` (status confirms "Pinned snapshot s1"),
+  then `:versions`. Expected (§2.3, §3.8): "Snapshots appear alongside
+  remote versions for local repos" — an `s1` row with its annotation
+  counts. Actual: the picker lists only `v0` (`Version History · 1-1/1`).
+  Snapshot creation works (`:prune` even counts the versions), so this is
+  the picker's query filtering out `kind='snapshot'` rows, not a storage
+  failure.
+
+### 14.2 P2 — wrong but usable
+
+- **J5. Ask blocks have no in-block follow-up prompt row.** [verified]
+  Repro: `a`, submit a question, wait for the streamed reply. Expected
+  (§3.4 mockup): after the reply, "a fresh `❯` prompt row for a
+  follow-up" inside the same block, so the block reads as an ongoing
+  sub-conversation. Actual: the block closes after the reply
+  (question + 🤖 answer only). Follow-ups DO work — pressing `i` with the
+  cursor on the block opens an "Ask follow-up" composer — but that
+  composer renders as a *separate* bordered block below, and nothing in
+  the closed block advertises that `i` does this. Fix is presentational:
+  render the persistent `❯` prompt row in-block (or an equivalent
+  affordance) and merge the follow-up composer into the block.
+
+- **J6. `gm` markdown preview renders raw markup instead of styled text.**
+  Two related failures, one shared renderer suspected:
+  (a) previewing a markdown *file* (cursor in `README.md`, `gm`) shows
+  literal `# README` / `## Overview` heading markers instead of styled
+  headings; (b) previewing an *annotation* whose text contains
+  `**bold**` strips the `**` but applies no bold styling — the semantics
+  are parsed, the styling is dropped. Expected (§3.11): semantic
+  rendering — "headings, lists, fenced code with syntax highlighting" —
+  reusing the Chat transcript renderer. Note the deterministic gallery's
+  chat `markdown` state shows the same literal `# Review result` heading,
+  so the gap is in (or upstream of) the shared renderer's heading/em
+  styling, not unique to the overlay.
+
+- **J7. Chat pipe-table rendering is garbled.** From the `ui-snapshot
+  --state markdown` gallery frame: the header/body rows render but the
+  separator row comes out as `┼ ·─── ┼ ───· ┼` — a mangled glyph mix,
+  columns unaligned with the rows above/below. Expected: aligned pipe
+  tables (README claims "renders aligned tables"; §7.2 requires selection
+  to work over them, which presupposes sane layout).
+
+- **J8. `yy` in Chat copies 0 bytes.** [verified] Repro: in Chat NORMAL,
+  cursor on a message text row, press `yy`. Expected (§9): "yank the
+  whole current message"; status reports bytes + backend. Actual:
+  status reads "Copied 0 bytes with pbcopy" — repeatable across rows and
+  transcript positions. Visual-mode `y` works correctly (e.g. "Copied 5
+  bytes with pbcopy"), so the defect is in `yy`'s message-extent
+  resolution, not the clipboard path.
+
+- **J9. Diff search matches are not visually highlighted.** Repro: `/`,
+  type `session`, Enter. The cursor jumps to the matching line but the
+  matched text itself gets no highlight/emphasis, and after the last
+  match `n` reports "Pattern not found" rather than wrapping or saying
+  "wrapped to first match" (§9 search table; spec says `n`/`N` are
+  next/prev *within the window* — either wrap or an explicit
+  no-more-matches message, but "Pattern not found" after a successful
+  match is wrong either way).
+
+- **J10. Fold-row label is rendered twice on the same row.** [verified]
+  In unified layout the fold row reads
+  `··· 173 unchanged lines ···  ··· 173 unchanged lines ··· (o expand 10 · O expand all)`
+  — the label is duplicated (likely the split-layout's two-column fold
+  row being emitted into the single unified stream). Expected (§9): one
+  label per fold row.
+
+- **J11. Quiet-vs-disconnected states are conflated in diagnostics.**
+  From the `ui-snapshot --state quiet` gallery frame: the same frame
+  shows `⚠ TOOL 23s`, "no SDK events for 23s", **and** `connected=false`.
+  Expected (§7.6): "A quiet-but-connected interval is distinguishable
+  from a disconnect." If this frame depicts quiet-but-connected,
+  `connected=false` is wrong; if it depicts disconnect, the state name
+  `quiet` is wrong. Needs a decision + a live disconnect test either way.
+
+- **J12. Model picker stage numbering lies when a stage is skipped.**
+  [verified] With the SDK reporting one model ("Auto", "fixed
+  reasoning"), the picker correctly skips the reasoning stage (§7.8 —
+  never offer unsupported values) but jumps from "step 1/3" straight to
+  "step 3/3" with no renumbering or explanation. Cosmetic, but it reads
+  as a broken wizard. Renumber dynamically ("step 2/2") or show the
+  skipped stage as pre-resolved.
+
+### 14.3 P3 — polish
+
+- **J13. The diff pane's first row is a layout marker styled like
+  content.** [verified] `▶ unified` renders as the first scrollable-
+  looking row of the diff stream, above the file header, using the same
+  chevron glyph as the cursor — it reads as a selectable row / second
+  cursor. Expected (§3.3): layout + position info live in the pane
+  header (`unified · ln 5/12`).
+
+- **J14. Focus breadcrumb format is inconsistent.** Header shows
+  `Focus: diff` in some states and `Focus: files → diff` in others.
+  §4.2 specifies the breadcrumb form always.
+
+- **J15. Chat footer doesn't advertise `Tab → Review`.** §7.1: "The
+  footer always advertises the reverse action." Actual Chat footer shows
+  `i edit · : commands` (NORMAL) / composer hints (INSERT); Tab's
+  round-trip is never surfaced.
+
+- **J16. Review chrome deviates from the §3.3 reference layout.** No
+  bordered panes with titles in Review (plain horizontal rules instead;
+  compare §3.3's mockup), file-position info in the top status line
+  rather than pane titles, and `▶` rather than the spec's `❯` as "the
+  one selection convention used everywhere." Decide whether the spec
+  mockups or the current chrome is normative and align the other.
+
+- **J17. Tiny-terminal notice clips its own title.** At 20×5 the
+  minimum-size box renders `┌ Terminal too smal┐`. Content is right
+  (needs ≥ 40×9); the box/title just doesn't fit itself.
+
+- **J18. No minimum-size messaging in the 40×9–≈50×15 band.** At 44×14
+  the app stays functional but visibly truncates status text and titles
+  with no indication it's below a comfortable size. The hard minimum
+  (40×9) triggers the notice; consider whether the spec's §7.9 "minimum
+  supported terminal size" should also define a degraded-but-supported
+  band, or raise the minimum.
+
+- **J19. Esc on an inline composer keeps a draft block visible in the
+  diff.** Behavior: `Esc` shows "Draft kept · i resumes · Ctrl-C
+  discards" and the draft block stays rendered inline; `Ctrl-C` is the
+  actual discard. This is self-consistent and matches Chat's Esc
+  semantics (§7.5), but testers repeatedly read it as "cancel failed"
+  because §3.4/§7.5 never say what happens to the *block* on Esc. Spec
+  gap — see errata E3 below; either behavior is fine once written down.
+
+- **J20. Resumed chat drafts read as "concatenation."** Esc preserves a
+  Chat draft; `i` resumes it; typing continues the old draft — all per
+  §7.5 — but a tester (and plausibly a user) who forgot the draft
+  experienced their next message as merged with stale text. Consider a
+  distinct visual treatment for a resumed non-empty draft (e.g. a
+  "draft" badge on the composer, already partially present via status
+  text).
+
+### 14.4 What was audited and passed
+
+For a low-context reader's calibration, these areas were exercised and
+behaved per spec: all Review navigation (`j`/`k` incl. through inline
+blocks, `h`/`l`, `gg`/`G`, paging), `t` toggle, the full `Ctrl-w` chord
+UX (prompt, timeout report, dead-end messages), rapid-input stability,
+comment/ask block creation and inline rendering in both layouts
+(full-width blocks in split, persistence across `:diff` switches), block
+traversal, `za` fold, `dd`+`u` undo toast, `:export` (batch into MAIN
+with visible acknowledgment), Chat full-screen model (`Tab`/`gc`/`gr`),
+composer wrap/growth/height-cap, queueing + `:queue` inspector, visual-
+mode selection (char/line/block) with backend-reported copy, word/line
+motions, rendered-row scrolling, streaming with durable typed activity,
+bullet/fenced-code chat rendering, SIDE/MAIN lifecycle (isolation,
+explicit progress text, second-SIDE rejection, `/main` restore, MAIN
+memory), resize storms incl. during streaming, kill/restart history
+resume without replay, CLI argument validation, `q`-vs-`:q`/`:q!`
+semantics, unknown-command errors, `:settings` (all §3.7 rows present),
+`:prune`, non-markdown `gm` hint, `*` search, file-tree fuzzy filter,
+per-window search state.
+
+**Not yet audited** (needs a follow-up pass): remote-PR (`--pr`) and
+multi-repo Work Items (version fetch/carry-forward/re-anchor UX,
+synthetic roots), `]a`/`[a` wrap-across-files with many blocks, `e`
+full edit round-trip, `:steer`, `:compact`, `:fork`, OSC 52 / copy-
+failure paths, `≈` ambiguous-anchor and outdated-placement rendering,
+startup pending-delivery recovery prompt, and the browser preview
+fallback.
+
+### 14.5 Spec errata found during this audit
+
+Fix these in this document — they will mislead exactly the low-context
+implementer this section targets:
+
+- **E1.** §8's change note for `placements.side` still says "with the
+  split old|new diff layout **gone**" — split was restored in §3.2 and
+  stays. The column's rationale (unified's single gutter needs a side
+  tag) survives; the clause about split's removal is residue from the
+  rejected draft and must go.
+- **E2.** §10's FSM still labels the `gm` box "[MD PREVIEW] opens
+  browser" — §3.11 made inline the default with browser as fallback.
+  Update the FSM box.
+- **E3.** Neither §3.4 nor §7.5 says what happens to an inline
+  ask/comment *block* on `Esc` (kept as resumable draft vs removed).
+  The build keeps it ("Draft kept"); testers read the spec as promising
+  removal. Write the intended behavior down (see J19).
+- **E4.** §7.5's composer "safe height cap" has no value (fraction of
+  terminal height? fixed rows?). The build picked one; the spec should
+  state it.
+- **E5.** §8 has no table for MAIN Chat transcript messages/outbox,
+  yet §6.2 assigns delivery states to "every outbound message"
+  including chat prompts, and §7.1 requires restoring MAIN history.
+  The implementation solved this; the schema section should document
+  the table(s) it actually uses.
+- **E6.** §3.10 scopes `:prune` to rows "with at least one **open
+  event** or annotation" — there is no events table in §8;
+  `last_opened_at` columns are the real mechanism. Align the wording.
+- **E7.** §4.1's "`i` (or **starting to type** in an input context)
+  enters INSERT" never defines which keys auto-enter INSERT where.
+  This ambiguity is load-bearing: it's the same transition J2's race
+  lives in. Specify the exact trigger set per context.
