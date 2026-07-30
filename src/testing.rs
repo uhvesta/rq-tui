@@ -1988,7 +1988,8 @@ mod tests {
 
         let frame = harness.render().unwrap();
         assert!(frame.contains("INSERT"));
-        assert!(frame.contains("rows "));
+        assert!(frame.contains("Enter send"));
+        assert!(frame.contains("Esc keep"));
         let bottom = frame.lines().last().unwrap_or_default();
         assert!(bottom.starts_with('└'), "{frame}");
         assert!(bottom.ends_with('┘'), "{frame}");
@@ -2052,6 +2053,40 @@ mod tests {
         assert!(chat.render().unwrap().contains("VISUAL CHAR"));
         chat.key(key(KeyCode::Char('y'))).unwrap();
         assert_eq!(chat.last_yank(), Some("hello\n\nstreamed answer"));
+        assert!(chat.render().unwrap().contains("Yanked 22 bytes"));
+    }
+
+    #[test]
+    fn chat_character_visual_at_latest_selects_the_final_source_character() {
+        let mut chat =
+            TuiHarness::from_unified_diff("latest-character", workflow_diff(), 100, 24).unwrap();
+        chat.key(key(KeyCode::Tab)).unwrap();
+        chat.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut chat, "prompt");
+        chat.key(key(KeyCode::Enter)).unwrap();
+        chat.stream_next_response(&["Short answer to copy"])
+            .unwrap();
+        chat.render().unwrap();
+        chat.key(key(KeyCode::Char('G'))).unwrap();
+        chat.key(key(KeyCode::Char('v'))).unwrap();
+        assert!(chat.selected_cell_count().unwrap() >= 1);
+        chat.key(key(KeyCode::Char('y'))).unwrap();
+        assert_eq!(chat.last_yank(), Some("y"));
+    }
+
+    #[test]
+    fn minimum_chat_latest_row_contains_source_text_instead_of_a_trailing_spacer() {
+        let mut chat =
+            TuiHarness::from_unified_diff("minimum-latest", workflow_diff(), 40, 9).unwrap();
+        chat.key(key(KeyCode::Tab)).unwrap();
+        chat.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut chat, "prompt");
+        chat.key(key(KeyCode::Enter)).unwrap();
+        chat.stream_next_response(&["latest visible answer"])
+            .unwrap();
+        chat.key(key(KeyCode::Char('G'))).unwrap();
+        let frame = chat.render().unwrap();
+        assert!(frame.contains("answer"), "{frame}");
     }
 
     #[test]
@@ -2387,6 +2422,21 @@ mod tests {
         let queue = harness.render().unwrap();
         assert!(queue.contains("1 pending"));
         assert!(!queue.contains("second queued follow-up"));
+
+        let mut narrow =
+            TuiHarness::from_unified_diff("narrow queue", workflow_diff(), 40, 9).unwrap();
+        narrow.key(key(KeyCode::Tab)).unwrap();
+        narrow.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut narrow, "queued prompt");
+        narrow.key(key(KeyCode::Enter)).unwrap();
+        narrow.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut narrow, "queue");
+        narrow.key(key(KeyCode::Enter)).unwrap();
+        let narrow_queue = narrow.render().unwrap();
+        assert!(narrow_queue.contains("e edit"));
+        assert!(narrow_queue.contains("d cancel"));
+        assert!(narrow_queue.contains("s stop"));
+        assert!(narrow_queue.contains("· q"));
     }
 
     #[test]
@@ -2655,10 +2705,20 @@ mod tests {
         harness.key(key(KeyCode::Enter)).unwrap();
         harness.render().unwrap();
         let live_bottom = harness.chat_scroll();
+        let viewport = harness.state.chat_viewport_rows.max(1);
         harness.key(key(KeyCode::Up)).unwrap();
-        harness.key(key(KeyCode::Up)).unwrap();
-        harness.key(key(KeyCode::Up)).unwrap();
-        assert!(harness.chat_scroll() < live_bottom);
+        assert_eq!(harness.chat_scroll(), live_bottom.saturating_sub(1));
+        let before_page = harness.chat_scroll();
+        harness.key(key(KeyCode::PageUp)).unwrap();
+        assert_eq!(harness.chat_scroll(), before_page.saturating_sub(viewport));
+        let before_half_page = harness.chat_scroll();
+        harness
+            .key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(
+            harness.chat_scroll(),
+            before_half_page.saturating_add((viewport / 2).max(1))
+        );
         let paused = harness.render().unwrap();
         assert!(paused.contains("rows "));
         harness.key(key(KeyCode::Char('G'))).unwrap();
@@ -2787,6 +2847,24 @@ mod tests {
         assert!(diagnostics.contains("last SDK event"));
         assert!(diagnostics.contains("outbound id"));
 
+        harness.resize(40, 9);
+        let narrow_diagnostics = harness.render().unwrap();
+        assert!(narrow_diagnostics.contains("j/k scroll"));
+        assert!(narrow_diagnostics.contains("s stop"));
+        assert!(narrow_diagnostics.contains("q/Esc back"));
+        let mut activity_visible = narrow_diagnostics.contains("Running security");
+        for _ in 0..16 {
+            if activity_visible {
+                break;
+            }
+            harness.key(key(KeyCode::Char('j'))).unwrap();
+            activity_visible = harness.render().unwrap().contains("Running security");
+        }
+        assert!(
+            activity_visible,
+            "compact timeline activity was unreachable"
+        );
+
         let mut standard =
             TuiHarness::from_unified_diff("standard-liveness", workflow_diff(), 72, 18).unwrap();
         standard.key(key(KeyCode::Tab)).unwrap();
@@ -2801,6 +2879,8 @@ mod tests {
         let standard_frame = standard.render().unwrap();
         assert!(standard_frame.contains("running review skill: exhaustive audit"));
         assert!(standard_frame.contains("· q0"));
+        standard.resize(40, 9);
+        assert!(standard.render().unwrap().contains("running review skill"));
     }
 
     #[test]

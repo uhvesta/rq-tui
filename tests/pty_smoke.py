@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import errno
 import fcntl
 import os
@@ -17,12 +18,15 @@ import sys
 import tempfile
 import termios
 import time
+import unicodedata
 from pathlib import Path
 
 
 ANSI_RE = re.compile(
     rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\a]*(?:\a|\x1b\\))"
 )
+OSC52_RE = re.compile(rb"\x1b\]52;c;([A-Za-z0-9+/=]*)\x07")
+CHAT_ROWS_RE = re.compile(r"rows (\d+)-(\d+)/(\d+)")
 
 
 def git(repo: Path, *args: str) -> None:
@@ -67,6 +71,198 @@ def terminal_text(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def character_width(character: str) -> int:
+    if unicodedata.combining(character) or character in ("\u200d", "\ufe0f"):
+        return 0
+    return 2 if unicodedata.east_asian_width(character) in ("W", "F") else 1
+
+
+class TerminalScreen:
+    """Minimal ANSI screen model for Crossterm/Ratatui differential frames."""
+
+    def __init__(self, columns: int = 80, rows: int = 24) -> None:
+        self.columns = columns
+        self.rows = rows
+        self.cells = [[" " for _ in range(columns)] for _ in range(rows)]
+        self.row = 0
+        self.column = 0
+        self.saved = (0, 0)
+        self.pending = bytearray()
+
+    def resize(self, columns: int, rows: int) -> None:
+        resized = [[" " for _ in range(columns)] for _ in range(rows)]
+        for row in range(min(self.rows, rows)):
+            for column in range(min(self.columns, columns)):
+                resized[row][column] = self.cells[row][column]
+        self.columns = columns
+        self.rows = rows
+        self.cells = resized
+        self.row = min(self.row, rows - 1)
+        self.column = min(self.column, columns - 1)
+        self.saved = (
+            min(self.saved[0], rows - 1),
+            min(self.saved[1], columns - 1),
+        )
+
+    def clear(self) -> None:
+        self.cells = [[" " for _ in range(self.columns)] for _ in range(self.rows)]
+        self.row = 0
+        self.column = 0
+
+    def text(self) -> str:
+        return "\n".join("".join(row).rstrip() for row in self.cells)
+
+    @staticmethod
+    def _parameters(raw: bytes) -> list[int]:
+        text = raw.decode("ascii", errors="ignore").lstrip("?<>")
+        result = []
+        for value in text.split(";"):
+            try:
+                result.append(int(value) if value else 0)
+            except ValueError:
+                result.append(0)
+        return result or [0]
+
+    def _csi(self, parameters: bytes, final: int) -> None:
+        values = self._parameters(parameters)
+        command = chr(final)
+        amount = values[0] or 1
+        if command in ("H", "f"):
+            self.row = min(self.rows - 1, max(0, (values[0] or 1) - 1))
+            self.column = min(
+                self.columns - 1,
+                max(0, (values[1] if len(values) > 1 else 1) - 1),
+            )
+        elif command == "A":
+            self.row = max(0, self.row - amount)
+        elif command == "B":
+            self.row = min(self.rows - 1, self.row + amount)
+        elif command == "C":
+            self.column = min(self.columns - 1, self.column + amount)
+        elif command == "D":
+            self.column = max(0, self.column - amount)
+        elif command == "G":
+            self.column = min(self.columns - 1, max(0, amount - 1))
+        elif command == "d":
+            self.row = min(self.rows - 1, max(0, amount - 1))
+        elif command == "J":
+            if values[0] in (2, 3):
+                self.clear()
+            elif values[0] == 0:
+                for column in range(self.column, self.columns):
+                    self.cells[self.row][column] = " "
+                for row in range(self.row + 1, self.rows):
+                    self.cells[row] = [" " for _ in range(self.columns)]
+        elif command == "K":
+            if values[0] == 1:
+                for column in range(0, self.column + 1):
+                    self.cells[self.row][column] = " "
+            elif values[0] == 2:
+                self.cells[self.row] = [" " for _ in range(self.columns)]
+            else:
+                for column in range(self.column, self.columns):
+                    self.cells[self.row][column] = " "
+        elif command == "s":
+            self.saved = (self.row, self.column)
+        elif command == "u":
+            self.row, self.column = self.saved
+            self.row = min(self.row, self.rows - 1)
+            self.column = min(self.column, self.columns - 1)
+        elif command == "h" and parameters.startswith(b"?1049"):
+            self.clear()
+
+    def _write(self, character: str) -> None:
+        width = character_width(character)
+        if width == 0:
+            if self.column > 0:
+                self.cells[self.row][self.column - 1] += character
+            return
+        if self.column >= self.columns:
+            self.column = 0
+            self.row = min(self.rows - 1, self.row + 1)
+        self.cells[self.row][self.column] = character
+        if width == 2 and self.column + 1 < self.columns:
+            self.cells[self.row][self.column + 1] = ""
+        self.column += width
+
+    def feed(self, data: bytes) -> None:
+        if self.pending:
+            data = bytes(self.pending) + data
+            self.pending.clear()
+        index = 0
+        while index < len(data):
+            byte = data[index]
+            if byte == 0x1B:
+                if index + 1 >= len(data):
+                    self.pending.extend(data[index:])
+                    return
+                kind = data[index + 1]
+                if kind == ord("["):
+                    end = index + 2
+                    while end < len(data) and not 0x40 <= data[end] <= 0x7E:
+                        end += 1
+                    if end >= len(data):
+                        self.pending.extend(data[index:])
+                        return
+                    self._csi(data[index + 2 : end], data[end])
+                    index = end + 1
+                    continue
+                if kind == ord("]"):
+                    end = index + 2
+                    terminated = False
+                    while end < len(data):
+                        if data[end] == 0x07:
+                            end += 1
+                            terminated = True
+                            break
+                        if data[end : end + 2] == b"\x1b\\":
+                            end += 2
+                            terminated = True
+                            break
+                        end += 1
+                    if not terminated:
+                        self.pending.extend(data[index:])
+                        return
+                    index = end
+                    continue
+                if kind == ord("7"):
+                    self.saved = (self.row, self.column)
+                elif kind == ord("8"):
+                    self.row, self.column = self.saved
+                    self.row = min(self.row, self.rows - 1)
+                    self.column = min(self.column, self.columns - 1)
+                index += 2
+                continue
+            if byte == 0x0D:
+                self.column = 0
+                index += 1
+                continue
+            if byte == 0x0A:
+                self.row = min(self.rows - 1, self.row + 1)
+                index += 1
+                continue
+            if byte == 0x08:
+                self.column = max(0, self.column - 1)
+                index += 1
+                continue
+            if byte < 0x20 or byte == 0x7F:
+                index += 1
+                continue
+            length = 1
+            if byte & 0xE0 == 0xC0:
+                length = 2
+            elif byte & 0xF0 == 0xE0:
+                length = 3
+            elif byte & 0xF8 == 0xF0:
+                length = 4
+            if index + length > len(data):
+                self.pending.extend(data[index:])
+                return
+            character = data[index : index + length].decode("utf-8", errors="replace")
+            self._write(character)
+            index += length
+
+
 class Child:
     def __init__(self, binary: Path, repo: Path, data_dir: Path) -> None:
         self.pid, self.master = pty.fork()
@@ -79,6 +275,8 @@ class Child:
                     "RQ_TUI_DATA_DIR": str(data_dir / "data"),
                     "RQ_TUI_CACHE_DIR": str(data_dir / "cache"),
                     "RQ_TUI_DATABASE": str(data_dir / "data" / "review.db"),
+                    "RQ_TUI_CLIPBOARD": "osc52",
+                    "RQ_TUI_CONTROLLED_AUDIT_EVENTS": "1",
                     "TERM": "xterm-256color",
                 }
             )
@@ -90,6 +288,11 @@ class Child:
             raise AssertionError("execve returned")
         self.output = bytearray()
         self.status: int | None = None
+        self.screen = TerminalScreen()
+
+    def resize(self, columns: int, rows: int) -> None:
+        set_size(self.master, columns, rows)
+        self.screen.resize(columns, rows)
 
     def poll(self) -> int | None:
         if self.status is not None:
@@ -113,7 +316,9 @@ class Child:
         if not ready:
             return
         try:
-            self.output.extend(os.read(self.master, 65536))
+            chunk = os.read(self.master, 65536)
+            self.output.extend(chunk)
+            self.screen.feed(chunk)
         except OSError as error:
             if error.errno != errno.EIO:
                 raise
@@ -143,6 +348,76 @@ class Child:
                 raise AssertionError(self.failure(f"process exited {status} before {marker!r}"))
         raise AssertionError(self.failure(f"timed out waiting for new {marker!r}"))
 
+    def wait_for_screen(self, marker: str, timeout: float = 8.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.read(0.1)
+            if marker in self.screen.text():
+                return
+            status = self.poll()
+            if status is not None:
+                raise AssertionError(
+                    self.failure(f"process exited {status} before screen marker {marker!r}")
+                )
+        raise AssertionError(self.failure(f"timed out waiting for screen marker {marker!r}"))
+
+    def press_until_screen(
+        self, marker: str, key: bytes = b"j", max_steps: int = 32
+    ) -> None:
+        for _ in range(max_steps + 1):
+            self.read(0.1)
+            if marker in self.screen.text():
+                return
+            self.send(key)
+        raise AssertionError(
+            self.failure(f"screen marker {marker!r} was not reachable by scrolling")
+        )
+
+    def wait_for_chat_rows(
+        self,
+        predicate=lambda _rows: True,
+        timeout: float = 8.0,
+    ) -> tuple[int, int, int]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.read(0.1)
+            matches = CHAT_ROWS_RE.findall(self.screen.text())
+            if matches:
+                rows = tuple(int(value) for value in matches[-1])
+                if predicate(rows):
+                    return rows
+            status = self.poll()
+            if status is not None:
+                raise AssertionError(
+                    self.failure(f"process exited {status} before a Chat row redraw")
+                )
+        raise AssertionError(self.failure("timed out waiting for a matching Chat row redraw"))
+
+    def assert_screen_stays(
+        self,
+        required: tuple[str, ...],
+        forbidden: tuple[str, ...],
+        duration: float,
+    ) -> None:
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            self.read(0.1)
+            text = self.screen.text()
+            missing = tuple(marker for marker in required if marker not in text)
+            present = tuple(marker for marker in forbidden if marker in text)
+            if missing or present:
+                raise AssertionError(
+                    self.failure(
+                        f"screen did not stay quiescent; missing={missing!r}, "
+                        f"forbidden={present!r}"
+                    )
+                )
+            status = self.poll()
+            if status is not None:
+                raise AssertionError(
+                    self.failure(f"process exited {status} during quiescence check")
+                )
+
     def wait_for_exit(self, timeout: float = 8.0) -> int:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -155,7 +430,10 @@ class Child:
 
     def failure(self, reason: str) -> str:
         text = terminal_text(bytes(self.output))
-        return f"{reason}\n--- terminal tail ---\n{text[-6000:]}"
+        return (
+            f"{reason}\n--- current screen ---\n{self.screen.text()}"
+            f"\n--- terminal tail ---\n{text[-6000:]}"
+        )
 
     def close(self) -> None:
         status = self.poll()
@@ -172,10 +450,9 @@ class Child:
                     os.kill(self.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                try:
-                    os.waitpid(self.pid, 0)
-                except ChildProcessError:
-                    pass
+                deadline = time.monotonic() + 1.0
+                while self.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
         try:
             os.close(self.master)
         except OSError:
@@ -193,7 +470,7 @@ def main() -> int:
         old_repo = make_fixture(root, "old-fixture")
         setup = Child(binary, old_repo, app_root)
         try:
-            set_size(setup.master, 80, 18)
+            setup.resize(80, 18)
             setup.wait_for("Review", timeout=8)
             setup.wait_for("COPILOT MAIN", timeout=8)
             setup.send(b":q\r")
@@ -205,7 +482,7 @@ def main() -> int:
         repo = make_fixture(root)
         child = Child(binary, repo, app_root)
         try:
-            set_size(child.master, 100, 24)
+            child.resize(100, 24)
             child.wait_for("Review", timeout=8)
             child.wait_for("COPILOT MAIN", timeout=8)
             if child.poll() is not None:
@@ -214,7 +491,7 @@ def main() -> int:
             # Resize the real terminal and require a post-resize redraw. The
             # ioctl is deliberately performed on the PTY master, so this also
             # exercises the child terminal's SIGWINCH path.
-            set_size(child.master, 72, 18)
+            child.resize(72, 18)
             size = struct.unpack("HHHH", fcntl.ioctl(child.master, termios.TIOCGWINSZ, bytes(8)))
             if size[:2] != (18, 72):
                 raise AssertionError(f"PTY resize was not applied: {size[:2]}")
@@ -227,9 +504,9 @@ def main() -> int:
             # call. The source text remains present after the smaller layout.
             child.send(b"j")
             child.send(b"v")
-            child.wait_for("rows 2-2", timeout=4)
+            child.wait_for_screen("rows 2-2", timeout=4)
             child.send(b"\x1b")
-            child.wait_for("NORMAL", timeout=4)
+            child.wait_for_screen("NORMAL", timeout=4)
 
             # The compiled TUI's prune screen must visibly disable the open
             # Work Item and retain the live Copilot progress surface.
@@ -252,14 +529,169 @@ def main() -> int:
             # preserved draft.
             child.send(b"\t")
             child.wait_for("Chat", timeout=4)
-            set_size(child.master, 42, 9)
-            child.read(0.3)
+
+            # PTY-24/25: keep accepting input while the controlled agent is
+            # active, expose the background FIFO plus typed activity, and
+            # prove that the compiled transcript scrolls by rendered rows.
+            first_prompt = (
+                b"First alpha beta gamma delta epsilon zeta eta theta iota kappa "
+                b"lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega "
+                b"repeated context keeps this first question tall enough for several "
+                b"terminal rows while Copilot inspects the selected source."
+            )
+            second_prompt = (
+                b"Second queued question remains editable and cancellable while the "
+                b"first controlled response is active; this deliberately wraps across "
+                b"many more rendered rows so page and mouse scrolling have room to move."
+            )
+            child.send(b"i" + first_prompt + b"\r")
+            child.wait_for_screen("Using read_file", timeout=4)
+            child.wait_for_screen("Finished read_file", timeout=4)
+            child.send(b"i" + second_prompt + b"\r")
+            child.wait_for_screen("queued", timeout=4)
+
+            child.send(b":queue\r")
+            child.wait_for_screen("Copilot queue", timeout=4)
+            child.wait_for_screen("2 pending", timeout=4)
+            child.wait_for_screen("ACTIVE", timeout=4)
+            child.wait_for_screen("QUEUED", timeout=4)
+            child.send(b"q")
+            child.wait_for_screen("Chat", timeout=4)
+
+            child.send(b":agent-status\r")
+            child.wait_for_screen("COPILOT SDK LIVENESS", timeout=4)
+            child.wait_for_screen("outbound id:", timeout=4)
+            child.press_until_screen("Running review skill: exhaustive audit")
+            child.press_until_screen("Subagent inspecting terminal edge cases")
+            child.press_until_screen("Retrying transient controlled operation")
+            child.wait_for_screen("q/Esc return", timeout=4)
+            child.send(b"q")
+            child.wait_for_screen("Chat", timeout=4)
+
+            child.resize(44, 14)
+            narrow_bottom = child.wait_for_chat_rows(
+                lambda rows: rows[2] > 12, timeout=4
+            )
+            child.send(b"\x1b[A")
+            arrow_up = child.wait_for_chat_rows(
+                lambda rows: rows[0] < narrow_bottom[0],
+                timeout=4,
+            )
+            child.send(b"\x1b[5~")
+            page_up = child.wait_for_chat_rows(
+                lambda rows: rows[0] < arrow_up[0],
+                timeout=4,
+            )
+            child.send(b"\x1b[<65;10;5M")
+            mouse_down = child.wait_for_chat_rows(
+                lambda rows: rows[0] > page_up[0],
+                timeout=4,
+            )
+            child.send(b"\x1b[<64;10;5M")
+            child.wait_for_chat_rows(
+                lambda rows: rows[0] < mouse_down[0],
+                timeout=4,
+            )
+
+            # Select five exact source characters from the first message and
+            # force OSC 52 so the PTY can decode and verify the payload.
+            child.send(b"ggvllll")
+            child.wait_for_screen("VISUAL CHAR", timeout=4)
+            before_yank = len(child.output)
+            child.send(b"y")
+            child.wait_for_screen("Sent 5 bytes via OSC 52", timeout=4)
+            payloads = OSC52_RE.findall(bytes(child.output[before_yank:]))
+            if not payloads:
+                raise AssertionError(child.failure("semantic yank emitted no OSC 52 payload"))
+            copied = base64.b64decode(payloads[-1], validate=True)
+            if copied != b"First":
+                raise AssertionError(f"unexpected semantic yank payload: {copied!r}")
+
+            # Line mode is inclusive and copies the exact semantic source row
+            # with one hard newline, never the Chat border or soft-wrap cells.
+            before_line_yank = len(child.output)
+            child.send(b"ggVy")
+            child.wait_for_screen("Sent 39 bytes via OSC 52", timeout=4)
+            line_payloads = OSC52_RE.findall(bytes(child.output[before_line_yank:]))
+            if not line_payloads:
+                raise AssertionError(child.failure("line yank emitted no OSC 52 payload"))
+            line_copy = base64.b64decode(line_payloads[-1], validate=True)
+            expected_line = b"First alpha beta gamma delta epsilon z\n"
+            if line_copy != expected_line:
+                raise AssertionError(f"unexpected semantic line yank: {line_copy!r}")
+
+            child.send(b"G")
+            child.wait_for_chat_rows(
+                lambda rows: rows[1] == rows[2],
+                timeout=4,
+            )
+            child.resize(100, 24)
+            child.wait_for_chat_rows(
+                lambda rows: rows[2] < narrow_bottom[2],
+                timeout=4,
+            )
+
+            # Exercise selection painting after a large streamed delta, then
+            # prove G lands on visible latest source rather than only a
+            # trailing row number.
+            child.wait_for_screen("audit-token-349", timeout=8)
+            before_long_yank = len(child.output)
+            child.send(b"ggvG")
+            child.wait_for_screen("VISUAL CHAR", timeout=4)
+            child.send(b"y")
+            child.wait_for_screen("via OSC 52", timeout=4)
+            long_payloads = OSC52_RE.findall(bytes(child.output[before_long_yank:]))
+            if not long_payloads:
+                raise AssertionError(child.failure("long Visual yank emitted no OSC 52 payload"))
+            long_copy = base64.b64decode(long_payloads[-1], validate=True)
+            if not long_copy.startswith(b"First ") or b"audit-token-349" not in long_copy:
+                raise AssertionError(
+                    f"long Visual yank missed semantic endpoints: "
+                    f"{long_copy[:32]!r} ... {long_copy[-64:]!r}"
+                )
+            child.send(b"G")
+            child.wait_for_chat_rows(lambda rows: rows[1] == rows[2], timeout=4)
+            child.wait_for_screen("audit-token-349", timeout=4)
+
+            # No events after the large delta should become visibly quiet
+            # rather than looking frozen. Ctrl-C then stops only the active
+            # response; the waiting prompt remains independently cancellable.
+            child.wait_for_screen("quiet for", timeout=8)
+            child.send(b"\x03")
+            child.wait_for_screen("STOPPING", timeout=4)
+            child.wait_for_screen("response cancelled", timeout=4)
+            child.send(b":queue\r")
+            child.wait_for_screen("1 pending", timeout=4)
+            child.wait_for_screen("QUEUED", timeout=4)
+            child.send(b"d")
+            child.wait_for_screen("No active or queued questions", timeout=4)
+            child.send(b"q")
+            child.wait_for_screen("Chat", timeout=4)
+            child.assert_screen_stays(
+                required=("response cancelled",),
+                forbidden=(
+                    "◐ streaming",
+                    " · active",
+                    " · queued",
+                    "CONNECTING",
+                    "QUEUED",
+                    "RESPONDING",
+                    "STOPPING",
+                    "THINKING",
+                    "TOOL",
+                ),
+                duration=4,
+            )
+
+            child.resize(42, 9)
+            child.wait_for_chat_rows(lambda rows: rows[2] > 100, timeout=8)
             child.send(
                 b"i"
                 b"a long compiled PTY draft that wraps and scrolls without clipping"
             )
-            child.wait_for("INSERT", timeout=4)
-            child.wait_for("rows", timeout=4)
+            child.wait_for_screen("INSERT", timeout=8)
+            child.wait_for_screen("Enter send", timeout=8)
+            child.wait_for_screen("Esc keep", timeout=8)
             before_keep = len(child.output)
             child.send(b"\x1b")
             child.wait_for_since("NORMAL", before_keep, timeout=4)
@@ -276,7 +708,7 @@ def main() -> int:
             before_discard = len(child.output)
             child.send(b"\x03")
             child.wait_for_since("Type a message", before_discard, timeout=4)
-            set_size(child.master, 72, 18)
+            child.resize(72, 18)
             child.read(0.3)
 
             # ':' must visibly enter command mode before the quit command is

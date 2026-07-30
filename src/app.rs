@@ -1097,21 +1097,24 @@ impl AppState {
     /// Streaming only changes a message's text and resizing only changes rows,
     /// so both cases are normalized against the rebuilt layout here.
     pub(crate) fn set_chat_layout(&mut self, layout: ChatLayout, display_rows: Vec<usize>) {
-        let cursor = self
-            .chat_navigation
-            .as_ref()
-            .and_then(|cursor| layout.normalize_point(&cursor.point))
-            .or_else(|| {
-                self.chat.get(self.chat_cursor).and_then(|entry| {
-                    layout.rows.iter().enumerate().find_map(|(index, row)| {
-                        (row.message_id.as_str() == entry.id)
-                            .then(|| layout.row_bounds(index))
-                            .flatten()
-                            .map(|bounds| bounds.0)
+        let cursor = if self.chat_autofollow && self.input_mode != InputMode::Visual {
+            layout.last_point()
+        } else {
+            self.chat_navigation
+                .as_ref()
+                .and_then(|cursor| layout.normalize_point(&cursor.point))
+                .or_else(|| {
+                    self.chat.get(self.chat_cursor).and_then(|entry| {
+                        layout.rows.iter().enumerate().find_map(|(index, row)| {
+                            (row.message_id.as_str() == entry.id)
+                                .then(|| layout.row_bounds(index))
+                                .flatten()
+                                .map(|bounds| bounds.0)
+                        })
                     })
                 })
-            })
-            .or_else(|| layout.first_point());
+                .or_else(|| layout.first_point())
+        };
         self.chat_navigation = cursor.map(ChatCursor::new);
         self.chat_selection = self.chat_selection.take().and_then(|mut selection| {
             let anchor = layout.normalize_point(&selection.anchor)?;
@@ -1219,10 +1222,16 @@ impl AppState {
             .map(|cursor| cursor.point.clone())
             .or_else(|| self.chat_point_for_current_message())
             .or_else(|| layout.first_point());
-        let Some(point) = point else {
+        let Some(mut point) = point else {
             self.status = "There is no selectable chat text yet".into();
             return false;
         };
+        if mode == ChatSelectionMode::Character {
+            point = layout
+                .locate(&point)
+                .and_then(|location| layout.point_for_column(location.row, location.column))
+                .unwrap_or(point);
+        }
         self.chat_navigation = Some(ChatCursor::new(point.clone()));
         self.chat_selection = match mode {
             ChatSelectionMode::Character => Some(ChatSelection::character(point)),
@@ -1239,6 +1248,14 @@ impl AppState {
     }
 
     fn move_chat_semantic(&mut self, movement: Movement) -> bool {
+        self.move_chat_semantic_inner(movement, true)
+    }
+
+    fn move_chat_semantic_without_scrolling(&mut self, movement: Movement) -> bool {
+        self.move_chat_semantic_inner(movement, false)
+    }
+
+    fn move_chat_semantic_inner(&mut self, movement: Movement, ensure_visible: bool) -> bool {
         let Some(layout) = self.chat_layout.as_ref() else {
             return false;
         };
@@ -1259,7 +1276,9 @@ impl AppState {
         self.chat_navigation = Some(next);
         self.chat_autofollow = false;
         self.sync_chat_cursor();
-        self.ensure_chat_navigation_visible();
+        if ensure_visible {
+            self.ensure_chat_navigation_visible();
+        }
         true
     }
 
@@ -1712,10 +1731,20 @@ impl AppState {
                 }
             }
             KeyCode::PageDown if self.focus == Focus::Chat => {
-                self.move_chat_semantic(Movement::PageDown(self.viewport_height.max(1)));
+                let amount = self.chat_viewport_rows.max(1);
+                if self.input_mode == InputMode::Visual {
+                    self.move_chat_semantic(Movement::PageDown(amount));
+                } else {
+                    self.move_down(amount);
+                }
             }
             KeyCode::PageUp if self.focus == Focus::Chat => {
-                self.move_chat_semantic(Movement::PageUp(self.viewport_height.max(1)));
+                let amount = self.chat_viewport_rows.max(1);
+                if self.input_mode == InputMode::Visual {
+                    self.move_chat_semantic(Movement::PageUp(amount));
+                } else {
+                    self.move_up(amount);
+                }
             }
             KeyCode::PageDown
                 if self.screen == Screen::Review
@@ -2364,7 +2393,12 @@ impl AppState {
     }
 
     fn handle_control_key(&mut self, code: KeyCode) -> Vec<Effect> {
-        let half = (self.viewport_height / 2).max(1);
+        let page = if self.focus == Focus::Chat {
+            self.chat_viewport_rows.max(1)
+        } else {
+            self.viewport_height.max(1)
+        };
+        let half = (page / 2).max(1);
         match code {
             KeyCode::Char('v') if self.focus == Focus::Chat => {
                 self.enter_chat_visual(ChatSelectionMode::Block);
@@ -2430,8 +2464,8 @@ impl AppState {
             }
             KeyCode::Char('d') => self.move_down(half),
             KeyCode::Char('u') => self.move_up(half),
-            KeyCode::Char('f') => self.move_down(self.viewport_height),
-            KeyCode::Char('b') => self.move_up(self.viewport_height),
+            KeyCode::Char('f') => self.move_down(page),
+            KeyCode::Char('b') => self.move_up(page),
             KeyCode::Char('w') => {
                 self.pending_prefix = "ctrl-w".into();
                 self.pending_prefix_started = Some(Instant::now());
@@ -3106,15 +3140,18 @@ impl AppState {
         match self.focus {
             Focus::FilePicker => self.next_file_by(amount),
             Focus::Chat => {
-                if !self.move_chat_semantic(Movement::Down) {
+                if self.input_mode == InputMode::Visual {
+                    for _ in 0..amount {
+                        self.move_chat_semantic(Movement::Down);
+                    }
+                } else {
+                    for _ in 0..amount {
+                        self.move_chat_semantic_without_scrolling(Movement::Down);
+                    }
                     let max_scroll = self.chat_total_rows.saturating_sub(self.chat_viewport_rows);
                     self.chat_scroll =
                         cmp::min(max_scroll, self.chat_scroll.saturating_add(amount));
                     self.chat_autofollow = false;
-                } else {
-                    for _ in 1..amount {
-                        self.move_chat_semantic(Movement::Down);
-                    }
                 }
             }
             Focus::Diff | Focus::InlineAsk
@@ -3140,13 +3177,16 @@ impl AppState {
                 }
             }
             Focus::Chat => {
-                if !self.move_chat_semantic(Movement::Up) {
-                    self.chat_scroll = self.chat_scroll.saturating_sub(amount);
-                    self.chat_autofollow = false;
-                } else {
-                    for _ in 1..amount {
+                if self.input_mode == InputMode::Visual {
+                    for _ in 0..amount {
                         self.move_chat_semantic(Movement::Up);
                     }
+                } else {
+                    for _ in 0..amount {
+                        self.move_chat_semantic_without_scrolling(Movement::Up);
+                    }
+                    self.chat_scroll = self.chat_scroll.saturating_sub(amount);
+                    self.chat_autofollow = false;
                 }
             }
             Focus::Diff | Focus::InlineAsk

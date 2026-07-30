@@ -1762,19 +1762,33 @@ pub(crate) fn finish_ready_prune(state: &mut AppState, storage: &Storage) -> Res
     Ok(())
 }
 
+#[derive(Debug)]
 enum ClipboardDelivery {
     Native(&'static str),
     Osc52,
 }
 
 fn copy_to_clipboard(text: &str) -> Result<ClipboardDelivery> {
-    if let Ok(program) = copy_with_native_clipboard(text) {
-        return Ok(ClipboardDelivery::Native(program));
+    let forced_osc52 = std::env::var_os("RQ_TUI_CLIPBOARD")
+        .is_some_and(|value| value == std::ffi::OsStr::new("osc52"));
+    let mut stdout = io::stdout();
+    copy_to_clipboard_with_writer(text, forced_osc52, &mut stdout)
+}
+
+fn copy_to_clipboard_with_writer(
+    text: &str,
+    forced_osc52: bool,
+    output: &mut dyn std::io::Write,
+) -> Result<ClipboardDelivery> {
+    if !forced_osc52 {
+        if let Ok(program) = copy_with_native_clipboard(text) {
+            return Ok(ClipboardDelivery::Native(program));
+        }
     }
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     let sequence = format!("\u{1b}]52;c;{encoded}\u{7}");
-    io::stdout().write_all(sequence.as_bytes())?;
-    io::stdout().flush()?;
+    output.write_all(sequence.as_bytes())?;
+    output.flush()?;
     Ok(ClipboardDelivery::Osc52)
 }
 
@@ -4917,22 +4931,26 @@ fn render_chat(
         }
     }
     let lane = visible_lane(state);
+    let row_range = format!(
+        "rows {}-{}/{}",
+        state
+            .chat_scroll
+            .saturating_add(1)
+            .min(state.chat_total_rows.max(1)),
+        (state.chat_scroll + viewport_rows).min(state.chat_total_rows),
+        state.chat_total_rows,
+    );
+    let chat_title = if frame.area().width < 60 {
+        format!(" Chat · {lane} · {row_range} ")
+    } else {
+        format!(
+            " {} — Chat · {lane} · {row_range} ",
+            state.work_item.item.name
+        )
+    };
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(
-                Block::default()
-                    .title(format!(
-                        " {} — Chat · {lane} · rows {}-{}/{} ",
-                        state.work_item.item.name,
-                        state
-                            .chat_scroll
-                            .saturating_add(1)
-                            .min(state.chat_total_rows.max(1)),
-                        (state.chat_scroll + viewport_rows).min(state.chat_total_rows),
-                        state.chat_total_rows,
-                    ))
-                    .borders(Borders::ALL),
-            )
+            .block(Block::default().title(chat_title).borders(Borders::ALL))
             .scroll((state.chat_scroll.min(u16::MAX as usize) as u16, 0)),
         vertical[0],
     );
@@ -5030,7 +5048,9 @@ fn chat_lines(
                 Style::default().fg(if stopped { Color::Yellow } else { Color::Red }),
             ));
         }
-        lines.push(Line::from(""));
+        if index + 1 < state.chat.len() {
+            lines.push(Line::from(""));
+        }
     }
     lines
 }
@@ -5038,14 +5058,16 @@ fn chat_lines(
 fn chat_display_rows(entries: &[ChatEntry], mapped: &[MappedMarkdown]) -> Vec<usize> {
     let mut display_row = 0usize;
     let mut result = Vec::new();
-    for (entry, rendered) in entries.iter().zip(mapped) {
+    for (index, (entry, rendered)) in entries.iter().zip(mapped).enumerate() {
         display_row = display_row.saturating_add(1); // message header
         result.extend((0..rendered.rows.len()).map(|row| display_row.saturating_add(row)));
         display_row = display_row.saturating_add(rendered.rows.len());
         if entry.error.is_some() {
             display_row = display_row.saturating_add(1);
         }
-        display_row = display_row.saturating_add(1); // message spacer
+        if index + 1 < entries.len() {
+            display_row = display_row.saturating_add(1); // message spacer
+        }
     }
     result
 }
@@ -5130,23 +5152,41 @@ fn mapped_cell_end(cell: &crate::chat_render::MappedCell) -> Option<usize> {
 }
 
 fn project_mapped_row(row: &MappedRow, layout_row: usize, state: &AppState) -> Vec<Span<'static>> {
+    let selected_cells = row
+        .cells
+        .iter()
+        .enumerate()
+        .map(|(cell_index, _)| {
+            state
+                .chat_selection
+                .as_ref()
+                .zip(state.chat_layout.as_ref())
+                .is_some_and(|(selection, layout)| {
+                    selection.contains_cell(layout, layout_row, cell_index)
+                })
+        })
+        .collect::<Vec<_>>();
     let mut column = 0usize;
+    let mut first_candidate = 0usize;
     let mut output = Vec::new();
     for span in &row.line.spans {
         for character in span.content.chars() {
             let text = character.to_string();
             let width = Span::raw(text.clone()).width().max(1);
-            let selected = state
-                .chat_selection
-                .as_ref()
-                .zip(state.chat_layout.as_ref())
-                .is_some_and(|(selection, layout)| {
-                    row.cells.iter().enumerate().any(|(cell_index, cell)| {
-                        cell.columns.start < column.saturating_add(width)
-                            && cell.columns.end > column
-                            && selection.contains_cell(layout, layout_row, cell_index)
-                    })
-                });
+            while row
+                .cells
+                .get(first_candidate)
+                .is_some_and(|cell| cell.columns.end <= column)
+            {
+                first_candidate = first_candidate.saturating_add(1);
+            }
+            let selected = row
+                .cells
+                .iter()
+                .zip(&selected_cells)
+                .skip(first_candidate)
+                .take_while(|(cell, _)| cell.columns.start < column.saturating_add(width))
+                .any(|(cell, selected)| *selected && cell.columns.end > column);
             let style = if selected {
                 span.style.bg(Color::Rgb(40, 50, 65))
             } else {
@@ -5186,18 +5226,29 @@ fn render_chat_composer(frame: &mut ratatui::Frame, state: &mut AppState, area: 
         .min(lines.len().saturating_sub(visible_rows));
 
     let (title, border_color) = match state.input_mode {
-        InputMode::Compose if lines.len() > visible_rows => (
-            format!(
-                " INSERT · rows {}-{}/{} · ↑/↓ scroll · Enter send · Esc keep ",
+        InputMode::Compose if lines.len() > visible_rows => {
+            let range = format!(
+                "{}-{}/{}",
                 state.compose_scroll + 1,
                 (state.compose_scroll + visible_rows).min(lines.len()),
                 lines.len()
-            ),
-            Color::Green,
-        ),
+            );
+            (
+                if area.width < 60 {
+                    format!(" INSERT {range} · Enter send · Esc keep ")
+                } else {
+                    format!(" INSERT · rows {range} · ↑/↓ scroll · Enter send · Esc keep ")
+                },
+                Color::Green,
+            )
+        }
         InputMode::Compose => (
-            " INSERT · Enter send · Shift-Enter newline · Esc keep draft · Ctrl-C stop/discard "
-                .to_owned(),
+            if area.width < 60 {
+                " INSERT · Enter send · Esc keep ".to_owned()
+            } else {
+                " INSERT · Enter send · Shift-Enter newline · Esc keep draft · Ctrl-C stop/discard "
+                    .to_owned()
+            },
             Color::Green,
         ),
         InputMode::Command => (
@@ -5236,10 +5287,16 @@ fn render_chat_composer(frame: &mut ratatui::Frame, state: &mut AppState, area: 
                 Color::Magenta,
             )
         }
-        InputMode::Normal => (
-            " NORMAL · i edit · j/k scroll · G latest · Tab review · Ctrl-C stop ".to_owned(),
-            Color::DarkGray,
-        ),
+        InputMode::Normal => {
+            let title = if state.status.is_empty() {
+                " NORMAL · i edit · j/k scroll · G latest · Tab review · Ctrl-C stop ".to_owned()
+            } else if area.width < 60 {
+                format!(" NORMAL · {} ", state.status)
+            } else {
+                format!(" NORMAL · {} · i edit · : commands ", state.status)
+            };
+            (title, Color::DarkGray)
+        }
     };
     let display = if state.input_mode == InputMode::Command {
         let command = terminal_text_tail(&state.command, inner_width.saturating_sub(2));
@@ -5401,10 +5458,8 @@ fn render_agent_progress(frame: &mut ratatui::Frame, state: &AppState, area: Rec
     let compact = area.width < 60;
     let headline = if compact {
         format!(
-            " COPILOT {lane} {state_marker} {} · q{} · SDK {}",
-            progress.phase.label(),
-            progress.queue_depth,
-            format_duration(age),
+            " COPILOT {lane} {state_marker} q{} · {}",
+            progress.queue_depth, progress.summary,
         )
     } else if area.width < 90 {
         format!(
@@ -5476,61 +5531,133 @@ fn render_agent_progress(frame: &mut ratatui::Frame, state: &AppState, area: Rec
 }
 
 fn render_agent_status(frame: &mut ratatui::Frame, state: &AppState) {
+    let area = frame.area();
+    let block = Block::default()
+        .title(" Agent status · explicit stuck diagnostics ")
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+    let footer_height = 1.min(inner.height);
+    let body = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(footer_height),
+    );
+    let footer = Rect::new(
+        inner.x,
+        inner.bottom().saturating_sub(footer_height),
+        inner.width,
+        footer_height,
+    );
     let progress = &state.agent_progress;
     let lane = visible_lane(state);
-    let mut lines = vec![
-        Line::styled(
-            "COPILOT SDK LIVENESS",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(format!(
-            "lane: {lane} · connected: {} · phase: {}",
-            state.agent_connected,
-            progress.phase.label()
-        )),
-        Line::raw(format!(
-            "active elapsed: {} · last SDK event: {} ago · events: {} · queue: {}",
-            format_duration(progress.elapsed()),
-            format_duration(progress.last_event_age()),
-            progress.event_count,
-            progress.queue_depth
-        )),
-        Line::raw(format!("working on: {}", progress.summary)),
-        Line::raw(format!("detail: {}", progress.detail)),
-        Line::raw(format!(
-            "outbound id: {}",
-            progress.active_outbound_id.as_deref().unwrap_or("none")
-        )),
-        Line::from(""),
-        Line::styled(
-            "Recent SDK activity (newest last)",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-    ];
+    let compact = area.width < 60 || area.height < 16;
+    let fit = |text: String| {
+        Line::raw(fit_terminal_text(
+            &text,
+            inner.width.saturating_sub(1) as usize,
+        ))
+    };
+    let mut lines = if compact {
+        vec![
+            Line::styled(
+                fit_terminal_text(
+                    &format!(
+                        "COPILOT {lane} · {} · q{}",
+                        progress.phase.label(),
+                        progress.queue_depth
+                    ),
+                    inner.width.saturating_sub(1) as usize,
+                ),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            fit(format!(
+                "elapsed {} · SDK {} ago · event #{} · connected={}",
+                format_duration(progress.elapsed()),
+                format_duration(progress.last_event_age()),
+                progress.event_count,
+                state.agent_connected
+            )),
+            fit(format!("working: {}", progress.summary)),
+            fit(format!(
+                "outbound: {}",
+                progress
+                    .active_outbound_id
+                    .as_deref()
+                    .map(short_id)
+                    .unwrap_or("none")
+            )),
+            Line::styled(
+                "Recent SDK activity",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]
+    } else {
+        vec![
+            Line::styled(
+                "COPILOT SDK LIVENESS",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(format!(
+                "lane: {lane} · connected: {} · phase: {}",
+                state.agent_connected,
+                progress.phase.label()
+            )),
+            Line::raw(format!(
+                "active elapsed: {} · last SDK event: {} ago · events: {} · queue: {}",
+                format_duration(progress.elapsed()),
+                format_duration(progress.last_event_age()),
+                progress.event_count,
+                progress.queue_depth
+            )),
+            Line::raw(format!("working on: {}", progress.summary)),
+            Line::raw(format!("detail: {}", progress.detail)),
+            Line::raw(format!(
+                "outbound id: {}",
+                progress.active_outbound_id.as_deref().unwrap_or("none")
+            )),
+            Line::from(""),
+            Line::styled(
+                "Recent SDK activity (newest last)",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]
+    };
     let now = std::time::Instant::now();
     lines.extend(progress.timeline.iter().skip(state.scroll).map(|entry| {
-        Line::raw(format!(
-            "  {:>7} ago  {}",
+        let text = format!(
+            "{:>7} ago · {}",
             format_duration(now.saturating_duration_since(entry.at)),
             entry.label
-        ))
+        );
+        if compact {
+            fit(text)
+        } else {
+            Line::raw(text)
+        }
     }));
-    lines.push(Line::from(""));
-    lines.push(Line::styled(
-        "q/Esc return · j/k scroll · s stop current response",
-        Style::default().fg(Color::DarkGray),
-    ));
+    let paragraph = Paragraph::new(lines);
+    if compact {
+        frame.render_widget(paragraph, body);
+    } else {
+        frame.render_widget(paragraph.wrap(Wrap { trim: false }), body);
+    }
+    let controls = if area.width < 60 {
+        "j/k scroll · s stop · q/Esc back"
+    } else {
+        "q/Esc return · j/k scroll · s stop current response"
+    };
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title(" Agent status · explicit stuck diagnostics ")
-                    .borders(Borders::ALL),
-            )
-            .wrap(Wrap { trim: false }),
-        frame.area(),
+        Paragraph::new(controls).style(Style::default().fg(Color::DarkGray)),
+        footer,
     );
 }
 
@@ -5612,11 +5739,15 @@ fn render_queue(frame: &mut ratatui::Frame, state: &AppState) {
         frame.area(),
     );
     let area = frame.area();
+    let controls = if area.width < 50 {
+        "j/k · e edit · d cancel · s stop · q"
+    } else if area.width < 80 {
+        "j/k select · e edit · d cancel · s stop · q/Esc back"
+    } else {
+        "j/k select · e edit selected queued prompt · d cancel selected queued prompt · s stop active · q/Esc return"
+    };
     frame.render_widget(
-        Paragraph::new(
-            "j/k select · e edit selected queued prompt · d cancel selected queued prompt · s stop active · q/Esc return",
-        )
-        .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(controls).style(Style::default().fg(Color::DarkGray)),
         Rect::new(
             area.x.saturating_add(1),
             area.bottom().saturating_sub(2),
@@ -5766,9 +5897,10 @@ mod tests {
     use ratatui::Terminal;
 
     use super::{
-        finish_ready_prune, handle_agent_envelope, handle_agent_event, handle_effect,
-        handle_effect_failure, load_ui_preferences, markdown_to_html, mouse_scroll_effects,
-        open_browser_preview, parse_review_context, render, run_clipboard_candidate, table_cells,
+        copy_to_clipboard_with_writer, finish_ready_prune, handle_agent_envelope,
+        handle_agent_event, handle_effect, handle_effect_failure, load_ui_preferences,
+        markdown_to_html, mouse_scroll_effects, open_browser_preview, parse_review_context, render,
+        run_clipboard_candidate, table_cells,
     };
     use crate::app::{
         tests_support::state_for_ui, AgentPhase, ChatEntry, ComposeTarget, DiffLayout, Effect,
@@ -6184,6 +6316,28 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(2),
             "clipboard timeout must not stall the TUI"
         );
+    }
+
+    #[test]
+    fn total_clipboard_failure_is_injectable_and_visibly_reported() {
+        struct RejectWrites;
+
+        impl std::io::Write for RejectWrites {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("simulated OSC 52 write failure"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = copy_to_clipboard_with_writer("exact text", true, &mut RejectWrites)
+            .expect_err("forced OSC 52 output must expose write failures");
+        let mut state = state_for_ui();
+        handle_effect_failure(&mut state, &Effect::Yank("exact text".into()), &error);
+        assert!(state.status.contains("Action failed"));
+        assert!(state.status.contains("simulated OSC 52 write failure"));
     }
 
     #[test]

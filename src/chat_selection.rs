@@ -224,7 +224,7 @@ impl ChatSelection {
                     .unwrap_or_else(|| cell_start.clone());
                 let (low, high) = layout.ordered_points(&self.anchor, &self.active);
                 let start = layout.compare_points(&cell_end, low) == Ordering::Greater;
-                let end = layout.compare_points(&cell_start, high) == Ordering::Less;
+                let end = layout.compare_points(&cell_start, high) != Ordering::Greater;
                 (start && end) || (low == high && cell_start == *low)
             }
             ChatSelectionMode::Line => self
@@ -658,12 +658,27 @@ impl ChatLayout {
     }
 
     pub fn compare_points(&self, left: &ChatPoint, right: &ChatPoint) -> Ordering {
-        let left_location = self.locate(left);
-        let right_location = self.locate(right);
-        match (left_location, right_location) {
-            (Some(left), Some(right)) => (left.row, left.column).cmp(&(right.row, right.column)),
-            _ => Ordering::Equal,
-        }
+        let key = |point: &ChatPoint| {
+            let message = self
+                .messages
+                .iter()
+                .position(|message| message.id == point.message_id)
+                .unwrap_or(usize::MAX);
+            let block = self
+                .message(&point.message_id)
+                .and_then(|message| {
+                    message
+                        .blocks
+                        .iter()
+                        .position(|block| block.id == point.block_id)
+                })
+                .unwrap_or(usize::MAX);
+            // Before/After disambiguates which rendered row owns a wrapped
+            // boundary, but both affinities are the same semantic source
+            // position for ordering and interval overlap.
+            (message, block, point.byte_offset)
+        };
+        key(left).cmp(&key(right))
     }
 
     pub fn ordered_points<'a>(
@@ -792,7 +807,7 @@ impl ChatLayout {
         }
     }
 
-    fn point_for_column(&self, row: usize, target: usize) -> Option<ChatPoint> {
+    pub(crate) fn point_for_column(&self, row: usize, target: usize) -> Option<ChatPoint> {
         let rendered = self.rows.get(row)?;
         let mut column = 0usize;
         for (index, cell) in rendered.cells.iter().enumerate() {
@@ -1386,6 +1401,7 @@ mod tests {
         assert!(!selection.contains_cell(&layout, 0, 0));
         assert!(selection.contains_cell(&layout, 0, 1));
         assert!(selection.contains_cell(&layout, 1, 1));
+        assert!(selection.contains_cell(&layout, 1, 2));
         assert!(!selection.contains_cell(&layout, 1, 3));
     }
 

@@ -887,6 +887,8 @@ impl ControlledAgent {
 
     fn schedule_turn(&self, lane: AgentLane, outbound: Outbound, delay: Duration) {
         let context_draft = matches!(&outbound.kind, OutboundKind::ContextDraft);
+        let audit_events = env::var_os("RQ_TUI_CONTROLLED_AUDIT_EVENTS").as_deref()
+            == Some(std::ffi::OsStr::new("1"));
         let first = if context_draft {
             "Title: Controlled review\nWhat: Deterministic context\n".to_owned()
         } else {
@@ -894,8 +896,22 @@ impl ControlledAgent {
         };
         let second = if context_draft {
             "Why: Repeatable tests\nHow: Fake streaming\nConsiderations: None\nOther approaches: Live agent".to_owned()
+        } else if audit_events {
+            (0..350)
+                .map(|index| format!(" audit-token-{index}"))
+                .collect()
         } else {
             "streamed response.".to_owned()
+        };
+        let delta_delay = if audit_events {
+            Duration::from_secs(4)
+        } else {
+            Duration::from_secs(12)
+        };
+        let complete_delay = if audit_events {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(16)
         };
         let id = outbound.id.clone();
         self.schedule_agent(
@@ -928,6 +944,31 @@ impl ControlledAgent {
                 detail: Some("Inspecting selected context".into()),
             },
         );
+        if audit_events {
+            self.schedule_activity(
+                lane.clone(),
+                delay + Duration::from_millis(500),
+                Some(id.clone()),
+                AgentActivity::other("Running review skill: exhaustive audit"),
+            );
+            self.schedule_activity(
+                lane.clone(),
+                delay + Duration::from_millis(600),
+                Some(id.clone()),
+                AgentActivity::other("Subagent inspecting terminal edge cases"),
+            );
+            self.schedule_activity(
+                lane.clone(),
+                delay + Duration::from_millis(700),
+                Some(id.clone()),
+                AgentActivity {
+                    kind: ActivityKind::Retry,
+                    label: "Retrying transient controlled operation".into(),
+                    tool: None,
+                    detail: Some("attempt 2/3".into()),
+                },
+            );
+        }
         self.schedule_activity(
             lane.clone(),
             delay + Duration::from_millis(800),
@@ -950,7 +991,7 @@ impl ControlledAgent {
         );
         self.schedule_agent(
             lane.clone(),
-            delay + Duration::from_secs(12),
+            delay + delta_delay,
             AgentEvent::ResponseDelta {
                 outbound_id: id.clone(),
                 delta: second,
@@ -958,7 +999,7 @@ impl ControlledAgent {
         );
         self.schedule_agent(
             lane.clone(),
-            delay + Duration::from_secs(16),
+            delay + complete_delay,
             AgentEvent::ResponseComplete {
                 outbound_id: id.clone(),
                 aborted: false,
@@ -968,7 +1009,7 @@ impl ControlledAgent {
         state.outbound_lanes.insert(id.clone(), lane);
         state.busy_until = state
             .busy_until
-            .max(Instant::now() + delay + Duration::from_secs(16));
+            .max(Instant::now() + delay + complete_delay);
     }
 }
 
@@ -5046,10 +5087,10 @@ mod tests {
 
     use super::{
         cleanup_ephemeral_record, create_config, delete_journaled_remote_sessions,
-        durable_export_choice, enqueue_message, execute_prune_operation, handle_session_event,
-        history_entries, model_option, now, register_sdk_message_root, resume_config,
-        resumed_active_from_history, retryable_cleanup_state, ActiveOutbound, ActivityKind,
-        AgentCommand, AgentEvent, AgentLane, AgentRuntime, AgentSink, BridgeConfig,
+        durable_export_choice, enqueue_message, envelope_outbound_id, execute_prune_operation,
+        handle_session_event, history_entries, model_option, now, register_sdk_message_root,
+        resume_config, resumed_active_from_history, retryable_cleanup_state, ActiveOutbound,
+        ActivityKind, AgentCommand, AgentEvent, AgentLane, AgentRuntime, AgentSink, BridgeConfig,
         ControlledAgent, CopilotBridge, EventPublisher, HistoryEntry, LaneEvent, Outbound,
         OutboundKind, ProgressHooks, PruneExecution, ReadOnlyPermissionHandler, SideCleanupBackend,
         WorkItemProcessLock,
@@ -6378,6 +6419,43 @@ mod tests {
                     event: LaneEvent::Agent(AgentEvent::QueueCancelled { outbound_id: id }),
                     ..
                 } if id == &outbound_id
+            )
+        }));
+    }
+
+    #[test]
+    fn controlled_abort_removes_all_late_success_events_for_the_outbound() {
+        let agent = ControlledAgent::new("work-item".into());
+        let _ = agent.try_recv_laned();
+        let outbound = Outbound::new(OutboundKind::Chat, "cancel before late delta".into());
+        let outbound_id = outbound.id.clone();
+        agent
+            .send(AgentCommand::Send(outbound))
+            .expect("schedule controlled turn");
+        agent
+            .send(AgentCommand::Abort)
+            .expect("abort controlled turn");
+
+        let state = agent.state.lock().expect("controlled agent lock");
+        assert!(state.events.iter().all(|(_, envelope)| {
+            if envelope_outbound_id(envelope).as_deref() != Some(outbound_id.as_str()) {
+                return true;
+            }
+            !matches!(
+                &envelope.event,
+                LaneEvent::Agent(
+                    AgentEvent::ResponseDelta { .. }
+                        | AgentEvent::ResponseComplete { aborted: false, .. }
+                )
+            )
+        }));
+        assert!(state.events.iter().any(|(_, envelope)| {
+            matches!(
+                &envelope.event,
+                LaneEvent::Agent(AgentEvent::ResponseComplete {
+                    outbound_id: id,
+                    aborted: true,
+                }) if id == &outbound_id
             )
         }));
     }

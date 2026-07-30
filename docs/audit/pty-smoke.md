@@ -27,7 +27,7 @@ earlier records that exposed foundational terminal defects.
 
 Date: 2026-07-30
 Platform: macOS arm64
-Terminal: tmux pseudo-terminal
+Terminal: Python standard-library POSIX pseudo-terminal
 Binary: `bazel-bin/src/rq-tui`, produced by `bazel build //:rq-tui`
 Agent: `RQ_TUI_CONTROLLED_AGENT=1`
 
@@ -41,6 +41,18 @@ Agent: `RQ_TUI_CONTROLLED_AGENT=1`
 | PTY-21 | Open Ask with content wrapping to 21 visual rows | The box capped safely inside the viewport, displayed `lines 9-21/21`, and Up scrolled it to `lines 1-13/21`; no text crossed the border. |
 | PTY-22 | Seed an older review, then drive the Bazel-built binary through resize, Visual mode, `:prune`, select/delete, return, and clean exit in a real PTY | The open Work Item rendered as `OPEN(disabled)`, the older Work Item completed typed remote/local cleanup, the prune screen retained the sticky Copilot progress surface, SQLite retained only the open review, return to Review completed before the next command, and alternate-screen cleanup succeeded without panic. |
 | PTY-23 | Enter Chat in the Bazel-built binary, resize to 42×9, type a long draft, open/cancel command completion, discard the restored draft, resize, and exit | The minimum viewport kept the expanding composer inside its borders, displayed the internal row viewport, rendered composer-local `COMMAND COMPLETIONS`, `COMMAND MODE ACTIVE`, compact `COPILOT MAIN` liveness, and the held-draft byte label, restored the draft on Esc, and remained responsive through cleanup and exit. |
+| PTY-24 | Submit two long prompts while the first controlled response is active; resize Chat to 44×14; drive Up, PageUp, SGR mouse-wheel down/up, character and line Visual yanks, `G`, then resize to 100×24 | Input stayed responsive, the queue retained `ACTIVE`/`QUEUED` identities, every scroll source changed the rendered `rows A-B/T` viewport, OSC 52 decoded to the exact inclusive character bytes `First` and exact line bytes `First alpha beta gamma delta epsilon z\n`, the whole-transcript Visual payload began at `First` and reached streamed `audit-token-349`, `G` exposed latest source rather than only reaching a row count, and wide reflow reduced the rendered-row total. |
+| PTY-25 | Open `:agent-status`, scroll to controlled skill/subagent/retry events, wait for the response to become visibly quiet, press `Ctrl-C`, then cancel the remaining queued prompt through `:queue` | Agent Status kept a sticky `q/Esc`/scroll/stop footer while its timeline moved, tool/skill/subagent/retry work and outbound liveness remained inspectable, the active turn transitioned through quiet → `STOPPING` → `response cancelled`, the waiting prompt remained independently cancellable, and the reusable Chat composer never disappeared. |
+
+PTY-16 through PTY-21 are retained manual compiled-binary captures. PTY-22
+through PTY-25 are reproduced on every `//:pty_smoke_test` run; the automated
+test now also holds the cancelled/empty queue state beyond the controlled
+agent's late-delta and completion deadlines to detect turn resurrection.
+
+The long-selection adversarial reproduction that previously took roughly
+27 seconds now completes inside the PTY test's four-second interaction bound
+for a response containing 350 generated tokens. The same script's latest-cell
+character yank now copies `y` rather than an empty payload.
 
 ## Current authenticated Copilot pass
 
