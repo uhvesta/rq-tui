@@ -3,12 +3,14 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::cmp;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::annotations::anchor_from_diff;
+use crate::chat_render::{render_markdown_mapped, MappedMarkdown};
 use crate::chat_selection::{
     ChatCursor, ChatLayout, ChatMessageId, ChatPoint, ChatSelection, ChatSelectionMode, CopyPolicy,
     Movement,
@@ -20,6 +22,7 @@ use crate::domain::{
     AnchorSide, Annotation, AnnotationKind, AskMessage, DeliveryState, PendingChat, Placement,
     ReviewContext, Version,
 };
+use crate::highlight::{Highlighter, PlainHighlighter};
 use crate::review_stream::{
     InlineAnnotation, ReviewDisplayLayout, ReviewFile, ReviewRow, ReviewStream, SourceSide,
     StreamMovement,
@@ -39,6 +42,66 @@ pub(crate) const INLINE_COMPOSER_ID: &str = "zzzzzzzz-inline-composer";
 struct ReviewStreamCache {
     revision: u64,
     stream: Option<Arc<ReviewStream>>,
+}
+
+/// The Markdown work for a chat message is independent of the transcript
+/// cursor, search term, and viewport. Keep it here rather than rebuilding it
+/// for every terminal draw. A cache entry owns a snapshot of the source text,
+/// so a streaming delta invalidates only that message.
+#[derive(Clone)]
+struct BackgroundChatRender(Arc<Mutex<mpsc::Receiver<MappedMarkdown>>>);
+
+impl std::fmt::Debug for BackgroundChatRender {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BackgroundChatRender(<receiver>)")
+    }
+}
+
+impl BackgroundChatRender {
+    fn try_recv(&self) -> Result<MappedMarkdown, TryRecvError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .try_recv()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CachedChatMessage {
+    id: String,
+    text: String,
+    source_ptr: usize,
+    source_len: usize,
+    has_error: bool,
+    mapped: Option<Arc<MappedMarkdown>>,
+    background: Option<BackgroundChatRender>,
+    display_start: usize,
+    semantic_start: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ChatRenderCache {
+    revision: u64,
+    width: usize,
+    entries: Vec<CachedChatMessage>,
+    next_index: usize,
+    indexed: usize,
+    total_rows: usize,
+}
+
+/// A small, deterministic unit of transcript indexing. The renderer performs
+/// at most this much Markdown work in one draw, leaving the event loop free to
+/// process input and Copilot progress while a restored transcript warms.
+const CHAT_MESSAGES_PER_RENDER_SLICE: usize = 32;
+const CHAT_BACKGROUND_RENDER_THRESHOLD: usize = 128 * 1024;
+const CHAT_BACKGROUND_RENDERERS: usize = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChatRenderProgress {
+    pub(crate) indexed: usize,
+    pub(crate) total: usize,
+    pub(crate) complete: bool,
+    pub(crate) total_rows: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -682,6 +745,12 @@ pub(crate) struct AppState {
     review_stream_builds: Cell<usize>,
     #[cfg(test)]
     review_layout_builds: Cell<usize>,
+    chat_render_revision: u64,
+    chat_render_cache: RefCell<ChatRenderCache>,
+    #[cfg(test)]
+    chat_markdown_builds: Cell<usize>,
+    #[cfg(test)]
+    chat_layout_builds: Cell<usize>,
     /// Width-specific renderer index. Cursor and selection endpoints remain
     /// source based, therefore survive a layout rebuild.
     pub(crate) chat_layout: Option<ChatLayout>,
@@ -800,6 +869,12 @@ impl AppState {
             review_stream_builds: Cell::new(0),
             #[cfg(test)]
             review_layout_builds: Cell::new(0),
+            chat_render_revision: 1,
+            chat_render_cache: RefCell::default(),
+            #[cfg(test)]
+            chat_markdown_builds: Cell::new(0),
+            #[cfg(test)]
+            chat_layout_builds: Cell::new(0),
             chat_layout: None,
             chat_navigation: None,
             chat_selection: None,
@@ -1108,11 +1183,266 @@ impl AppState {
         let insertion = self.history_restore_len.min(self.chat.len());
         self.chat.splice(insertion..insertion, restored);
         self.history_restore_len = self.history_restore_len.saturating_add(restored_count);
+        if restored_count > 0 {
+            self.invalidate_chat_render_cache();
+        }
     }
 
     pub(crate) fn finish_history_restore(&mut self) {
         self.history_restore_accepting = false;
         self.history_restore_len = 0;
+    }
+
+    /// Mark the visible transcript as changed. The next draw reconciles cache
+    /// entries by immutable message id and text, retaining every unaffected
+    /// Markdown/layout result.
+    pub(crate) fn invalidate_chat_render_cache(&mut self) {
+        self.chat_render_revision = self.chat_render_revision.wrapping_add(1).max(1);
+    }
+
+    /// Incrementally prepare width-specific Markdown rows for the visible
+    /// transcript. This deliberately bounds expensive parsing to a small,
+    /// deterministic message count per draw; the tail is indexed first so an
+    /// active/resumed response remains visible immediately.
+    pub(crate) fn warm_chat_render_cache(
+        &mut self,
+        width: usize,
+        highlighter: &mut dyn Highlighter,
+    ) -> ChatRenderProgress {
+        let width = width.max(1);
+        let mut semantic_changed = false;
+        let mut cache = self.chat_render_cache.borrow_mut();
+        let active_message_changed = self
+            .chat
+            .iter()
+            .enumerate()
+            .rev()
+            .take(self.agent_progress.queue_depth.saturating_add(2))
+            .find(|(_, message)| message.streaming)
+            .is_some_and(|(index, message)| {
+                cache.entries.get(index).is_none_or(|cached| {
+                    cached.id != message.id
+                        || cached.source_ptr != message.text.as_ptr() as usize
+                        || cached.source_len != message.text.len()
+                        || cached.text != message.text
+                        || cached.has_error != message.error.is_some()
+                })
+            });
+        let source_changed = cache.entries.len() != self.chat.len() || active_message_changed;
+        if cache.revision != self.chat_render_revision || cache.width != width || source_changed {
+            let width_changed = cache.width != 0 && cache.width != width;
+            let mut previous = std::mem::take(&mut cache.entries)
+                .into_iter()
+                .map(|entry| (entry.id.clone(), entry))
+                .collect::<HashMap<_, _>>();
+            cache.entries = self
+                .chat
+                .iter()
+                .map(|message| {
+                    if !width_changed {
+                        if let Some(mut entry) = previous.remove(&message.id) {
+                            if entry.text == message.text {
+                                entry.source_ptr = message.text.as_ptr() as usize;
+                                entry.source_len = message.text.len();
+                                let error_changed = entry.has_error != message.error.is_some();
+                                entry.has_error = message.error.is_some();
+                                semantic_changed |= error_changed;
+                                return entry;
+                            }
+                        }
+                    }
+                    semantic_changed = true;
+                    CachedChatMessage {
+                        id: message.id.clone(),
+                        text: message.text.clone(),
+                        source_ptr: message.text.as_ptr() as usize,
+                        source_len: message.text.len(),
+                        has_error: message.error.is_some(),
+                        mapped: None,
+                        background: None,
+                        display_start: 0,
+                        semantic_start: 0,
+                    }
+                })
+                .collect();
+            // Removal is semantic too: a cached selection layout must not
+            // retain rows for a message that is no longer visible.
+            semantic_changed |= !previous.is_empty() || width_changed;
+            cache.revision = self.chat_render_revision;
+            cache.width = width;
+            cache.next_index = self.chat.len();
+            cache.indexed = cache
+                .entries
+                .iter()
+                .filter(|entry| entry.mapped.is_some())
+                .count();
+        }
+
+        let mut rendered = 0usize;
+        let mut background_renderers = cache
+            .entries
+            .iter()
+            .filter(|entry| entry.background.is_some())
+            .count();
+        while rendered < CHAT_MESSAGES_PER_RENDER_SLICE && cache.indexed < cache.entries.len() {
+            if cache.next_index == 0 {
+                cache.next_index = cache.entries.len();
+            }
+            cache.next_index = cache.next_index.saturating_sub(1);
+            let next_index = cache.next_index;
+            let Some(entry) = cache.entries.get_mut(next_index) else {
+                break;
+            };
+            if entry.mapped.is_some() {
+                continue;
+            }
+            if let Some(receiver) = entry.background.take() {
+                match receiver.try_recv() {
+                    Ok(mapped) => {
+                        entry.mapped = Some(Arc::new(mapped));
+                        cache.indexed = cache.indexed.saturating_add(1);
+                        background_renderers = background_renderers.saturating_sub(1);
+                        semantic_changed = true;
+                        #[cfg(test)]
+                        self.chat_markdown_builds
+                            .set(self.chat_markdown_builds.get().saturating_add(1));
+                    }
+                    Err(TryRecvError::Empty) => {
+                        entry.background = Some(receiver);
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        background_renderers = background_renderers.saturating_sub(1);
+                    }
+                }
+                rendered = rendered.saturating_add(1);
+                continue;
+            }
+            if entry.text.len() >= CHAT_BACKGROUND_RENDER_THRESHOLD
+                && background_renderers < CHAT_BACKGROUND_RENDERERS
+            {
+                let text = entry.text.clone();
+                let (sender, receiver) = mpsc::sync_channel(1);
+                std::thread::spawn(move || {
+                    // Pathological transcripts must never monopolize the input
+                    // thread. Preserve Markdown/source mappings in the
+                    // background; syntax highlighting resumes for ordinary
+                    // messages, while huge fenced outputs use plain styling.
+                    let mut highlighter = PlainHighlighter;
+                    let mapped = render_markdown_mapped(&text, width, &mut highlighter);
+                    sender.send(mapped).ok();
+                });
+                entry.background = Some(BackgroundChatRender(Arc::new(Mutex::new(receiver))));
+                background_renderers = background_renderers.saturating_add(1);
+                rendered = rendered.saturating_add(1);
+                continue;
+            }
+            if entry.text.len() >= CHAT_BACKGROUND_RENDER_THRESHOLD {
+                rendered = rendered.saturating_add(1);
+                continue;
+            }
+            entry.mapped = Some(Arc::new(render_markdown_mapped(
+                &entry.text,
+                width,
+                highlighter,
+            )));
+            cache.indexed = cache.indexed.saturating_add(1);
+            rendered = rendered.saturating_add(1);
+            semantic_changed = true;
+            #[cfg(test)]
+            self.chat_markdown_builds
+                .set(self.chat_markdown_builds.get().saturating_add(1));
+        }
+
+        let mut display_start = 0usize;
+        let mut semantic_start = 0usize;
+        let entry_count = cache.entries.len();
+        for (index, entry) in cache.entries.iter_mut().enumerate() {
+            entry.display_start = display_start;
+            entry.semantic_start = semantic_start;
+            // An unindexed message occupies a single, explicitly labelled
+            // placeholder row until its exact Markdown geometry is ready.
+            let body_rows = entry
+                .mapped
+                .as_ref()
+                .map(|mapped| mapped.rows.len())
+                .unwrap_or(1);
+            display_start = display_start.saturating_add(1 + body_rows);
+            semantic_start = semantic_start.saturating_add(body_rows);
+            if self
+                .chat
+                .get(index)
+                .and_then(|message| message.error.as_ref())
+                .is_some()
+            {
+                display_start = display_start.saturating_add(1);
+            }
+            if index + 1 < entry_count {
+                display_start = display_start.saturating_add(1);
+            }
+        }
+        cache.total_rows = display_start;
+        let progress = ChatRenderProgress {
+            indexed: cache.indexed,
+            total: cache.entries.len(),
+            complete: cache.indexed == cache.entries.len(),
+            total_rows: cache.total_rows,
+        };
+        drop(cache);
+        if semantic_changed {
+            self.chat_layout = None;
+        }
+        progress
+    }
+
+    pub(crate) fn chat_render_progress(&self) -> ChatRenderProgress {
+        let cache = self.chat_render_cache.borrow();
+        ChatRenderProgress {
+            indexed: cache.indexed,
+            total: cache.entries.len(),
+            complete: cache.indexed == cache.entries.len()
+                && cache.revision == self.chat_render_revision,
+            total_rows: cache.total_rows,
+        }
+    }
+
+    pub(crate) fn cached_chat_markdown(&self, index: usize) -> Option<Arc<MappedMarkdown>> {
+        self.chat_render_cache
+            .borrow()
+            .entries
+            .get(index)
+            .and_then(|entry| entry.mapped.as_ref().map(Arc::clone))
+    }
+
+    pub(crate) fn cached_chat_display_start(&self, index: usize) -> Option<usize> {
+        self.chat_render_cache
+            .borrow()
+            .entries
+            .get(index)
+            .map(|entry| entry.display_start)
+    }
+
+    pub(crate) fn cached_chat_semantic_start(&self, index: usize) -> Option<usize> {
+        self.chat_render_cache
+            .borrow()
+            .entries
+            .get(index)
+            .map(|entry| entry.semantic_start)
+    }
+
+    pub(crate) fn cached_chat_window_start(&self, row: usize) -> usize {
+        let cache = self.chat_render_cache.borrow();
+        cache
+            .entries
+            .partition_point(|entry| entry.display_start <= row)
+            .saturating_sub(1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn chat_render_build_counts(&self) -> (usize, usize) {
+        (
+            self.chat_markdown_builds.get(),
+            self.chat_layout_builds.get(),
+        )
     }
 
     fn inline_composer_annotation(&self) -> Option<InlineAnnotation> {
@@ -1561,9 +1891,13 @@ impl AppState {
         self.chat_layout = Some(layout);
         self.chat_display_rows = display_rows;
         self.sync_chat_cursor();
+        #[cfg(test)]
+        self.chat_layout_builds
+            .set(self.chat_layout_builds.get().saturating_add(1));
     }
 
     pub(crate) fn reset_chat_semantics(&mut self) {
+        self.invalidate_chat_render_cache();
         let restore_main = !self.side_active
             && !self.side_starting
             && self.main_chat.is_none()

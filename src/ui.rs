@@ -333,7 +333,15 @@ fn run_loop<B: Backend>(
         if redraw || now >= next_periodic_redraw {
             terminal.draw(|frame| render(frame, state, highlighter))?;
             redraw = false;
-            next_periodic_redraw = now + std::time::Duration::from_secs(1);
+            next_periodic_redraw = now
+                + if state.screen == Screen::Chat && !state.chat_render_progress().complete {
+                    // Continue bounded history indexing at an interactive
+                    // cadence. Each draw has a fixed parsing budget, so this
+                    // cannot monopolize keyboard/event handling.
+                    std::time::Duration::from_millis(16)
+                } else {
+                    std::time::Duration::from_secs(1)
+                };
         }
         let poll_timeout = if agent_slice_saturated {
             // Check pending terminal input immediately between saturated SDK
@@ -545,6 +553,7 @@ fn mark_outbound_failed_before_delivery(state: &mut AppState, outbound_id: &str,
     {
         chat.streaming = false;
         chat.error = Some(message);
+        state.invalidate_chat_render_cache();
     }
 }
 
@@ -2901,6 +2910,7 @@ pub(crate) fn handle_agent_event(
                 .find(|message| message.outbound_id.as_deref() == Some(outbound_id.as_str()))
             {
                 message.error = Some("cancelled before start".into());
+                state.invalidate_chat_render_cache();
             }
             if state.agent_progress.active_outbound_id.is_none()
                 && state.pending_outbound_ids.is_empty()
@@ -2959,6 +2969,7 @@ pub(crate) fn handle_agent_event(
                 .find(|message| message.outbound_id.as_deref() == Some(outbound_id.as_str()))
             {
                 message.error = Some("replaced before start".into());
+                state.invalidate_chat_render_cache();
             }
             state.pending_outbound_ids.remove(&outbound_id);
             state.pending_outbound_ids.insert(replacement_id.clone());
@@ -3009,6 +3020,7 @@ pub(crate) fn handle_agent_event(
             {
                 message.error = Some(format!("queue edit rejected: {reason}"));
             }
+            state.invalidate_chat_render_cache();
             state.status = format!("Queue edit rejected: {reason}");
             state.agent_progress.record_queued(
                 "Queued prompt was not replaced",
@@ -3072,6 +3084,7 @@ pub(crate) fn handle_agent_event(
                 .find(|entry| entry.outbound_id.as_deref() == Some(steering_id.as_str()))
             {
                 chat.error = Some(format!("steering failed: {message}"));
+                state.invalidate_chat_render_cache();
             }
             if state.agent_progress.active_outbound_id.as_deref()
                 == Some(active_outbound_id.as_str())
@@ -3341,6 +3354,9 @@ pub(crate) fn handle_agent_event(
                     message.error = Some("cancelled before response start".into());
                 }
             }
+            if aborted {
+                state.invalidate_chat_render_cache();
+            }
             if !context_completed && completed_visible_turn {
                 state.status = if aborted {
                     "Copilot response stopped".into()
@@ -3410,6 +3426,7 @@ pub(crate) fn handle_agent_event(
             {
                 chat.streaming = false;
                 chat.error = Some(message.clone());
+                state.invalidate_chat_render_cache();
             }
             let changes_review = matches!(
                 &outbound,
@@ -3740,6 +3757,7 @@ pub(crate) fn handle_agent_event(
                 message.streaming = false;
                 message.error = Some("connection lost".into());
             }
+            state.invalidate_chat_render_cache();
             state.status = format!("Copilot unavailable: {error}");
         }
         AgentEvent::Stopped => {
@@ -3770,6 +3788,7 @@ pub(crate) fn handle_agent_event(
                 message.streaming = false;
                 message.error = Some("worker stopped".into());
             }
+            state.invalidate_chat_render_cache();
             state.status = cleanup_warning
                 .map(|warning| {
                     format!(
@@ -5868,17 +5887,30 @@ fn render_chat(
         ])
         .split(frame.area());
 
-    let mut lines = chat_lines(state, width, highlighter);
-    if lines.is_empty() {
-        lines.push(Line::styled(
-            "No session messages yet. The composer is always available below.",
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
     let viewport_rows = vertical[0].height.saturating_sub(2) as usize;
-    state.chat_total_rows = lines.len();
+    let cache = state.warm_chat_render_cache(width.saturating_sub(2).max(1), highlighter);
+    let defer_large_streaming_layout = state.chat.len() > 256
+        && state
+            .chat
+            .iter()
+            .rev()
+            .take(state.agent_progress.queue_depth.saturating_add(2))
+            .any(|message| message.streaming);
+    if cache.complete && state.chat_layout.is_none() && !defer_large_streaming_layout {
+        let mapped = (0..state.chat.len())
+            .map(|index| state.cached_chat_markdown(index))
+            .collect::<Option<Vec<_>>>();
+        if let Some(mapped) = mapped {
+            if let Some(layout) =
+                build_chat_layout(&state.chat, &mapped, width.saturating_sub(2).max(1))
+            {
+                state.set_chat_layout(layout, chat_display_rows(&state.chat, &mapped));
+            }
+        }
+    }
+    state.chat_total_rows = cache.total_rows;
     state.chat_viewport_rows = viewport_rows;
-    let max_scroll = lines.len().saturating_sub(viewport_rows);
+    let max_scroll = state.chat_total_rows.saturating_sub(viewport_rows);
     if state.chat_autofollow {
         state.chat_scroll = max_scroll;
     } else {
@@ -5903,6 +5935,17 @@ fn render_chat(
             }
         }
     }
+    let mut lines = chat_window_lines(
+        state,
+        state.chat_scroll,
+        state.chat_scroll.saturating_add(viewport_rows),
+    );
+    if lines.is_empty() {
+        lines.push(Line::styled(
+            "No session messages yet. The composer is always available below.",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     let lane = visible_lane(state);
     let row_range = format!(
         "rows {}-{}/{}",
@@ -5913,18 +5956,24 @@ fn render_chat(
         (state.chat_scroll + viewport_rows).min(state.chat_total_rows),
         state.chat_total_rows,
     );
+    let indexing =
+        (!cache.complete).then(|| format!(" · indexing {}/{}", cache.indexed, cache.total));
     let chat_title = if frame.area().width < 60 {
-        format!(" Chat · {lane} · {row_range} ")
+        format!(
+            " Chat · {lane} · {row_range}{} ",
+            indexing.as_deref().unwrap_or("")
+        )
     } else {
         format!(
-            " {} — Chat · {lane} · {} · {row_range} ",
-            state.work_item.item.name, state.model,
+            " {} — Chat · {lane} · {} · {row_range}{} ",
+            state.work_item.item.name,
+            state.model,
+            indexing.as_deref().unwrap_or(""),
         )
     };
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(Block::default().title(chat_title).borders(Borders::ALL))
-            .scroll((state.chat_scroll.min(u16::MAX as usize) as u16, 0)),
+            .block(Block::default().title(chat_title).borders(Borders::ALL)),
         vertical[0],
     );
     if progress_height > 0 {
@@ -5938,23 +5987,24 @@ fn render_chat(
     }
 }
 
-fn chat_lines(
-    state: &mut AppState,
-    width: usize,
-    highlighter: &mut dyn Highlighter,
-) -> Vec<Line<'static>> {
-    let body_width = width.saturating_sub(2).max(1);
-    let mapped = state
-        .chat
-        .iter()
-        .map(|message| render_markdown_mapped(&message.text, body_width, highlighter))
-        .collect::<Vec<_>>();
-    if let Some(layout) = build_chat_layout(&state.chat, &mapped, body_width) {
-        state.set_chat_layout(layout, chat_display_rows(&state.chat, &mapped));
-    }
+fn chat_window_lines(state: &AppState, start_row: usize, end_row: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let mut layout_row = 0usize;
-    for (index, (message, mapped_message)) in state.chat.iter().zip(mapped.iter()).enumerate() {
+    let first_index = state.cached_chat_window_start(start_row);
+    for (index, message) in state.chat.iter().enumerate().skip(first_index) {
+        let Some(display_start) = state.cached_chat_display_start(index) else {
+            continue;
+        };
+        let mapped = state.cached_chat_markdown(index);
+        let body_rows = mapped.as_ref().map(|item| item.rows.len()).unwrap_or(1);
+        let display_end = display_start
+            .saturating_add(1 + body_rows + usize::from(message.error.is_some()))
+            .saturating_add(usize::from(index + 1 < state.chat.len()));
+        if display_start >= end_row {
+            break;
+        }
+        if display_end <= start_row {
+            continue;
+        }
         let cursor_message = index == state.chat_cursor;
         let stopped = message
             .error
@@ -5984,34 +6034,62 @@ fn chat_lines(
             ""
         };
         let lane = if state.side_active { "SIDE" } else { "MAIN" };
-        lines.push(
-            Line::styled(
-                format!(
-                    "{}{} · {lane}{marker}",
-                    if cursor_message { "▶ " } else { "  " },
-                    message.role
-                ),
-                Style::default()
-                    .fg(if message.role == "copilot" {
-                        Color::Cyan
-                    } else {
-                        Color::Green
-                    })
-                    .add_modifier(Modifier::BOLD),
-            )
-            .style(if cursor_message {
-                Style::default().bg(Color::Rgb(40, 50, 65))
-            } else {
-                Style::default()
-            }),
-        );
-        for row in &mapped_message.rows {
-            let mut spans = vec![Span::raw("  ")];
-            spans.extend(project_mapped_row(row, layout_row, state, &message.text));
-            lines.push(Line::from(spans));
-            layout_row = layout_row.saturating_add(1);
+        if display_start >= start_row && display_start < end_row {
+            lines.push(
+                Line::styled(
+                    format!(
+                        "{}{} · {lane}{marker}",
+                        if cursor_message { "▶ " } else { "  " },
+                        message.role
+                    ),
+                    Style::default()
+                        .fg(if message.role == "copilot" {
+                            Color::Cyan
+                        } else {
+                            Color::Green
+                        })
+                        .add_modifier(Modifier::BOLD),
+                )
+                .style(if cursor_message {
+                    Style::default().bg(Color::Rgb(40, 50, 65))
+                } else {
+                    Style::default()
+                }),
+            );
         }
-        if let Some(error) = &message.error {
+        let body_start = display_start.saturating_add(1);
+        if let Some(mapped) = mapped {
+            let semantic_start = state.cached_chat_semantic_start(index).unwrap_or(0);
+            for (row_index, row) in mapped.rows.iter().enumerate() {
+                let display_row = body_start.saturating_add(row_index);
+                if display_row < start_row || display_row >= end_row {
+                    continue;
+                }
+                let mut spans = vec![Span::raw("  ")];
+                spans.extend(project_mapped_row(
+                    row,
+                    semantic_start.saturating_add(row_index),
+                    state,
+                    &message.text,
+                ));
+                lines.push(Line::from(spans));
+            }
+        } else if body_start >= start_row && body_start < end_row {
+            let progress = state.chat_render_progress();
+            lines.push(Line::styled(
+                format!(
+                    "  … indexing restored transcript ({}/{})",
+                    progress.indexed, progress.total
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        let error_row = body_start.saturating_add(body_rows);
+        if let Some(error) = message
+            .error
+            .as_ref()
+            .filter(|_| error_row >= start_row && error_row < end_row)
+        {
             lines.push(Line::styled(
                 if stopped {
                     "  response cancelled".to_owned()
@@ -6021,14 +6099,20 @@ fn chat_lines(
                 Style::default().fg(if stopped { Color::Yellow } else { Color::Red }),
             ));
         }
-        if index + 1 < state.chat.len() {
+        if index + 1 < state.chat.len()
+            && error_row.saturating_add(usize::from(message.error.is_some())) >= start_row
+            && error_row.saturating_add(usize::from(message.error.is_some())) < end_row
+        {
             lines.push(Line::from(""));
         }
     }
     lines
 }
 
-fn chat_display_rows(entries: &[ChatEntry], mapped: &[MappedMarkdown]) -> Vec<usize> {
+fn chat_display_rows(
+    entries: &[ChatEntry],
+    mapped: &[std::sync::Arc<MappedMarkdown>],
+) -> Vec<usize> {
     let mut display_row = 0usize;
     let mut result = Vec::new();
     for (index, (entry, rendered)) in entries.iter().zip(mapped).enumerate() {
@@ -6047,7 +6131,7 @@ fn chat_display_rows(entries: &[ChatEntry], mapped: &[MappedMarkdown]) -> Vec<us
 
 fn build_chat_layout(
     entries: &[ChatEntry],
-    mapped: &[MappedMarkdown],
+    mapped: &[std::sync::Arc<MappedMarkdown>],
     width: usize,
 ) -> Option<ChatLayout> {
     let messages = entries
@@ -8705,6 +8789,139 @@ mod tests {
         assert_eq!(state.chat[4].text, "New answer");
         assert!(!state.chat[4].streaming);
         assert!(state.pending_outbound_ids.is_empty());
+    }
+
+    #[test]
+    fn large_resumed_chat_is_warmed_in_bounded_slices_and_reuses_markdown_layout() {
+        let mut state = state_for_ui();
+        state.screen = Screen::Chat;
+        state.focus = Focus::Chat;
+        state.append_resumed_history(
+            (0..4_096)
+                .map(|index| HistoryEntry {
+                    role: if index % 2 == 0 { "you" } else { "copilot" }.into(),
+                    text: format!("# Restored {index}\n\n`needle-{index}`"),
+                })
+                .collect(),
+        );
+        state.agent_progress.record(
+            AgentPhase::Responding,
+            "Copilot is streaming a response",
+            "Restoring history while progress remains visible",
+            Some("active-turn".into()),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut highlighter = PlainHighlighter;
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        let first = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(first.contains("indexing 32/4096"));
+        assert!(first.contains("Copilot is streaming"));
+        assert_eq!(state.chat_render_build_counts(), (32, 0));
+
+        // This is a work-count assertion, not a timing assertion: command
+        // input remains actionable while the transcript is still warming.
+        state.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        assert_eq!(state.input_mode, InputMode::Command);
+        state.input_mode = InputMode::Normal;
+
+        for _ in 1..128 {
+            terminal
+                .draw(|frame| render(frame, &mut state, &mut highlighter))
+                .unwrap();
+        }
+        assert_eq!(state.chat_render_build_counts(), (4_096, 1));
+        assert!(state.chat_layout.is_some());
+        assert_eq!(
+            state.chat_render_progress().total_rows,
+            state.chat_total_rows
+        );
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        assert_eq!(
+            state.chat_render_build_counts(),
+            (4_096, 1),
+            "idle redraws must reuse the complete transcript cache"
+        );
+    }
+
+    #[test]
+    fn same_length_streaming_snapshot_invalidates_cached_markdown() {
+        let mut state = state_for_ui();
+        state.screen = Screen::Chat;
+        state.focus = Focus::Chat;
+        state.chat.push(ChatEntry {
+            id: "streaming-answer".into(),
+            role: "copilot".into(),
+            text: "alpha".into(),
+            streaming: true,
+            annotation_id: None,
+            outbound_id: Some("outbound".into()),
+            error: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let mut highlighter = PlainHighlighter;
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        assert_eq!(state.chat_render_build_counts(), (1, 1));
+
+        // Keep the allocation and byte length stable: pointer/length-only
+        // invalidation would leave the old snapshot visible indefinitely.
+        state.chat[0].text.replace_range(.., "bravo");
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        let frame = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(frame.contains("bravo"));
+        assert!(!frame.contains("alpha"));
+        assert_eq!(state.chat_render_build_counts(), (2, 2));
+    }
+
+    #[test]
+    fn oversized_markdown_is_dispatched_off_the_input_thread() {
+        let mut state = state_for_ui();
+        state.screen = Screen::Chat;
+        state.focus = Focus::Chat;
+        state.chat.push(ChatEntry {
+            id: "huge-tool-output".into(),
+            role: "copilot".into(),
+            text: format!("```rust\n{}\n```", "let value = 1;\n".repeat(16_384)),
+            streaming: false,
+            annotation_id: None,
+            outbound_id: None,
+            error: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let mut highlighter = PlainHighlighter;
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+
+        assert_eq!(
+            state.chat_render_build_counts(),
+            (0, 0),
+            "the first frame must dispatch huge Markdown instead of parsing it inline"
+        );
+        assert!(!state.chat_render_progress().complete);
+        state.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        assert_eq!(state.input_mode, InputMode::Command);
     }
 
     #[test]

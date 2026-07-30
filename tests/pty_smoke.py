@@ -571,6 +571,7 @@ def main() -> int:
         repo = make_fixture(root, extra_changed_lines=12_000)
         entry_latency = 0.0
         resumed_input_latency = 0.0
+        resumed_chat_input_latency = 0.0
         entry_started = time.monotonic()
         resume_probe = Child(
             binary,
@@ -579,7 +580,7 @@ def main() -> int:
             {
                 "RQ_TUI_CONTROLLED_STARTUP_FLOOD": "1",
                 "RQ_TUI_CONTROLLED_RESUMED": "1",
-                "RQ_TUI_CONTROLLED_RESUMED_HISTORY": "1024",
+                "RQ_TUI_CONTROLLED_RESUMED_HISTORY": "4096",
             },
         )
         try:
@@ -604,7 +605,7 @@ def main() -> int:
                 )
 
             # PTY-32: production resume history is delivered in bounded chunks.
-            # Command mode must remain actionable while 1,000+ restored messages
+            # Command mode must remain actionable while 4,000+ restored messages
             # and the startup activity flood are still being applied.
             resume_probe.send(b":")
             resumed_input_latency = resume_probe.wait_for_screen_within(
@@ -617,6 +618,22 @@ def main() -> int:
                 timeout=4,
             )
             resume_probe.wait_for_screen("session resumed", timeout=4)
+
+            # PTY-33: entering Chat after a large resume must render only a
+            # bounded Markdown slice. The visible indexing state proves the
+            # cache is still warming when command input is acknowledged.
+            resume_probe.send(b"\t")
+            resume_probe.wait_for_screen("indexing 32/4096", timeout=4)
+            resume_probe.send(b":")
+            resumed_chat_input_latency = resume_probe.wait_for_screen_within(
+                "COMMAND MODE ACTIVE", BURST_RESPONSE_TIMEOUT
+            )
+            resume_probe.send(b"\x1b")
+            resume_probe.wait_for_screen_state(
+                ("NORMAL",),
+                ("COMMAND MODE ACTIVE",),
+                timeout=4,
+            )
             resume_probe.send(b":q\r")
             if resume_probe.wait_for_exit(timeout=8) != 0:
                 raise AssertionError(
@@ -959,6 +976,7 @@ def main() -> int:
         "PTY_SMOKE_OK: entry resize prune-progress chat-composer "
         f"first-frame={entry_latency:.3f}s "
         f"resumed-input={resumed_input_latency:.3f}s "
+        f"resumed-chat-input={resumed_chat_input_latency:.3f}s "
         f"held-key-burst={burst_latency:.3f}s ctrl-w clean-exit no-panic"
     )
     return 0
