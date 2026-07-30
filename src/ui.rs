@@ -5888,16 +5888,18 @@ fn render_command_palette_area(
         state.command_index.min(matches.len() - 1) + 1
     };
     let compact = palette.width < 60;
-    let help = if compact {
-        format!(
-            " ↑/↓ Pg · Home/End · Enter · Esc  {selected_number}/{}",
-            matches.len()
-        )
+    let controls = if compact {
+        " ↑/↓ Pg · Home/End · Enter · Esc"
     } else {
-        format!(
-            " ↑/↓ wrap · PgUp/PgDn · Home/End · Tab complete · Enter run · Esc cancel  {selected_number}/{}",
-            matches.len()
-        )
+        " ↑/↓ wrap · PgUp/PgDn · Home/End · Tab complete · Enter run · Esc cancel"
+    };
+    let counter = format!("{selected_number}/{}", matches.len());
+    let inner_width = usize::from(palette.width.saturating_sub(2));
+    let controls_width = inner_width.saturating_sub(cell_width(&counter).saturating_add(1));
+    let help = if controls_width == 0 {
+        fit_terminal_text(&counter, inner_width)
+    } else {
+        format!("{} {counter}", fit_terminal_text(controls, controls_width))
     };
     lines.push(Line::styled(help, Style::default().fg(Color::DarkGray)));
     frame.render_widget(Clear, palette);

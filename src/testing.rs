@@ -3237,6 +3237,17 @@ mod tests {
         );
         assert!(compact_frame.contains("COPILOT"));
 
+        let mut medium =
+            TuiHarness::from_unified_diff("medium commands", workflow_diff(), 70, 20).unwrap();
+        medium.key(key(KeyCode::Tab)).unwrap();
+        medium.key(key(KeyCode::Char(':'))).unwrap();
+        medium.key(key(KeyCode::End)).unwrap();
+        let medium_frame = medium.render().unwrap();
+        assert!(
+            medium_frame.contains("28/28"),
+            "the scroll position must stay visible at medium widths:\n{medium_frame}"
+        );
+
         let mut empty =
             TuiHarness::from_unified_diff("empty commands", workflow_diff(), 42, 12).unwrap();
         empty.key(key(KeyCode::Char(':'))).unwrap();
