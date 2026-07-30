@@ -699,9 +699,9 @@ def main() -> int:
             child.send(b"\x17")
             child.wait_for_screen("CTRL-W", timeout=4)
             child.send(b"h")
-            child.wait_for_screen("Focus: files", timeout=4)
+            child.wait_for_screen("Focus: diff → files", timeout=4)
             child.send(b"\x17l")
-            child.wait_for_screen("Focus: diff", timeout=4)
+            child.wait_for_screen("Focus: files → diff", timeout=4)
 
             # Resize the real terminal and require a post-resize redraw. The
             # ioctl is deliberately performed on the PTY master, so this also

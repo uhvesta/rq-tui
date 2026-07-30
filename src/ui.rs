@@ -4700,10 +4700,10 @@ fn render_header(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
         .map(|title| format!("  │  {title}"))
         .unwrap_or_default();
     let focus = match state.focus {
-        crate::app::Focus::FilePicker => "files",
-        crate::app::Focus::Diff => "diff",
+        crate::app::Focus::FilePicker => "diff → files",
+        crate::app::Focus::Diff => "files → diff",
         crate::app::Focus::Chat => "chat",
-        crate::app::Focus::InlineAsk => "inline ask",
+        crate::app::Focus::InlineAsk => "files → diff → inline ask",
     };
     let title = format!(
         " {} — Review  │  Focus: {}  │  {} > {}  │  {}/{} files{} ",
@@ -4924,9 +4924,13 @@ fn render_unified(
     if area.height <= 5 && render_compact_inline_composer(frame, state, area) {
         return;
     }
+    let stream = state.review_stream();
+    let row_count = stream.rows().len();
+    let current_row = usize::from(row_count > 0)
+        .saturating_add(state.review_cursor.min(row_count.saturating_sub(1)));
     let focused = state.focus == crate::app::Focus::Diff;
     frame.render_widget(
-        Paragraph::new(if focused { "▶ unified" } else { "unified" }).style(
+        Paragraph::new(format!("unified · ln {current_row}/{row_count}")).style(
             Style::default()
                 .fg(if focused {
                     Color::Cyan
@@ -4944,7 +4948,6 @@ fn render_unified(
     state.viewport_height = body.height.max(1) as usize;
     state.compose_wrap_width = body.width.saturating_sub(4).max(1) as usize;
     state.set_review_content_width(body.width.saturating_sub(9) as usize);
-    let stream = state.review_stream();
     sync_active_follow_up_cursor(state, stream.rows());
     let layout = state.review_display_layout(stream.rows(), body.width.max(1) as usize);
     clamp_review_display_scroll(state, &layout, body.height.max(1) as usize);
@@ -5000,13 +5003,11 @@ fn render_split(
         Color::DarkGray
     });
     frame.render_widget(
-        Paragraph::new(if focused { "▶ - old" } else { "- old" })
-            .style(diff_border.add_modifier(Modifier::BOLD)),
+        Paragraph::new("- old").style(diff_border.add_modifier(Modifier::BOLD)),
         Rect::new(columns[0].x, columns[0].y, columns[0].width, 1),
     );
     frame.render_widget(
-        Paragraph::new(if focused { "▶ + new" } else { "+ new" })
-            .style(diff_border.add_modifier(Modifier::BOLD)),
+        Paragraph::new("+ new").style(diff_border.add_modifier(Modifier::BOLD)),
         Rect::new(columns[1].x, columns[1].y, columns[1].width, 1),
     );
     if area.height == 1 {
@@ -7335,7 +7336,9 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains("demo — Review"));
-        assert!(content.contains("unified"));
+        assert!(content.contains("Focus: files → diff"));
+        assert!(content.contains("unified · ln "));
+        assert!(!content.contains("▶ unified"));
         assert!(content.contains("a ask"));
     }
 

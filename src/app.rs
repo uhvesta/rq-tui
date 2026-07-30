@@ -2286,9 +2286,9 @@ impl AppState {
                 ModalEffect::ToggleFilePicker => {
                     self.clear_visual_selection();
                     self.status = if self.picker_open {
-                        "File tree opened · Focus: files → diff".into()
+                        "File tree opened · Focus: diff → files".into()
                     } else {
-                        "File tree closed · Focus: diff".into()
+                        "File tree closed · Focus: files → diff".into()
                     };
                 }
                 ModalEffect::DismissVisualSelection => self.clear_visual_selection(),
@@ -4363,7 +4363,7 @@ impl AppState {
             (Focus::Diff | Focus::InlineAsk, 'h') => {
                 self.picker_open = true;
                 self.focus = Focus::FilePicker;
-                self.status = "Focus: files → diff".into();
+                self.status = "Focus: diff → files".into();
             }
             (Focus::FilePicker, 'l') => {
                 self.focus = Focus::Diff;
