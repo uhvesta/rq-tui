@@ -394,6 +394,15 @@ pub(crate) enum AgentEvent {
         original_active: bool,
         reason: String,
     },
+    SteeringAccepted {
+        steering_id: String,
+        active_outbound_id: String,
+    },
+    SteeringFailed {
+        steering_id: String,
+        active_outbound_id: String,
+        message: String,
+    },
     ResponseStarted {
         outbound_id: String,
         outbound: OutboundKind,
@@ -1026,6 +1035,7 @@ impl AgentSink for ControlledAgent {
                 self.schedule_turn(AgentLane::Main, outbound, delay)
             }
             AgentCommand::Steer(outbound) => {
+                let steering_id = outbound.id.clone();
                 let (lane, outbound_id) = {
                     let state = self.state.lock().expect("controlled agent lock");
                     let outbound_id = state.active_outbound_id.clone().or_else(|| {
@@ -1043,17 +1053,16 @@ impl AgentSink for ControlledAgent {
                         .unwrap_or(AgentLane::Main);
                     (lane, outbound_id)
                 };
-                self.schedule_activity(
-                    lane,
-                    Duration::ZERO,
-                    outbound_id,
-                    AgentActivity {
-                        kind: ActivityKind::Intent,
-                        label: "Steering the active response".into(),
-                        tool: None,
-                        detail: Some(outbound.text),
-                    },
-                );
+                if let Some(active_outbound_id) = outbound_id {
+                    self.schedule_agent(
+                        lane,
+                        Duration::ZERO,
+                        AgentEvent::SteeringAccepted {
+                            steering_id,
+                            active_outbound_id,
+                        },
+                    );
+                }
             }
             AgentCommand::CancelQueued(outbound_id) => {
                 let (lane, cancelled) = {
@@ -3625,9 +3634,9 @@ async fn worker(
                         main_events.emit(AgentEvent::Queued { outbound_id, position });
                     }
                     AgentCommand::Steer(outbound) => {
+                        let steering_id = outbound.id.clone();
                         let events = main_events.on_lane(active_lane.clone());
                         if active.is_none() {
-                            let outbound_id = outbound.id.clone();
                             let queue = if active_lane == AgentLane::Main {
                                 &mut main_queue
                             } else {
@@ -3636,7 +3645,7 @@ async fn worker(
                             let position = queue_position(queue, &active, &active_lane, &active_lane);
                             queue.push_back(outbound);
                             events.emit(AgentEvent::Queued {
-                                outbound_id,
+                                outbound_id: steering_id,
                                 position,
                             });
                         } else {
@@ -3662,22 +3671,18 @@ async fn worker(
                                     if let Some(active) = active.as_mut() {
                                         register_sdk_message_root(active, message_id);
                                     }
-                                    events.activity(
-                                        outbound_id,
-                                        AgentActivity {
-                                            kind: ActivityKind::Intent,
-                                            label: "Steering accepted by Copilot".into(),
-                                            tool: None,
-                                            detail: Some(outbound.text),
-                                        },
-                                    );
+                                    events.emit(AgentEvent::SteeringAccepted {
+                                        steering_id,
+                                        active_outbound_id: outbound_id
+                                            .expect("active steering has an outbound id"),
+                                    });
                                 }
-                                Err(error) => events.activity(
-                                    outbound_id,
-                                    AgentActivity::other(format!(
-                                        "Steering could not interrupt the turn: {error}"
-                                    )),
-                                ),
+                                Err(error) => events.emit(AgentEvent::SteeringFailed {
+                                    steering_id,
+                                    active_outbound_id: outbound_id
+                                        .expect("active steering has an outbound id"),
+                                    message: error.to_string(),
+                                }),
                             }
                         }
                     }
@@ -6553,11 +6558,10 @@ mod tests {
         agent
             .send(AgentCommand::Send(outbound))
             .expect("queue main");
+        let steering = Outbound::new(OutboundKind::Correction, "focus on the failure".into());
+        let steering_id = steering.id.clone();
         agent
-            .send(AgentCommand::Steer(Outbound::new(
-                OutboundKind::Chat,
-                "focus on the failure".into(),
-            )))
+            .send(AgentCommand::Steer(steering))
             .expect("steer main");
 
         let events = std::iter::from_fn(|| agent.try_recv_laned()).collect::<Vec<_>>();
@@ -6566,16 +6570,13 @@ mod tests {
                 event,
                 super::AgentEventEnvelope {
                     lane: AgentLane::Main,
-                    activity: Some(activity),
-                    ..
-                } if activity.label == "Steering the active response"
-                    && matches!(
-                        &event.event,
-                        LaneEvent::Agent(AgentEvent::Activity {
-                            outbound_id: Some(id),
-                            ..
-                        }) if id == &outbound_id
-                    )
+                    event: LaneEvent::Agent(AgentEvent::SteeringAccepted {
+                        steering_id: actual_steering_id,
+                        active_outbound_id,
+                    }),
+                    activity: None,
+                } if actual_steering_id == &steering_id
+                    && active_outbound_id == &outbound_id
             )
         }));
     }

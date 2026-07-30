@@ -1197,6 +1197,14 @@ pub(crate) fn handle_effect(
             state.status = "Pending context discarded without resending".into();
         }
         Effect::AbortAgent => {
+            if state.agent_progress.phase != AgentPhase::Stopping {
+                state.agent_progress.record(
+                    AgentPhase::Stopping,
+                    "Stopping the active Copilot response",
+                    "Cancellation was requested; waiting for the SDK idle event",
+                    state.agent_progress.active_outbound_id.clone(),
+                );
+            }
             bridge.send(AgentCommand::Abort)?;
             state.status = "Stopping the current Copilot response…".into();
         }
@@ -1522,6 +1530,18 @@ pub(crate) fn handle_effect_failure(state: &mut AppState, effect: &Effect, error
             state.compose = format!("/steer {text}");
             state.compose_cursor = state.compose.len();
             state.status = format!("Could not steer the active response: {error:#}");
+        }
+        Effect::AbortAgent => {
+            state.agent_progress.record(
+                AgentPhase::Failed,
+                "Could not request cancellation",
+                format!(
+                    "{error:#} · the response may still be active; inspect :agent-status and retry"
+                ),
+                state.agent_progress.active_outbound_id.clone(),
+            );
+            state.status =
+                format!("Could not stop the Copilot response: {error:#} · retry with :stop");
         }
         Effect::CancelQueued(outbound_id) => {
             state.status = format!(
@@ -2851,6 +2871,52 @@ pub(crate) fn handle_agent_event(
                     )
                 },
             );
+        }
+        AgentEvent::SteeringAccepted {
+            steering_id,
+            active_outbound_id,
+        } => {
+            storage.delete_queued_chat(&steering_id)?;
+            state.pending_outbound_ids.remove(&steering_id);
+            state.side_outbound_ids.remove(&steering_id);
+            state.agent_progress.record(
+                AgentPhase::Planning,
+                "Steering accepted by Copilot",
+                format!(
+                    "Correction {} is attached to active turn {}",
+                    short_id(&steering_id),
+                    short_id(&active_outbound_id)
+                ),
+                Some(active_outbound_id),
+            );
+            state.status =
+                "Steering accepted immediately · the active response is continuing".into();
+        }
+        AgentEvent::SteeringFailed {
+            steering_id,
+            active_outbound_id,
+            message,
+        } => {
+            storage.delete_queued_chat(&steering_id)?;
+            state.pending_outbound_ids.remove(&steering_id);
+            state.side_outbound_ids.remove(&steering_id);
+            if let Some(chat) = state
+                .chat
+                .iter_mut()
+                .chain(state.pending_side_entries.iter_mut())
+                .chain(state.main_chat.iter_mut().flatten())
+                .find(|entry| entry.outbound_id.as_deref() == Some(steering_id.as_str()))
+            {
+                chat.error = Some(format!("steering failed: {message}"));
+            }
+            state.agent_progress.record(
+                AgentPhase::Responding,
+                "Steering was not accepted",
+                format!("{message} · the original response is still active"),
+                Some(active_outbound_id),
+            );
+            state.status =
+                format!("Steering failed: {message} · the original response is still running");
         }
         AgentEvent::ResponseStarted {
             outbound_id,
@@ -6354,6 +6420,12 @@ fn agent_event_outbound_id(event: &AgentEvent) -> Option<String> {
         | AgentEvent::ResponseSnapshot { outbound_id, .. }
         | AgentEvent::ResponseComplete { outbound_id, .. }
         | AgentEvent::TurnFailed { outbound_id, .. } => Some(outbound_id.clone()),
+        AgentEvent::SteeringAccepted {
+            active_outbound_id, ..
+        }
+        | AgentEvent::SteeringFailed {
+            active_outbound_id, ..
+        } => Some(active_outbound_id.clone()),
         AgentEvent::Activity { outbound_id, .. } => outbound_id.clone(),
         _ => None,
     }
@@ -6635,6 +6707,91 @@ mod tests {
         assert_eq!(restarted_second.model, "fast");
         assert_eq!(restarted_second.reasoning_effort.as_deref(), Some("low"));
         assert_eq!(restarted_second.context_tier.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn rejected_immediate_steering_settles_its_durable_record() {
+        let storage = Storage::in_memory().unwrap();
+        let agent = FakeAgent::default();
+        let mut state = state_for_ui();
+        storage.upsert_work_item(&state.work_item.item).unwrap();
+        state.agent_progress.phase = AgentPhase::Responding;
+        state.agent_progress.active_outbound_id = Some("active-turn".into());
+
+        handle_effect(
+            &mut state,
+            &storage,
+            &paths(),
+            &agent,
+            Effect::SteerChat("focus on cleanup".into()),
+        )
+        .unwrap();
+        let steering_id = match agent.commands.lock().unwrap().last().cloned().unwrap() {
+            AgentCommand::Steer(outbound) => outbound.id,
+            command => panic!("expected steering command, got {command:?}"),
+        };
+        assert_eq!(state.pending_outbound_ids.len(), 1);
+        assert_eq!(
+            storage
+                .pending_chats(&state.work_item.item.id)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        handle_agent_event(
+            &mut state,
+            &storage,
+            AgentEvent::SteeringFailed {
+                steering_id: steering_id.clone(),
+                active_outbound_id: "active-turn".into(),
+                message: "runtime rejected immediate delivery".into(),
+            },
+        )
+        .unwrap();
+
+        assert!(state.pending_outbound_ids.is_empty());
+        assert!(storage
+            .pending_chats(&state.work_item.item.id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(state.agent_progress.phase, AgentPhase::Responding);
+        assert_eq!(
+            state.agent_progress.active_outbound_id.as_deref(),
+            Some("active-turn")
+        );
+        assert!(state
+            .chat
+            .iter()
+            .find(|entry| entry.outbound_id.as_deref() == Some(steering_id.as_str()))
+            .and_then(|entry| entry.error.as_deref())
+            .is_some_and(|error| error.contains("steering failed")));
+    }
+
+    #[test]
+    fn abort_delivery_failure_never_leaves_a_false_stopping_state() {
+        let mut state = state_for_ui();
+        state.agent_progress.phase = AgentPhase::Responding;
+        state.agent_progress.active_outbound_id = Some("active-turn".into());
+        let storage = Storage::in_memory().unwrap();
+        let effect = Effect::AbortAgent;
+        let error = handle_effect(
+            &mut state,
+            &storage,
+            &paths(),
+            &RejectingAgent,
+            effect.clone(),
+        )
+        .unwrap_err();
+        handle_effect_failure(&mut state, &effect, &error);
+
+        assert_eq!(state.agent_progress.phase, AgentPhase::Failed);
+        assert_eq!(
+            state.agent_progress.active_outbound_id.as_deref(),
+            Some("active-turn")
+        );
+        assert!(state.status.contains("retry with :stop"));
+        assert!(state.agent_progress.detail.contains("may still be active"));
     }
 
     #[test]

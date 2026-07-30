@@ -1678,7 +1678,9 @@ impl AppState {
                     self.scroll = self.scroll.saturating_sub(1);
                     Vec::new()
                 }
-                KeyCode::Char('s') => vec![Effect::AbortAgent],
+                KeyCode::Char('s') => self.request_agent_stop(
+                    "Cancellation was requested from Agent Status; waiting for the SDK idle event",
+                ),
                 _ => Vec::new(),
             };
         }
@@ -1699,7 +1701,9 @@ impl AppState {
                     self.scroll = self.scroll.saturating_sub(1);
                     Vec::new()
                 }
-                KeyCode::Char('s') => vec![Effect::AbortAgent],
+                KeyCode::Char('s') => self.request_agent_stop(
+                    "Cancellation was requested from the queue; waiting for the SDK idle event",
+                ),
                 KeyCode::Char('d') => {
                     let Some((outbound_id, active)) =
                         self.queue_entry_ids().get(self.scroll).cloned()
@@ -2765,6 +2769,33 @@ impl AppState {
             .collect()
     }
 
+    fn request_agent_stop(&mut self, detail: &str) -> Vec<Effect> {
+        if self.agent_progress.phase == AgentPhase::Stopping {
+            self.status =
+                "Cancellation is already in progress · open :agent-status to verify activity"
+                    .into();
+            return Vec::new();
+        }
+        let Some(outbound_id) = self.agent_progress.active_outbound_id.clone() else {
+            self.status =
+                "No active Copilot response to stop · queued prompts are unchanged".into();
+            return Vec::new();
+        };
+        if !self.agent_progress.phase.is_active() {
+            self.status =
+                "No active Copilot response to stop · queued prompts are unchanged".into();
+            return Vec::new();
+        }
+        self.agent_progress.record(
+            AgentPhase::Stopping,
+            "Stopping the active Copilot response",
+            detail,
+            Some(outbound_id),
+        );
+        self.status = "Stopping the current Copilot response…".into();
+        vec![Effect::AbortAgent]
+    }
+
     fn handle_control_key(&mut self, code: KeyCode) -> Vec<Effect> {
         let page = if self.focus == Focus::Chat {
             self.chat_viewport_rows.max(1)
@@ -2791,13 +2822,9 @@ impl AppState {
                 if self.agent_progress.phase.is_active()
                     && self.agent_progress.active_outbound_id.is_some()
                 {
-                    self.agent_progress.record(
-                        AgentPhase::Stopping,
-                        "Stopping the active Copilot response",
+                    return self.request_agent_stop(
                         "Cancellation was requested; waiting for the SDK idle event",
-                        self.agent_progress.active_outbound_id.clone(),
                     );
-                    return vec![Effect::AbortAgent];
                 }
                 if self.screen == Screen::Chat && !self.compose.is_empty() {
                     self.compose.clear();
@@ -3066,13 +3093,9 @@ impl AppState {
                     if self.agent_progress.phase.is_active()
                         && self.agent_progress.active_outbound_id.is_some()
                     {
-                        self.agent_progress.record(
-                            AgentPhase::Stopping,
-                            "Stopping the active Copilot response",
+                        return self.request_agent_stop(
                             "Draft preserved; press Ctrl-C again after Copilot stops to discard it",
-                            self.agent_progress.active_outbound_id.clone(),
                         );
-                        return vec![Effect::AbortAgent];
                     }
                     self.compose.clear();
                     self.compose_cursor = 0;
@@ -3378,7 +3401,9 @@ impl AppState {
                 let rest = parts.collect::<Vec<_>>().join(" ");
                 vec![Effect::Compact((!rest.is_empty()).then_some(rest))]
             }
-            (Some("stop" | "abort"), _) => vec![Effect::AbortAgent],
+            (Some("stop" | "abort"), _) => self.request_agent_stop(
+                "Cancellation was requested from command mode; waiting for the SDK idle event",
+            ),
             (Some("agent-status" | "progress"), _) => {
                 self.open_overlay(Screen::AgentStatus);
                 Vec::new()
@@ -4916,6 +4941,8 @@ mod tests {
     #[test]
     fn stop_command_aborts_the_active_agent_turn() {
         let mut app = state();
+        app.agent_progress.phase = AgentPhase::Responding;
+        app.agent_progress.active_outbound_id = Some("active".into());
         app.input_mode = InputMode::Command;
         for character in "stop".chars() {
             app.handle_key(key(KeyCode::Char(character)));
@@ -4924,6 +4951,43 @@ mod tests {
             app.handle_key(key(KeyCode::Enter)),
             vec![Effect::AbortAgent]
         );
+        assert_eq!(app.agent_progress.phase, AgentPhase::Stopping);
+        assert!(app.status.contains("Stopping the current Copilot response"));
+
+        app.input_mode = InputMode::Command;
+        for character in "stop".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
+        assert!(app.status.contains("already in progress"));
+    }
+
+    #[test]
+    fn queue_and_agent_status_stop_controls_share_the_same_transition() {
+        for screen in [Screen::Queue, Screen::AgentStatus] {
+            let mut app = state();
+            app.screen = screen;
+            app.agent_progress.phase = AgentPhase::Tool;
+            app.agent_progress.active_outbound_id = Some("active".into());
+
+            assert_eq!(
+                app.handle_key(key(KeyCode::Char('s'))),
+                vec![Effect::AbortAgent]
+            );
+            assert_eq!(app.agent_progress.phase, AgentPhase::Stopping);
+            assert_eq!(
+                app.agent_progress.active_outbound_id.as_deref(),
+                Some("active")
+            );
+        }
+
+        let mut idle = state();
+        idle.input_mode = InputMode::Command;
+        for character in "abort".chars() {
+            idle.handle_key(key(KeyCode::Char(character)));
+        }
+        assert!(idle.handle_key(key(KeyCode::Enter)).is_empty());
+        assert!(idle.status.contains("No active Copilot response"));
     }
 
     #[test]

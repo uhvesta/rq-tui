@@ -158,6 +158,31 @@ impl TuiHarness {
             );
             if let Err(error) = result {
                 handle_effect_failure(&mut self.state, &effect, &error);
+            } else if let Effect::SteerChat(_) = effect {
+                let command = self
+                    .agent
+                    .commands
+                    .lock()
+                    .expect("agent lock")
+                    .last()
+                    .cloned();
+                let Some(AgentCommand::Steer(steering)) = command else {
+                    anyhow::bail!("fake agent did not receive steering");
+                };
+                let active_outbound_id = self
+                    .state
+                    .agent_progress
+                    .active_outbound_id
+                    .clone()
+                    .context("steering has no active fake-agent turn")?;
+                handle_agent_event(
+                    &mut self.state,
+                    &self.storage,
+                    AgentEvent::SteeringAccepted {
+                        steering_id: steering.id,
+                        active_outbound_id,
+                    },
+                )?;
             } else if let Effect::CancelQueued(outbound_id) = effect {
                 self.agent
                     .pending
@@ -3021,7 +3046,17 @@ mod tests {
         let frame = harness.render().unwrap();
         assert!(frame.contains("you · steer"));
         assert!(frame.contains("inspect the cleanup branch"));
-        assert!(harness.status().contains("Steering sent immediately"));
+        assert!(harness.status().contains("Steering accepted immediately"));
+        assert_eq!(harness.pending_outbound_count(), 0);
+        assert!(harness
+            .storage
+            .pending_chats(&harness.state.work_item.item.id)
+            .unwrap()
+            .is_empty());
+
+        harness.restart().unwrap();
+        assert_ne!(harness.state.screen, crate::app::Screen::Recovery);
+        assert!(harness.state.pending_chats.is_empty());
     }
 
     #[test]
