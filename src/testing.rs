@@ -1480,6 +1480,54 @@ mod tests {
     }
 
     #[test]
+    fn editing_a_parked_main_queue_entry_from_side_keeps_it_on_main() {
+        let mut harness =
+            TuiHarness::from_unified_diff("side-main-edit", workflow_diff(), 92, 22).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        for prompt in ["main first", "main queued original"] {
+            harness.key(key(KeyCode::Char('i'))).unwrap();
+            type_text(&mut harness, prompt);
+            harness.key(key(KeyCode::Enter)).unwrap();
+        }
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "/side isolated");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness
+            .inject_side_started("main-session", "side-session")
+            .unwrap();
+
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "queue");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.key(key(KeyCode::Down)).unwrap();
+        harness.key(key(KeyCode::Char('e'))).unwrap();
+        harness
+            .key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
+        type_text(&mut harness, "main queued replacement");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        assert!(!harness
+            .state
+            .chat
+            .iter()
+            .any(|entry| entry.text == "main queued replacement"));
+        assert!(harness.state.main_chat.as_ref().is_some_and(|chat| chat
+            .iter()
+            .any(|entry| entry.text == "main queued replacement")));
+
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "/main");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        assert!(!harness.state.side_active);
+        assert!(harness
+            .state
+            .chat
+            .iter()
+            .any(|entry| entry.text == "main queued replacement"));
+        assert!(harness.status().contains("MAIN restored"));
+    }
+
+    #[test]
     fn ui_script_exposes_models_activity_quiet_history_and_exact_effects() {
         let output = super::run_ui_script(
             "unicode",
@@ -1977,6 +2025,40 @@ mod tests {
         let annotation = harness.persisted_annotations().unwrap().remove(0);
         assert!(annotation.submitted);
         assert_eq!(annotation.delivery_state, "sent");
+    }
+
+    #[test]
+    fn comment_export_in_side_uses_the_side_lane_and_transcript() {
+        let mut harness =
+            TuiHarness::from_unified_diff("side-export", workflow_diff(), 100, 24).unwrap();
+        harness.key(key(KeyCode::Char('c'))).unwrap();
+        type_text(&mut harness, "export only to active side");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "/side isolated");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness
+            .inject_side_started("main-session", "side-session")
+            .unwrap();
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "export");
+        harness.key(key(KeyCode::Enter)).unwrap();
+
+        assert!(harness
+            .agent_commands()
+            .iter()
+            .any(|command| command.starts_with("SendSide(") && command.contains("CommentBatch")));
+        assert!(harness
+            .state
+            .chat
+            .iter()
+            .any(|entry| entry.role == "comments"));
+        assert!(harness
+            .state
+            .main_chat
+            .as_ref()
+            .is_some_and(|chat| chat.iter().all(|entry| entry.role != "comments")));
     }
 
     #[test]

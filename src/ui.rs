@@ -247,8 +247,8 @@ fn queue_outbound(
     outbound: Outbound,
 ) -> Result<String> {
     let outbound_id = outbound.id.clone();
-    let side_outbound =
-        (state.side_active || state.side_starting) && outbound.kind == OutboundKind::Chat;
+    let side_outbound = (state.side_active || state.side_starting)
+        && !matches!(&outbound.kind, OutboundKind::Ask { .. });
     let command = if side_outbound {
         AgentCommand::SendSide(outbound)
     } else {
@@ -265,6 +265,21 @@ fn queue_outbound(
         format!("Outbound {} has not started yet", short_id(&outbound_id)),
     );
     Ok(outbound_id)
+}
+
+fn push_outbound_entry(state: &mut AppState, entry: ChatEntry) {
+    let side_outbound = entry
+        .outbound_id
+        .as_ref()
+        .is_some_and(|id| state.side_outbound_ids.contains(id));
+    if side_outbound && state.side_starting && !state.side_active {
+        state.pending_side_entries.push(entry);
+    } else if !side_outbound && state.side_active {
+        state.main_chat.get_or_insert_with(Vec::new).push(entry);
+    } else {
+        state.chat.push(entry);
+        follow_chat(state);
+    }
 }
 
 fn mark_outbound_failed_before_delivery(state: &mut AppState, outbound_id: &str, message: String) {
@@ -436,12 +451,7 @@ pub(crate) fn handle_effect(
                     outbound_id: Some(outbound_id.clone()),
                     error: None,
                 };
-                if state.side_starting && !state.side_active {
-                    state.pending_side_entries.push(entry);
-                } else {
-                    state.chat.push(entry);
-                }
-                follow_chat(state);
+                push_outbound_entry(state, entry);
                 state.status = if state.side_starting {
                     "SIDE message buffered safely while the ephemeral fork starts".into()
                 } else if state.status.starts_with("No response is active;") {
@@ -499,7 +509,7 @@ pub(crate) fn handle_effect(
             if state.side_outbound_ids.remove(&outbound_id) {
                 state.side_outbound_ids.insert(replacement_id.clone());
             }
-            state.chat.push(ChatEntry {
+            let replacement_entry = ChatEntry {
                 id: uuid::Uuid::new_v4().to_string(),
                 role: "you".into(),
                 text,
@@ -507,8 +517,8 @@ pub(crate) fn handle_effect(
                 annotation_id: None,
                 outbound_id: Some(replacement_id),
                 error: None,
-            });
-            follow_chat(state);
+            };
+            push_outbound_entry(state, replacement_entry);
             state.status = "Replacing the queued prompt atomically…".into();
         }
         Effect::StartSide(question) => {
@@ -548,20 +558,24 @@ pub(crate) fn handle_effect(
         Effect::ExitSide => {
             if state.side_starting {
                 bridge.send(AgentCommand::CancelSide)?;
+                restore_main_surface(state);
                 state.agent_progress.record(
                     AgentPhase::Stopping,
                     "Cancelling SIDE creation",
-                    "Waiting for the SDK fork operation to unwind; MAIN remains unchanged",
+                    "MAIN is restored; the SDK fork operation is unwinding in the background",
                     None,
                 );
+                state.status = "MAIN restored · cancelling SIDE creation in background".into();
             } else if state.side_active {
                 bridge.send(AgentCommand::ExitSide)?;
+                restore_main_surface(state);
                 state.agent_progress.record(
                     AgentPhase::Stopping,
-                    "Closing SIDE and returning to MAIN",
-                    "SIDE is ephemeral; MAIN history remains unchanged",
+                    "Closing SIDE in the background",
+                    "MAIN is already restored; SIDE abort and cleanup are still running",
                     None,
                 );
+                state.status = "MAIN restored · closing SIDE in background".into();
             } else {
                 state.status = "Already on MAIN".into();
             }
@@ -873,16 +887,18 @@ pub(crate) fn handle_effect(
                     self_contained_ask(&annotation, &message, &tail),
                 ),
             )?;
-            state.chat.push(ChatEntry {
-                id: uuid::Uuid::new_v4().to_string(),
-                role: "you (resent)".into(),
-                text: message.text.clone(),
-                streaming: false,
-                annotation_id: Some(annotation.id),
-                outbound_id: Some(outbound_id.clone()),
-                error: None,
-            });
-            follow_chat(state);
+            push_outbound_entry(
+                state,
+                ChatEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: "you (resent)".into(),
+                    text: message.text.clone(),
+                    streaming: false,
+                    annotation_id: Some(annotation.id),
+                    outbound_id: Some(outbound_id.clone()),
+                    error: None,
+                },
+            );
             finish_recovery_item(state, &message.id);
             state.status = "Pending ask intentionally resent".into();
         }
@@ -906,16 +922,18 @@ pub(crate) fn handle_effect(
                     export.structured_session_message(),
                 ),
             )?;
-            state.chat.push(ChatEntry {
-                id: uuid::Uuid::new_v4().to_string(),
-                role: "comments (resent)".into(),
-                text: export.structured_session_message(),
-                streaming: false,
-                annotation_id: None,
-                outbound_id: Some(outbound_id.clone()),
-                error: None,
-            });
-            follow_chat(state);
+            push_outbound_entry(
+                state,
+                ChatEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: "comments (resent)".into(),
+                    text: export.structured_session_message(),
+                    streaming: false,
+                    annotation_id: None,
+                    outbound_id: Some(outbound_id.clone()),
+                    error: None,
+                },
+            );
             state.pending_comment_ids.clear();
             finish_recovery(state);
             state.status = "Pending comment batch intentionally resent".into();
@@ -1052,16 +1070,18 @@ pub(crate) fn handle_effect(
                         export.structured_session_message(),
                     ),
                 )?;
-                state.chat.push(ChatEntry {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    role: "comments".into(),
-                    text: export.structured_session_message(),
-                    streaming: false,
-                    annotation_id: None,
-                    outbound_id: Some(outbound_id),
-                    error: None,
-                });
-                follow_chat(state);
+                push_outbound_entry(
+                    state,
+                    ChatEntry {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        role: "comments".into(),
+                        text: export.structured_session_message(),
+                        streaming: false,
+                        annotation_id: None,
+                        outbound_id: Some(outbound_id),
+                        error: None,
+                    },
+                );
                 state.status = export_path.map_or_else(
                     || "Comment batch queued".into(),
                     |path| format!("Exported comments to {} · batch queued", path.display()),
@@ -1867,6 +1887,23 @@ pub(crate) fn handle_agent_envelope(
             ..
         } => {
             if !state.side_active && !state.side_starting {
+                if let Some(warning) = cleanup_warning {
+                    state.agent_progress.record(
+                        AgentPhase::Failed,
+                        "SIDE closed, but cleanup needs attention",
+                        warning.clone(),
+                        None,
+                    );
+                    state.status = format!("MAIN active · SIDE cleanup warning: {warning}");
+                } else if state.agent_progress.phase == AgentPhase::Stopping {
+                    state.agent_progress.record(
+                        AgentPhase::Idle,
+                        "SIDE cleanup complete",
+                        "MAIN remained available while the ephemeral session closed",
+                        None,
+                    );
+                    state.status = "MAIN active · SIDE cleanup complete".into();
+                }
                 return Ok(());
             }
             if state
@@ -1876,18 +1913,7 @@ pub(crate) fn handle_agent_envelope(
             {
                 return Ok(());
             }
-            state.chat = state.main_chat.take().unwrap_or_default();
-            state.pending_side_entries.clear();
-            state.side_starting = false;
-            state.side_active = false;
-            state.side_session_id = None;
-            state.chat_scroll = 0;
-            state.chat_autofollow = true;
-            state.reset_chat_semantics();
-            for id in state.side_outbound_ids.drain() {
-                state.pending_outbound_ids.remove(&id);
-            }
-            state.agent_progress.queue_depth = 0;
+            restore_main_surface(state);
             let detail = cleanup_warning.clone().unwrap_or_else(|| {
                 "SIDE was discarded; persistent MAIN history was not changed".into()
             });
@@ -2048,6 +2074,20 @@ fn handle_parked_main_event(
     state.agent_activity = visible_agent_activity;
     state.agent_progress = visible_agent_progress;
     result
+}
+
+fn restore_main_surface(state: &mut AppState) {
+    if let Some(main_chat) = state.main_chat.take() {
+        state.chat = main_chat;
+    }
+    state.pending_side_entries.clear();
+    state.side_starting = false;
+    state.side_active = false;
+    state.side_session_id = None;
+    for id in state.side_outbound_ids.drain() {
+        state.pending_outbound_ids.remove(&id);
+    }
+    state.reset_chat_semantics();
 }
 
 pub(crate) fn handle_agent_event(
@@ -2618,7 +2658,12 @@ pub(crate) fn handle_agent_event(
                 error.clone(),
                 None,
             );
-            for message in state.chat.iter_mut().filter(|message| message.streaming) {
+            for message in state
+                .chat
+                .iter_mut()
+                .chain(state.main_chat.iter_mut().flatten())
+                .filter(|message| message.streaming)
+            {
                 message.streaming = false;
                 message.error = Some("connection lost".into());
             }
@@ -2633,6 +2678,16 @@ pub(crate) fn handle_agent_event(
                 "No SDK event stream is active",
                 None,
             );
+            for message in state
+                .chat
+                .iter_mut()
+                .chain(state.main_chat.iter_mut().flatten())
+                .filter(|message| message.streaming)
+            {
+                message.streaming = false;
+                message.error = Some("worker stopped".into());
+            }
+            state.status = "Copilot worker stopped · restart to resume the session".into();
         }
     }
     Ok(())
@@ -5010,7 +5065,9 @@ mod tests {
             &mut state,
             &storage,
             AgentEventEnvelope {
-                lane: AgentLane::Main,
+                lane: AgentLane::Side {
+                    id: "side-session".into(),
+                },
                 event: LaneEvent::Agent(AgentEvent::Error("event stream closed".into())),
                 activity: None,
             },
@@ -5023,6 +5080,28 @@ mod tests {
         assert_eq!(
             state.main_chat.as_ref().unwrap()[0].error.as_deref(),
             Some("connection lost")
+        );
+
+        state.chat[0].streaming = true;
+        state.chat[0].error = None;
+        state.main_chat.as_mut().unwrap()[0].streaming = true;
+        state.main_chat.as_mut().unwrap()[0].error = None;
+        handle_agent_envelope(
+            &mut state,
+            &storage,
+            AgentEventEnvelope {
+                lane: AgentLane::Side {
+                    id: "side-session".into(),
+                },
+                event: LaneEvent::Agent(AgentEvent::Stopped),
+                activity: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(state.chat[0].error.as_deref(), Some("worker stopped"));
+        assert_eq!(
+            state.main_chat.as_ref().unwrap()[0].error.as_deref(),
+            Some("worker stopped")
         );
     }
 
