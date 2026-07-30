@@ -969,11 +969,12 @@ struct ActiveOutbound {
     /// after an earlier turn released the local FIFO.
     turn_started: bool,
     turn_id: Option<String>,
-    /// Identifier acknowledged by `session.send`. The current CLI exposes this
-    /// as interaction metadata rather than as the `user.message` event ID, so
-    /// the event itself must be observed before descendant events can be
-    /// attributed safely.
-    sdk_message_id: Option<String>,
+    /// Message identifiers acknowledged by `session.send`. The current CLI
+    /// exposes these as interaction metadata rather than as the
+    /// `user.message` event ID. There can be more than one while an active
+    /// turn is steered with immediate delivery, and each is a trusted root for
+    /// its descendant event chain.
+    sdk_message_ids: HashSet<String>,
     accepted_event_ids: HashSet<String>,
     message_buffers: HashMap<String, String>,
     message_order: Vec<String>,
@@ -1075,7 +1076,7 @@ impl SessionHooks for ProgressHooks {
                 kind: ActivityKind::ToolStart,
                 label: format!("Hook: starting {}", input.tool_name),
                 tool: Some(input.tool_name),
-                detail: Some("pre-tool-use hook accepted the read-only operation".into()),
+                detail: Some("Awaiting the separate read-only permission-policy decision".into()),
             },
             HookEvent::PreMcpToolCall { input, .. } => AgentActivity {
                 kind: ActivityKind::ToolStart,
@@ -1603,15 +1604,20 @@ async fn worker(
                             )
                             .await
                             {
-                                Ok(_) => events.activity(
-                                    outbound_id,
-                                    AgentActivity {
-                                        kind: ActivityKind::Intent,
-                                        label: "Steering accepted by Copilot".into(),
-                                        tool: None,
-                                        detail: Some(outbound.text),
-                                    },
-                                ),
+                                Ok(message_id) => {
+                                    if let Some(active) = active.as_mut() {
+                                        register_sdk_message_root(active, message_id);
+                                    }
+                                    events.activity(
+                                        outbound_id,
+                                        AgentActivity {
+                                            kind: ActivityKind::Intent,
+                                            label: "Steering accepted by Copilot".into(),
+                                            tool: None,
+                                            detail: Some(outbound.text),
+                                        },
+                                    );
+                                }
                                 Err(error) => events.activity(
                                     outbound_id,
                                     AgentActivity::other(format!(
@@ -1921,18 +1927,20 @@ async fn start_next(
             if env::var_os("RQ_TUI_DEBUG_EVENTS").is_some() {
                 eprintln!("rq-tui accepted user-message root={user_message_id}");
             }
-            *active = Some(ActiveOutbound {
+            let mut next = ActiveOutbound {
                 outbound,
                 response_started: false,
                 turn_started: false,
                 turn_id: None,
-                sdk_message_id: Some(user_message_id),
+                sdk_message_ids: HashSet::new(),
                 accepted_event_ids: HashSet::new(),
                 message_buffers: HashMap::new(),
                 message_order: Vec::new(),
                 emitted_text: String::new(),
                 hidden_message_ids: HashSet::new(),
-            });
+            };
+            register_sdk_message_root(&mut next, user_message_id);
+            *active = Some(next);
         }
         Err(error) => {
             events.emit(AgentEvent::TurnFailed {
@@ -1955,20 +1963,25 @@ fn handle_session_event(
         || event.event_type.starts_with("tool.")
         || event.event_type.starts_with("skill.")
         || event.event_type.starts_with("subagent.")
-        || matches!(event.event_type.as_str(), "session.idle" | "session.error");
+        || matches!(
+            event.event_type.as_str(),
+            "session.idle" | "session.error" | "session.task_complete"
+        );
     if let Some(active) = active.as_mut() {
-        if !active.turn_started && event.event_type == "user.message" {
-            let matches_sdk_id = active.sdk_message_id.as_deref().is_some_and(|id| {
-                event.id == id
-                    || event
-                        .data
-                        .get("interactionId")
-                        .and_then(|value| value.as_str())
-                        == Some(id)
-            });
+        if event.event_type == "user.message" {
+            let matches_sdk_id = active.sdk_message_ids.contains(&event.id)
+                || event
+                    .data
+                    .get("interactionId")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|id| active.sdk_message_ids.contains(id));
             let matches_content = event.data.get("content").and_then(|value| value.as_str())
                 == Some(active.outbound.text.as_str());
-            if matches_sdk_id || matches_content {
+            // Content is only a compatibility fallback for the first prompt.
+            // A steering prompt is always registered by the returned SDK ID;
+            // accepting it by text after a turn started could bind an unrelated
+            // historical user event to this turn.
+            if matches_sdk_id || (!active.turn_started && matches_content) {
                 active.accepted_event_ids.insert(event.id.clone());
             }
         }
@@ -2402,6 +2415,23 @@ fn handle_session_event(
                     .and_then(|value| value.as_i64()),
             });
         }
+        "session.task_complete" => {
+            let summary = event
+                .data
+                .get("summary")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned);
+            send_activity(
+                active,
+                AgentActivity {
+                    kind: ActivityKind::ToolComplete,
+                    label: "Copilot marked the task complete".into(),
+                    tool: Some("task_complete".into()),
+                    detail: summary,
+                },
+                events,
+            );
+        }
         "session.idle" => {
             if active.as_ref().is_some_and(|active| !active.turn_started) {
                 events.activity(
@@ -2409,6 +2439,20 @@ fn handle_session_event(
                     AgentActivity::other(
                         "Ignored an idle boundary from the previous turn; waiting for this turn to start",
                     ),
+                );
+            } else if background_tasks_are_running(event.data.get("backgroundTasks")) {
+                send_activity(
+                    active,
+                    AgentActivity {
+                        kind: ActivityKind::ToolProgress,
+                        label: "Copilot is still running background work".into(),
+                        tool: Some("background_tasks".into()),
+                        detail: Some(
+                            "Waiting for Copilot to report that its background tasks are done"
+                                .into(),
+                        ),
+                    },
+                    events,
                 );
             } else if let Some(active) = active.take() {
                 let aborted = event
@@ -2446,6 +2490,29 @@ fn handle_session_event(
             }
         }
         _ => {}
+    }
+}
+
+fn register_sdk_message_root(active: &mut ActiveOutbound, message_id: String) {
+    if message_id.is_empty() {
+        return;
+    }
+    active.sdk_message_ids.insert(message_id.clone());
+    // SDK-assigned IDs are trusted roots. Some CLI versions use this exact ID
+    // as a parent while others expose it via `user.message.interactionId`.
+    active.accepted_event_ids.insert(message_id);
+}
+
+fn background_tasks_are_running(background_tasks: Option<&serde_json::Value>) -> bool {
+    match background_tasks {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(running)) => *running,
+        Some(serde_json::Value::Number(count)) => count.as_u64().is_none_or(|count| count > 0),
+        Some(serde_json::Value::String(status)) => !status.is_empty(),
+        Some(serde_json::Value::Array(tasks)) => !tasks.is_empty(),
+        Some(serde_json::Value::Object(tasks)) => tasks
+            .values()
+            .any(|task| background_tasks_are_running(Some(task))),
     }
 }
 
@@ -2562,7 +2629,7 @@ fn resumed_active_from_history(
         response_started: false,
         turn_started: turn_id.is_some(),
         turn_id,
-        sdk_message_id: None,
+        sdk_message_ids: HashSet::new(),
         accepted_event_ids: events[pending_index..]
             .iter()
             .map(|event| event.id.clone())
@@ -2814,16 +2881,17 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use github_copilot_sdk::handler::PermissionHandler;
+    use github_copilot_sdk::hooks::{HookContext, HookEvent, PreToolUseInput, SessionHooks};
     use github_copilot_sdk::{
         PermissionRequestData, PermissionRequestKind, RequestId, SessionEvent, SessionId,
     };
 
     use super::{
         create_config, enqueue_message, handle_session_event, history_entries, model_option,
-        resume_config, resumed_active_from_history, ActiveOutbound, ActivityKind, AgentCommand,
-        AgentEvent, AgentLane, AgentRuntime, AgentSink, BridgeConfig, ControlledAgent,
-        CopilotBridge, EventPublisher, HistoryEntry, LaneEvent, Outbound, OutboundKind,
-        ReadOnlyPermissionHandler,
+        register_sdk_message_root, resume_config, resumed_active_from_history, ActiveOutbound,
+        ActivityKind, AgentCommand, AgentEvent, AgentLane, AgentRuntime, AgentSink, BridgeConfig,
+        ControlledAgent, CopilotBridge, EventPublisher, HistoryEntry, LaneEvent, Outbound,
+        OutboundKind, ProgressHooks, ReadOnlyPermissionHandler,
     };
 
     #[test]
@@ -2961,6 +3029,37 @@ mod tests {
         assert!(format!("{result:?}").contains("Reject"));
     }
 
+    #[tokio::test]
+    async fn pre_tool_progress_does_not_claim_permission_was_already_granted() {
+        let (sender, receiver) = mpsc::channel();
+        let hooks = ProgressHooks {
+            events: EventPublisher::new(sender, AgentLane::Main),
+        };
+        hooks
+            .on_hook(HookEvent::PreToolUse {
+                input: PreToolUseInput {
+                    session_id: "session".into(),
+                    timestamp: 0.0,
+                    working_directory: PathBuf::from("."),
+                    tool_name: "read_file".into(),
+                    tool_args: serde_json::json!({}),
+                },
+                ctx: HookContext {
+                    session_id: SessionId::new("session"),
+                },
+            })
+            .await;
+        let activity = receiver
+            .recv()
+            .expect("pre-tool hook activity")
+            .activity
+            .expect("detailed pre-tool activity");
+        assert_eq!(
+            activity.detail.as_deref(),
+            Some("Awaiting the separate read-only permission-policy decision")
+        );
+    }
+
     fn event(event_type: &str, data: serde_json::Value) -> SessionEvent {
         SessionEvent {
             id: uuid::Uuid::new_v4().to_string(),
@@ -2985,7 +3084,7 @@ mod tests {
             response_started: false,
             turn_started: true,
             turn_id: Some("test-turn".into()),
-            sdk_message_id: None,
+            sdk_message_ids: HashSet::new(),
             accepted_event_ids: HashSet::from(["test-root".into()]),
             message_buffers: Default::default(),
             message_order: Vec::new(),
@@ -3238,7 +3337,7 @@ mod tests {
         let active_turn = active.as_mut().unwrap();
         active_turn.turn_started = false;
         active_turn.turn_id = None;
-        active_turn.sdk_message_id = Some("interaction-new".into());
+        active_turn.sdk_message_ids = HashSet::from(["interaction-new".into()]);
         active_turn.accepted_event_ids.clear();
 
         let stale_user = event(
@@ -3284,6 +3383,75 @@ mod tests {
         assert!(active.as_ref().unwrap().turn_started);
         assert!(drain(&receiver).iter().any(
             |event| matches!(event, AgentEvent::ResponseStarted { first_delta, .. } if first_delta == "fresh")
+        ));
+    }
+
+    #[test]
+    fn immediate_steering_message_root_binds_its_descendant_chain() {
+        let (sender, receiver) = mpsc::channel();
+        let mut active = active();
+        register_sdk_message_root(active.as_mut().unwrap(), "steer-interaction".into());
+
+        let steering_root = event(
+            "user.message",
+            serde_json::json!({
+                "content": "focus on the failing test",
+                "interactionId": "steer-interaction"
+            }),
+        );
+        let steering_root_id = steering_root.id.clone();
+        handle_session_event(steering_root, &mut active, &sender);
+        assert!(active
+            .as_ref()
+            .unwrap()
+            .accepted_event_ids
+            .contains(&steering_root_id));
+
+        let mut turn_start = event(
+            "assistant.turn_start",
+            serde_json::json!({"turnId": "steered-turn"}),
+        );
+        let turn_start_id = turn_start.id.clone();
+        turn_start.parent_id = Some(steering_root_id);
+        handle_session_event(turn_start, &mut active, &sender);
+
+        let mut delta = event(
+            "assistant.message_delta",
+            serde_json::json!({"messageId": "steered", "deltaContent": "updated"}),
+        );
+        delta.parent_id = Some(turn_start_id);
+        handle_session_event(delta, &mut active, &sender);
+
+        assert!(matches!(
+            drain(&receiver).last(),
+            Some(AgentEvent::ResponseStarted { first_delta, .. }) if first_delta == "updated"
+        ));
+    }
+
+    #[test]
+    fn sdk_steering_message_id_is_also_accepted_as_a_direct_chain_root() {
+        let (sender, receiver) = mpsc::channel();
+        let mut active = active();
+        register_sdk_message_root(active.as_mut().unwrap(), "steer-message-id".into());
+
+        let mut turn_start = event(
+            "assistant.turn_start",
+            serde_json::json!({"turnId": "steered-turn"}),
+        );
+        let turn_start_id = turn_start.id.clone();
+        turn_start.parent_id = Some("steer-message-id".into());
+        handle_session_event(turn_start, &mut active, &sender);
+
+        let mut delta = event(
+            "assistant.message_delta",
+            serde_json::json!({"messageId": "steered", "deltaContent": "direct root"}),
+        );
+        delta.parent_id = Some(turn_start_id);
+        handle_session_event(delta, &mut active, &sender);
+
+        assert!(matches!(
+            drain(&receiver).last(),
+            Some(AgentEvent::ResponseStarted { first_delta, .. }) if first_delta == "direct root"
         ));
     }
 
@@ -3343,6 +3511,65 @@ mod tests {
                 AgentEvent::ResponseStarted { .. },
                 AgentEvent::ResponseComplete { aborted: true, .. }
             ]
+        ));
+    }
+
+    #[test]
+    fn idle_with_background_tasks_keeps_the_turn_active_until_truly_idle() {
+        let (sender, receiver) = mpsc::channel();
+        let mut active = active();
+        handle_session_event(
+            event(
+                "session.idle",
+                serde_json::json!({
+                    "backgroundTasks": {"agents": [{"id": "research"}], "shells": []}
+                }),
+            ),
+            &mut active,
+            &sender,
+        );
+        assert!(active.is_some());
+        assert!(matches!(
+            drain(&receiver).as_slice(),
+            [AgentEvent::Activity { label, .. }]
+                if label == "Copilot is still running background work"
+        ));
+
+        handle_session_event(
+            event(
+                "session.idle",
+                serde_json::json!({"backgroundTasks": {"agents": [], "shells": []}}),
+            ),
+            &mut active,
+            &sender,
+        );
+        assert!(active.is_none());
+        assert!(matches!(
+            drain(&receiver).as_slice(),
+            [
+                AgentEvent::ResponseStarted { .. },
+                AgentEvent::ResponseComplete { aborted: false, .. }
+            ]
+        ));
+    }
+
+    #[test]
+    fn task_complete_is_visible_but_does_not_replace_the_idle_boundary() {
+        let (sender, receiver) = mpsc::channel();
+        let mut active = active();
+        handle_session_event(
+            event(
+                "session.task_complete",
+                serde_json::json!({"summary": "The requested review is complete."}),
+            ),
+            &mut active,
+            &sender,
+        );
+        assert!(active.is_some());
+        assert!(matches!(
+            drain(&receiver).as_slice(),
+            [AgentEvent::Activity { label, .. }]
+                if label == "Copilot marked the task complete"
         ));
     }
 
