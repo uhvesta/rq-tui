@@ -4742,6 +4742,7 @@ fn render_unified(
         composer_cursor,
     );
     let viewport_end = state.review_scroll.saturating_add(body.height as usize);
+    let search = (!state.search.is_empty()).then_some(state.search.as_str());
     let mut lines = Vec::with_capacity(body.height as usize);
     for display in layout.iter().filter(|display| {
         display.start < viewport_end
@@ -4753,12 +4754,13 @@ fn render_unified(
             .saturating_sub(display.start.max(state.review_scroll))
             .min(display.height.saturating_sub(skip));
         lines.extend(
-            review_row_lines(
+            review_row_lines_with_search(
                 row,
                 review_row_selection(state, row, display.semantic_row),
                 body.width.max(1) as usize,
                 state.review_horizontal_scroll,
                 highlighter,
+                search,
             )
             .into_iter()
             .skip(skip)
@@ -4828,6 +4830,7 @@ fn render_split(
         composer_cursor,
     );
     let viewport_end = state.review_scroll.saturating_add(body.height as usize);
+    let search = (!state.search.is_empty()).then_some(state.search.as_str());
     let mut rendered_rows = Vec::new();
     for display in layout.iter().filter(|display| {
         display.start < viewport_end
@@ -4868,6 +4871,7 @@ fn render_split(
                         Some(std::path::Path::new(file)),
                         old.and(selection.filter(|_| selection_side == Some(AnchorSide::Old))),
                         highlighter,
+                        search,
                     ),
                     1,
                     state.review_horizontal_scroll,
@@ -4879,6 +4883,7 @@ fn render_split(
                         Some(std::path::Path::new(file)),
                         new.and(selection.filter(|_| selection_side == Some(AnchorSide::New))),
                         highlighter,
+                        search,
                     ),
                     1,
                     state.review_horizontal_scroll,
@@ -4890,12 +4895,13 @@ fn render_split(
                 let _ = line;
             }
             _ => {
-                for line in review_row_lines(
+                for line in review_row_lines_with_search(
                     row,
                     selection,
                     body.width as usize,
                     state.review_horizontal_scroll,
                     highlighter,
+                    search,
                 )
                 .into_iter()
                 .skip(skip)
@@ -5142,6 +5148,17 @@ fn review_row_lines(
     horizontal_scroll: usize,
     highlighter: &mut dyn Highlighter,
 ) -> Vec<Line<'static>> {
+    review_row_lines_with_search(row, selection, width, horizontal_scroll, highlighter, None)
+}
+
+fn review_row_lines_with_search(
+    row: &ReviewRow,
+    selection: Option<ReviewRowSelection>,
+    width: usize,
+    horizontal_scroll: usize,
+    highlighter: &mut dyn Highlighter,
+    search: Option<&str>,
+) -> Vec<Line<'static>> {
     let selected = selection.is_some();
     let selected_style = matches!(selection, Some(ReviewRowSelection::Whole))
         .then_some(Style::default().bg(Color::Rgb(40, 50, 65)));
@@ -5212,6 +5229,7 @@ fn review_row_lines(
                 *line,
                 selected,
                 highlighter,
+                search,
             );
             rendered = rendered.style(match (selection, kind) {
                 (Some(ReviewRowSelection::Whole), _) => Style::default().bg(Color::Rgb(40, 50, 65)),
@@ -5884,7 +5902,7 @@ fn chat_lines(
         );
         for row in &mapped_message.rows {
             let mut spans = vec![Span::raw("  ")];
-            spans.extend(project_mapped_row(row, layout_row, state));
+            spans.extend(project_mapped_row(row, layout_row, state, &message.text));
             lines.push(Line::from(spans));
             layout_row = layout_row.saturating_add(1);
         }
@@ -6001,7 +6019,17 @@ fn mapped_cell_end(cell: &crate::chat_render::MappedCell) -> Option<usize> {
     }
 }
 
-fn project_mapped_row(row: &MappedRow, layout_row: usize, state: &AppState) -> Vec<Span<'static>> {
+fn project_mapped_row(
+    row: &MappedRow,
+    layout_row: usize,
+    state: &AppState,
+    message_text: &str,
+) -> Vec<Span<'static>> {
+    let search_matches = state
+        .search
+        .is_empty()
+        .then(Vec::new)
+        .unwrap_or_else(|| search_ranges(message_text, &state.search));
     let selected_cells = row
         .cells
         .iter()
@@ -6037,11 +6065,32 @@ fn project_mapped_row(row: &MappedRow, layout_row: usize, state: &AppState) -> V
                 .skip(first_candidate)
                 .take_while(|(cell, _)| cell.columns.start < column.saturating_add(width))
                 .any(|(cell, selected)| *selected && cell.columns.end > column);
-            let style = if selected {
+            let search_hit = row
+                .cells
+                .iter()
+                .filter_map(|cell| match &cell.source {
+                    CellSource::Text(source) => Some((cell, source)),
+                    CellSource::Decoration(_) | CellSource::Synthetic => None,
+                })
+                .filter(|(cell, _)| {
+                    cell.columns.start < column.saturating_add(width) && cell.columns.end > column
+                })
+                .any(|(_, source)| {
+                    search_matches
+                        .iter()
+                        .any(|range| range.start < source.end && source.start < range.end)
+                });
+            let mut style = if selected {
                 span.style.bg(Color::Rgb(40, 50, 65))
             } else {
                 span.style
             };
+            if search_hit {
+                style = style
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD);
+            }
             output.push(Span::styled(text, style));
             column = column.saturating_add(width);
         }
@@ -6735,6 +6784,7 @@ fn unified_line(
     index: usize,
     selected: bool,
     highlighter: &mut dyn Highlighter,
+    search: Option<&str>,
 ) -> Line<'static> {
     let marker = match line.kind {
         LineKind::Addition => "+",
@@ -6752,10 +6802,12 @@ fn unified_line(
         ),
         gutter_style(line.kind),
     )];
-    spans.extend(highlight_spans(
+    spans.extend(highlight_spans_with_search(
         highlighter
             .highlight_line(path, index, &line.content)
             .unwrap_or_else(|_| plain_segments(&line.content)),
+        &line.content,
+        search,
     ));
     let mut result = Line::from(spans);
     if selected {
@@ -6769,6 +6821,7 @@ fn split_line(
     path: Option<&std::path::Path>,
     selection: Option<ReviewRowSelection>,
     highlighter: &mut dyn Highlighter,
+    search: Option<&str>,
 ) -> Line<'static> {
     let Some(line) = line else {
         return Line::from("");
@@ -6779,9 +6832,11 @@ fn split_line(
         format!("{}{:>4} ", if selected { "▶" } else { " " }, number),
         gutter_style(line.kind),
     )];
-    spans.extend(highlight_spans(
+    spans.extend(highlight_spans_with_search(
         path.and_then(|path| highlighter.highlight_line(path, number, &line.content).ok())
             .unwrap_or_else(|| plain_segments(&line.content)),
+        &line.content,
+        search,
     ));
     let mut rendered = Line::from(spans);
     if matches!(selection, Some(ReviewRowSelection::Whole)) {
@@ -6822,6 +6877,79 @@ fn highlight_spans(segments: Vec<StyledSegment>) -> Vec<Span<'static>> {
         .collect()
 }
 
+fn highlight_spans_with_search(
+    segments: Vec<StyledSegment>,
+    text: &str,
+    needle: Option<&str>,
+) -> Vec<Span<'static>> {
+    let Some(needle) = needle.filter(|needle| !needle.is_empty()) else {
+        return highlight_spans(segments);
+    };
+    let matches = search_ranges(text, needle);
+    if matches.is_empty() {
+        return highlight_spans(segments);
+    }
+    let mut source_offset = 0usize;
+    let mut output = Vec::new();
+    for segment in segments {
+        for (offset, character) in segment.text.char_indices() {
+            let end = offset + character.len_utf8();
+            let source_start = source_offset + offset;
+            let source_end = source_offset + end;
+            let mut style = Style::default().fg(Color::Rgb(
+                segment.foreground.0,
+                segment.foreground.1,
+                segment.foreground.2,
+            ));
+            if segment.bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if segment.italic {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            if matches
+                .iter()
+                .any(|range| range.start < source_end && source_start < range.end)
+            {
+                style = style
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD);
+            }
+            output.push(Span::styled(character.to_string(), style));
+        }
+        source_offset = source_offset.saturating_add(segment.text.len());
+    }
+    output
+}
+
+fn search_ranges(text: &str, needle: &str) -> Vec<std::ops::Range<usize>> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let needle = needle.to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut folded = String::new();
+    let mut folded_sources = Vec::new();
+    for (source_start, character) in text.char_indices() {
+        let source_end = source_start + character.len_utf8();
+        let lowered = character.to_lowercase().collect::<String>();
+        for _ in lowered.bytes() {
+            folded_sources.push(source_start..source_end);
+        }
+        folded.push_str(&lowered);
+    }
+    folded
+        .match_indices(&needle)
+        .filter_map(|(start, matched)| {
+            let end = start + matched.len();
+            Some(folded_sources.get(start)?.start..folded_sources.get(end.saturating_sub(1))?.end)
+        })
+        .collect()
+}
+
 fn plain_segments(text: &str) -> Vec<StyledSegment> {
     vec![StyledSegment {
         text: text.to_owned(),
@@ -6842,14 +6970,15 @@ mod tests {
     use anyhow::Result;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
     use ratatui::Terminal;
 
     use super::{
         copy_to_clipboard_with_writer, finish_ready_prune, handle_agent_envelope,
         handle_agent_event, handle_effect, handle_effect_failure, load_model_preferences,
         load_ui_preferences, markdown_to_html, mouse_scroll_effects, open_browser_preview,
-        parse_review_context, render, review_row_lines, run_clipboard_candidate, table_cells,
-        NavigationBurstLimiter, MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST,
+        parse_review_context, render, review_row_lines, run_clipboard_candidate, search_ranges,
+        table_cells, NavigationBurstLimiter, MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST,
     };
     use crate::app::{
         tests_support::state_for_ui, AgentPhase, ChatEntry, ComposeTarget, DiffLayout, Effect,
@@ -6954,6 +7083,53 @@ mod tests {
         assert!(content.contains("demo — Review"));
         assert!(content.contains("unified"));
         assert!(content.contains("a ask"));
+    }
+
+    #[test]
+    fn diff_and_chat_search_matches_have_visible_rendered_highlights() {
+        let mut diff_state = state_for_ui();
+        diff_state.search = "two".into();
+        let mut diff_terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut highlighter = PlainHighlighter;
+        diff_terminal
+            .draw(|frame| render(frame, &mut diff_state, &mut highlighter))
+            .unwrap();
+        assert!(diff_terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "t" && cell.bg == Color::Yellow));
+
+        let mut chat_state = state_for_ui();
+        chat_state.screen = Screen::Chat;
+        chat_state.focus = Focus::Chat;
+        chat_state.search = "target".into();
+        chat_state.chat.push(ChatEntry {
+            id: "chat-search".into(),
+            role: "you".into(),
+            text: "find target in chat".into(),
+            streaming: false,
+            annotation_id: None,
+            outbound_id: None,
+            error: None,
+        });
+        let mut chat_terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        chat_terminal
+            .draw(|frame| render(frame, &mut chat_state, &mut highlighter))
+            .unwrap();
+        assert!(chat_terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "t" && cell.bg == Color::Yellow));
+    }
+
+    #[test]
+    fn unicode_search_highlights_map_folded_bytes_back_to_source_bytes() {
+        assert_eq!(search_ranges("AİB", "i\u{307}"), vec![1..3]);
+        assert_eq!(search_ranges("Éclair", "é"), vec![0..2]);
     }
 
     #[test]

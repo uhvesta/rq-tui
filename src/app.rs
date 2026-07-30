@@ -52,6 +52,12 @@ pub(crate) enum InputMode {
     Compose,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatSearchOutcome {
+    Found { wrapped: bool },
+    NotFound,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Focus {
     FilePicker,
@@ -3228,7 +3234,8 @@ impl AppState {
                 return Vec::new();
             }
             if self.focus == Focus::Chat {
-                self.jump_to_chat_search(true, true);
+                let outcome = self.jump_to_chat_search(true, true);
+                self.report_chat_search(outcome, true);
                 return Vec::new();
             }
             self.jump_to_search();
@@ -3992,9 +3999,8 @@ impl AppState {
             return;
         }
         if self.focus == Focus::Chat {
-            if !self.jump_to_chat_search(true, false) {
-                self.status = format!("Pattern not found: {}", self.search);
-            }
+            let outcome = self.jump_to_chat_search(true, false);
+            self.report_chat_search(outcome, true);
             return;
         }
         if self.focus == Focus::FilePicker {
@@ -4021,13 +4027,29 @@ impl AppState {
                 .find(|(_, line)| line.content.to_lowercase().contains(&needle))
                 .map(|(index, _)| index)
         });
-        if let Some(index) = matches {
+        let (index, wrapped) = if let Some(index) = matches {
+            (index, false)
+        } else if let Some(index) = self.current_file().and_then(|file| {
+            file.visible_lines()
+                .enumerate()
+                .find(|(_, line)| line.content.to_lowercase().contains(&needle))
+                .map(|(index, _)| index)
+        }) {
+            (index, true)
+        } else {
+            self.status = format!("Pattern not found: {}", self.search);
+            return;
+        };
+        {
             self.cursor = index;
             self.sync_review_visual_column();
             self.sync_review_cursor_to_current_source();
             self.ensure_cursor_visible();
-        } else {
-            self.status = format!("Pattern not found: {}", self.search);
+            self.status = if wrapped {
+                format!("Wrapped to first match: {}", self.search)
+            } else {
+                format!("Match: {}", self.search)
+            };
         }
     }
 
@@ -4037,9 +4059,8 @@ impl AppState {
             return;
         }
         if self.focus == Focus::Chat {
-            if !self.jump_to_chat_search(false, false) {
-                self.status = format!("Pattern not found: {}", self.search);
-            }
+            let outcome = self.jump_to_chat_search(false, false);
+            self.report_chat_search(outcome, false);
             return;
         }
         if self.focus == Focus::FilePicker {
@@ -4067,23 +4088,59 @@ impl AppState {
                 .map(|(index, _)| index)
                 .last()
         });
-        if let Some(index) = found {
+        let (index, wrapped) = if let Some(index) = found {
+            (index, false)
+        } else if let Some(index) = self.current_file().and_then(|file| {
+            file.visible_lines()
+                .enumerate()
+                .filter(|(_, line)| line.content.to_lowercase().contains(&needle))
+                .map(|(index, _)| index)
+                .last()
+        }) {
+            (index, true)
+        } else {
+            self.status = format!("Pattern not found: {}", self.search);
+            return;
+        };
+        {
             self.cursor = index;
             self.sync_review_visual_column();
             self.sync_review_cursor_to_current_source();
             self.ensure_cursor_visible();
-        } else {
-            self.status = format!("Pattern not found: {}", self.search);
+            self.status = if wrapped {
+                format!("Wrapped to last match: {}", self.search)
+            } else {
+                format!("Match: {}", self.search)
+            };
         }
     }
 
-    fn jump_to_chat_search(&mut self, forward: bool, include_current: bool) -> bool {
+    fn report_chat_search(&mut self, outcome: ChatSearchOutcome, forward: bool) {
+        match outcome {
+            ChatSearchOutcome::Found { wrapped } => {
+                self.status = if wrapped {
+                    if forward {
+                        format!("Wrapped to first match: {}", self.search)
+                    } else {
+                        format!("Wrapped to last match: {}", self.search)
+                    }
+                } else {
+                    format!("Match: {}", self.search)
+                };
+            }
+            ChatSearchOutcome::NotFound => {
+                self.status = format!("Pattern not found: {}", self.search);
+            }
+        }
+    }
+
+    fn jump_to_chat_search(&mut self, forward: bool, include_current: bool) -> ChatSearchOutcome {
         if self.search.is_empty() {
-            return false;
+            return ChatSearchOutcome::NotFound;
         }
         let Some(layout) = self.chat_layout.as_ref() else {
             self.status = "Chat layout is not ready yet; render once and try again".into();
-            return false;
+            return ChatSearchOutcome::NotFound;
         };
         let current_message = self
             .chat_navigation
@@ -4096,6 +4153,7 @@ impl AppState {
             })
             .unwrap_or((self.chat_cursor.min(self.chat.len().saturating_sub(1)), 0));
         let mut found = None;
+        let mut wrapped = false;
         if forward {
             for (index, entry) in self.chat.iter().enumerate().skip(current_message.0) {
                 let start = if index == current_message.0 {
@@ -4113,6 +4171,7 @@ impl AppState {
                 }
             }
             if found.is_none() {
+                wrapped = true;
                 for (index, entry) in self
                     .chat
                     .iter()
@@ -4151,6 +4210,7 @@ impl AppState {
                 }
             }
             if found.is_none() {
+                wrapped = true;
                 for (index, entry) in self.chat.iter().enumerate().skip(current_message.0).rev() {
                     let start = if index == current_message.0 {
                         current_message.1
@@ -4168,12 +4228,12 @@ impl AppState {
             }
         }
         let Some((index, offset)) = found else {
-            return false;
+            return ChatSearchOutcome::NotFound;
         };
         let message_id = ChatMessageId::new(self.chat[index].id.clone());
         let Some(point) = layout.point_for_message_offset(&message_id, offset) else {
             self.status = "The match is Markdown decoration and has no selectable cell".into();
-            return false;
+            return ChatSearchOutcome::NotFound;
         };
         self.chat_navigation = Some(ChatCursor::new(point.clone()));
         if self.input_mode == InputMode::Visual {
@@ -4184,8 +4244,7 @@ impl AppState {
         self.chat_cursor = index;
         self.chat_autofollow = false;
         self.ensure_chat_navigation_visible();
-        self.status = format!("Match in message {}", index + 1);
-        true
+        ChatSearchOutcome::Found { wrapped }
     }
 
     fn annotation_under_cursor(&self) -> Option<&(Annotation, Placement)> {
@@ -4736,6 +4795,10 @@ mod tests {
         AgentPhase, AppState, ComposeTarget, DiffLayout, Effect, Focus, InputMode, MarkdownPreview,
         PruneChoice, Screen,
     };
+    use crate::chat_selection::{
+        BlockId, ChatBlock, ChatCell, ChatLayout, ChatMessage, ChatPoint, ChatRow, RowBreak,
+        SourceRange,
+    };
     use crate::diff::{DiffLine, LineKind};
     use crate::domain::{AskMessage, DeliveryState};
 
@@ -4745,6 +4808,134 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn install_chat_search_layout(app: &mut AppState) {
+        let entries = [
+            ("m1", "target in the first message"),
+            ("m2", "target in the second message"),
+        ];
+        app.chat = entries
+            .iter()
+            .map(|(id, text)| super::ChatEntry {
+                id: (*id).into(),
+                role: "you".into(),
+                text: (*text).into(),
+                streaming: false,
+                annotation_id: None,
+                outbound_id: None,
+                error: None,
+            })
+            .collect();
+        let messages = entries
+            .iter()
+            .map(|(id, text)| ChatMessage {
+                id: (*id).into(),
+                speaker: Some("you".into()),
+                text: (*text).into(),
+                blocks: vec![ChatBlock {
+                    id: BlockId(0),
+                    source: SourceRange::new(0, text.len()),
+                }],
+            })
+            .collect();
+        let rows = entries
+            .iter()
+            .map(|(id, text)| {
+                ChatRow::new(
+                    *id,
+                    BlockId(0),
+                    (0..text.len())
+                        .map(|offset| ChatCell::source(SourceRange::new(offset, offset + 1), 1))
+                        .collect(),
+                    RowBreak::End,
+                )
+            })
+            .collect();
+        app.set_chat_layout(ChatLayout::new(80, messages, rows).unwrap(), vec![0, 1]);
+        app.chat_navigation = Some(crate::chat_selection::ChatCursor::new(ChatPoint::new(
+            "m1",
+            BlockId(0),
+            0,
+        )));
+        app.chat_cursor = 0;
+        app.chat_autofollow = false;
+        app.search = "target".into();
+    }
+
+    #[test]
+    fn diff_search_wraps_forward_and_backward_with_truthful_status() {
+        let mut app = state();
+        app.work_item.repos[0].diff.files[0].hunks[0].lines = [
+            (LineKind::Context, Some(1), Some(1), "target first"),
+            (LineKind::Context, Some(2), Some(2), "middle"),
+            (LineKind::Context, Some(3), Some(3), "target last"),
+        ]
+        .into_iter()
+        .map(|(kind, old_line, new_line, content)| DiffLine {
+            kind,
+            old_line,
+            new_line,
+            content: content.into(),
+        })
+        .collect();
+        app.search = "target".into();
+        app.cursor = 2;
+        app.jump_to_search();
+        assert_eq!(app.cursor, 0);
+        assert_eq!(app.status, "Wrapped to first match: target");
+
+        app.cursor = 0;
+        app.jump_to_search_reverse();
+        assert_eq!(app.cursor, 2);
+        assert_eq!(app.status, "Wrapped to last match: target");
+    }
+
+    #[test]
+    fn chat_search_wraps_forward_and_backward_with_truthful_status() {
+        let mut app = state();
+        install_chat_search_layout(&mut app);
+
+        let outcome = app.jump_to_chat_search(true, false);
+        assert_eq!(outcome, super::ChatSearchOutcome::Found { wrapped: false });
+        assert_eq!(
+            app.chat_navigation
+                .as_ref()
+                .unwrap()
+                .point
+                .message_id
+                .as_str(),
+            "m2"
+        );
+
+        let outcome = app.jump_to_chat_search(true, false);
+        assert_eq!(outcome, super::ChatSearchOutcome::Found { wrapped: true });
+        assert_eq!(
+            app.chat_navigation
+                .as_ref()
+                .unwrap()
+                .point
+                .message_id
+                .as_str(),
+            "m1"
+        );
+
+        app.chat_navigation = Some(crate::chat_selection::ChatCursor::new(ChatPoint::new(
+            "m1",
+            BlockId(0),
+            0,
+        )));
+        let outcome = app.jump_to_chat_search(false, false);
+        assert_eq!(outcome, super::ChatSearchOutcome::Found { wrapped: true });
+        assert_eq!(
+            app.chat_navigation
+                .as_ref()
+                .unwrap()
+                .point
+                .message_id
+                .as_str(),
+            "m2"
+        );
     }
 
     #[test]
