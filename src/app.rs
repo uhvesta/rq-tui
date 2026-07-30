@@ -1073,12 +1073,6 @@ impl AppState {
                 file,
                 hunk,
                 ..
-            }
-            | ReviewRow::Fold {
-                repo_id,
-                file,
-                hunk,
-                ..
             } => {
                 let visible =
                     self.work_item
@@ -1098,6 +1092,34 @@ impl AppState {
                                 .sum()
                         })
                         .unwrap_or(0);
+                self.set_current_review_location(repo_id, file, visible);
+            }
+            ReviewRow::Fold {
+                repo_id,
+                file,
+                hunk,
+                line,
+                ..
+            } => {
+                let visible = self
+                    .work_item
+                    .repos
+                    .iter()
+                    .find(|repo| repo.record.id == *repo_id)
+                    .and_then(|repo| {
+                        repo.diff.files.iter().find(|candidate| {
+                            candidate.path().to_string_lossy() == file.as_str()
+                        })
+                    })
+                    .map(|file| {
+                        file.hunks
+                            .iter()
+                            .take(*hunk)
+                            .map(|hunk| hunk.lines.len())
+                            .sum::<usize>()
+                            .saturating_add(*line)
+                    })
+                    .unwrap_or(0);
                 self.set_current_review_location(repo_id, file, visible);
             }
             ReviewRow::Source { .. } | ReviewRow::Annotation { .. } => {}
@@ -4652,6 +4674,7 @@ mod tests {
         AgentPhase, AppState, ComposeTarget, DiffLayout, Effect, Focus, InputMode, MarkdownPreview,
         PruneChoice, Screen,
     };
+    use crate::diff::{DiffLine, Hunk, LineKind};
     use crate::domain::{AskMessage, DeliveryState};
 
     fn state() -> AppState {
@@ -4759,6 +4782,40 @@ mod tests {
                 "missing palette descriptor for :{command}"
             );
         }
+    }
+
+    #[test]
+    fn fold_rows_map_to_their_source_line_for_context_expansion() {
+        let mut app = state();
+        app.work_item.repos[0].diff.files[0].hunks[0].lines = vec![
+            DiffLine {
+                kind: LineKind::Context,
+                old_line: Some(1),
+                new_line: Some(1),
+                content: "visible before fold".into(),
+            },
+            DiffLine {
+                kind: LineKind::Meta,
+                old_line: None,
+                new_line: None,
+                content: "⋯ 6 unchanged lines".into(),
+            },
+        ];
+        app.sync_review_cursor_to_current_file();
+        app.screen = Screen::Review;
+        app.focus = Focus::Diff;
+        app.input_mode = InputMode::Normal;
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.cursor, 1, "the fold must map after the prior hunk line");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('o'))),
+            vec![Effect::ExpandContext { all: false }]
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('O'))),
+            vec![Effect::ExpandContext { all: true }]
+        );
     }
 
     #[test]
