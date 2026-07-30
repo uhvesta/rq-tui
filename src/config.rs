@@ -12,6 +12,7 @@ pub(crate) struct AppPaths {
     pub(crate) prs: PathBuf,
     pub(crate) exports: PathBuf,
     pub(crate) skills: PathBuf,
+    pub(crate) plugins: PathBuf,
 }
 
 impl AppPaths {
@@ -29,6 +30,7 @@ impl AppPaths {
             roots: data.join("roots"),
             exports: data.join("exports"),
             skills: data.join("skills"),
+            plugins: data.join("plugins"),
             prs: cache.join("prs"),
             data,
             cache,
@@ -45,6 +47,7 @@ impl AppPaths {
             &self.prs,
             &self.exports,
             &self.skills,
+            &self.plugins,
         ] {
             std::fs::create_dir_all(path)
                 .with_context(|| format!("cannot create {}", path.display()))?;

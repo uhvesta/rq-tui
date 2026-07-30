@@ -71,10 +71,18 @@ impl Storage {
     fn configure(connection: &Connection) -> Result<()> {
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", true)?;
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .context("cannot enable SQLite WAL mode")?;
-        Ok(())
+        let mut last_error = None;
+        for _ in 0..50 {
+            match connection.pragma_update(None, "journal_mode", "WAL") {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last_error = Some(error);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        Err(last_error.expect("WAL retry loop always records an error"))
+            .context("cannot enable SQLite WAL mode")
     }
 
     fn migrate(&self) -> Result<()> {

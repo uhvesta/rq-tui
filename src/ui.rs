@@ -25,7 +25,7 @@ use crate::annotations::{
 };
 use crate::app::{
     command_matches, AgentPhase, AppState, ChatEntry, ComposeTarget, DiffLayout, Effect, InputMode,
-    PruneChoice, Screen, VersionChoice,
+    ModelPickerStage, PruneChoice, Screen, VersionChoice,
 };
 use crate::chat_render::render_markdown;
 use crate::config::AppPaths;
@@ -89,6 +89,12 @@ pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> R
         .setting("model")?
         .unwrap_or_else(|| "gpt-5".to_owned());
     state.model = model.clone();
+    state.reasoning_effort = storage
+        .setting("model.reasoning_effort")?
+        .filter(|value| !value.trim().is_empty());
+    state.context_tier = storage
+        .setting("model.context_tier")?
+        .filter(|value| !value.trim().is_empty());
     state.expand_step = storage
         .setting("diff.expand_step")?
         .and_then(|value| value.parse::<usize>().ok())
@@ -107,12 +113,25 @@ pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> R
         let skills = root.join(".rq-tui").join("skills");
         skills.is_dir().then_some(skills)
     }));
+    let mut plugin_directories = vec![paths.plugins.clone()];
+    plugin_directories.extend(state.work_item.repos.iter().filter_map(|repo| {
+        let root = repo
+            .version
+            .worktree_path
+            .as_deref()
+            .unwrap_or(&repo.record.path);
+        let plugins = root.join(".rq-tui").join("plugins");
+        plugins.is_dir().then_some(plugins)
+    }));
     let bridge = start_agent(BridgeConfig {
         work_item_id: state.work_item.item.id.clone(),
         session_root: state.work_item.session_root.clone(),
         existing_session_id,
         model,
+        reasoning_effort: state.reasoning_effort.clone(),
+        context_tier: state.context_tier.clone(),
         skill_directories,
+        plugin_directories,
     });
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -182,7 +201,12 @@ fn run_loop<B: Backend>(
     highlighter: &mut dyn Highlighter,
 ) -> Result<()> {
     while !state.should_quit {
-        while let Some(event) = bridge.try_recv_laned() {
+        // A noisy tool or streaming source must not starve drawing and input.
+        // Remaining events stay queued for the next frame.
+        for _ in 0..256 {
+            let Some(event) = bridge.try_recv_laned() else {
+                break;
+            };
             handle_agent_envelope(state, storage, event)?;
         }
         terminal.draw(|frame| render(frame, state, highlighter))?;
@@ -229,11 +253,9 @@ fn queue_outbound(
         state.side_outbound_ids.insert(outbound_id.clone());
     }
     state.agent_progress.queue_depth = state.agent_progress.queue_depth.saturating_add(1);
-    state.agent_progress.record(
-        AgentPhase::Queued,
+    state.agent_progress.record_queued(
         "Waiting in the Copilot SDK queue",
         format!("Outbound {} has not started yet", short_id(&outbound_id)),
-        Some(outbound_id.clone()),
     );
     Ok(outbound_id)
 }
@@ -381,10 +403,38 @@ pub(crate) fn handle_effect(
                 follow_chat(state);
                 state.status = if state.side_starting {
                     "SIDE message buffered safely while the ephemeral fork starts".into()
+                } else if state.status.starts_with("No response is active;") {
+                    "No response is active; the correction was queued as a normal prompt".into()
                 } else {
                     "Chat message queued".into()
                 };
             }
+        }
+        Effect::SteerChat(text) => {
+            if !text.trim().is_empty() {
+                let outbound = Outbound::new(OutboundKind::Correction, text.clone());
+                bridge.send(AgentCommand::Steer(outbound))?;
+                state.chat.push(ChatEntry {
+                    role: "you · steer".into(),
+                    text,
+                    streaming: false,
+                    annotation_id: None,
+                    outbound_id: None,
+                    error: None,
+                });
+                state.agent_progress.record(
+                    AgentPhase::Planning,
+                    "Steering the active Copilot response",
+                    "Immediate delivery requested; if the turn ended concurrently, Copilot may queue it",
+                    state.agent_progress.active_outbound_id.clone(),
+                );
+                follow_chat(state);
+                state.status = "Steering sent immediately to the active Copilot response".into();
+            }
+        }
+        Effect::CancelQueued(outbound_id) => {
+            bridge.send(AgentCommand::CancelQueued(outbound_id.clone()))?;
+            state.status = format!("Cancelling queued prompt {}…", short_id(&outbound_id));
         }
         Effect::StartSide(question) => {
             if state.side_active || state.side_starting {
@@ -421,8 +471,7 @@ pub(crate) fn handle_effect(
         }
         Effect::ExitSide => {
             if state.side_starting {
-                bridge.send(AgentCommand::Abort)?;
-                bridge.send(AgentCommand::ExitSide)?;
+                bridge.send(AgentCommand::CancelSide)?;
                 state.agent_progress.record(
                     AgentPhase::Stopping,
                     "Cancelling SIDE creation",
@@ -814,10 +863,33 @@ pub(crate) fn handle_effect(
             bridge.send(AgentCommand::Compact(instructions))?;
             state.status = "Compacting active session…".into();
         }
+        Effect::LoadModels => {
+            bridge.send(AgentCommand::ListModels)?;
+            state.status = "Loading model capabilities from the Copilot runtime…".into();
+        }
+        Effect::SelectModel(selection) => {
+            bridge.send(AgentCommand::SelectModel(selection.clone()))?;
+            state.status = format!(
+                "Switching to {} · reasoning {} · context {}…",
+                selection.model_id,
+                selection
+                    .reasoning_effort
+                    .as_deref()
+                    .unwrap_or("runtime default"),
+                selection
+                    .context_tier
+                    .as_deref()
+                    .unwrap_or("runtime default"),
+            );
+        }
         Effect::SetModel(model) => {
             storage.set_setting("model", &model)?;
+            storage.set_setting("model.reasoning_effort", "")?;
+            storage.set_setting("model.context_tier", "")?;
             bridge.send(AgentCommand::SetModel(model.clone()))?;
             state.model = model.clone();
+            state.reasoning_effort = None;
+            state.context_tier = None;
             state.status = format!("Switching model to {model}…");
         }
         Effect::Snapshot => {
@@ -1046,6 +1118,21 @@ pub(crate) fn handle_effect_failure(state: &mut AppState, effect: &Effect, error
             state.compose = text.clone();
             state.compose_cursor = state.compose.len();
         }
+        Effect::SteerChat(text) => {
+            state.screen = Screen::Chat;
+            state.input_return_mode = InputMode::Normal;
+            state.input_mode = InputMode::Compose;
+            state.compose_target = Some(ComposeTarget::Chat);
+            state.compose = format!("/steer {text}");
+            state.compose_cursor = state.compose.len();
+            state.status = format!("Could not steer the active response: {error:#}");
+        }
+        Effect::CancelQueued(outbound_id) => {
+            state.status = format!(
+                "Could not cancel queued prompt {}: {error:#}",
+                short_id(outbound_id)
+            );
+        }
         Effect::StartSide(question) => {
             for entry in state.pending_side_entries.drain(..) {
                 if let Some(id) = entry.outbound_id {
@@ -1070,6 +1157,16 @@ pub(crate) fn handle_effect_failure(state: &mut AppState, effect: &Effect, error
                 "Could not leave SIDE",
                 format!("{error:#}"),
                 None,
+            );
+        }
+        Effect::LoadModels => {
+            state.screen = state.previous_screen;
+            state.status = format!("Could not load Copilot models: {error:#}");
+        }
+        Effect::SelectModel(selection) => {
+            state.status = format!(
+                "Could not apply model selection for {}: {error:#}",
+                selection.model_id
             );
         }
         _ => {}
@@ -1307,30 +1404,43 @@ fn prune_work_item(
 }
 
 fn copy_to_clipboard(text: &str) -> Result<()> {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-    let sequence = format!("\u{1b}]52;c;{encoded}\u{7}");
-    if io::stdout().write_all(sequence.as_bytes()).is_ok() {
-        io::stdout().flush().ok();
+    if copy_with_native_clipboard(text).is_ok() {
         return Ok(());
     }
-    let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
-        ("pbcopy", &[])
-    } else {
-        ("xclip", &["-selection", "clipboard"])
-    };
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("clipboard process has no stdin"))?
-        .write_all(text.as_bytes())?;
-    if !child.wait()?.success() {
-        anyhow::bail!("native clipboard command failed");
-    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let sequence = format!("\u{1b}]52;c;{encoded}\u{7}");
+    io::stdout().write_all(sequence.as_bytes())?;
+    io::stdout().flush()?;
     Ok(())
+}
+
+fn copy_with_native_clipboard(text: &str) -> Result<()> {
+    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+    for (program, args) in candidates {
+        let Ok(mut child) = Command::new(program)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .spawn()
+        else {
+            continue;
+        };
+        let wrote = child
+            .stdin
+            .take()
+            .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+        if wrote && child.wait().is_ok_and(|status| status.success()) {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("no native clipboard backend accepted the text")
 }
 
 fn preview_markdown(state: &AppState, paths: &AppPaths) -> Result<std::path::PathBuf> {
@@ -1609,7 +1719,11 @@ pub(crate) fn handle_agent_envelope(
             );
             state.status = "SIDE conversation ready · /main returns to MAIN".into();
         }
-        LaneEvent::SideExited { side_id, .. } => {
+        LaneEvent::SideExited {
+            side_id,
+            cleanup_warning,
+            ..
+        } => {
             if !state.side_active && !state.side_starting {
                 return Ok(());
             }
@@ -1631,13 +1745,26 @@ pub(crate) fn handle_agent_envelope(
                 state.pending_outbound_ids.remove(&id);
             }
             state.agent_progress.queue_depth = 0;
+            let detail = cleanup_warning.clone().unwrap_or_else(|| {
+                "SIDE was discarded; persistent MAIN history was not changed".into()
+            });
             state.agent_progress.record(
-                AgentPhase::Idle,
-                "Back on MAIN",
-                "SIDE was discarded; persistent MAIN history was not changed",
+                if cleanup_warning.is_some() {
+                    AgentPhase::Failed
+                } else {
+                    AgentPhase::Idle
+                },
+                if cleanup_warning.is_some() {
+                    "Back on MAIN · SIDE cleanup needs attention"
+                } else {
+                    "Back on MAIN"
+                },
+                detail,
                 None,
             );
-            state.status = "SIDE closed · returned to MAIN".into();
+            state.status = cleanup_warning
+                .map(|warning| format!("Returned to MAIN · {warning}"))
+                .unwrap_or_else(|| "SIDE closed · returned to MAIN".into());
         }
         LaneEvent::SideFailed { message } => {
             if !state.side_starting {
@@ -1659,6 +1786,22 @@ pub(crate) fn handle_agent_envelope(
                 None,
             );
             state.status = message;
+        }
+        LaneEvent::SideCancelled => {
+            for id in state.side_outbound_ids.drain() {
+                state.pending_outbound_ids.remove(&id);
+            }
+            state.pending_side_entries.clear();
+            state.side_starting = false;
+            state.side_active = false;
+            state.agent_progress.queue_depth = 0;
+            state.agent_progress.record(
+                AgentPhase::Idle,
+                "SIDE creation cancelled",
+                "Still on MAIN; no side message entered persistent history",
+                None,
+            );
+            state.status = "SIDE creation cancelled · MAIN is unchanged".into();
         }
         LaneEvent::Agent(agent_event) => {
             let lane_is_visible = match &lane {
@@ -1687,11 +1830,19 @@ pub(crate) fn handle_agent_envelope(
                     (None, None) => "SDK activity event".into(),
                 };
                 let lane_label = lane.label();
+                let outbound_id = agent_event_outbound_id(&agent_event).or_else(|| {
+                    state
+                        .agent_progress
+                        .phase
+                        .is_active()
+                        .then(|| state.agent_progress.active_outbound_id.clone())
+                        .flatten()
+                });
                 state.agent_progress.record(
                     phase,
                     format!("{lane_label} · {}", activity.label),
                     detail,
-                    agent_event_outbound_id(&agent_event),
+                    outbound_id,
                 );
                 state.agent_activity = activity.label.clone();
                 state.status = format!("{} · {}", lane.label(), activity.label);
@@ -1767,16 +1918,47 @@ pub(crate) fn handle_agent_event(
                 .agent_progress
                 .queue_depth
                 .max(position.saturating_add(1));
-            state.agent_progress.record(
-                AgentPhase::Queued,
+            state.agent_progress.record_queued(
                 format!("Queued request #{}", position + 1),
                 format!(
                     "Waiting for the SDK to start outbound {}",
                     short_id(&outbound_id)
                 ),
-                Some(outbound_id),
             );
             state.status = format!("Agent message queued at position {}", position + 1);
+        }
+        AgentEvent::QueueCancelled { outbound_id } => {
+            state.pending_outbound_ids.remove(&outbound_id);
+            state.side_outbound_ids.remove(&outbound_id);
+            state.agent_progress.queue_depth = state.agent_progress.queue_depth.saturating_sub(1);
+            if let Some(message) = state
+                .chat
+                .iter_mut()
+                .chain(state.pending_side_entries.iter_mut())
+                .chain(state.main_chat.iter_mut().flatten())
+                .find(|message| message.outbound_id.as_deref() == Some(outbound_id.as_str()))
+            {
+                message.error = Some("cancelled before start".into());
+            }
+            if state.agent_progress.active_outbound_id.is_none()
+                && state.pending_outbound_ids.is_empty()
+            {
+                state.agent_progress.record(
+                    AgentPhase::Idle,
+                    "Queue is empty",
+                    "The selected prompt was cancelled before Copilot started it",
+                    None,
+                );
+            } else {
+                state.agent_progress.record_queued(
+                    "Queued prompt cancelled",
+                    format!("Outbound {} will not run", short_id(&outbound_id)),
+                );
+            }
+            state.scroll = state
+                .scroll
+                .min(state.queue_entry_ids().len().saturating_sub(1));
+            state.status = format!("Cancelled queued prompt {}", short_id(&outbound_id));
         }
         AgentEvent::ResponseStarted {
             outbound_id,
@@ -1944,6 +2126,9 @@ pub(crate) fn handle_agent_event(
         } => {
             state.pending_outbound_ids.remove(&outbound_id);
             state.side_outbound_ids.remove(&outbound_id);
+            let completed_visible_turn = state.agent_progress.active_outbound_id.as_deref()
+                == Some(outbound_id.as_str())
+                || state.agent_progress.active_outbound_id.is_none();
             let context_completed = state.context_streaming;
             if context_completed {
                 state.context_streaming = false;
@@ -1961,24 +2146,26 @@ pub(crate) fn handle_agent_event(
                     message.error = Some("stopped".into());
                 }
             }
-            if !context_completed {
+            if !context_completed && completed_visible_turn {
                 state.status = if aborted {
                     "Copilot response stopped".into()
                 } else {
                     "Copilot response complete".into()
                 };
             }
-            state.agent_activity.clear();
-            state.agent_progress.record(
-                AgentPhase::Idle,
-                if aborted {
-                    "Copilot response aborted"
-                } else {
-                    "Copilot response complete"
-                },
-                format!("Outbound {} reached SDK idle", short_id(&outbound_id)),
-                None,
-            );
+            if completed_visible_turn {
+                state.agent_activity.clear();
+                state.agent_progress.record(
+                    AgentPhase::Idle,
+                    if aborted {
+                        "Copilot response aborted"
+                    } else {
+                        "Copilot response complete"
+                    },
+                    format!("Outbound {} reached SDK idle", short_id(&outbound_id)),
+                    None,
+                );
+            }
         }
         AgentEvent::TurnFailed {
             outbound_id,
@@ -2029,14 +2216,24 @@ pub(crate) fn handle_agent_event(
             );
             state.status = format!("Copilot turn failed: {message}");
         }
-        AgentEvent::Activity { label, .. } => {
+        AgentEvent::Activity { outbound_id, label } => {
             state.agent_activity = label.clone();
-            state.agent_progress.record(
-                AgentPhase::Planning,
-                label.clone(),
-                "Copilot SDK activity",
-                None,
-            );
+            let outbound_id = outbound_id.or_else(|| {
+                state
+                    .agent_progress
+                    .phase
+                    .is_active()
+                    .then(|| state.agent_progress.active_outbound_id.clone())
+                    .flatten()
+            });
+            let phase = if outbound_id.is_some() {
+                AgentPhase::Planning
+            } else {
+                state.agent_progress.phase
+            };
+            state
+                .agent_progress
+                .record(phase, label.clone(), "Copilot SDK activity", outbound_id);
             state.status = label;
         }
         AgentEvent::Usage {
@@ -2079,7 +2276,50 @@ pub(crate) fn handle_agent_event(
             );
             state.status = "Forked and activated a new session".into();
         }
+        AgentEvent::ModelsListed(models) => {
+            state.model_options = models;
+            state.model_picker_index = state
+                .model_options
+                .iter()
+                .position(|model| model.id == state.model)
+                .unwrap_or(0);
+            state.status = if state.model_options.is_empty() {
+                "Copilot runtime returned no selectable models".into()
+            } else {
+                format!(
+                    "Loaded {} runtime model choices · select one to continue",
+                    state.model_options.len()
+                )
+            };
+        }
+        AgentEvent::ModelSelectionChanged(selection) => {
+            storage.set_setting("model", &selection.model_id)?;
+            storage.set_setting(
+                "model.reasoning_effort",
+                selection.reasoning_effort.as_deref().unwrap_or(""),
+            )?;
+            storage.set_setting(
+                "model.context_tier",
+                selection.context_tier.as_deref().unwrap_or(""),
+            )?;
+            state.model = selection.model_id.clone();
+            state.reasoning_effort = selection.reasoning_effort.clone();
+            state.context_tier = selection.context_tier.clone();
+            state.status = format!(
+                "Model changed to {} · reasoning {} · context {}",
+                selection.model_id,
+                selection
+                    .reasoning_effort
+                    .as_deref()
+                    .unwrap_or("runtime default"),
+                selection
+                    .context_tier
+                    .as_deref()
+                    .unwrap_or("runtime default"),
+            );
+        }
         AgentEvent::ModelChanged(model) => {
+            state.model = model.clone();
             state.status = format!("Model changed to {model}");
         }
         AgentEvent::Compacted => state.status = "Session compacted".into(),
@@ -2153,12 +2393,12 @@ pub(crate) fn render(
     state: &mut AppState,
     highlighter: &mut dyn Highlighter,
 ) {
-    if frame.area().width < 32 || frame.area().height < 8 {
+    if frame.area().width <= 32 || frame.area().height <= 8 {
         let area = frame.area();
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(format!(
-                "rq-tui needs at least 32×8\ncurrent: {}×{}\nresize the terminal to continue",
+                "needs at least 33×9\n32×8 is too small\ncurrent: {}×{}\n:q still exits safely",
                 area.width, area.height
             ))
             .block(
@@ -2181,6 +2421,8 @@ pub(crate) fn render(
         Screen::Prune => render_prune(frame, state),
         Screen::Recovery => render_recovery(frame, state),
         Screen::AgentStatus => render_agent_status(frame, state),
+        Screen::Queue => render_queue(frame, state),
+        Screen::ModelPicker => render_model_picker(frame, state),
     }
     if state.input_mode == InputMode::Command {
         render_command_palette(frame, state);
@@ -2286,7 +2528,15 @@ fn render_settings(frame: &mut ratatui::Frame, state: &AppState) {
         .and_then(|repo| repo.record.base_branch.as_deref())
         .unwrap_or("auto-detect");
     let rows = [
-        format!("Model             {}", state.model),
+        format!(
+            "Model             {} · reasoning {} · context {}",
+            state.model,
+            state
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or("runtime default"),
+            state.context_tier.as_deref().unwrap_or("runtime default"),
+        ),
         "Ask tool scope    read/search only (fixed)".into(),
         format!("Base branch       {base} (per repository)"),
         "Keybindings       vim".into(),
@@ -2319,6 +2569,159 @@ fn render_settings(frame: &mut ratatui::Frame, state: &AppState) {
         ),
         frame.area(),
     );
+}
+
+fn render_model_picker(frame: &mut ratatui::Frame, state: &AppState) {
+    let (step, title, subtitle, rows) = match state.model_picker_stage {
+        ModelPickerStage::Model => (
+            1,
+            "Choose a model",
+            "Choices reported by Copilot",
+            state
+                .model_options
+                .iter()
+                .map(|model| {
+                    let context = model
+                        .max_context_tokens
+                        .map(format_token_count)
+                        .unwrap_or_else(|| "runtime default".into());
+                    let efforts = if model.supported_reasoning_efforts.is_empty() {
+                        "fixed reasoning".into()
+                    } else {
+                        model.supported_reasoning_efforts.join("/")
+                    };
+                    format!(
+                        "{:<24} {:<24} · context {context} · {efforts}",
+                        model.name, model.id
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ),
+        ModelPickerStage::Reasoning => {
+            let model = state
+                .pending_model_selection
+                .as_ref()
+                .and_then(|selection| {
+                    state
+                        .model_options
+                        .iter()
+                        .find(|model| model.id == selection.model_id)
+                });
+            (
+                2,
+                "Choose reasoning effort",
+                "Levels supported by this model",
+                model
+                    .map(|model| {
+                        model
+                            .supported_reasoning_efforts
+                            .iter()
+                            .map(|effort| {
+                                if model.default_reasoning_effort.as_deref()
+                                    == Some(effort.as_str())
+                                {
+                                    format!("{effort} · runtime default")
+                                } else {
+                                    effort.clone()
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        }
+        ModelPickerStage::Context => {
+            let model = state
+                .pending_model_selection
+                .as_ref()
+                .and_then(|selection| {
+                    state
+                        .model_options
+                        .iter()
+                        .find(|model| model.id == selection.model_id)
+                });
+            (
+                3,
+                "Choose context tier",
+                "Runtime-advertised capacity",
+                model
+                    .map(|model| {
+                        model
+                            .context_tiers
+                            .iter()
+                            .map(|tier| {
+                                format!(
+                                    "{} · {}",
+                                    tier.id,
+                                    tier.max_context_tokens
+                                        .map(format_token_count)
+                                        .unwrap_or_else(|| "runtime default".into())
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        }
+    };
+    let viewport = frame.area().height.saturating_sub(6).max(1) as usize;
+    let start = state
+        .model_picker_index
+        .saturating_add(1)
+        .saturating_sub(viewport)
+        .min(rows.len().saturating_sub(viewport));
+    let items = rows
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(viewport)
+        .map(|(index, row)| {
+            let selected = index == state.model_picker_index;
+            ListItem::new(format!("{} {row}", if selected { "▶" } else { " " })).style(
+                if selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let items = if items.is_empty() {
+        vec![ListItem::new("Loading model capabilities from Copilot…")]
+    } else {
+        items
+    };
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .title(format!(" Model picker · step {step}/3 · {title} "))
+                .borders(Borders::ALL),
+        ),
+        frame.area(),
+    );
+    let area = frame.area();
+    frame.render_widget(
+        Paragraph::new(format!("{subtitle} · ↑/↓ select · Enter next · Esc cancel"))
+            .style(Style::default().fg(Color::DarkGray)),
+        Rect::new(
+            area.x.saturating_add(1),
+            area.bottom().saturating_sub(2),
+            area.width.saturating_sub(2),
+            1,
+        ),
+    );
+}
+
+fn format_token_count(tokens: i64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M tokens", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.0}k tokens", tokens as f64 / 1_000.0)
+    } else {
+        format!("{tokens} tokens")
+    }
 }
 
 fn render_versions(frame: &mut ratatui::Frame, state: &AppState) {
@@ -2385,7 +2788,11 @@ fn render_prune(frame: &mut ratatui::Frame, state: &AppState) {
     );
 }
 
-fn render_review(frame: &mut ratatui::Frame, state: &AppState, highlighter: &mut dyn Highlighter) {
+fn render_review(
+    frame: &mut ratatui::Frame,
+    state: &mut AppState,
+    highlighter: &mut dyn Highlighter,
+) {
     let area = frame.area();
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -2462,9 +2869,17 @@ fn render_header(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
         })
         .map(|title| format!("  │  {title}"))
         .unwrap_or_default();
+    let focus = match state.focus {
+        crate::app::Focus::FilePicker => "files",
+        crate::app::Focus::Diff => "diff",
+        crate::app::Focus::AnnotationRail => "annotations",
+        crate::app::Focus::Chat => "chat",
+        crate::app::Focus::InlineAsk => "inline ask",
+    };
     let title = format!(
-        " {} — Review  │  {} > {}  │  {}/{} files{} ",
+        " {} — Review  │  Focus: {}  │  {} > {}  │  {}/{} files{} ",
         state.work_item.item.name,
+        focus,
         repo,
         file,
         state.file_index.saturating_add(1),
@@ -2518,8 +2933,18 @@ fn render_picker(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             )));
         }
     }
+    let focused = state.focus == crate::app::Focus::FilePicker;
     frame.render_widget(
-        List::new(items).block(Block::default().title("files").borders(Borders::RIGHT)),
+        List::new(items).block(
+            Block::default()
+                .title(if focused { "▶ files" } else { "files" })
+                .border_style(Style::default().fg(if focused {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                }))
+                .borders(Borders::RIGHT),
+        ),
         area,
     );
 }
@@ -2545,9 +2970,19 @@ fn render_unified(
     highlighter: &mut dyn Highlighter,
 ) {
     let lines = visible_diff_lines(state, highlighter, area.height as usize);
+    let focused = state.focus == crate::app::Focus::Diff;
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(Block::default().title("unified").borders(Borders::NONE))
+            .block(
+                Block::default()
+                    .title(if focused { "▶ unified" } else { "unified" })
+                    .title_style(Style::default().fg(if focused {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    }))
+                    .borders(Borders::NONE),
+            )
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -2592,12 +3027,28 @@ fn render_split(
             )
         })
         .collect::<Vec<_>>();
+    let focused = state.focus == crate::app::Focus::Diff;
+    let diff_border = Style::default().fg(if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    });
     frame.render_widget(
-        Paragraph::new(old).block(Block::default().title("- old").borders(Borders::RIGHT)),
+        Paragraph::new(old).block(
+            Block::default()
+                .title(if focused { "▶ - old" } else { "- old" })
+                .border_style(diff_border)
+                .borders(Borders::RIGHT),
+        ),
         columns[0],
     );
     frame.render_widget(
-        Paragraph::new(new).block(Block::default().title("+ new").borders(Borders::RIGHT)),
+        Paragraph::new(new).block(
+            Block::default()
+                .title(if focused { "▶ + new" } else { "+ new" })
+                .border_style(diff_border)
+                .borders(Borders::RIGHT),
+        ),
         columns[1],
     );
     render_annotation_rail(frame, state, columns[2]);
@@ -2673,11 +3124,20 @@ fn render_status(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
 fn render_command_palette(frame: &mut ratatui::Frame, state: &AppState) {
     let area = frame.area();
-    let width = area.width.saturating_sub(4).min(96);
-    let height = 12.min(area.height.saturating_sub(2)).max(4);
+    let compact = area.width < 60 || area.height < 16;
+    let width = if compact {
+        area.width
+    } else {
+        area.width.saturating_sub(4).min(96)
+    };
+    let height = if compact {
+        area.height
+    } else {
+        12.min(area.height.saturating_sub(2)).max(4)
+    };
     let palette = Rect::new(
         area.x + (area.width.saturating_sub(width)) / 2,
-        area.y + 1,
+        area.y + if compact { 0 } else { 1 },
         width,
         height,
     );
@@ -2757,19 +3217,47 @@ fn render_command_palette(frame: &mut ratatui::Frame, state: &AppState) {
     );
 }
 
-fn render_contextual_composer(frame: &mut ratatui::Frame, state: &AppState, body: Rect) {
+fn render_contextual_composer(frame: &mut ratatui::Frame, state: &mut AppState, body: Rect) {
     if body.width < 20 || body.height < 4 {
         return;
     }
-    let title = match &state.compose_target {
+    let base_title = match &state.compose_target {
         Some(ComposeTarget::Annotation(AnnotationKind::Ask)) => " Ask ",
         Some(ComposeTarget::Annotation(AnnotationKind::Comment)) => " Comment ",
         Some(ComposeTarget::FollowUp(_)) => " Ask follow-up ",
         Some(ComposeTarget::EditAnnotation(_) | ComposeTarget::EditAskMessage { .. }) => " Edit ",
         _ => return,
     };
-    let width = body.width.saturating_sub(4).min(76);
-    let height = 4.min(body.height);
+    let width = if body.width < 60 {
+        body.width
+    } else {
+        body.width.saturating_sub(4).clamp(20, 120)
+    };
+    let inner_width = width.saturating_sub(2).max(1) as usize;
+    state.compose_wrap_width = inner_width;
+    let (lines, cursor_row, cursor_col) =
+        wrapped_editor_lines(&state.compose, state.compose_cursor, inner_width);
+    let desired_height = lines.len().saturating_add(3) as u16;
+    let height_cap = body.height.saturating_mul(2).saturating_div(3).max(4);
+    let height = desired_height.clamp(4, height_cap.min(body.height));
+    let visible_rows = height.saturating_sub(3).max(1) as usize;
+    if cursor_row < state.compose_scroll {
+        state.compose_scroll = cursor_row;
+    } else if cursor_row >= state.compose_scroll.saturating_add(visible_rows) {
+        state.compose_scroll = cursor_row.saturating_add(1).saturating_sub(visible_rows);
+    }
+    let max_scroll = lines.len().saturating_sub(visible_rows);
+    state.compose_scroll = state.compose_scroll.min(max_scroll);
+    let title = if lines.len() > visible_rows {
+        format!(
+            "{base_title}· lines {}-{}/{} · ↑/↓ scroll ",
+            state.compose_scroll + 1,
+            (state.compose_scroll + visible_rows).min(lines.len()),
+            lines.len()
+        )
+    } else {
+        base_title.to_owned()
+    };
     let cursor_y = state.cursor.saturating_sub(state.scroll) as u16;
     let preferred_y = body.y.saturating_add(cursor_y).saturating_add(1);
     let max_y = body.bottom().saturating_sub(height);
@@ -2794,12 +3282,40 @@ fn render_contextual_composer(frame: &mut ratatui::Frame, state: &AppState, body
         })
         .unwrap_or_else(|| "selected code".into());
     frame.render_widget(Clear, composer);
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(composer);
+    frame.render_widget(block, composer);
+    let rows = lines
+        .iter()
+        .skip(state.compose_scroll)
+        .take(visible_rows)
+        .cloned()
+        .map(Line::raw)
+        .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(format!("{}\n  {range}", state.compose.replace('\n', " ↵ ")))
-            .block(Block::default().title(title).borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
-        composer,
+        Paragraph::new(rows),
+        Rect::new(inner.x, inner.y, inner.width, visible_rows as u16),
     );
+    frame.render_widget(
+        Paragraph::new(format!("↳ {range} · Enter submit · Esc keep draft"))
+            .style(Style::default().fg(Color::DarkGray)),
+        Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+    );
+    if state.input_mode == InputMode::Compose
+        && cursor_row >= state.compose_scroll
+        && cursor_row < state.compose_scroll.saturating_add(visible_rows)
+    {
+        frame.set_cursor_position((
+            inner
+                .x
+                .saturating_add((cursor_col as u16).min(inner.width.saturating_sub(1))),
+            inner.y.saturating_add(
+                cursor_row
+                    .saturating_sub(state.compose_scroll)
+                    .min(visible_rows.saturating_sub(1)) as u16,
+            ),
+        ));
+    }
 }
 
 fn render_chat(
@@ -2809,7 +3325,13 @@ fn render_chat(
 ) {
     let width = frame.area().width.saturating_sub(4).max(1) as usize;
     let composer_height = chat_composer_height(state, width, frame.area().height);
-    let progress_height = if frame.area().height >= 14 { 4 } else { 3 };
+    let progress_height = if frame.area().width < 60 {
+        5
+    } else if frame.area().height >= 14 {
+        4
+    } else {
+        3
+    };
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2881,7 +3403,10 @@ fn chat_lines(
             || state.chat_visual_anchor.is_some_and(|anchor| {
                 anchor.min(state.chat_cursor) <= index && index <= anchor.max(state.chat_cursor)
             });
-        let stopped = message.error.as_deref() == Some("stopped");
+        let stopped = message
+            .error
+            .as_deref()
+            .is_some_and(|error| error == "stopped" || error.starts_with("cancelled"));
         let marker = if message.streaming {
             " ◐ streaming"
         } else if stopped {
@@ -2889,8 +3414,9 @@ fn chat_lines(
         } else if message.error.is_some() {
             " ⚠ failed"
         } else if message.role != "copilot"
-            && message.outbound_id.as_deref()
-                == state.agent_progress.active_outbound_id.as_deref()
+            && message.outbound_id.is_some()
+            && state.agent_progress.active_outbound_id.is_some()
+            && message.outbound_id.as_deref() == state.agent_progress.active_outbound_id.as_deref()
             && state.agent_progress.phase.is_active()
         {
             " · active"
@@ -2966,6 +3492,7 @@ fn chat_composer_height(state: &AppState, width: usize, terminal_height: u16) ->
 
 fn render_chat_composer(frame: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
     let inner_width = area.width.saturating_sub(2).max(1) as usize;
+    state.compose_wrap_width = inner_width;
     let (lines, cursor_row, cursor_col) =
         wrapped_editor_lines(&state.compose, state.compose_cursor, inner_width);
     let visible_rows = area.height.saturating_sub(2).max(1) as usize;
@@ -2980,7 +3507,7 @@ fn render_chat_composer(frame: &mut ratatui::Frame, state: &mut AppState, area: 
 
     let (title, border_color) = match state.input_mode {
         InputMode::Compose => (
-            " CHAT INPUT · INSERT · Enter send · Shift-Enter newline · Esc normal · Ctrl-C discard "
+            " INSERT · Enter send · Shift-Enter newline · Esc keep draft · Ctrl-C stop/discard "
                 .to_owned(),
             Color::Green,
         ),
@@ -3004,7 +3531,7 @@ fn render_chat_composer(frame: &mut ratatui::Frame, state: &mut AppState, area: 
             )
         }
         InputMode::Normal => (
-            " CHAT INPUT · NORMAL · i edit · j/k scroll · G latest · Ctrl-C stop ".to_owned(),
+            " NORMAL · i edit · j/k scroll · G latest · Tab review · Ctrl-C stop ".to_owned(),
             Color::DarkGray,
         ),
     };
@@ -3154,15 +3681,26 @@ fn render_agent_progress(frame: &mut ratatui::Frame, state: &AppState, area: Rec
     } else {
         Color::DarkGray
     };
+    let compact = area.width < 60;
     let mut lines = vec![Line::from(vec![Span::styled(
-        format!(
-            " COPILOT {lane} {state_marker} {} {} · last SDK event {} · event #{} · queue {} ",
-            progress.phase.label(),
-            format_duration(progress.elapsed()),
-            format_duration(age),
-            progress.event_count,
-            progress.queue_depth,
-        ),
+        if compact {
+            format!(
+                " COPILOT {lane} {state_marker} {} {} · event {} · q{}",
+                progress.phase.label(),
+                format_duration(progress.elapsed()),
+                format_duration(age),
+                progress.queue_depth,
+            )
+        } else {
+            format!(
+                " COPILOT {lane} {state_marker} {} {} · last SDK event {} · event #{} · queue {} ",
+                progress.phase.label(),
+                format_duration(progress.elapsed()),
+                format_duration(age),
+                progress.event_count,
+                progress.queue_depth,
+            )
+        },
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )])];
     if area.height > 1 {
@@ -3187,8 +3725,16 @@ fn render_agent_progress(frame: &mut ratatui::Frame, state: &AppState, area: Rec
             Style::default().fg(color),
         ));
     }
+    if compact && area.height > 3 {
+        lines.push(Line::styled(
+            format!(" detail: {}", progress.detail),
+            Style::default().fg(color),
+        ));
+    }
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::TOP | Borders::BOTTOM)),
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::TOP | Borders::BOTTOM))
+            .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -3252,6 +3798,97 @@ fn render_agent_status(frame: &mut ratatui::Frame, state: &AppState) {
     );
 }
 
+fn render_queue(frame: &mut ratatui::Frame, state: &AppState) {
+    let visible_width = frame.area().width.saturating_sub(34).max(8) as usize;
+    let main_entries = state.main_chat.as_ref().into_iter().flatten().chain(
+        (state.main_chat.is_none())
+            .then_some(&state.chat)
+            .into_iter()
+            .flatten(),
+    );
+    let side_entries = if state.main_chat.is_some() {
+        state.chat.iter().chain(state.pending_side_entries.iter())
+    } else {
+        [].iter().chain(state.pending_side_entries.iter())
+    };
+    let entries = main_entries
+        .chain(side_entries)
+        .filter(|entry| {
+            entry.role != "copilot"
+                && entry
+                    .outbound_id
+                    .as_ref()
+                    .is_some_and(|id| state.pending_outbound_ids.contains(id))
+        })
+        .enumerate()
+        .map(|(index, entry)| {
+            let id = entry.outbound_id.as_deref().unwrap_or("unknown");
+            let lane = if state.side_outbound_ids.contains(id) {
+                "SIDE"
+            } else {
+                "MAIN"
+            };
+            let status = if state.agent_progress.active_outbound_id.as_deref() == Some(id)
+                && state.agent_progress.phase.is_active()
+            {
+                "ACTIVE"
+            } else {
+                "QUEUED"
+            };
+            let text = entry.text.replace('\n', " ↵ ");
+            let preview = text.chars().take(visible_width).collect::<String>();
+            let marker = if index == state.scroll { "▶" } else { " " };
+            ListItem::new(format!(
+                "{marker} {status:<6} {lane:<4} {}  {preview}",
+                short_id(id)
+            ))
+            .style(if index == state.scroll {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            })
+        })
+        .collect::<Vec<_>>();
+    let total = entries.len();
+    let viewport = frame.area().height.saturating_sub(4).max(1) as usize;
+    let start = state.scroll.min(total.saturating_sub(viewport));
+    let visible = entries
+        .into_iter()
+        .skip(start)
+        .take(viewport)
+        .collect::<Vec<_>>();
+    let title = format!(
+        " Copilot queue · {} pending · background FIFO ",
+        state.pending_outbound_ids.len()
+    );
+    let list = if visible.is_empty() {
+        List::new(vec![ListItem::new(
+            "No active or queued questions. New Chat messages remain editable while Copilot works.",
+        )])
+    } else {
+        List::new(visible)
+    };
+    frame.render_widget(
+        list.block(Block::default().title(title).borders(Borders::ALL)),
+        frame.area(),
+    );
+    let area = frame.area();
+    frame.render_widget(
+        Paragraph::new(
+            "j/k select · d cancel selected queued prompt · s stop active · q/Esc return",
+        )
+        .style(Style::default().fg(Color::DarkGray)),
+        Rect::new(
+            area.x.saturating_add(1),
+            area.bottom().saturating_sub(2),
+            area.width.saturating_sub(2),
+            1,
+        ),
+    );
+}
+
 fn format_duration(duration: std::time::Duration) -> String {
     let seconds = duration.as_secs();
     if seconds >= 60 {
@@ -3266,6 +3903,7 @@ fn format_duration(duration: std::time::Duration) -> String {
 fn agent_event_outbound_id(event: &AgentEvent) -> Option<String> {
     match event {
         AgentEvent::Queued { outbound_id, .. }
+        | AgentEvent::QueueCancelled { outbound_id }
         | AgentEvent::ResponseStarted { outbound_id, .. }
         | AgentEvent::ResponseDelta { outbound_id, .. }
         | AgentEvent::ResponseSnapshot { outbound_id, .. }
@@ -3330,10 +3968,20 @@ fn render_annotation_rail(frame: &mut ratatui::Frame, state: &AppState, area: Re
     } else {
         rows
     };
+    let focused = state.focus == crate::app::Focus::AnnotationRail;
     frame.render_widget(
         List::new(rows).block(
             Block::default()
-                .title("ask / comments (this file)")
+                .title(if focused {
+                    "▶ ask / comments (this file)"
+                } else {
+                    "ask / comments (this file)"
+                })
+                .title_style(Style::default().fg(if focused {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                }))
                 .borders(Borders::NONE),
         ),
         area,
@@ -3606,6 +4254,7 @@ mod tests {
             prs: PathBuf::from("/tmp/rq-tui-test/cache/prs"),
             exports: PathBuf::from("/tmp/rq-tui-test/data/exports"),
             skills: PathBuf::from("/tmp/rq-tui-test/data/skills"),
+            plugins: PathBuf::from("/tmp/rq-tui-test/data/plugins"),
         }
     }
 

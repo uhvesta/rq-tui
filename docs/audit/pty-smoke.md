@@ -1,5 +1,48 @@
 # Compiled-binary pseudo-terminal record
 
+This file contains both the current 2026-07-30 compiled-binary pass and the
+earlier records that exposed foundational terminal defects.
+
+## Current compiled-binary pass
+
+Date: 2026-07-30
+Platform: macOS arm64
+Terminal: tmux pseudo-terminal
+Binary: `bazel-bin/src/rq-tui`, produced by `bazel build //:rq-tui`
+Agent: `RQ_TUI_CONTROLLED_AGENT=1`
+
+| ID | Action | Captured terminal evidence |
+|---|---|---|
+| PTY-16 | Submit two prompts while the first is active; open `:queue`, select the waiting item, press `d` | The first item remained `ACTIVE`, the second was `QUEUED`, and cancellation removed only the selected waiting prompt while input remained responsive. |
+| PTY-17 | Submit `/steer correct the active answer` during an active turn | The original turn remained active, the correction appeared as `you · steer`, and progress identified immediate steering rather than falsely marking the correction as the active queued item. |
+| PTY-18 | Type a draft during an active response and press `Ctrl-C` | The active response stopped, the session remained connected, and the draft remained visible in the sticky `INSERT` composer. |
+| PTY-19 | Open `:model`, choose a model, reasoning effort, then context tier | Three separate stages rendered in order and the final selection applied the advertised capability values. |
+| PTY-20 | Enter SIDE, start a controlled stream, then submit `/main` | SIDE teardown interrupted the active turn and restored MAIN in about one second without waiting for natural completion. |
+| PTY-21 | Open Ask with content wrapping to 21 visual rows | The box capped safely inside the viewport, displayed `lines 9-21/21`, and Up scrolled it to `lines 1-13/21`; no text crossed the border. |
+
+## Current authenticated Copilot pass
+
+| ID | Action | Result |
+|---|---|---|
+| LIVE-01 | Run the ignored `live_copilot_streams_and_resumes_persisted_history` test with `RQ_TUI_LIVE_COPILOT=1` | Passed against the installed Copilot CLI. It exercised real streaming, SIDE creation/deletion, disconnect, persisted MAIN resume, and history reload. |
+
+The authenticated command used Bazel only:
+
+```sh
+RQ_TUI_LIVE_COPILOT=1 \
+COPILOT_CLI_PATH=/opt/homebrew/bin/copilot \
+bazel test //src:rq_tui_tests \
+  --test_filter=live_copilot_streams_and_resumes_persisted_history \
+  --test_arg=--ignored \
+  --test_env=RQ_TUI_LIVE_COPILOT=1 \
+  --test_env=COPILOT_CLI_PATH=/opt/homebrew/bin/copilot \
+  --test_env=HOME --test_env=PATH \
+  --strategy=TestRunner=local \
+  --test_output=streamed --nocache_test_results
+```
+
+## Earlier compiled-binary pass
+
 Date: 2026-07-29  
 Platform: macOS arm64  
 Terminal: tmux 140×35 pseudo-terminal  
@@ -63,7 +106,6 @@ performed with production data disabled.
 | PTY-15 | Submit `/main`, then type a long multiline draft | MAIN returned without the SIDE transcript. The sticky bordered composer wrapped over multiple rows, retained its insertion cursor, and remained separate from the transcript. |
 
 The pass did not produce a reliable capture for the quiet-warning threshold or
-active-turn cancellation. The deterministic liveness test is also currently
-red; see the verification addendum in
-[`../behavioral-audit.md`](../behavioral-audit.md). These are therefore not
-claimed as completed PTY behaviors.
+active-turn cancellation. Those behaviors are covered by the later
+deterministic 99-test baseline, but they are not claimed as current PTY
+behaviors.

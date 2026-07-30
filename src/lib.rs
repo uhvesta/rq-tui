@@ -41,5 +41,19 @@ pub fn run() -> Result<()> {
             );
             Ok(())
         }
+        Command::UiScript {
+            fixture,
+            width,
+            height,
+        } => {
+            use std::io::Read;
+            let mut script = String::new();
+            std::io::stdin().read_to_string(&mut script)?;
+            print!(
+                "{}",
+                crate::testing::run_ui_script(&fixture, width, height, &script)?
+            );
+            Ok(())
+        }
     }
 }

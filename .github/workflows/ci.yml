@@ -37,6 +37,6 @@ jobs:
           key: bazel-9-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.bazelversion', 'MODULE.bazel', 'MODULE.bazel.lock', 'Cargo.lock', '**/*.bzl') }}
           restore-keys: bazel-9-${{ runner.os }}-${{ runner.arch }}-
       - name: Test
-        run: bazel test //:rq_tui_tests
+        run: bazel test //:rq_tui_tests --lockfile_mode=error
       - name: Build
-        run: bazel build //:rq-tui
+        run: bazel build //:rq-tui --lockfile_mode=error

@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::annotations::anchor_from_diff;
+use crate::copilot::{ModelOption, ModelSelection};
 use crate::diff::{DiffFile, DiffSet, LineKind};
 use crate::domain::{AnchorSide, Annotation, AnnotationKind, AskMessage, Placement, Version};
 use crate::work_item::ResolvedWorkItem;
@@ -20,6 +21,8 @@ pub(crate) enum Screen {
     Prune,
     Recovery,
     AgentStatus,
+    Queue,
+    ModelPicker,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -47,6 +50,14 @@ pub(crate) enum DiffLayout {
     #[default]
     Split,
     Unified,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ModelPickerStage {
+    #[default]
+    Model,
+    Reasoning,
+    Context,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +109,8 @@ pub(crate) enum Effect {
         export_first: bool,
     },
     SendChat(String),
+    SteerChat(String),
+    CancelQueued(String),
     StartSide(Option<String>),
     ExitSide,
     AbortAgent,
@@ -109,6 +122,8 @@ pub(crate) enum Effect {
     DiscardPendingContext,
     Fork,
     Compact(Option<String>),
+    LoadModels,
+    SelectModel(ModelSelection),
     SetModel(String),
     SetBase {
         branch: String,
@@ -136,7 +151,6 @@ pub(crate) enum ComposeTarget {
     },
     Chat,
     Context,
-    SettingModel,
     SettingBase,
     SettingExpandStep,
 }
@@ -241,6 +255,8 @@ impl AgentProgress {
         outbound_id: Option<String>,
     ) {
         let now = Instant::now();
+        let summary = summary.into();
+        let detail = detail.into();
         if phase.is_active() && !self.phase.is_active() {
             self.turn_started_at = Some(now);
         }
@@ -248,14 +264,18 @@ impl AgentProgress {
             self.turn_started_at = None;
         }
         self.phase = phase;
-        self.summary = summary.into();
-        self.detail = detail.into();
+        self.summary = summary;
+        self.detail = detail;
         self.active_outbound_id = outbound_id;
         self.last_event_at = now;
         self.event_count = self.event_count.saturating_add(1);
         self.timeline.push_back(AgentTimelineEntry {
             at: now,
-            label: self.summary.clone(),
+            label: if self.detail.is_empty() || self.detail == self.summary {
+                self.summary.clone()
+            } else {
+                format!("{} — {}", self.summary, self.detail)
+            },
         });
         while self.timeline.len() > 24 {
             self.timeline.pop_front();
@@ -266,6 +286,31 @@ impl AgentProgress {
         self.turn_started_at
             .map(|started| started.elapsed())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn record_queued(&mut self, summary: impl Into<String>, detail: impl Into<String>) {
+        let now = Instant::now();
+        let summary = summary.into();
+        let detail = detail.into();
+        if self.active_outbound_id.is_none() {
+            self.phase = AgentPhase::Queued;
+            self.summary = summary.clone();
+            self.detail = detail.clone();
+            self.turn_started_at.get_or_insert(now);
+        }
+        self.last_event_at = now;
+        self.event_count = self.event_count.saturating_add(1);
+        self.timeline.push_back(AgentTimelineEntry {
+            at: now,
+            label: if detail.is_empty() || detail == summary {
+                summary
+            } else {
+                format!("{summary} — {detail}")
+            },
+        });
+        while self.timeline.len() > 24 {
+            self.timeline.pop_front();
+        }
     }
 
     pub(crate) fn last_event_age(&self) -> Duration {
@@ -296,13 +341,21 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
         "agent-status",
         "inspect Copilot liveness and recent SDK events",
     ),
+    ("queue", "inspect active and queued Copilot questions"),
+    (
+        "steer <correction>",
+        "redirect the active response immediately",
+    ),
     ("side [question]", "start an ephemeral side conversation"),
     ("main", "leave the side conversation and return to main"),
     ("stop", "cancel the active Copilot response"),
     ("diff split", "show the side-by-side diff"),
     ("diff unified", "show a single-column diff"),
     ("diff expand", "expand all folded context"),
-    ("model <name>", "change the Copilot model"),
+    (
+        "model [name]",
+        "pick model, reasoning, and context in stages",
+    ),
     ("fork", "fork and activate a persistent session"),
     (
         "compact [instructions]",
@@ -368,6 +421,8 @@ pub(crate) struct AppState {
     pub(crate) compose: String,
     pub(crate) compose_cursor: usize,
     pub(crate) compose_scroll: usize,
+    /// Inner terminal-cell width used by visual-row cursor movement.
+    pub(crate) compose_wrap_width: usize,
     pub(crate) compose_target: Option<ComposeTarget>,
     pub(crate) input_return_mode: InputMode,
     pub(crate) status: String,
@@ -397,6 +452,12 @@ pub(crate) struct AppState {
     pub(crate) pending_outbound_ids: HashSet<String>,
     pub(crate) side_outbound_ids: HashSet<String>,
     pub(crate) model: String,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) context_tier: Option<String>,
+    pub(crate) model_options: Vec<ModelOption>,
+    pub(crate) model_picker_stage: ModelPickerStage,
+    pub(crate) model_picker_index: usize,
+    pub(crate) pending_model_selection: Option<ModelSelection>,
     pub(crate) pending_prefix: String,
     pub(crate) pending_asks: Vec<AskMessage>,
     pub(crate) pending_comment_ids: Vec<String>,
@@ -436,6 +497,7 @@ impl AppState {
             compose: String::new(),
             compose_cursor: 0,
             compose_scroll: 0,
+            compose_wrap_width: 80,
             compose_target: None,
             input_return_mode: InputMode::Normal,
             status: String::new(),
@@ -465,6 +527,12 @@ impl AppState {
             pending_outbound_ids: HashSet::new(),
             side_outbound_ids: HashSet::new(),
             model: "gpt-5".into(),
+            reasoning_effort: None,
+            context_tier: None,
+            model_options: Vec::new(),
+            model_picker_stage: ModelPickerStage::Model,
+            model_picker_index: 0,
+            pending_model_selection: None,
             pending_prefix: String::new(),
             pending_asks: Vec::new(),
             pending_comment_ids: Vec::new(),
@@ -570,7 +638,10 @@ impl AppState {
                     Vec::new()
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.scroll = self.scroll.saturating_add(1);
+                    self.scroll = self
+                        .scroll
+                        .saturating_add(1)
+                        .min(self.agent_progress.timeline.len().saturating_sub(1));
                     Vec::new()
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
@@ -580,6 +651,58 @@ impl AppState {
                 KeyCode::Char('s') => vec![Effect::AbortAgent],
                 _ => Vec::new(),
             };
+        }
+        if self.screen == Screen::Queue {
+            return match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.screen = self.previous_screen;
+                    Vec::new()
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.scroll = self
+                        .scroll
+                        .saturating_add(1)
+                        .min(self.queue_entry_ids().len().saturating_sub(1));
+                    Vec::new()
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.scroll = self.scroll.saturating_sub(1);
+                    Vec::new()
+                }
+                KeyCode::Char('s') => vec![Effect::AbortAgent],
+                KeyCode::Char('d') => {
+                    let Some((outbound_id, active)) =
+                        self.queue_entry_ids().get(self.scroll).cloned()
+                    else {
+                        self.status = "No queued prompt is selected".into();
+                        return Vec::new();
+                    };
+                    if active {
+                        self.status = "That prompt is active · press s or Ctrl-C to stop it".into();
+                        Vec::new()
+                    } else {
+                        vec![Effect::CancelQueued(outbound_id)]
+                    }
+                }
+                _ => Vec::new(),
+            };
+        }
+        if self.screen == Screen::ModelPicker {
+            return self.handle_model_picker_key(key);
+        }
+        if self.pending_prefix == "ctrl-w" {
+            match key.code {
+                KeyCode::Left => return self.handle_prefix_key('h'),
+                KeyCode::Right => return self.handle_prefix_key('l'),
+                KeyCode::Down => return self.handle_prefix_key('j'),
+                KeyCode::Up => return self.handle_prefix_key('k'),
+                KeyCode::Esc => {
+                    self.pending_prefix.clear();
+                    self.status = "CTRL-W focus navigation cancelled".into();
+                    return Vec::new();
+                }
+                _ => {}
+            }
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return self.handle_control_key(key.code);
@@ -838,8 +961,15 @@ impl AppState {
                 self.settings_index = self.settings_index.saturating_sub(1);
             }
             KeyCode::Enter => {
+                if self.settings_index == 0 {
+                    self.open_overlay(Screen::ModelPicker);
+                    self.model_picker_stage = ModelPickerStage::Model;
+                    self.model_picker_index = 0;
+                    self.pending_model_selection = None;
+                    self.status = "Loading runtime model capabilities…".into();
+                    return vec![Effect::LoadModels];
+                }
                 let target = match self.settings_index {
-                    0 => Some((ComposeTarget::SettingModel, self.model.clone())),
                     2 => Some((
                         ComposeTarget::SettingBase,
                         self.work_item
@@ -867,6 +997,149 @@ impl AppState {
             }
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.screen = self.previous_screen;
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn handle_model_picker_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let count = match self.model_picker_stage {
+            ModelPickerStage::Model => self.model_options.len(),
+            ModelPickerStage::Reasoning => self
+                .pending_model_selection
+                .as_ref()
+                .and_then(|selection| {
+                    self.model_options
+                        .iter()
+                        .find(|model| model.id == selection.model_id)
+                })
+                .map_or(0, |model| model.supported_reasoning_efforts.len()),
+            ModelPickerStage::Context => self
+                .pending_model_selection
+                .as_ref()
+                .and_then(|selection| {
+                    self.model_options
+                        .iter()
+                        .find(|model| model.id == selection.model_id)
+                })
+                .map_or(0, |model| model.context_tiers.len()),
+        };
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down if count > 0 => {
+                self.model_picker_index =
+                    (self.model_picker_index + 1).min(count.saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up if count > 0 => {
+                self.model_picker_index = self.model_picker_index.saturating_sub(1);
+            }
+            KeyCode::Enter => match self.model_picker_stage {
+                ModelPickerStage::Model => {
+                    let Some(model) = self.model_options.get(self.model_picker_index).cloned()
+                    else {
+                        self.status = "No runtime models are available".into();
+                        return Vec::new();
+                    };
+                    self.pending_model_selection = Some(ModelSelection {
+                        model_id: model.id,
+                        reasoning_effort: model.default_reasoning_effort.clone(),
+                        context_tier: None,
+                    });
+                    if model.supported_reasoning_efforts.is_empty() {
+                        self.model_picker_stage = ModelPickerStage::Context;
+                        self.model_picker_index = 0;
+                    } else {
+                        self.model_picker_stage = ModelPickerStage::Reasoning;
+                        self.model_picker_index = model
+                            .default_reasoning_effort
+                            .as_ref()
+                            .and_then(|default| {
+                                model
+                                    .supported_reasoning_efforts
+                                    .iter()
+                                    .position(|effort| effort == default)
+                            })
+                            .unwrap_or(0);
+                    }
+                }
+                ModelPickerStage::Reasoning => {
+                    let Some(selection) = self.pending_model_selection.as_mut() else {
+                        return Vec::new();
+                    };
+                    let Some(model) = self
+                        .model_options
+                        .iter()
+                        .find(|model| model.id == selection.model_id)
+                    else {
+                        return Vec::new();
+                    };
+                    selection.reasoning_effort = model
+                        .supported_reasoning_efforts
+                        .get(self.model_picker_index)
+                        .cloned();
+                    self.model_picker_stage = ModelPickerStage::Context;
+                    self.model_picker_index = 0;
+                }
+                ModelPickerStage::Context => {
+                    let Some(mut selection) = self.pending_model_selection.clone() else {
+                        return Vec::new();
+                    };
+                    let Some(model) = self
+                        .model_options
+                        .iter()
+                        .find(|model| model.id == selection.model_id)
+                    else {
+                        return Vec::new();
+                    };
+                    selection.context_tier = model
+                        .context_tiers
+                        .get(self.model_picker_index)
+                        .map(|tier| tier.id.clone());
+                    self.screen = self.previous_screen;
+                    self.pending_model_selection = None;
+                    return vec![Effect::SelectModel(selection)];
+                }
+            },
+            KeyCode::Esc => match self.model_picker_stage {
+                ModelPickerStage::Context => {
+                    let has_reasoning = self
+                        .pending_model_selection
+                        .as_ref()
+                        .and_then(|selection| {
+                            self.model_options
+                                .iter()
+                                .find(|model| model.id == selection.model_id)
+                        })
+                        .is_some_and(|model| !model.supported_reasoning_efforts.is_empty());
+                    self.model_picker_stage = if has_reasoning {
+                        ModelPickerStage::Reasoning
+                    } else {
+                        ModelPickerStage::Model
+                    };
+                    self.model_picker_index = 0;
+                    self.status = "Back to the previous model choice".into();
+                }
+                ModelPickerStage::Reasoning => {
+                    self.model_picker_stage = ModelPickerStage::Model;
+                    self.model_picker_index = self
+                        .pending_model_selection
+                        .as_ref()
+                        .and_then(|selection| {
+                            self.model_options
+                                .iter()
+                                .position(|model| model.id == selection.model_id)
+                        })
+                        .unwrap_or(0);
+                    self.status = "Back to model selection".into();
+                }
+                ModelPickerStage::Model => {
+                    self.screen = self.previous_screen;
+                    self.pending_model_selection = None;
+                }
+            },
+            KeyCode::Char('q') => {
+                self.screen = self.previous_screen;
+                self.pending_model_selection = None;
             }
             _ => {}
         }
@@ -907,30 +1180,44 @@ impl AppState {
         let prefix = std::mem::take(&mut self.pending_prefix);
         match (prefix.as_str(), character) {
             ("g", 'g') => self.jump_top(),
-            ("g", 'c' | 'r') if self.input_mode == InputMode::Normal => self.toggle_review_chat(),
+            ("g", 'c') if self.input_mode == InputMode::Normal => {
+                self.screen = Screen::Chat;
+                self.focus = Focus::Chat;
+                self.clear_visual_selection();
+            }
+            ("g", 'r') if self.input_mode == InputMode::Normal => {
+                self.screen = Screen::Review;
+                self.focus = Focus::Diff;
+                self.clear_visual_selection();
+            }
             ("g", 'm') => return vec![Effect::Preview],
             ("ctrl-w", 'h') => {
                 self.focus = Focus::FilePicker;
                 self.picker_open = true;
                 self.clear_visual_selection();
+                self.status = "Focus: files".into();
             }
             ("ctrl-w", 'l') => {
-                self.focus = if self.layout == DiffLayout::Split {
-                    Focus::AnnotationRail
+                if self.layout == DiffLayout::Split {
+                    self.focus = Focus::AnnotationRail;
+                    self.status = "Focus: annotations".into();
                 } else {
-                    Focus::Diff
-                };
+                    self.focus = Focus::Diff;
+                    self.status = "No pane to the right in unified layout".into();
+                }
                 self.clear_visual_selection();
             }
             ("ctrl-w", 'j') => {
                 self.screen = Screen::Chat;
                 self.focus = Focus::Chat;
                 self.clear_visual_selection();
+                self.status = "Focus: chat transcript".into();
             }
             ("ctrl-w", 'k') => {
                 self.screen = Screen::Review;
                 self.focus = Focus::Diff;
                 self.clear_visual_selection();
+                self.status = "Focus: review diff".into();
             }
             ("]", 'a') => self.jump_annotation(true),
             ("[", 'a') => self.jump_annotation(false),
@@ -1049,22 +1336,43 @@ impl AppState {
             + usize::from(self.pending_context)
     }
 
+    pub(crate) fn queue_entry_ids(&self) -> Vec<(String, bool)> {
+        let main_entries = self.main_chat.as_ref().into_iter().flatten().chain(
+            (self.main_chat.is_none())
+                .then_some(&self.chat)
+                .into_iter()
+                .flatten(),
+        );
+        let side_entries = if self.main_chat.is_some() {
+            self.chat.iter().chain(self.pending_side_entries.iter())
+        } else {
+            [].iter().chain(self.pending_side_entries.iter())
+        };
+        main_entries
+            .chain(side_entries)
+            .filter_map(|entry| {
+                let id = entry.outbound_id.as_ref()?;
+                self.pending_outbound_ids.contains(id).then(|| {
+                    (
+                        id.clone(),
+                        self.agent_progress.active_outbound_id.as_deref() == Some(id.as_str())
+                            && self.agent_progress.phase.is_active(),
+                    )
+                })
+            })
+            .collect()
+    }
+
     fn handle_control_key(&mut self, code: KeyCode) -> Vec<Effect> {
         let half = (self.viewport_height / 2).max(1);
         match code {
             KeyCode::Char('c') => {
-                if self.screen == Screen::Chat && !self.compose.is_empty() {
-                    self.compose.clear();
-                    self.compose_cursor = 0;
-                    self.compose_scroll = 0;
-                    self.compose_target = None;
-                    self.status = "Draft cancelled".into();
-                    return Vec::new();
-                }
                 if self.side_starting {
                     return vec![Effect::ExitSide];
                 }
-                if self.agent_progress.phase.is_active() {
+                if self.agent_progress.phase.is_active()
+                    && self.agent_progress.active_outbound_id.is_some()
+                {
                     self.agent_progress.record(
                         AgentPhase::Stopping,
                         "Stopping the active Copilot response",
@@ -1072,6 +1380,14 @@ impl AppState {
                         self.agent_progress.active_outbound_id.clone(),
                     );
                     return vec![Effect::AbortAgent];
+                }
+                if self.screen == Screen::Chat && !self.compose.is_empty() {
+                    self.compose.clear();
+                    self.compose_cursor = 0;
+                    self.compose_scroll = 0;
+                    self.compose_target = None;
+                    self.status = "Draft cancelled".into();
+                    return Vec::new();
                 }
                 if self.side_active {
                     return vec![Effect::ExitSide];
@@ -1084,29 +1400,21 @@ impl AppState {
             KeyCode::Char('u') => self.move_up(half),
             KeyCode::Char('f') => self.move_down(self.viewport_height),
             KeyCode::Char('b') => self.move_up(self.viewport_height),
-            KeyCode::Char('w') => self.pending_prefix = "ctrl-w".into(),
+            KeyCode::Char('w') => {
+                self.pending_prefix = "ctrl-w".into();
+                self.status = "CTRL-W · h/j/k/l or arrows · Esc cancel".into();
+            }
             KeyCode::Char('h') if self.pending_prefix == "ctrl-w" => {
-                self.pending_prefix.clear();
-                self.focus = Focus::FilePicker;
-                self.picker_open = true;
+                return self.handle_prefix_key('h');
             }
             KeyCode::Char('l') if self.pending_prefix == "ctrl-w" => {
-                self.pending_prefix.clear();
-                self.focus = if self.layout == DiffLayout::Split {
-                    Focus::AnnotationRail
-                } else {
-                    Focus::Diff
-                };
+                return self.handle_prefix_key('l');
             }
             KeyCode::Char('j') if self.pending_prefix == "ctrl-w" => {
-                self.pending_prefix.clear();
-                self.screen = Screen::Chat;
-                self.focus = Focus::Chat;
+                return self.handle_prefix_key('j');
             }
             KeyCode::Char('k') if self.pending_prefix == "ctrl-w" => {
-                self.pending_prefix.clear();
-                self.screen = Screen::Review;
-                self.focus = Focus::Diff;
+                return self.handle_prefix_key('k');
             }
             KeyCode::Char('j' | 'm') => {
                 return self.handle_normal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1121,8 +1429,14 @@ impl AppState {
             let matches = command_matches(&self.command);
             let selected = matches.get(self.command_index).map(|(command, _)| *command);
             let typed = self.command.trim();
+            let exact = COMMANDS
+                .iter()
+                .map(|(command, _)| *command)
+                .find(|command| command_seed(command) == typed);
             let command = if typed.is_empty() {
                 selected.map(command_seed).unwrap_or_default()
+            } else if exact.is_some() {
+                typed.to_owned()
             } else if !typed.contains(char::is_whitespace) {
                 selected
                     .map(command_seed)
@@ -1130,7 +1444,8 @@ impl AppState {
             } else {
                 typed.to_owned()
             };
-            if selected.is_some_and(|suggestion| suggestion.contains('<'))
+            if exact.is_none()
+                && selected.is_some_and(|suggestion| suggestion.contains('<'))
                 && !typed.contains(char::is_whitespace)
             {
                 self.command = format!("{command} ");
@@ -1243,6 +1558,17 @@ impl AppState {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
+                    if self.agent_progress.phase.is_active()
+                        && self.agent_progress.active_outbound_id.is_some()
+                    {
+                        self.agent_progress.record(
+                            AgentPhase::Stopping,
+                            "Stopping the active Copilot response",
+                            "Draft preserved; press Ctrl-C again after Copilot stops to discard it",
+                            self.agent_progress.active_outbound_id.clone(),
+                        );
+                        return vec![Effect::AbortAgent];
+                    }
                     self.compose.clear();
                     self.compose_cursor = 0;
                     self.compose_scroll = 0;
@@ -1394,6 +1720,18 @@ impl AppState {
                     vec![Effect::StartSide(None)]
                 } else if let Some(question) = trimmed.strip_prefix("/side ") {
                     vec![Effect::StartSide(Some(question.trim().to_owned()))]
+                } else if let Some(correction) = trimmed.strip_prefix("/steer ") {
+                    let correction = correction.trim().to_owned();
+                    if self.agent_progress.phase.is_active()
+                        && self.agent_progress.active_outbound_id.is_some()
+                    {
+                        vec![Effect::SteerChat(correction)]
+                    } else {
+                        self.status =
+                            "No response is active; the correction was queued as a normal prompt"
+                                .into();
+                        vec![Effect::SendChat(correction)]
+                    }
                 } else if matches!(trimmed, "/main" | "/side-exit") {
                     vec![Effect::ExitSide]
                 } else {
@@ -1404,7 +1742,6 @@ impl AppState {
                 self.context_draft = text;
                 Vec::new()
             }
-            ComposeTarget::SettingModel => vec![Effect::SetModel(text)],
             ComposeTarget::SettingBase => vec![Effect::SetBase {
                 branch: text,
                 repo: None,
@@ -1467,6 +1804,28 @@ impl AppState {
                 self.open_overlay(Screen::AgentStatus);
                 Vec::new()
             }
+            (Some("queue"), _) => {
+                self.open_overlay(Screen::Queue);
+                Vec::new()
+            }
+            (Some("steer"), correction) => {
+                let mut words = correction.into_iter().collect::<Vec<_>>();
+                words.extend(parts);
+                let correction = words.join(" ");
+                if correction.is_empty() {
+                    self.status = "Usage: :steer <correction>".into();
+                    Vec::new()
+                } else if self.agent_progress.phase.is_active()
+                    && self.agent_progress.active_outbound_id.is_some()
+                {
+                    vec![Effect::SteerChat(correction)]
+                } else {
+                    self.status =
+                        "No response is active; the correction was queued as a normal prompt"
+                            .into();
+                    vec![Effect::SendChat(correction)]
+                }
+            }
             (Some("side"), question) => {
                 let mut words = question.into_iter().collect::<Vec<_>>();
                 words.extend(parts);
@@ -1477,6 +1836,14 @@ impl AppState {
             }
             (Some("main" | "side-exit"), _) => vec![Effect::ExitSide],
             (Some("model"), Some(model)) => vec![Effect::SetModel(model.to_owned())],
+            (Some("model"), None) => {
+                self.open_overlay(Screen::ModelPicker);
+                self.model_picker_stage = ModelPickerStage::Model;
+                self.model_picker_index = 0;
+                self.pending_model_selection = None;
+                self.status = "Loading runtime model capabilities…".into();
+                vec![Effect::LoadModels]
+            }
             (Some("export"), format) => vec![Effect::Export {
                 format: format.map(str::to_owned),
             }],
@@ -1560,30 +1927,28 @@ impl AppState {
     }
 
     fn move_compose_vertical(&mut self, direction: i8) {
-        let start = self.compose_line_start();
-        let column = self.compose[start..self.compose_cursor].chars().count();
-        if direction < 0 {
-            if start == 0 {
-                return;
-            }
-            let previous_end = start - 1;
-            let previous_start = self.compose[..previous_end]
-                .rfind('\n')
-                .map(|index| index + 1)
-                .unwrap_or(0);
-            self.compose_cursor =
-                byte_at_char_column(&self.compose, previous_start, previous_end, column);
+        let positions = editor_cursor_positions(&self.compose, self.compose_wrap_width);
+        let Some((_, row, column)) = positions
+            .iter()
+            .find(|(byte, _, _)| *byte == self.compose_cursor)
+            .copied()
+        else {
+            return;
+        };
+        let target_row = if direction < 0 {
+            row.checked_sub(1)
         } else {
-            let end = self.compose_line_end();
-            if end == self.compose.len() {
-                return;
-            }
-            let next_start = end + 1;
-            let next_end = self.compose[next_start..]
-                .find('\n')
-                .map(|index| next_start + index)
-                .unwrap_or(self.compose.len());
-            self.compose_cursor = byte_at_char_column(&self.compose, next_start, next_end, column);
+            Some(row.saturating_add(1))
+        };
+        let Some(target_row) = target_row else {
+            return;
+        };
+        if let Some((byte, _, _)) = positions
+            .iter()
+            .filter(|(_, candidate_row, _)| *candidate_row == target_row)
+            .min_by_key(|(_, _, candidate_column)| candidate_column.abs_diff(column))
+        {
+            self.compose_cursor = *byte;
         }
     }
 
@@ -2085,12 +2450,53 @@ fn terminal_enter(key: &KeyEvent) -> bool {
             && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
-fn byte_at_char_column(text: &str, start: usize, end: usize, column: usize) -> usize {
-    text[start..end]
-        .char_indices()
-        .nth(column)
-        .map(|(offset, _)| start + offset)
-        .unwrap_or(end)
+fn editor_cursor_positions(text: &str, width: usize) -> Vec<(usize, usize, usize)> {
+    let width = width.max(1);
+    let mut positions = Vec::with_capacity(text.chars().count().saturating_add(1));
+    let mut row = 0usize;
+    let mut column = 0usize;
+    for (byte, character) in text.char_indices() {
+        positions.push((byte, row, column));
+        if character == '\n' {
+            row = row.saturating_add(1);
+            column = 0;
+            continue;
+        }
+        let character_width = terminal_cell_width(character);
+        if column > 0 && column.saturating_add(character_width) > width {
+            row = row.saturating_add(1);
+            column = 0;
+            if let Some(position) = positions.last_mut() {
+                position.1 = row;
+                position.2 = column;
+            }
+        }
+        column = column.saturating_add(character_width);
+    }
+    positions.push((text.len(), row, column));
+    positions
+}
+
+fn terminal_cell_width(character: char) -> usize {
+    if character.is_control() {
+        0
+    } else if matches!(
+        character as u32,
+        0x1100..=0x115f
+            | 0x2329..=0x232a
+            | 0x2e80..=0xa4cf
+            | 0xac00..=0xd7a3
+            | 0xf900..=0xfaff
+            | 0xfe10..=0xfe19
+            | 0xfe30..=0xfe6f
+            | 0xff00..=0xff60
+            | 0xffe0..=0xffe6
+            | 0x1f300..=0x1faff
+    ) {
+        2
+    } else {
+        1
+    }
 }
 
 fn placement_line(line: &crate::diff::DiffLine, side: Option<AnchorSide>) -> Option<usize> {
@@ -2194,7 +2600,9 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::tests_support::state_for_ui;
-    use super::{AppState, DiffLayout, Effect, Focus, InputMode, Screen};
+    use super::{
+        AgentPhase, AppState, ComposeTarget, DiffLayout, Effect, Focus, InputMode, Screen,
+    };
     use crate::domain::{AskMessage, DeliveryState};
 
     fn state() -> AppState {
@@ -2228,6 +2636,70 @@ mod tests {
     }
 
     #[test]
+    fn composer_up_and_down_follow_wrapped_visual_rows() {
+        let mut app = state();
+        app.screen = Screen::Chat;
+        app.input_mode = InputMode::Compose;
+        app.compose_target = Some(ComposeTarget::Chat);
+        app.compose_wrap_width = 8;
+        app.compose = "first wrapped visual row".into();
+        app.compose_cursor = app.compose.len();
+
+        app.handle_key(key(KeyCode::Up));
+        let upper = app.compose_cursor;
+        assert!(upper < app.compose.len());
+        app.handle_key(key(KeyCode::Down));
+        assert!(app.compose_cursor > upper);
+    }
+
+    #[test]
+    fn ctrl_c_stops_active_response_before_discarding_chat_draft() {
+        let mut app = state();
+        app.screen = Screen::Chat;
+        app.input_mode = InputMode::Compose;
+        app.compose_target = Some(ComposeTarget::Chat);
+        app.compose = "keep this draft".into();
+        app.compose_cursor = app.compose.len();
+        app.agent_progress.phase = AgentPhase::Responding;
+        app.agent_progress.active_outbound_id = Some("active".into());
+
+        let effects = app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert_eq!(effects, vec![Effect::AbortAgent]);
+        assert_eq!(app.compose, "keep this draft");
+        assert_eq!(app.agent_progress.phase, AgentPhase::Stopping);
+    }
+
+    #[test]
+    fn steer_command_interrupts_only_when_a_response_is_active() {
+        let mut app = state();
+        app.screen = Screen::Chat;
+        app.input_mode = InputMode::Compose;
+        app.compose_target = Some(ComposeTarget::Chat);
+        app.compose = "/steer focus on the error path".into();
+        app.compose_cursor = app.compose.len();
+        app.agent_progress.phase = AgentPhase::Responding;
+        app.agent_progress.active_outbound_id = Some("active".into());
+
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            effects,
+            vec![Effect::SteerChat("focus on the error path".into())]
+        );
+
+        app.input_mode = InputMode::Compose;
+        app.compose_target = Some(ComposeTarget::Chat);
+        app.compose = "/steer now answer normally".into();
+        app.compose_cursor = app.compose.len();
+        app.agent_progress.phase = AgentPhase::Idle;
+        app.agent_progress.active_outbound_id = None;
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            vec![Effect::SendChat("now answer normally".into())]
+        );
+    }
+
+    #[test]
     fn tab_toggles_review_and_chat_only_in_normal_mode() {
         let mut app = state();
         app.handle_key(key(KeyCode::Tab));
@@ -2247,6 +2719,12 @@ mod tests {
         app.handle_key(key(KeyCode::Char('g')));
         app.handle_key(key(KeyCode::Char('c')));
         assert_eq!(app.screen, Screen::Chat);
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(app.screen, Screen::Chat);
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(app.screen, Screen::Review);
         app.handle_key(key(KeyCode::Char('g')));
         app.handle_key(key(KeyCode::Char('r')));
         assert_eq!(app.screen, Screen::Review);
@@ -2353,6 +2831,7 @@ mod tests {
     fn ctrl_w_then_plain_direction_moves_focus_as_documented() {
         let mut app = state();
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert!(app.status.contains("CTRL-W"));
         app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(app.focus, Focus::FilePicker);
         assert!(app.picker_open);
@@ -2361,6 +2840,18 @@ mod tests {
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.screen, Screen::Chat);
         assert_eq!(app.focus, Focus::Chat);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.focus, Focus::Diff);
+        assert!(app.status.contains("Focus: review diff"));
+
+        app.layout = DiffLayout::Unified;
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.focus, Focus::Diff);
+        assert!(app.status.contains("No pane to the right"));
     }
 
     #[test]

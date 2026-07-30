@@ -38,9 +38,21 @@ pub(crate) enum Command {
     /// Render a deterministic mocked UI state for visual inspection.
     #[command(hide = true)]
     UiSnapshot {
-        /// State name: review, command, composer, quiet, side, markdown, tiny, or all.
+        /// State name: review, ask, command, composer, quiet, queue, side, model, markdown, tiny, or all.
         #[arg(long, default_value = "all")]
         state: String,
+        #[arg(long, default_value_t = 100)]
+        width: u16,
+        #[arg(long, default_value_t = 28)]
+        height: u16,
+    },
+    /// Drive the headless TUI harness with a scripted key/text sequence read
+    /// from stdin and print the resulting frame(s) for e2e exploration.
+    #[command(hide = true)]
+    UiScript {
+        /// Fixture diff: default, foldheavy, manyfiles, longlines, or unicode.
+        #[arg(long, default_value = "default")]
+        fixture: String,
         #[arg(long, default_value_t = 100)]
         width: u16,
         #[arg(long, default_value_t = 28)]

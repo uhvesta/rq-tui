@@ -14,7 +14,7 @@ use crate::app::{AppState, Effect, InputMode, Screen};
 use crate::config::AppPaths;
 use crate::copilot::{
     ActivityKind, AgentActivity, AgentCommand, AgentEvent, AgentEventEnvelope, AgentLane,
-    AgentSink, HistoryEntry, LaneEvent, Outbound,
+    AgentSink, ContextTierOption, HistoryEntry, LaneEvent, ModelOption, Outbound,
 };
 use crate::diff::{parse_unified, DiffSet};
 use crate::domain::{BaseBranchSource, DeliveryState, Repo, Version, VersionKind, WorkItem};
@@ -79,6 +79,7 @@ pub struct TuiHarness {
     agent: FakeAgent,
     effects: Vec<String>,
     last_yank: Option<String>,
+    active_stream: Option<Outbound>,
     width: u16,
     height: u16,
     _temp: TempDir,
@@ -97,6 +98,7 @@ impl TuiHarness {
             agent: FakeAgent::default(),
             effects: Vec::new(),
             last_yank: None,
+            active_stream: None,
             width,
             height,
             _temp: temp,
@@ -129,21 +131,37 @@ impl TuiHarness {
                 self.state.status = format!("Yanked {} bytes", text.len());
                 continue;
             }
-            if let Err(error) = handle_effect(
+            let result = handle_effect(
                 &mut self.state,
                 &self.storage,
                 &self.paths,
                 &self.agent,
                 effect.clone(),
-            ) {
+            );
+            if let Err(error) = result {
                 handle_effect_failure(&mut self.state, &effect, &error);
+            } else if let Effect::CancelQueued(outbound_id) = effect {
+                self.agent
+                    .pending
+                    .lock()
+                    .expect("agent lock")
+                    .retain(|outbound| outbound.id != outbound_id);
+                handle_agent_event(
+                    &mut self.state,
+                    &self.storage,
+                    AgentEvent::QueueCancelled { outbound_id },
+                )?;
             }
         }
         Ok(descriptions)
     }
 
-    /// Injects a successful streamed response for the oldest queued outbound.
-    pub fn stream_next_response(&mut self, chunks: &[&str]) -> Result<()> {
+    /// Starts, but deliberately does not complete, the oldest fake-agent turn.
+    pub fn start_next_response(&mut self, first_delta: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.active_stream.is_none(),
+            "a fake-agent response is already streaming"
+        );
         let outbound = self
             .agent
             .pending
@@ -151,34 +169,57 @@ impl TuiHarness {
             .expect("agent lock")
             .pop_front()
             .context("no queued fake-agent outbound")?;
-        let mut chunks = chunks.iter();
         handle_agent_event(
             &mut self.state,
             &self.storage,
             AgentEvent::ResponseStarted {
                 outbound_id: outbound.id.clone(),
                 outbound: outbound.kind.clone(),
-                first_delta: chunks.next().copied().unwrap_or_default().to_owned(),
+                first_delta: first_delta.to_owned(),
             },
         )?;
-        for chunk in chunks {
-            handle_agent_event(
-                &mut self.state,
-                &self.storage,
-                AgentEvent::ResponseDelta {
-                    outbound_id: outbound.id.clone(),
-                    delta: (*chunk).to_owned(),
-                },
-            )?;
-        }
+        self.active_stream = Some(outbound);
+        Ok(())
+    }
+
+    pub fn push_response_delta(&mut self, delta: &str) -> Result<()> {
+        let outbound = self
+            .active_stream
+            .as_ref()
+            .context("no fake-agent response is streaming")?;
+        handle_agent_event(
+            &mut self.state,
+            &self.storage,
+            AgentEvent::ResponseDelta {
+                outbound_id: outbound.id.clone(),
+                delta: delta.to_owned(),
+            },
+        )
+    }
+
+    pub fn complete_response(&mut self, aborted: bool) -> Result<()> {
+        let outbound = self
+            .active_stream
+            .take()
+            .context("no fake-agent response is streaming")?;
         handle_agent_event(
             &mut self.state,
             &self.storage,
             AgentEvent::ResponseComplete {
                 outbound_id: outbound.id,
-                aborted: false,
+                aborted,
             },
         )
+    }
+
+    /// Injects a successful streamed response for the oldest queued outbound.
+    pub fn stream_next_response(&mut self, chunks: &[&str]) -> Result<()> {
+        let mut chunks = chunks.iter();
+        self.start_next_response(chunks.next().copied().unwrap_or_default())?;
+        for chunk in chunks {
+            self.push_response_delta(chunk)?;
+        }
+        self.complete_response(false)
     }
 
     /// Injects a failed delivery for the oldest queued outbound.
@@ -342,6 +383,7 @@ impl TuiHarness {
                 event: LaneEvent::SideExited {
                     parent_id: parent_id.into(),
                     side_id,
+                    cleanup_warning: None,
                 },
                 activity: None,
             },
@@ -368,7 +410,10 @@ impl TuiHarness {
         let mut output = String::new();
         for row in 0..self.height {
             let line = (0..self.width)
-                .map(|column| buffer[(column, row)].symbol())
+                .filter_map(|column| {
+                    let cell = &buffer[(column, row)];
+                    (!cell.skip).then(|| cell.symbol())
+                })
                 .collect::<String>();
             output.push_str(line.trim_end());
             output.push('\n');
@@ -468,6 +513,7 @@ fn fixture_paths(root: &std::path::Path) -> AppPaths {
         prs: root.join("cache/prs"),
         exports: root.join("data/exports"),
         skills: root.join("data/skills"),
+        plugins: root.join("data/plugins"),
     }
 }
 
@@ -534,7 +580,8 @@ pub fn render_ui_scenario(name: &str, width: u16, height: u16) -> Result<String>
     if name == "all" {
         let mut gallery = String::new();
         for scenario in [
-            "review", "command", "composer", "quiet", "side", "markdown", "tiny",
+            "review", "ask", "command", "composer", "quiet", "queue", "side", "model", "markdown",
+            "tiny",
         ] {
             gallery.push_str(&format!("\n===== {scenario} =====\n"));
             gallery.push_str(&render_ui_scenario(scenario, width, height)?);
@@ -555,6 +602,13 @@ pub fn render_ui_scenario(name: &str, width: u16, height: u16) -> Result<String>
 
     match name {
         "review" => {}
+        "ask" => {
+            press(&mut harness, crossterm::event::KeyCode::Char('a'))?;
+            type_into(
+                &mut harness,
+                "How does this work here? How can we make it better? What do we need to do to make it better? Why did the old editor overflow so easily? This Ask editor now expands based on wrapped rows, keeps the selected code visible around it, and scrolls internally when the prompt becomes taller than its safe terminal-height cap.",
+            )?;
+        }
         "command" => {
             press(&mut harness, crossterm::event::KeyCode::Tab)?;
             press(&mut harness, crossterm::event::KeyCode::Char(':'))?;
@@ -588,12 +642,62 @@ pub fn render_ui_scenario(name: &str, width: u16, height: u16) -> Result<String>
             )?;
             harness.backdate_agent_progress(std::time::Duration::from_secs(23));
         }
+        "queue" => {
+            press(&mut harness, crossterm::event::KeyCode::Tab)?;
+            for prompt in [
+                "Review the error path first",
+                "Then check cancellation cleanup",
+                "Finally summarize the public API",
+            ] {
+                press(&mut harness, crossterm::event::KeyCode::Char('i'))?;
+                type_into(&mut harness, prompt)?;
+                press(&mut harness, crossterm::event::KeyCode::Enter)?;
+            }
+            press(&mut harness, crossterm::event::KeyCode::Char(':'))?;
+            type_into(&mut harness, "queue")?;
+            press(&mut harness, crossterm::event::KeyCode::Enter)?;
+        }
         "side" => {
             press(&mut harness, crossterm::event::KeyCode::Tab)?;
             press(&mut harness, crossterm::event::KeyCode::Char('i'))?;
             type_into(&mut harness, "/side What does this function guarantee?")?;
             press(&mut harness, crossterm::event::KeyCode::Enter)?;
             harness.inject_side_started("main-session", "side-session")?;
+        }
+        "model" => {
+            press(&mut harness, crossterm::event::KeyCode::Char(':'))?;
+            type_into(&mut harness, "model")?;
+            press(&mut harness, crossterm::event::KeyCode::Enter)?;
+            harness.inject_agent_event(AgentEvent::ModelsListed(vec![
+                ModelOption {
+                    id: "fast".into(),
+                    name: "Fast".into(),
+                    supported_reasoning_efforts: vec!["low".into(), "medium".into()],
+                    default_reasoning_effort: Some("medium".into()),
+                    max_context_tokens: Some(32_768),
+                    context_tiers: vec![ContextTierOption {
+                        id: "default".into(),
+                        max_context_tokens: Some(32_768),
+                    }],
+                },
+                ModelOption {
+                    id: "deep".into(),
+                    name: "Deep".into(),
+                    supported_reasoning_efforts: vec!["medium".into(), "high".into()],
+                    default_reasoning_effort: Some("high".into()),
+                    max_context_tokens: Some(128_000),
+                    context_tiers: vec![
+                        ContextTierOption {
+                            id: "default".into(),
+                            max_context_tokens: Some(128_000),
+                        },
+                        ContextTierOption {
+                            id: "long_context".into(),
+                            max_context_tokens: Some(256_000),
+                        },
+                    ],
+                },
+            ]))?;
         }
         "markdown" => {
             press(&mut harness, crossterm::event::KeyCode::Tab)?;
@@ -606,10 +710,274 @@ pub fn render_ui_scenario(name: &str, width: u16, height: u16) -> Result<String>
             harness.resize(width.min(20), height.min(5));
         }
         other => anyhow::bail!(
-            "unknown UI snapshot state {other:?}; use review, command, composer, quiet, side, markdown, tiny, or all"
+            "unknown UI snapshot state {other:?}; use review, ask, command, composer, quiet, queue, side, model, markdown, tiny, or all"
         ),
     }
     harness.render()
+}
+
+/// Named diff fixtures for [`run_ui_script`], covering shapes that surface
+/// different corner cases (long unchanged regions, many files, long lines,
+/// wide/combining Unicode).
+fn ui_script_fixture(name: &str) -> Result<(String, String)> {
+    let diff = match name {
+        "default" => concat!(
+            "diff --git a/src/lib.rs b/src/lib.rs\n",
+            "--- a/src/lib.rs\n",
+            "+++ b/src/lib.rs\n",
+            "@@ -1,3 +1,4 @@\n",
+            " fn review() {\n",
+            "+    let visible = true;\n",
+            "     finish();\n",
+            " }\n",
+        )
+        .to_owned(),
+        "foldheavy" => {
+            let mut body = String::new();
+            body.push_str("diff --git a/src/big.rs b/src/big.rs\n");
+            body.push_str("--- a/src/big.rs\n");
+            body.push_str("+++ b/src/big.rs\n");
+            body.push_str("@@ -1,80 +1,81 @@\n");
+            for line_number in 1..=30 {
+                body.push_str(&format!(" fn helper_{line_number}() {{}}\n"));
+            }
+            body.push_str("+    let inserted_marker = true;\n");
+            for line_number in 31..=80 {
+                body.push_str(&format!(" fn helper_{line_number}() {{}}\n"));
+            }
+            body
+        }
+        "manyfiles" => {
+            let mut body = String::new();
+            for index in 1..=12 {
+                body.push_str(&format!(
+                    "diff --git a/src/module_{index}.rs b/src/module_{index}.rs\n"
+                ));
+                body.push_str(&format!("--- a/src/module_{index}.rs\n"));
+                body.push_str(&format!("+++ b/src/module_{index}.rs\n"));
+                body.push_str("@@ -1,2 +1,3 @@\n");
+                body.push_str(" fn existing() {}\n");
+                body.push_str(&format!("+fn added_{index}() {{}}\n"));
+                body.push_str(" fn trailer() {}\n");
+            }
+            body
+        }
+        "longlines" => {
+            let long_old = "x".repeat(40) + &" old_token".repeat(30);
+            let long_new = "y".repeat(40) + &" new_token_replacement_value".repeat(30);
+            format!(
+                "diff --git a/src/long.rs b/src/long.rs\n--- a/src/long.rs\n+++ b/src/long.rs\n@@ -1,3 +1,3 @@\n fn wrap() {{\n-    let value = \"{long_old}\";\n+    let value = \"{long_new}\";\n }}\n"
+            )
+        }
+        "unicode" => concat!(
+            "diff --git a/src/unicode.rs b/src/unicode.rs\n",
+            "--- a/src/unicode.rs\n",
+            "+++ b/src/unicode.rs\n",
+            "@@ -1,3 +1,4 @@\n",
+            " fn greet() {\n",
+            "+    // 你好世界 こんにちは мир 🎉🚀👍 café naïve e\u{301}\n",
+            "     finish();\n",
+            " }\n",
+        )
+        .to_owned(),
+        other => anyhow::bail!(
+            "unknown ui-script fixture {other:?}; use default, foldheavy, manyfiles, longlines, or unicode"
+        ),
+    };
+    Ok((name.to_owned(), diff))
+}
+
+fn parse_key_spec(spec: &str) -> Result<KeyEvent> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut modifiers = KeyModifiers::NONE;
+    let mut rest = spec;
+    loop {
+        if let Some(tail) = rest.strip_prefix("C-") {
+            modifiers |= KeyModifiers::CONTROL;
+            rest = tail;
+        } else if let Some(tail) = rest.strip_prefix("S-") {
+            modifiers |= KeyModifiers::SHIFT;
+            rest = tail;
+        } else if let Some(tail) = rest.strip_prefix("A-") {
+            modifiers |= KeyModifiers::ALT;
+            rest = tail;
+        } else {
+            break;
+        }
+    }
+    let code = match rest.to_ascii_lowercase().as_str() {
+        "enter" | "return" | "cr" => KeyCode::Enter,
+        "esc" | "escape" => KeyCode::Esc,
+        "tab" => KeyCode::Tab,
+        "backspace" | "bs" => KeyCode::Backspace,
+        "delete" | "del" => KeyCode::Delete,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "pageup" | "pgup" => KeyCode::PageUp,
+        "pagedown" | "pgdn" => KeyCode::PageDown,
+        "space" => KeyCode::Char(' '),
+        _ => {
+            let mut chars = rest.chars();
+            let first = chars
+                .next()
+                .with_context(|| format!("empty key spec {spec:?}"))?;
+            if chars.next().is_some() {
+                anyhow::bail!("key spec {spec:?} must name one key (named key or single char)");
+            }
+            KeyCode::Char(first)
+        }
+    };
+    Ok(KeyEvent::new(code, modifiers))
+}
+
+/// Runs a plain-text action script against a named diff fixture and returns
+/// every requested snapshot plus a final state/debug dump. Intended as the
+/// entry point subagents drive over `rq-tui ui-script` without needing to
+/// write Rust or recompile the binary for each new scenario.
+///
+/// Script grammar, one action per line (blank lines and `#`-comments ignored):
+///   key <spec>       press one key; spec is `[C-][S-][A-]<name-or-char>`,
+///                     e.g. `a`, `Enter`, `C-w`, `S-Tab`, `C-c`
+///   type <text>       press every remaining character on the line in order
+///   resize <w> <h>    change terminal dimensions
+///   stream <text>     deliver and complete a single-chunk fake-agent response
+///   stream-start <text> start a response and leave it active
+///   stream-delta <text> append a delta to the active response
+///   stream-complete   complete the active response
+///   stream-abort      abort the active response
+///   fail <message>    fail the oldest queued response before it starts
+///   snapshot [label]  render the current frame into the output now
+pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Result<String> {
+    let (name, diff) = ui_script_fixture(fixture)?;
+    let mut harness = TuiHarness::from_unified_diff(name, &diff, width, height)?;
+    let mut output = String::new();
+    let mut snapshot_count = 0usize;
+
+    let mut emit_snapshot = |harness: &mut TuiHarness, label: &str, output: &mut String| {
+        snapshot_count += 1;
+        output.push_str(&format!(
+            "\n===== snapshot {snapshot_count}: {label} ({}x{}, mode={}) =====\n",
+            harness.width,
+            harness.height,
+            harness.mode()
+        ));
+        match harness.render() {
+            Ok(frame) => output.push_str(&frame),
+            Err(error) => output.push_str(&format!("<render error: {error:#}>\n")),
+        }
+        output.push_str(&format!("status: {}\n", harness.status()));
+    };
+
+    for (line_number, raw_line) in script.lines().enumerate() {
+        let line = raw_line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (command, raw_argument) = line.split_once(' ').unwrap_or((line, ""));
+        let argument = if matches!(
+            command,
+            "type" | "stream" | "stream-start" | "stream-delta" | "fail"
+        ) {
+            raw_argument
+        } else {
+            raw_argument.trim()
+        };
+        match command {
+            "key" => {
+                let key = parse_key_spec(argument)
+                    .with_context(|| format!("line {}: {raw_line:?}", line_number + 1))?;
+                harness
+                    .key(key)
+                    .with_context(|| format!("line {}: {raw_line:?}", line_number + 1))?;
+            }
+            "type" => {
+                for character in argument.chars() {
+                    harness
+                        .key(KeyEvent::new(
+                            crossterm::event::KeyCode::Char(character),
+                            crossterm::event::KeyModifiers::NONE,
+                        ))
+                        .with_context(|| format!("line {}: {raw_line:?}", line_number + 1))?;
+                }
+            }
+            "resize" => {
+                let mut parts = argument.split_whitespace();
+                let w: u16 = parts
+                    .next()
+                    .context("resize requires <w> <h>")?
+                    .parse()
+                    .context("resize width must be a number")?;
+                let h: u16 = parts
+                    .next()
+                    .context("resize requires <w> <h>")?
+                    .parse()
+                    .context("resize height must be a number")?;
+                harness.resize(w, h);
+            }
+            "stream" => {
+                harness
+                    .stream_next_response(&[argument])
+                    .with_context(|| format!("line {}: {raw_line:?}", line_number + 1))?;
+            }
+            "stream-start" => {
+                harness
+                    .start_next_response(argument)
+                    .with_context(|| format!("line {}: {raw_line:?}", line_number + 1))?;
+            }
+            "stream-delta" => {
+                harness
+                    .push_response_delta(argument)
+                    .with_context(|| format!("line {}: {raw_line:?}", line_number + 1))?;
+            }
+            "stream-complete" => {
+                harness
+                    .complete_response(false)
+                    .with_context(|| format!("line {}: {raw_line:?}", line_number + 1))?;
+            }
+            "stream-abort" => {
+                harness
+                    .complete_response(true)
+                    .with_context(|| format!("line {}: {raw_line:?}", line_number + 1))?;
+            }
+            "fail" => {
+                harness
+                    .fail_next_response(argument)
+                    .with_context(|| format!("line {}: {raw_line:?}", line_number + 1))?;
+            }
+            "snapshot" => {
+                let label = if argument.is_empty() {
+                    format!("line {}", line_number + 1)
+                } else {
+                    argument.to_owned()
+                };
+                emit_snapshot(&mut harness, &label, &mut output);
+            }
+            other => anyhow::bail!(
+                "line {}: unknown ui-script command {other:?} (use key, type, resize, stream*, fail, or snapshot)",
+                line_number + 1
+            ),
+        }
+    }
+
+    emit_snapshot(&mut harness, "final", &mut output);
+    output.push_str(&format!("mode: {}\n", harness.mode()));
+    output.push_str(&format!(
+        "compose ({} bytes, cursor {}): {:?}\n",
+        harness.compose_text().len(),
+        harness.state.compose_cursor,
+        harness.compose_text()
+    ));
+    output.push_str(&format!(
+        "compose_scroll: {}\n",
+        harness.state.compose_scroll
+    ));
+    output.push_str(&format!("chat_scroll: {}\n", harness.chat_scroll()));
+    output.push_str(&format!("agent_commands: {:?}\n", harness.agent_commands()));
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -620,7 +988,10 @@ mod tests {
 
     use super::TuiHarness;
     use crate::app::tests_support::state_for_ui;
-    use crate::copilot::{ActivityKind, AgentEvent, AgentLane, HistoryEntry};
+    use crate::app::AgentPhase;
+    use crate::copilot::{
+        ActivityKind, AgentEvent, AgentLane, ContextTierOption, HistoryEntry, ModelOption,
+    };
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1120,6 +1491,172 @@ mod tests {
     }
 
     #[test]
+    fn subsequent_questions_enter_a_visible_background_fifo_queue() {
+        let mut harness = TuiHarness::from_unified_diff("queue", workflow_diff(), 92, 22).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        for prompt in ["first background question", "second queued follow-up"] {
+            harness.key(key(KeyCode::Char('i'))).unwrap();
+            type_text(&mut harness, prompt);
+            harness.key(key(KeyCode::Enter)).unwrap();
+        }
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "queue");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        let queue = harness.render().unwrap();
+        assert!(queue.contains("Copilot queue · 2 pending · background FIFO"));
+        assert!(queue.contains("first background question"));
+        assert!(queue.contains("second queued follow-up"));
+        assert!(!queue.contains("ACTIVE"));
+        assert!(queue.contains("d cancel selected queued prompt"));
+
+        let second_id = harness.state.queue_entry_ids()[1].0.clone();
+        harness.key(key(KeyCode::Down)).unwrap();
+        harness.key(key(KeyCode::Char('d'))).unwrap();
+        assert!(harness
+            .agent_commands()
+            .iter()
+            .any(|command| command.contains("CancelQueued") && command.contains(&second_id)));
+        let queue = harness.render().unwrap();
+        assert!(queue.contains("1 pending"));
+        assert!(!queue.contains("second queued follow-up"));
+    }
+
+    #[test]
+    fn steering_is_immediate_and_visible_without_blocking_the_composer() {
+        let mut harness = TuiHarness::from_unified_diff("steer", workflow_diff(), 92, 22).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.state.agent_progress.phase = AgentPhase::Responding;
+        harness.state.agent_progress.active_outbound_id = Some("active-turn".into());
+        harness
+            .inject_agent_event(AgentEvent::Activity {
+                outbound_id: None,
+                label: "background hook activity".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            harness.state.agent_progress.active_outbound_id.as_deref(),
+            Some("active-turn")
+        );
+        harness
+            .inject_activity(
+                ActivityKind::Intent,
+                "typed background activity",
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            harness.state.agent_progress.active_outbound_id.as_deref(),
+            Some("active-turn")
+        );
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "/steer inspect the cleanup branch");
+        harness.key(key(KeyCode::Enter)).unwrap();
+
+        assert!(harness
+            .agent_commands()
+            .iter()
+            .any(|command| command.contains("Steer") && command.contains("cleanup branch")));
+        let frame = harness.render().unwrap();
+        assert!(frame.contains("you · steer"));
+        assert!(frame.contains("inspect the cleanup branch"));
+        assert!(harness.status().contains("Steering sent immediately"));
+    }
+
+    #[test]
+    fn model_picker_drills_into_runtime_reasoning_and_context_capabilities() {
+        let mut harness =
+            TuiHarness::from_unified_diff("models", workflow_diff(), 100, 24).unwrap();
+        harness.key(key(KeyCode::Char(':'))).unwrap();
+        type_text(&mut harness, "model");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        assert!(harness
+            .agent_commands()
+            .iter()
+            .any(|command| command == "ListModels"));
+        harness
+            .inject_agent_event(AgentEvent::ModelsListed(vec![ModelOption {
+                id: "capable-model".into(),
+                name: "Capable Model".into(),
+                supported_reasoning_efforts: vec!["low".into(), "high".into()],
+                default_reasoning_effort: Some("low".into()),
+                max_context_tokens: Some(128_000),
+                context_tiers: vec![
+                    ContextTierOption {
+                        id: "default".into(),
+                        max_context_tokens: Some(128_000),
+                    },
+                    ContextTierOption {
+                        id: "long_context".into(),
+                        max_context_tokens: Some(256_000),
+                    },
+                ],
+            }]))
+            .unwrap();
+        assert!(harness
+            .render()
+            .unwrap()
+            .contains("Model picker · step 1/3"));
+        harness.key(key(KeyCode::Enter)).unwrap();
+        assert!(harness
+            .render()
+            .unwrap()
+            .contains("step 2/3 · Choose reasoning effort"));
+        harness.key(key(KeyCode::Down)).unwrap();
+        harness.key(key(KeyCode::Enter)).unwrap();
+        assert!(harness
+            .render()
+            .unwrap()
+            .contains("step 3/3 · Choose context tier"));
+        harness.key(key(KeyCode::Esc)).unwrap();
+        assert!(harness
+            .render()
+            .unwrap()
+            .contains("step 2/3 · Choose reasoning effort"));
+        harness.key(key(KeyCode::Esc)).unwrap();
+        assert!(harness
+            .render()
+            .unwrap()
+            .contains("Model picker · step 1/3"));
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.key(key(KeyCode::Down)).unwrap();
+        harness.key(key(KeyCode::Enter)).unwrap();
+        harness.key(key(KeyCode::Down)).unwrap();
+        harness.key(key(KeyCode::Enter)).unwrap();
+        let commands = harness.agent_commands();
+        let selection = commands
+            .iter()
+            .find(|command| command.starts_with("SelectModel"))
+            .expect("staged selection command");
+        assert!(selection.contains("capable-model"));
+        assert!(selection.contains("high"));
+        assert!(selection.contains("long_context"));
+    }
+
+    #[test]
+    fn review_ask_composer_expands_wraps_and_scrolls_without_overflow() {
+        let mut harness =
+            TuiHarness::from_unified_diff("ask-composer", workflow_diff(), 48, 18).unwrap();
+        harness.key(key(KeyCode::Char('a'))).unwrap();
+        type_text(
+            &mut harness,
+            concat!(
+                "How does this work here? How can we make it better? What do we need to do ",
+                "to make it better? Why did this overflow from the old fixed-height box so ",
+                "easily? The replacement computes wrapped rows, expands to a safe height, ",
+                "and keeps the cursor visible through an internal vertical viewport."
+            ),
+        );
+        let frame = harness.render().unwrap();
+        assert!(frame.contains("Ask"));
+        assert!(frame.contains("lines "));
+        assert!(frame.contains("↑/↓ scroll"));
+        assert!(frame.contains("internal vertic"));
+        assert!(frame.contains("al viewport"));
+        assert!(frame.contains("Enter submit"));
+    }
+
+    #[test]
     fn sticky_chat_composer_wraps_edits_preserves_and_explicitly_discards_drafts() {
         let mut harness =
             TuiHarness::from_unified_diff("composer", workflow_diff(), 48, 16).unwrap();
@@ -1136,7 +1673,7 @@ mod tests {
         harness.key(key(KeyCode::Left)).unwrap();
         harness.key(key(KeyCode::Char('!'))).unwrap();
         let composing = harness.render().unwrap();
-        assert!(composing.contains("CHAT INPUT · INSERT"));
+        assert!(composing.contains("INSERT · Enter send"));
         assert!(composing.contains("long prompt"));
         assert!(composing.contains("second lin!e"));
 
@@ -1369,8 +1906,8 @@ mod tests {
             .unwrap();
 
         let commands = harness.agent_commands();
-        assert!(commands.iter().any(|command| command == "Abort"));
-        assert!(commands.iter().any(|command| command == "ExitSide"));
+        assert!(commands.iter().any(|command| command == "CancelSide"));
+        assert!(!commands.iter().any(|command| command == "Abort"));
         assert!(harness
             .render()
             .unwrap()

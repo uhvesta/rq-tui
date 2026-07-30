@@ -18,12 +18,16 @@ jobs:
         include:
           - name: linux-x86_64
             os: ubuntu-24.04
+            architecture_pattern: "x86-64"
           - name: linux-aarch64
             os: ubuntu-24.04-arm
+            architecture_pattern: "ARM aarch64"
           - name: macos-x86_64
             os: macos-15-intel
+            architecture_pattern: "x86_64"
           - name: macos-aarch64
             os: macos-15
+            architecture_pattern: "arm64"
 
     steps:
       - uses: actions/checkout@v4
@@ -36,9 +40,12 @@ jobs:
           key: bazel-9-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.bazelversion', 'MODULE.bazel', 'MODULE.bazel.lock', 'Cargo.lock', '**/*.bzl') }}
           restore-keys: bazel-9-${{ runner.os }}-${{ runner.arch }}-
       - name: Test
-        run: bazel test //:rq_tui_tests
+        run: bazel test //:rq_tui_tests --lockfile_mode=error
       - name: Build
-        run: bazel build //:rq-tui
+        run: bazel build //:rq-tui --compilation_mode=opt --lockfile_mode=error
+      - name: Verify binary architecture
+        shell: bash
+        run: file bazel-bin/src/rq-tui | grep -E '${{ matrix.architecture_pattern }}'
       - name: Package binary
         shell: bash
         run: |

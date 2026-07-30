@@ -1,6 +1,6 @@
 # Code Review Harness v2 behavioral audit
 
-Audit date: 2026-07-29
+Audit date: 2026-07-30
 
 This report compares the v2 specification, the repository implementation, the
 subsequent Visual/composer/palette/chat feedback, the full headless effect
@@ -13,6 +13,12 @@ Evidence abbreviations:
 - `WF::<name>` means a test in `src/testing.rs`.
 - `PTY-xx` refers to [`audit/pty-smoke.md`](audit/pty-smoke.md).
 - Other test names identify their Rust module directly.
+
+Current-evidence boundary: the deterministic harness baseline is 104 regular
+tests passing with 1 authenticated live test ignored by default. The ignored
+stream/resume test was also run explicitly against the installed Copilot CLI
+and passed. PTY-16 through PTY-21 are current compiled-binary evidence; earlier
+PTY references remain useful historical records.
 
 ## Findings remediated during this audit
 
@@ -34,6 +40,11 @@ Evidence abbreviations:
 | P1 | File-picker Enter and annotation-rail indexing were misleading. | Enter accepts the current file; rail movement is scoped to annotations in the displayed file. `app::tests::picker_enter_accepts_the_current_file_and_returns_focus_to_diff`. |
 | P1 | Command entry and annotation composition were confined to the bottom status line. | Commands render in a top palette; annotation composers render beside the selected range and remain usable in narrow terminals. `WF::narrow_terminal_keeps_selection_composer_and_top_palette_visible`, PTY-03/08. |
 | P1 | Export could retain an unrelated previous status after successfully queueing a batch. | Export now always reports the queued batch and optional written path. `WF::comment_export_queues_one_batch_and_acknowledges_delivery`. |
+| P1 | Narrow command/Ask overlays leaked fragments of underlying panes, making their borders and content ambiguous. | Compact terminals use full-width cleared modal surfaces; the 40×12 adversarial reproductions are clean. |
+| P1 | Review focus and advertised `Ctrl-W` arrow chords were not visibly reliable. | The header and focused pane titles show focus, arrows and letter chords share one path, and unavailable destinations report an explicit status. `app::tests::ctrl_w_then_plain_direction_moves_focus_as_documented`. |
+| P1 | Wide CJK/emoji text wrapped by character count and clipped terminal cells. | Markdown wrapping now uses Ratatui's terminal-cell width, and snapshot extraction omits wide-character continuation cells. `chat_render::tests::wide_unicode_wraps_by_terminal_cells_without_clipping`. |
+| P1 | Lagged/closed SDK subscriptions, stale deltas, and resumed pending work could strand or corrupt the local active turn. | Lagged/closed streams fail active and queued work visibly instead of hanging; resumed in-flight turns receive a synthetic local outbound; pre-turn stale events are quarantined. Corresponding `copilot::tests::*` race tests pass. |
+| P1 | The checked-in Bzlmod lock was incomplete for strict consumers and the root alias could not analyze under `bazel test //...`. | The lockfile is refreshed, CI/release use `--lockfile_mode=error`, package visibility admits only the root alias, and the full aggregate Bazel gate passes. |
 
 ## Requirement traceability
 
@@ -59,7 +70,7 @@ Evidence abbreviations:
 | R-18 | Structured local context generation, editing, acceptance, persistence | Partially working | Parser/editor/effects and controlled-agent shape exist; no complete attach/restart workflow test. |
 | R-19 | Split and unified review layouts with inline/rail annotations | Working end-to-end | `WF::file_switch_clears_visual_mode_and_split_unified_render_selection`; PTY-01/04/08. |
 | R-20 | Multi-repo grouped file/folder picker ordered by activity | Partially working | Repo grouping, collapse/expand, fuzzy filtering, and Enter work; folder hierarchy and complete activity-order workflow are absent. |
-| R-21 | Full Chat panel with streaming, queue/activity/usage, model/session controls | Partially working | Streaming, queue/activity, usage, scrolling, composer, and status paths are implemented and covered by `WF::*`/PTY evidence; the current deterministic liveness workflow is red, so the complete Chat/liveness claim is not green. |
+| R-21 | Full Chat panel with streaming, queue/activity/usage, model/session controls | Partially working | Streaming, queue/activity, usage, scrolling, composer, model capability picker, steering, and status paths are covered by deterministic `WF::*` tests. Durable queue recovery across process restart and character-wise terminal selection remain gaps. |
 | R-22 | Top command palette with autocomplete and execution | Working end-to-end | `WF::narrow_terminal_keeps_selection_composer_and_top_palette_visible`; PTY-08. |
 | R-23 | Settings screen | Partially working | Model, base, and context-step edits work; keybinding editing and several global preferences are informational/not implemented. |
 | R-24 | Generated context editor six-field presentation | Partially working | Parser and editor render; complete accept-to-session workflow untested. |
@@ -69,8 +80,8 @@ Evidence abbreviations:
 | R-28 | WAL, busy timeout, FKs, migrations, indexed SQLite model | Working end-to-end | Storage migration/concurrency tests; workflow tests use a real temporary SQLite file. |
 | R-29 | Editing delivered content queues correction rather than rewriting history | Partially working | Effects implement correction messages; delivered-edit workflow not yet tested against a real SDK session. |
 | R-30 | Lazy viewport syntax highlighting behind a trait, broad language support | Working end-to-end | `highlight::tests::recognizes_common_languages`; `highlight::tests::highlights_only_requested_lines_and_reuses_cache`; deterministic rendered frames. |
-| R-31 | Read/search-only Ask permissions | Partially working | `copilot::tests::permission_handler_allows_reads_and_denies_shell_and_write`; the authenticated live test exists but was not rerun in the current documentation-only pass. |
-| R-32 | Streaming events and persisted-session resume | Partially working | Deterministic delta/final/resync/sub-agent tests pass; the opt-in authenticated stream/resume test exists but was not rerun in the current documentation-only pass. |
+| R-31 | Read/search-only Ask permissions | Working in the audited local Copilot path | `copilot::tests::permission_handler_allows_reads_and_denies_shell_and_write`; LIVE-01 ran the authenticated bridge with its configured read-only permission handler. |
+| R-32 | Streaming events and persisted-session resume | Working end-to-end | Deterministic delta/final/resync/sub-agent tests pass; LIVE-01 streamed a real response, exercised SIDE teardown, disconnected, resumed the persisted MAIN session, and reloaded history. |
 | R-33 | Session deletion during prune or manual storage-path guidance | Not implemented | Current SDK path does not delete transcripts and prune does not yet provide a reliable CLI storage path. |
 | R-34 | Interdiff view | Explicitly deferred by the specification | v1.x item in §11. |
 | R-35 | Live file-watcher/re-anchor cadence while review remains open | Explicitly deferred by the specification | Open item in §11; manual `:sync` is present. |
@@ -97,7 +108,7 @@ Evidence abbreviations:
 | V-15 | File/repo/version/screen/layout transitions clear or preserve predictably | Working end-to-end for file/screen/layout; partially working for version | File/screen/layout tests pass. Old-version switching lacks full workflow coverage. |
 | V-16 | Normal `a`/`c` uses current code line | Working end-to-end | Normal Ask and Comment workflows. |
 | V-17 | Binary/empty/deleted/renamed/fold cases fail safely | Working end-to-end | `WF::binary_empty_and_renamed_files_have_explicit_safe_behavior`, deleted-line workflow, and fold/mixed-side workflow. |
-| V-18 | Chat Visual selects visible meaningful messages | Working end-to-end | Chat Visual frame and yank assertion in `WF::visual_search_extends_the_fixed_anchor_and_chat_visual_yanks_messages`. |
+| V-18 | Chat Visual selects visible meaningful text | Partially working | Chat Visual currently selects and yanks whole messages. Character-wise, line-wise, and block-wise rendered-text selection are not implemented; see [`chat-interaction-spec.md`](chat-interaction-spec.md). |
 | V-19 | Footer exposes Visual actions | Working end-to-end | Frame assertions and PTY-02. |
 | V-20 | Composer cancellation restores prior mode without stale draft | Working end-to-end | `WF::cancel_restores_visual_selection_without_stale_draft`. |
 
@@ -182,40 +193,38 @@ matrix so that new evidence is not confused with the earlier PTY run.
 | ID | Behavior | Current classification | Evidence / limitation |
 |---|---|---|---|
 | T-01 | Chat has explicit NORMAL, INSERT, COMMAND, SEARCH, and VISUAL modes with visible mode text | Working in deterministic frames | `testing::tests::command_palette_is_scrollable_selectable_and_unmistakably_modal`, `testing::tests::sticky_chat_composer_wraps_edits_preserves_and_explicitly_discards_drafts`, and the `ui-snapshot` gallery. |
-| T-02 | Command palette selection and scrolling | Working end-to-end in the headless harness and compiled PTY audit | Up/down selection, PageUp/PageDown, Tab completion, modal title/footer, and visible selection are covered by `WF::command_palette_is_scrollable_selectable_and_unmistakably_modal` and PTY-12. |
+| T-02 | Command palette selection and scrolling | Working in the deterministic harness and compiled PTY | Up/down selection, PageUp/PageDown, Tab completion, modal title/footer, and visible selection are covered by `WF::command_palette_is_scrollable_selectable_and_unmistakably_modal` and PTY-12. |
 | T-03 | Chat scrolling by rendered rows, including wrapped single messages | Working in the deterministic harness | `WF::chat_scrolls_by_rendered_rows_and_pauses_live_following`; no separate mouse-drag selection automation exists. |
-| T-04 | Sticky multiline composer with wrapping, independent scroll, editing, preserved drafts, and explicit discard | Working in the deterministic harness and compiled PTY audit | `WF::sticky_chat_composer_wraps_edits_preserves_and_explicitly_discards_drafts`; PTY-15. |
-| T-05 | Cancel draft versus cancel active Copilot turn | Partially working | Draft preservation/discard and deterministic abort/reusable-session paths pass. A current compiled-PTY cancellation capture is not recorded. |
+| T-04 | Sticky multiline composer with wrapping, independent scroll, editing, preserved drafts, and explicit discard | Working in the deterministic harness and compiled PTY | `WF::sticky_chat_composer_wraps_edits_preserves_and_explicitly_discards_drafts`; PTY-21 exercised a 21-row contextual composer and its independent row-range scroll. |
+| T-05 | Cancel draft versus cancel active Copilot turn | Working in the deterministic harness and compiled PTY | Draft preservation/discard and deterministic abort/reusable-session paths pass. PTY-18 stopped an active response while preserving the draft in Insert mode. |
 | T-06 | Markdown semantics in Chat and fenced-code rendering | Working in deterministic frames | `chat_render::*` tests and `WF::markdown_history_and_minimum_terminal_state_have_inspectable_frames`; renderer covers headings, lists, task lists, blockquotes, emphasis, inline code, wrapping, blank lines, and fences. |
 | T-07 | Lazy cached syntax highlighting for diff lines and fenced code | Working in unit tests and deterministic frames | `highlight::tests::recognizes_common_languages`, `highlight::tests::highlights_only_requested_lines_and_reuses_cache`, and `chat_render::tests::highlights_fenced_code_with_a_language_specific_synthetic_path`. |
-| T-08 | Durable Copilot progress, quiet warning, tool/skill visibility, and `:agent-status` timeline | Partially working; current regression | The renderer and overlay expose lane, phase, elapsed time, last event, queue, outbound ID, operation detail, and timeline. The latest Bazel run failed `testing::tests::liveness_panel_exposes_quiet_sdk_diagnostics_and_tool_skill_history` because the expected `No SDK events recently` text was absent after the harness backdated progress. This must be fixed before claiming a green liveness audit. |
-| T-09 | `/side` isolated ephemeral conversation and `/main` restoration | Working in deterministic harness and compiled PTY audit | `WF::side_conversation_is_visibly_isolated_and_main_transcript_is_restored`; PTY-13/14. The authenticated SIDE lifecycle remains opt-in and was not rerun in this pass. |
-| T-10 | Deterministic state gallery for visual inspection | Working as a headless command path | `ui-snapshot --state all` exercises review, command, composer, quiet, side, markdown, and tiny states through the same renderer. Gallery output is terminal text, not a committed image artifact. |
+| T-08 | Durable Copilot progress, quiet warning, tool/skill visibility, and `:agent-status` timeline | Working in the deterministic harness and compiled PTY | The renderer and overlay expose lane, phase, elapsed time, last event, queue, outbound ID, operation detail, quiet diagnostics, and timeline. Tool, skill, subagent, hook, retry, and error activity are typed and visible. PTY-17 captured active, queued, and immediate-steering progress. |
+| T-09 | `/side` isolated ephemeral conversation and `/main` restoration | Working in deterministic, compiled-PTY, and authenticated paths | `WF::side_conversation_is_visibly_isolated_and_main_transcript_is_restored`; PTY-20 returned from an active SIDE turn promptly, and LIVE-01 exercised real SIDE creation and SDK deletion. |
+| T-10 | Deterministic state gallery for visual inspection | Working as headless command paths | `ui-snapshot --state all` exercises review, ask, command, composer, quiet, queue, side, model, markdown, and tiny states through the production renderer. `ui-script` drives resize, input, stream events, and snapshots. Gallery output is terminal text, not a committed image artifact. |
 | T-11 | Copilot SDK decoupled behind a testable agent interface | Working for deterministic tests | `TuiHarness` uses a fake agent and injected lane/activity events; the production bridge remains the only path that starts the real Copilot CLI. |
-| T-12 | Mouse wheel scrolling and terminal text selection | Partially working | The TUI handles wheel events for Chat/diff scrolling. Shift-drag selection is delegated to the terminal emulator by convention; it is not covered by the Rust harness or a recorded automated PTY assertion. |
+| T-12 | Mouse wheel scrolling and exact terminal text selection | Partially working | The TUI handles wheel events for Chat/diff scrolling. Built-in Visual mode selects whole messages, not rendered lines or characters. Shift-drag is a terminal-emulator workaround rather than completion of the requested behavior; see [`chat-interaction-spec.md`](chat-interaction-spec.md). |
 
 ### Verification status for this addendum
 
-The latest command run for this documentation update was:
+The current checked-in regular-test baseline is:
 
 ```text
-bazel test //:rq_tui_tests --test_output=errors --nocache_test_results
+104 regular tests passed; 1 authenticated live Copilot test ignored by default
 ```
 
-It compiled all three root test targets. `//src:clippy_test` and
-`//src:rustfmt_test` passed. `//src:rq_tui_tests` ran 86 tests: 84 passed, 1
-failed, and 1 ignored. The ignored test is the authenticated
-`copilot::tests::live_copilot_streams_and_resumes_persisted_history`; it was
-not enabled because this pass did not use production Copilot credentials.
+The regular baseline includes the reducer/effect, storage, rendering, SDK
+adapter, deterministic UI, model-picker, queue/steering, liveness, and
+MAIN/SIDE tests. The ignored test is the authenticated
+`copilot::tests::live_copilot_streams_and_resumes_persisted_history`; it is not
+part of the regular count. It was run separately with
+`RQ_TUI_LIVE_COPILOT=1` and passed as LIVE-01. PTY-16 through PTY-21 were
+captured from the current Bazel-built binary.
 
-The one failure is not hidden by this report: the liveness workflow test
-backdates the fake agent's progress and expects the quiet diagnostic, but the
-rendered frame does not contain that diagnostic. The implementation currently
-contains the corresponding progress panel and `:agent-status` overlay, but
-the deterministic assertion is evidence of a code/test mismatch that remains
-open.
+### Compiled PTY evidence
 
-### Additional compiled PTY evidence
+Earlier records are kept for reproducibility and design context. The current
+pass is PTY-16 through PTY-21 in [`audit/pty-smoke.md`](audit/pty-smoke.md).
 
 The second compiled-binary audit used the Bazel-built binary and a controlled
 agent. It captured the following behaviors in a 100×28 tmux pane:
@@ -227,6 +236,7 @@ agent. It captured the following behaviors in a 100×28 tmux pane:
 | PTY-14 | Open `:agent-status` during SIDE | The overlay showed SIDE, connected state, phase, elapsed time, last SDK event, event count, queue depth, current operation/detail, outbound ID, and recent activity; `j/k` reached the timeline footer. |
 | PTY-15 | Exit with `/main` and edit a long draft | MAIN returned without the SIDE transcript, and the bordered composer wrapped across multiple rows while retaining its cursor and sticky position. |
 
-The controlled PTY run did not provide a reliable quiet-warning or active-turn
-cancel capture. Those remain open validation items, consistent with T-05 and
-T-08 above.
+The current pass adds active-turn cancellation, queue cancellation, steering,
+staged model selection, immediate SIDE exit, and oversized contextual-composer
+scrolling. Quiet-warning behavior remains deterministic-gallery evidence
+rather than a wall-clock PTY capture.

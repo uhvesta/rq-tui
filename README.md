@@ -51,8 +51,9 @@ initializes the TUI.
 Review mode is the diff workspace. `j/k`, `gg/G`, page and half-page movement
 navigate the focused pane; `h/l` changes files; `-` or `,e` opens the file
 picker; `v` selects rows; `a` asks a grounded question; and `c` records a
-local comment. `y`/`yy` copy through OSC 52. `Tab`, `gc`, and `gr` switch
-between Review and Chat in normal mode.
+local comment. `y`/`yy` first use the native clipboard and fall back to OSC 52.
+`Tab` toggles Review/Chat, while `gc` always opens Chat and `gr` always opens
+Review in normal mode.
 
 Chat deliberately has explicit modes so the input state is never ambiguous:
 
@@ -61,14 +62,18 @@ Chat deliberately has explicit modes so the input state is never ambiguous:
   page movement to scroll.
 - `INSERT`: edit the sticky composer. `Enter`, `Ctrl-J`, `Ctrl-M`, or `Ctrl-S`
   submits; `Shift-Enter` inserts a newline. `Esc` returns to normal mode and
-  preserves a Chat draft; `Ctrl-C` discards it.
+  preserves a Chat draft. During an active response, the first `Ctrl-C` stops
+  Copilot and preserves the draft; while idle, `Ctrl-C` discards it.
 - `COMMAND`: the palette is a modal overlay and the sticky bar says
   `COMMAND MODE ACTIVE`. `↑/↓` changes the selected suggestion, `PgUp/PgDn`
   scrolls the list, `Tab` completes, `Enter` runs, and `Esc` cancels.
 - `SEARCH`: `/` searches the focused transcript or diff; `Enter` accepts and
   `Esc` cancels.
-- `VISUAL`: `v` selects a diff range or visible Chat messages; `y` copies and
-  `Esc` returns to normal mode.
+- `VISUAL`: in a diff, `v` selects source rows. Chat currently selects whole
+  messages as an interim behavior; editor-grade character-wise, line-wise,
+  and block-wise rendered-text selection is specified but not yet implemented
+  in [`docs/chat-interaction-spec.md`](docs/chat-interaction-spec.md). `y`
+  copies the current selection and `Esc` returns to normal mode.
 
 Chat scrolling is based on rendered terminal rows, including wrapped Markdown
 and long single messages, rather than skipping from message to message. `G`
@@ -78,11 +83,12 @@ terminal text with the terminal emulator, hold `Shift` while dragging; the
 terminal then receives the selection gesture instead of the TUI.
 
 The Chat composer is a sticky bordered rectangle. It wraps, expands with the
-draft, supports multiple lines, keeps its own vertical scroll position, and
-shows an insertion cursor. It is capped at a terminal-sized height so a long
-draft does not cover the complete transcript. `Ctrl-C` while a Copilot turn is
-active requests cancellation; `:stop`, `:abort`, or `s` in the agent-status
-overlay provide the same stop path.
+draft, supports multiple lines, moves through wrapped visual rows, keeps its
+own vertical scroll position, and shows an insertion cursor. It is capped at a
+terminal-sized height so a long draft does not cover the complete transcript.
+`Ctrl-C` while a Copilot turn is active stops that response and preserves the
+draft; after the turn is idle, `Ctrl-C` discards the draft. `:stop`, `:abort`,
+or `s` in the agent-status overlay provide the same stop path.
 
 Responses stream through ephemeral deltas and then reconcile with the final
 SDK message, so a dropped delta does not corrupt the visible transcript.
@@ -100,6 +106,13 @@ time, last event, queue depth, outbound ID, and a scrollable recent activity
 timeline. Use `j/k` to inspect it, `s` to stop the current turn, and `q`/`Esc`
 to return.
 
+Questions submitted during an active turn continue in the background. They are
+shown by `:queue` and delivered FIFO; `j/k` selects an entry, `d` cancels a
+selected waiting prompt, and `s` stops the active prompt. `/steer <correction>`
+(or `:steer <correction>`) sends an immediate correction to the active Copilot
+loop. `:model` opens a staged runtime-capability picker for model, reasoning
+effort, and context tier.
+
 ### `/side`
 
 `/side [question]` in the Chat composer creates an ephemeral, isolated SIDE
@@ -113,6 +126,15 @@ messages stay in that lane.
 unchanged MAIN transcript. The equivalent command-palette forms are
 `:side [question]` and `:main`. A second SIDE cannot be created until the
 current one is exited.
+
+## Skills and plugins
+
+Copilot receives global skills from the data directory's `skills/` folder and
+repository skills from `.rq-tui/skills`. Plugin directories follow the same
+pattern through the global `plugins/` folder and repository
+`.rq-tui/plugins`. Hook, tool, skill, MCP-tool, and subagent lifecycle activity
+is routed into the visible progress timeline; the read-only permission handler
+still rejects shell and write requests.
 
 ## Markdown and syntax highlighting
 
@@ -159,11 +181,31 @@ bazel run //:rq-tui -- ui-snapshot --state all --width 100 --height 28
 bazel run //:rq-tui -- ui-snapshot --state quiet --width 110 --height 26
 ```
 
-The `all` gallery includes `review`, `command`, `composer`, `quiet`, `side`,
-`markdown`, and `tiny` states. It prints the terminal buffer, making mode
-labels, palette selection, composer wrapping, Markdown rows, progress
-diagnostics, lane isolation, and minimum-terminal behavior easy to inspect or
-snapshot in a test harness.
+The `all` gallery includes `review`, `ask`, `command`, `composer`, `quiet`,
+`queue`, `side`, `model`, `markdown`, and `tiny` states. It prints the terminal
+buffer, making mode labels, palette selection, composer wrapping, Markdown
+rows, progress diagnostics, lane isolation, and minimum-terminal behavior easy
+to inspect or snapshot in a test harness.
+
+For multi-step inspection, the hidden `ui-script` command reads a deterministic
+script from stdin. Commands include `key`, `type`, `resize`, `stream`,
+`stream-start`, `stream-delta`, `stream-complete`, `stream-abort`, `fail`, and
+`snapshot`:
+
+```sh
+printf '%s\n' \
+  'key Tab' \
+  'key i' \
+  'type inspect the cleanup path' \
+  'key Enter' \
+  'snapshot queued' \
+  'stream-start deterministic ' \
+  'snapshot partial' \
+  'stream-delta answer' \
+  'stream-complete' \
+  'snapshot complete' |
+  bazel run //:rq-tui -- ui-script --fixture unicode --width 80 --height 20
+```
 
 `TuiHarness` is the public headless testing surface. Its reducer/effect loop
 uses a temporary SQLite database and a fake agent behind the small agent
@@ -187,6 +229,11 @@ scrolling, command-palette scrolling, sticky-composer editing/cancellation,
 SDK liveness diagnostics, and MAIN/SIDE isolation. The suite also runs the
 Rust formatting and Clippy targets through the root test suite.
 
+The current regular verification baseline is recorded in
+[`docs/behavioral-audit.md`](docs/behavioral-audit.md). The opt-in authenticated
+test and compiled controlled-agent PTY workflows were also rerun on
+2026-07-30.
+
 The authenticated live test is opt-in and ignored by default. It checks real
 Copilot streaming, completion, SIDE lifecycle, SIDE boundary behavior,
 disconnect, session resume, and restored MAIN history:
@@ -206,10 +253,8 @@ bazel test //src:rq_tui_tests \
 ```
 
 The local test strategy is required on macOS because the sandbox blocks the
-Copilot CLI's network access. The current verification caveat is recorded in
-[`docs/behavioral-audit.md`](docs/behavioral-audit.md): the latest regular
-Bazel run had one failing deterministic liveness assertion, so the full suite
-must be considered red until that implementation/test mismatch is resolved.
+Copilot CLI's network access. The authenticated test remains opt-in and is not
+part of the regular baseline.
 
 ## Releases
 
@@ -218,6 +263,13 @@ aarch64, macOS x86_64, and macOS aarch64. Tags matching `v*` publish a
 compressed binary and SHA-256 file for each of those four targets through
 GitHub Actions. Windows is intentionally not part of the matrix.
 
-The current requirement matrix and compiled pseudo-terminal records are in
+The current requirement matrix and Copilot SDK feature matrix are in
 [`docs/behavioral-audit.md`](docs/behavioral-audit.md) and
+[`docs/copilot-sdk-audit.md`](docs/copilot-sdk-audit.md). Current compiled
+pseudo-terminal evidence is recorded in
 [`docs/audit/pty-smoke.md`](docs/audit/pty-smoke.md).
+The remaining interaction requirements—including Review-integrated
+conversation navigation, explicit pane focus, `Ctrl-W` chord feedback, exact
+rendered-text selection/copy, and complete deterministic acceptance states—are
+tracked in
+[`docs/chat-interaction-spec.md`](docs/chat-interaction-spec.md).

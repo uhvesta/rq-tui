@@ -44,7 +44,10 @@ rust_library(
     edition = "2021",
     deps = RUNTIME_DEPS,
     proc_macro_deps = PROC_MACRO_DEPS,
-    visibility = ["//src:__pkg__"],
+    visibility = [
+        "//:__pkg__",
+        "//src:__pkg__",
+    ],
 )
 
 rust_binary(

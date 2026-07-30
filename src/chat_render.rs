@@ -412,7 +412,7 @@ fn push_wrapped_parts(rows: &mut Vec<Line<'static>>, parts: Vec<StyledPart>, wid
     for part in parts {
         let mut chunk = String::new();
         for character in part.text.chars() {
-            let character_width = 1;
+            let character_width = terminal_cell_width(character);
             if current_width + character_width > width && (!chunk.is_empty() || !current.is_empty())
             {
                 if !chunk.is_empty() {
@@ -445,10 +445,17 @@ fn expand_tabs(text: &str) -> String {
             column += spaces;
         } else {
             expanded.push(character);
-            column += 1;
+            column += terminal_cell_width(character);
         }
     }
     expanded
+}
+
+fn terminal_cell_width(character: char) -> usize {
+    // Ratatui applies the same Unicode-width rules when it writes a Span into
+    // the terminal buffer. Reusing Span::width keeps our pre-wrap boundary in
+    // sync without exposing a second width implementation.
+    Span::raw(character.to_string()).width()
 }
 
 #[cfg(test)]
@@ -550,6 +557,15 @@ mod tests {
         assert!(text(&lines[0]).starts_with("  "));
         let rendered: Vec<_> = lines.iter().map(text).collect();
         assert!(rendered.join("").contains("without a close"));
+    }
+
+    #[test]
+    fn wide_unicode_wraps_by_terminal_cells_without_clipping() {
+        let mut highlighter = RecordingHighlighter::default();
+        let source = "这是一个很长的中文响应，包含 🎉🚀 text";
+        let lines = render_markdown(source, 10, &mut highlighter);
+        assert!(lines.iter().all(|line| line.width() <= 10));
+        assert_eq!(lines.iter().map(text).collect::<String>(), source);
     }
 
     #[test]
