@@ -40,7 +40,9 @@ def git(repo: Path, *args: str) -> None:
     )
 
 
-def make_fixture(root: Path, name: str = "pty-fixture") -> Path:
+def make_fixture(
+    root: Path, name: str = "pty-fixture", extra_changed_lines: int = 0
+) -> Path:
     repo = root / name
     repo.mkdir()
     git(repo, "init", "-b", "main")
@@ -52,8 +54,16 @@ def make_fixture(root: Path, name: str = "pty-fixture") -> Path:
     )
     git(repo, "add", ".")
     git(repo, "commit", "-m", "base")
+    generated = "".join(
+        f"    let generated_{index} = {index};\n"
+        for index in range(extra_changed_lines)
+    )
     (repo / "src" / "demo.rs").write_text(
-        "fn main() {\n    println!(\"pty smoke\");\n    println!(\"resize me\");\n}\n",
+        "fn main() {\n"
+        '    println!("pty smoke");\n'
+        '    println!("resize me");\n'
+        f"{generated}"
+        "}\n",
         encoding="utf-8",
     )
     return repo
@@ -500,7 +510,10 @@ def main() -> int:
         finally:
             setup.close()
 
-        repo = make_fixture(root)
+        # A repository-scale source file guards the real input-latency path.
+        # Rendering must syntax-highlight only the viewport; a full-diff pass
+        # here starves Crossterm input for many seconds.
+        repo = make_fixture(root, extra_changed_lines=12_000)
         child = Child(binary, repo, app_root)
         try:
             child.resize(100, 24)

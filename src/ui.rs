@@ -27,7 +27,7 @@ use crate::annotations::{
 use crate::app::{
     command_matches, AgentPhase, AppState, ChatEntry, ComposeTarget, DiffLayout, Effect, Focus,
     InputMode, MarkdownPreview, ModelPickerStage, PendingPrune, PruneChoice, ReadyPrune,
-    ReviewRowSelection, Screen, VersionChoice,
+    ReviewRowSelection, Screen, VersionChoice, INLINE_COMPOSER_ID,
 };
 use crate::chat_render::{render_markdown_mapped, CellSource, MappedMarkdown, MappedRow};
 use crate::chat_selection::{
@@ -299,19 +299,33 @@ fn run_loop<B: Backend>(
     bridge: &dyn AgentRuntime,
     highlighter: &mut dyn Highlighter,
 ) -> Result<()> {
+    let mut redraw = true;
+    let mut next_periodic_redraw = std::time::Instant::now();
     while !state.should_quit {
         // A noisy tool or streaming source must not starve drawing and input.
         // Remaining events stay queued for the next frame.
+        let mut received_agent_event = false;
         for _ in 0..256 {
             let Some(event) = bridge.try_recv_laned() else {
                 break;
             };
             handle_agent_envelope(state, storage, event)?;
+            received_agent_event = true;
         }
+        redraw |= received_agent_event;
+        redraw |= state.ready_prune.is_some();
         finish_ready_prune(state, storage)?;
-        state.tick(std::time::Instant::now());
-        terminal.draw(|frame| render(frame, state, highlighter))?;
-        if event::poll(std::time::Duration::from_millis(100))? {
+        let now = std::time::Instant::now();
+        state.tick(now);
+        if redraw || now >= next_periodic_redraw {
+            terminal.draw(|frame| render(frame, state, highlighter))?;
+            redraw = false;
+            next_periodic_redraw = now + std::time::Duration::from_secs(1);
+        }
+        let poll_timeout = next_periodic_redraw
+            .saturating_duration_since(std::time::Instant::now())
+            .min(std::time::Duration::from_millis(100));
+        if event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key) => {
                     let effects = state.handle_key(key);
@@ -322,6 +336,7 @@ fn run_loop<B: Backend>(
                             handle_effect_failure(state, &effect, &error);
                         }
                     }
+                    redraw = true;
                 }
                 Event::Mouse(mouse) => {
                     for effect in mouse_scroll_effects(state, mouse.kind) {
@@ -331,6 +346,7 @@ fn run_loop<B: Backend>(
                             handle_effect_failure(state, &effect, &error);
                         }
                     }
+                    redraw = true;
                 }
                 Event::Paste(text) => {
                     let effects = state.handle_paste(&text);
@@ -341,8 +357,11 @@ fn run_loop<B: Backend>(
                             handle_effect_failure(state, &effect, &error);
                         }
                     }
+                    redraw = true;
                 }
-                _ => {}
+                // Resize/focus events can change terminal geometry or visual
+                // state without producing an application effect.
+                _ => redraw = true,
             }
         }
     }
@@ -4609,38 +4628,38 @@ fn render_unified(
     state.compose_wrap_width = body.width.saturating_sub(4).max(1) as usize;
     state.set_review_content_width(body.width.saturating_sub(9) as usize);
     let stream = state.review_stream();
-    let rendered = stream
-        .rows()
-        .iter()
-        .enumerate()
-        .flat_map(|(index, row)| {
-            review_row_lines(
-                row,
-                review_row_selection(state, row, index),
-                body.width.max(1) as usize,
-                state.review_horizontal_scroll,
-                highlighter,
-            )
-            .into_iter()
-            .map(move |line| (index, line))
-        })
-        .collect::<Vec<_>>();
-    let semantic_rows = rendered.iter().map(|(index, _)| *index).collect::<Vec<_>>();
-    let composer_cursor = rendered
-        .iter()
-        .position(|(_, line)| line_has_composer_cursor(line));
+    let (layout, semantic_rows, composer_cursor) =
+        review_display_layout(stream.rows(), body.width.max(1) as usize);
     clamp_review_display_scroll(
         state,
         &semantic_rows,
         body.height.max(1) as usize,
         composer_cursor,
     );
-    let lines = rendered
-        .into_iter()
-        .skip(state.review_scroll)
-        .map(|(_, line)| line)
-        .take(body.height as usize)
-        .collect::<Vec<_>>();
+    let viewport_end = state.review_scroll.saturating_add(body.height as usize);
+    let mut lines = Vec::with_capacity(body.height as usize);
+    for display in layout.iter().filter(|display| {
+        display.start < viewport_end
+            && display.start.saturating_add(display.height) > state.review_scroll
+    }) {
+        let row = &stream.rows()[display.semantic_row];
+        let skip = state.review_scroll.saturating_sub(display.start);
+        let take = viewport_end
+            .saturating_sub(display.start.max(state.review_scroll))
+            .min(display.height.saturating_sub(skip));
+        lines.extend(
+            review_row_lines(
+                row,
+                review_row_selection(state, row, display.semantic_row),
+                body.width.max(1) as usize,
+                state.review_horizontal_scroll,
+                highlighter,
+            )
+            .into_iter()
+            .skip(skip)
+            .take(take),
+        );
+    }
     frame.render_widget(Paragraph::new(Text::from(lines)), body);
 }
 
@@ -4695,9 +4714,27 @@ fn render_split(
     );
     let stream = state.review_stream();
     let selection_side = state.review_selection_side();
+    let (layout, semantic_rows, composer_cursor) =
+        review_display_layout(stream.rows(), body.width.max(1) as usize);
+    clamp_review_display_scroll(
+        state,
+        &semantic_rows,
+        body.height.max(1) as usize,
+        composer_cursor,
+    );
+    let viewport_end = state.review_scroll.saturating_add(body.height as usize);
     let mut rendered_rows = Vec::new();
-    for (index, row) in stream.rows().iter().enumerate() {
+    for display in layout.iter().filter(|display| {
+        display.start < viewport_end
+            && display.start.saturating_add(display.height) > state.review_scroll
+    }) {
+        let index = display.semantic_row;
+        let row = &stream.rows()[index];
         let selection = review_row_selection(state, row, index);
+        let skip = state.review_scroll.saturating_sub(display.start);
+        let take = viewport_end
+            .saturating_sub(display.start.max(state.review_scroll))
+            .min(display.height.saturating_sub(skip));
         match row {
             ReviewRow::Source {
                 file,
@@ -4742,7 +4779,9 @@ fn render_split(
                     state.review_horizontal_scroll,
                     body_columns[1].width as usize,
                 );
-                rendered_rows.push((index, old, new, None));
+                if skip == 0 && take > 0 {
+                    rendered_rows.push((index, old, new, None));
+                }
                 let _ = line;
             }
             _ => {
@@ -4752,37 +4791,21 @@ fn render_split(
                     body.width as usize,
                     state.review_horizontal_scroll,
                     highlighter,
-                ) {
+                )
+                .into_iter()
+                .skip(skip)
+                .take(take)
+                {
                     rendered_rows.push((index, Line::from(""), Line::from(""), Some(line)));
                 }
             }
         }
     }
-    let semantic_rows = rendered_rows
-        .iter()
-        .map(|(index, _, _, _)| *index)
-        .collect::<Vec<_>>();
-    let composer_cursor = rendered_rows.iter().position(|(_, old, new, full)| {
-        full.as_ref().is_some_and(line_has_composer_cursor)
-            || line_has_composer_cursor(old)
-            || line_has_composer_cursor(new)
-    });
-    clamp_review_display_scroll(
-        state,
-        &semantic_rows,
-        body.height.max(1) as usize,
-        composer_cursor,
-    );
-    let visible = rendered_rows
-        .into_iter()
-        .skip(state.review_scroll)
-        .take(body.height as usize)
-        .collect::<Vec<_>>();
-    let old_lines = visible
+    let old_lines = rendered_rows
         .iter()
         .map(|(_, old, _, _)| old.clone())
         .collect::<Vec<_>>();
-    let new_lines = visible
+    let new_lines = rendered_rows
         .iter()
         .map(|(_, _, new, _)| new.clone())
         .collect::<Vec<_>>();
@@ -4795,7 +4818,7 @@ fn render_split(
         body_columns[0],
     );
     frame.render_widget(Paragraph::new(new_lines), body_columns[1]);
-    for (offset, (_, _, _, line)) in visible.into_iter().enumerate() {
+    for (offset, (_, _, _, line)) in rendered_rows.into_iter().enumerate() {
         let Some(line) = line else {
             continue;
         };
@@ -4803,6 +4826,53 @@ fn render_split(
         frame.render_widget(Clear, line_area);
         frame.render_widget(Paragraph::new(line), line_area);
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReviewDisplayRow {
+    semantic_row: usize,
+    start: usize,
+    height: usize,
+}
+
+fn review_display_layout(
+    rows: &[ReviewRow],
+    width: usize,
+) -> (Vec<ReviewDisplayRow>, Vec<usize>, Option<usize>) {
+    let mut layout = Vec::with_capacity(rows.len());
+    let mut semantic_rows = Vec::with_capacity(rows.len());
+    let mut composer_cursor = None;
+    let mut start = 0usize;
+    for (semantic_row, row) in rows.iter().enumerate() {
+        let (height, cursor_line) = review_row_geometry(row, width);
+        let height = height.max(1);
+        layout.push(ReviewDisplayRow {
+            semantic_row,
+            start,
+            height,
+        });
+        semantic_rows.extend(std::iter::repeat_n(semantic_row, height));
+        if let Some(cursor_line) = cursor_line {
+            composer_cursor = Some(start.saturating_add(cursor_line));
+        }
+        start = start.saturating_add(height);
+    }
+    (layout, semantic_rows, composer_cursor)
+}
+
+fn review_row_geometry(row: &ReviewRow, width: usize) -> (usize, Option<usize>) {
+    let ReviewRow::Annotation { block, .. } = row else {
+        return (1, None);
+    };
+    let AnnotationRowPart::Body { .. } = block.part else {
+        return (1, None);
+    };
+    let available = width.saturating_sub(4).max(1);
+    let lines = wrapped_editor_lines(&block.text, block.text.len(), available).0;
+    let cursor = (block.annotation_id == INLINE_COMPOSER_ID)
+        .then(|| lines.iter().position(|line| line.contains('▏')))
+        .flatten();
+    (lines.len().max(1), cursor)
 }
 
 fn clamp_review_display_scroll(
@@ -4836,12 +4906,6 @@ fn clamp_review_display_scroll(
     state.review_scroll = state
         .review_scroll
         .min(semantic_rows.len().saturating_sub(viewport));
-}
-
-fn line_has_composer_cursor(line: &Line<'_>) -> bool {
-    line.spans
-        .iter()
-        .any(|span| span.content.as_ref().contains('▏'))
 }
 
 fn render_compact_inline_composer(
@@ -6650,6 +6714,7 @@ fn plain_segments(text: &str) -> Vec<StyledSegment> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::path::PathBuf;
     use std::sync::Mutex;
 
@@ -6673,8 +6738,9 @@ mod tests {
         AgentCommand, AgentEvent, AgentEventEnvelope, AgentLane, AgentSink, HistoryEntry,
         LaneEvent, ModelSelection, OutboundKind, PruneSessionOutcome,
     };
+    use crate::diff::{DiffLine, LineKind};
     use crate::domain::{PendingChat, WorkItem};
-    use crate::highlight::PlainHighlighter;
+    use crate::highlight::{Highlighter, PlainHighlighter, StyledSegment};
     use crate::storage::{now, Storage};
 
     #[derive(Default)]
@@ -6694,6 +6760,28 @@ mod tests {
     impl AgentSink for RejectingAgent {
         fn send(&self, _command: AgentCommand) -> Result<()> {
             anyhow::bail!("controlled send failure")
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingHighlighter {
+        calls: usize,
+    }
+
+    impl Highlighter for CountingHighlighter {
+        fn highlight_line(
+            &mut self,
+            _path: &Path,
+            _line_number: usize,
+            text: &str,
+        ) -> Result<Vec<StyledSegment>> {
+            self.calls += 1;
+            Ok(vec![StyledSegment {
+                text: text.to_owned(),
+                foreground: (210, 210, 210),
+                bold: false,
+                italic: false,
+            }])
         }
     }
 
@@ -7347,6 +7435,35 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(2),
             "clipboard timeout must not stall the TUI"
         );
+    }
+
+    #[test]
+    fn large_review_highlights_only_the_visible_viewport() {
+        let mut state = state_for_ui();
+        state.work_item.repos[0].diff.files[0].hunks[0].lines = (0..12_000)
+            .map(|index| DiffLine {
+                kind: LineKind::Addition,
+                old_line: None,
+                new_line: Some(index + 1),
+                content: format!("let generated_{index} = {index};"),
+            })
+            .collect();
+
+        for layout in [DiffLayout::Unified, DiffLayout::Split] {
+            state.layout = layout;
+            let backend = TestBackend::new(100, 30);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut highlighter = CountingHighlighter::default();
+            terminal
+                .draw(|frame| render(frame, &mut state, &mut highlighter))
+                .unwrap();
+            assert!(
+                highlighter.calls <= 30,
+                "{layout:?} highlighted {} lines for a 30-row terminal",
+                highlighter.calls
+            );
+            assert!(highlighter.calls > 0);
+        }
     }
 
     #[test]

@@ -24,7 +24,7 @@ use crate::terminal_text::{
 };
 use crate::work_item::ResolvedWorkItem;
 
-const INLINE_COMPOSER_ID: &str = "zzzzzzzz-inline-composer";
+pub(crate) const INLINE_COMPOSER_ID: &str = "zzzzzzzz-inline-composer";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Screen {
