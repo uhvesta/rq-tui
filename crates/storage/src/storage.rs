@@ -108,6 +108,12 @@ impl Storage {
         &self.path
     }
 
+    pub fn set_busy_timeout(&self, timeout: Duration) -> Result<()> {
+        self.connection
+            .busy_timeout(timeout)
+            .context("cannot configure SQLite busy timeout")
+    }
+
     pub fn set_query_only_for_testing(&self, enabled: bool) -> Result<()> {
         self.connection
             .pragma_update(None, "query_only", enabled)
@@ -2052,26 +2058,21 @@ impl Storage {
         Ok(())
     }
 
-    pub fn update_latest_ask_response(&self, annotation_id: &str, text: &str) -> Result<()> {
-        self.connection.execute(
-            "UPDATE ask_messages
-             SET text = ?2
-             WHERE id = (
-                 SELECT id FROM ask_messages
-                 WHERE annotation_id = ?1 AND role = 'assistant'
-                 ORDER BY seq DESC
-                 LIMIT 1
-             )",
-            params![annotation_id, text],
-        )?;
-        Ok(())
-    }
-
     pub fn update_ask_message_text(&self, message_id: &str, text: &str) -> Result<()> {
-        self.connection.execute(
+        let updated = self.connection.execute(
             "UPDATE ask_messages SET text = ?2 WHERE id = ?1",
             params![message_id, text],
         )?;
+        anyhow::ensure!(updated == 1, "Ask message {message_id} no longer exists");
+        Ok(())
+    }
+
+    pub fn append_ask_message_delta(&self, message_id: &str, delta: &str) -> Result<()> {
+        let updated = self.connection.execute(
+            "UPDATE ask_messages SET text = text || ?2 WHERE id = ?1",
+            params![message_id, delta],
+        )?;
+        anyhow::ensure!(updated == 1, "Ask message {message_id} no longer exists");
         Ok(())
     }
 
@@ -3310,5 +3311,17 @@ mod tests {
                 .len(),
             2
         );
+        storage
+            .append_ask_message_delta("assistant", " more")
+            .unwrap();
+        storage
+            .update_ask_message_text("assistant", "exact response")
+            .unwrap();
+        assert_eq!(
+            storage.ask_messages_for_annotation("annotation").unwrap()[1].text,
+            "exact response"
+        );
+        assert!(storage.append_ask_message_delta("missing", "lost").is_err());
+        assert!(storage.update_ask_message_text("missing", "lost").is_err());
     }
 }

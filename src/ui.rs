@@ -333,6 +333,7 @@ fn run_loop<B: Backend>(
     bridge: &dyn AgentRuntime,
     highlighter: &mut dyn Highlighter,
 ) -> Result<()> {
+    let ask_response_writer = AskResponseWriter::start(paths.database.clone())?;
     let mut redraw = true;
     let mut next_periodic_redraw = std::time::Instant::now();
     let mut navigation_limiter = NavigationBurstLimiter::default();
@@ -350,7 +351,9 @@ fn run_loop<B: Backend>(
             let Some(event) = bridge.try_recv_laned() else {
                 break;
             };
-            handle_agent_envelope(state, storage, event)?;
+            handle_agent_envelope_with_persistence(state, storage, event, &|update| {
+                ask_response_writer.persist(update)
+            })?;
             received_agent_event = true;
             agent_events_processed += 1;
             if agent_slice_started.elapsed() >= MAX_AGENT_EVENT_SLICE {
@@ -362,6 +365,23 @@ fn run_loop<B: Backend>(
         redraw |= received_agent_event;
         redraw |= state.ready_prune.is_some();
         finish_ready_prune(state, storage)?;
+        if let Some(error) = ask_response_writer.take_error() {
+            let recovered = error == "Ask response persistence recovered";
+            state.agent_progress.record_observation(
+                if recovered {
+                    "Ask response persistence recovered"
+                } else {
+                    "Ask response persistence is retrying"
+                },
+                error.clone(),
+            );
+            state.status = if recovered {
+                "Ask response persistence recovered · streaming remains active".into()
+            } else {
+                format!("Copilot response is visible · save retrying: {error}")
+            };
+            redraw = true;
+        }
         let now = std::time::Instant::now();
         state.tick(now);
         if redraw || now >= next_periodic_redraw {
@@ -432,7 +452,400 @@ fn run_loop<B: Backend>(
         }
         terminal_burst_continues = terminal_burst.saturated;
     }
+    // Give the latest coalesced snapshots a small, strictly bounded durability
+    // window without making terminal shutdown depend on SQLite's busy timeout.
+    let _ = ask_response_writer.flush(std::time::Duration::from_millis(250));
     Ok(())
+}
+
+type PersistAskResponse<'a> = dyn Fn(AskResponseUpdate) -> Result<()> + 'a;
+
+#[derive(Clone, Debug)]
+enum AskResponseUpdate {
+    Delta { message_id: String, text: String },
+    Snapshot { message_id: String, text: String },
+}
+
+impl AskResponseUpdate {
+    fn message_id(&self) -> &str {
+        match self {
+            Self::Delta { message_id, .. } | Self::Snapshot { message_id, .. } => message_id,
+        }
+    }
+
+    fn merge(&mut self, newer: Self) {
+        match (self, newer) {
+            (
+                Self::Delta { text, .. } | Self::Snapshot { text, .. },
+                Self::Delta {
+                    text: newer_text, ..
+                },
+            ) => text.push_str(&newer_text),
+            (current, newer @ Self::Snapshot { .. }) => *current = newer,
+        }
+    }
+
+    fn persist(&self, storage: &Storage) -> Result<()> {
+        match self {
+            Self::Delta { message_id, text } => storage.append_ask_message_delta(message_id, text),
+            Self::Snapshot { message_id, text } => {
+                storage.update_ask_message_text(message_id, text)
+            }
+        }
+    }
+}
+
+enum AskResponseWriterSignal {
+    Wake,
+    Flush(std::sync::mpsc::SyncSender<std::result::Result<(), String>>),
+    Stop,
+}
+
+/// Coalesces streamed Ask snapshots outside the terminal event loop.
+///
+/// Copilot can emit hundreds of deltas per second. Persisting every intermediate
+/// string on the input thread made an otherwise responsive TUI appear frozen
+/// whenever SQLite was busy. Deltas are merged by exact assistant-message ID,
+/// preserving follow-up ordering without cloning the full accumulated answer
+/// on every terminal event.
+struct AskResponseWriter {
+    pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, AskResponseUpdate>>>,
+    signal: std::sync::mpsc::SyncSender<AskResponseWriterSignal>,
+    errors: std::sync::mpsc::Receiver<String>,
+    completed: std::sync::mpsc::Receiver<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AskResponseWriter {
+    fn start(database_path: std::path::PathBuf) -> Result<Self> {
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            AskResponseUpdate,
+        >::new()));
+        let (signal, signals) = std::sync::mpsc::sync_channel(1);
+        let (error_tx, errors) = std::sync::mpsc::sync_channel(8);
+        let (completed_tx, completed) = std::sync::mpsc::sync_channel(1);
+        let worker_pending = std::sync::Arc::clone(&pending);
+        let thread = std::thread::Builder::new()
+            .name("rq-tui-ask-persistence".into())
+            .spawn(move || {
+                (|| {
+                    let Some(storage) =
+                        open_ask_response_storage(&database_path, &signals, &error_tx)
+                    else {
+                        return;
+                    };
+                    let mut consecutive_failures = 0_u8;
+                    loop {
+                        let signal = if ask_responses_pending(&worker_pending) {
+                            match wait_for_ask_retry_signal(
+                                &signals,
+                                ask_response_retry_delay(consecutive_failures),
+                                consecutive_failures > 0,
+                            ) {
+                                Some(signal) => signal,
+                                None => {
+                                    let _ = flush_ask_responses(&storage, &worker_pending);
+                                    return;
+                                }
+                            }
+                        } else {
+                            match signals.recv() {
+                                Ok(signal) => signal,
+                                Err(_) => {
+                                    let _ = flush_ask_responses(&storage, &worker_pending);
+                                    return;
+                                }
+                            }
+                        };
+                        let flush_ack = match signal {
+                            AskResponseWriterSignal::Wake => {
+                                // Absorb a burst while producers merge small
+                                // deltas for the same exact message.
+                                let burst_started = std::time::Instant::now();
+                                let mut flush_ack = None;
+                                loop {
+                                    let elapsed = burst_started.elapsed();
+                                    if elapsed >= ASK_RESPONSE_COALESCE_WINDOW {
+                                        break;
+                                    }
+                                    match signals
+                                        .recv_timeout(ASK_RESPONSE_COALESCE_WINDOW - elapsed)
+                                    {
+                                        Ok(AskResponseWriterSignal::Wake) => {}
+                                        Ok(AskResponseWriterSignal::Flush(ack)) => {
+                                            flush_ack = Some(ack);
+                                            break;
+                                        }
+                                        Ok(AskResponseWriterSignal::Stop) => {
+                                            let _ = flush_ask_responses(&storage, &worker_pending);
+                                            return;
+                                        }
+                                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                            let _ = flush_ask_responses(&storage, &worker_pending);
+                                            return;
+                                        }
+                                    }
+                                }
+                                flush_ack
+                            }
+                            AskResponseWriterSignal::Flush(ack) => Some(ack),
+                            AskResponseWriterSignal::Stop => {
+                                let _ = flush_ask_responses(&storage, &worker_pending);
+                                return;
+                            }
+                        };
+                        let result = flush_ask_responses(&storage, &worker_pending);
+                        update_ask_writer_health(
+                            result.clone(),
+                            &mut consecutive_failures,
+                            &error_tx,
+                        );
+                        if let Some(ack) = flush_ack {
+                            let _ = ack.send(result);
+                        }
+                    }
+                })();
+                let _ = completed_tx.send(());
+            })
+            .context("cannot start Ask persistence worker")?;
+        Ok(Self {
+            pending,
+            signal,
+            errors,
+            completed,
+            thread: Some(thread),
+        })
+    }
+
+    fn persist(&self, update: AskResponseUpdate) -> Result<()> {
+        let message_id = update.message_id().to_owned();
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Ask persistence queue is poisoned"))?;
+        match pending.entry(message_id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().merge(update);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(update);
+            }
+        }
+        drop(pending);
+        match self.signal.try_send(AskResponseWriterSignal::Wake) {
+            Ok(())
+            | Err(std::sync::mpsc::TrySendError::Full(_))
+            | Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Ok(()),
+        }
+    }
+
+    fn flush(&self, timeout: std::time::Duration) -> Result<()> {
+        let (ack, completed) = std::sync::mpsc::sync_channel(0);
+        let deadline = std::time::Instant::now() + timeout;
+        let mut signal = AskResponseWriterSignal::Flush(ack);
+        loop {
+            match self.signal.try_send(signal) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    if std::time::Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "Ask persistence worker did not accept a flush within {}ms",
+                            timeout.as_millis()
+                        );
+                    }
+                    signal = returned;
+                    std::thread::yield_now();
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    anyhow::bail!("Ask persistence worker stopped");
+                }
+            }
+        }
+        completed
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .with_context(|| {
+                format!(
+                    "Ask persistence worker did not flush within {}ms",
+                    timeout.as_millis()
+                )
+            })?
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn take_error(&self) -> Option<String> {
+        self.errors.try_recv().ok()
+    }
+}
+
+impl Drop for AskResponseWriter {
+    fn drop(&mut self) {
+        let stop_deadline = std::time::Instant::now() + std::time::Duration::from_millis(25);
+        let mut stop = AskResponseWriterSignal::Stop;
+        loop {
+            match self.signal.try_send(stop) {
+                Ok(()) | Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    if std::time::Instant::now() >= stop_deadline {
+                        break;
+                    }
+                    stop = returned;
+                    std::thread::yield_now();
+                }
+            }
+        }
+        if let Some(thread) = self.thread.take() {
+            let completed = self
+                .completed
+                .recv_timeout(ASK_RESPONSE_SHUTDOWN_GRACE)
+                .is_ok();
+            if completed || thread.is_finished() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+const ASK_RESPONSE_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(24);
+const ASK_RESPONSE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+const ASK_RESPONSE_DATABASE_BUSY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(100);
+const ASK_RESPONSE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn ask_response_retry_delay(consecutive_failures: u8) -> std::time::Duration {
+    ASK_RESPONSE_RETRY_DELAY * u32::from(1_u8 << consecutive_failures.min(4))
+}
+
+fn wait_for_ask_retry_signal(
+    signals: &std::sync::mpsc::Receiver<AskResponseWriterSignal>,
+    delay: std::time::Duration,
+    absorb_wakes: bool,
+) -> Option<AskResponseWriterSignal> {
+    let deadline = std::time::Instant::now() + delay;
+    loop {
+        match signals.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(AskResponseWriterSignal::Wake) if absorb_wakes => {
+                if std::time::Instant::now() >= deadline {
+                    return Some(AskResponseWriterSignal::Wake);
+                }
+            }
+            Ok(signal) => return Some(signal),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Some(AskResponseWriterSignal::Wake);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
+fn open_ask_response_storage(
+    database_path: &std::path::Path,
+    signals: &std::sync::mpsc::Receiver<AskResponseWriterSignal>,
+    errors: &std::sync::mpsc::SyncSender<String>,
+) -> Option<Storage> {
+    let mut consecutive_failures = 0_u8;
+    loop {
+        let opened = Storage::open(database_path).and_then(|storage| {
+            storage
+                .set_busy_timeout(ASK_RESPONSE_DATABASE_BUSY_TIMEOUT)
+                .map(|()| storage)
+        });
+        match opened {
+            Ok(storage) => {
+                if consecutive_failures > 0 {
+                    let _ = errors.try_send("Ask response persistence recovered".into());
+                }
+                return Some(storage);
+            }
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let detail = format!(
+                    "cannot open {}: {error:#} · retrying in {:.1}s",
+                    database_path.display(),
+                    ask_response_retry_delay(consecutive_failures).as_secs_f32()
+                );
+                let _ = errors.try_send(detail.clone());
+                let deadline =
+                    std::time::Instant::now() + ask_response_retry_delay(consecutive_failures);
+                loop {
+                    match signals
+                        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    {
+                        Ok(AskResponseWriterSignal::Wake) => {}
+                        Ok(AskResponseWriterSignal::Flush(ack)) => {
+                            let _ = ack.send(Err(detail.clone()));
+                        }
+                        Ok(AskResponseWriterSignal::Stop)
+                        | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn ask_responses_pending(
+    pending: &std::sync::Mutex<std::collections::HashMap<String, AskResponseUpdate>>,
+) -> bool {
+    pending.lock().map_or(true, |pending| !pending.is_empty())
+}
+
+fn flush_ask_responses(
+    storage: &Storage,
+    pending: &std::sync::Mutex<std::collections::HashMap<String, AskResponseUpdate>>,
+) -> std::result::Result<(), String> {
+    let updates = match pending.lock() {
+        Ok(mut pending) => std::mem::take(&mut *pending),
+        Err(_) => {
+            return Err("Ask persistence queue is poisoned".into());
+        }
+    };
+    let mut first_error = None;
+    for (message_id, update) in updates {
+        if let Err(error) = update.persist(storage) {
+            if let Ok(mut pending) = pending.lock() {
+                match pending.entry(message_id.clone()) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        let newer = entry.get().clone();
+                        entry.insert(update);
+                        entry.get_mut().merge(newer);
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(update);
+                    }
+                }
+            }
+            first_error
+                .get_or_insert_with(|| format!("message {}: {error:#}", short_id(&message_id)));
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn update_ask_writer_health(
+    result: std::result::Result<(), String>,
+    consecutive_failures: &mut u8,
+    errors: &std::sync::mpsc::SyncSender<String>,
+) {
+    match result {
+        Ok(()) => {
+            if *consecutive_failures > 0 {
+                let _ = errors.try_send("Ask response persistence recovered".into());
+            }
+            *consecutive_failures = 0;
+        }
+        Err(error) => {
+            *consecutive_failures = consecutive_failures.saturating_add(1);
+            let retry_seconds = (ASK_RESPONSE_RETRY_DELAY
+                * u32::from(1_u8 << (*consecutive_failures).min(4)))
+            .as_secs_f32();
+            let detail =
+                format!("{error} · retrying in {retry_seconds:.1}s; response remains visible");
+            let _ = errors.try_send(detail);
+        }
+    }
 }
 
 const MAX_AGENT_EVENTS_PER_FRAME: usize = 256;
@@ -2651,6 +3064,17 @@ pub(crate) fn handle_agent_envelope(
     storage: &Storage,
     envelope: AgentEventEnvelope,
 ) -> Result<()> {
+    handle_agent_envelope_with_persistence(state, storage, envelope, &|update| {
+        update.persist(storage)
+    })
+}
+
+fn handle_agent_envelope_with_persistence(
+    state: &mut AppState,
+    storage: &Storage,
+    envelope: AgentEventEnvelope,
+    persist_ask_response: &PersistAskResponse<'_>,
+) -> Result<()> {
     let AgentEventEnvelope {
         lane,
         event,
@@ -2790,14 +3214,24 @@ pub(crate) fn handle_agent_envelope(
                 if lane != crate::copilot::AgentLane::Main {
                     return Ok(());
                 }
-                handle_agent_event(state, storage, agent_event)?;
+                handle_agent_event_with_persistence(
+                    state,
+                    storage,
+                    agent_event,
+                    persist_ask_response,
+                )?;
                 return Ok(());
             }
             let fatal_side = matches!(&agent_event, AgentEvent::Error(_) | AgentEvent::Stopped)
                 && (state.side_active || state.side_starting);
             if fatal_side {
                 restore_main_surface(state);
-                handle_agent_event(state, storage, agent_event)?;
+                handle_agent_event_with_persistence(
+                    state,
+                    storage,
+                    agent_event,
+                    persist_ask_response,
+                )?;
                 state.status = format!("MAIN restored · {}", state.status);
                 return Ok(());
             }
@@ -2811,10 +3245,20 @@ pub(crate) fn handle_agent_envelope(
                 let globally_visible =
                     matches!(&agent_event, AgentEvent::Error(_) | AgentEvent::Stopped);
                 if lane == crate::copilot::AgentLane::Main && state.side_active {
-                    handle_parked_main_event(state, storage, agent_event.clone())?;
+                    handle_parked_main_event(
+                        state,
+                        storage,
+                        agent_event.clone(),
+                        persist_ask_response,
+                    )?;
                 }
                 if globally_visible {
-                    handle_agent_event(state, storage, agent_event)?;
+                    handle_agent_event_with_persistence(
+                        state,
+                        storage,
+                        agent_event,
+                        persist_ask_response,
+                    )?;
                 }
                 return Ok(());
             }
@@ -2854,7 +3298,7 @@ pub(crate) fn handle_agent_envelope(
                 state.status = format!("{} · {}", lane.label(), activity.label);
                 return Ok(());
             }
-            handle_agent_event(state, storage, agent_event)?;
+            handle_agent_event_with_persistence(state, storage, agent_event, persist_ask_response)?;
         }
     }
     Ok(())
@@ -2867,6 +3311,7 @@ fn handle_parked_main_event(
     state: &mut AppState,
     storage: &Storage,
     event: AgentEvent,
+    persist_ask_response: &PersistAskResponse<'_>,
 ) -> Result<()> {
     let Some(mut main_chat) = state.main_chat.take() else {
         return Ok(());
@@ -2885,7 +3330,7 @@ fn handle_parked_main_event(
     let visible_agent_activity = state.agent_activity.clone();
     let visible_agent_progress = state.agent_progress.clone();
 
-    let result = handle_agent_event(state, storage, event);
+    let result = handle_agent_event_with_persistence(state, storage, event, persist_ask_response);
     main_chat = std::mem::replace(&mut state.chat, side_chat);
     state.main_chat = Some(main_chat);
     state.chat_layout = visible_chat_layout;
@@ -2943,6 +3388,15 @@ pub(crate) fn handle_agent_event(
     state: &mut AppState,
     storage: &Storage,
     event: AgentEvent,
+) -> Result<()> {
+    handle_agent_event_with_persistence(state, storage, event, &|update| update.persist(storage))
+}
+
+fn handle_agent_event_with_persistence(
+    state: &mut AppState,
+    storage: &Storage,
+    event: AgentEvent,
+    persist_ask_response: &PersistAskResponse<'_>,
 ) -> Result<()> {
     match event {
         AgentEvent::SessionReady {
@@ -3226,7 +3680,7 @@ pub(crate) fn handle_agent_event(
                 OutboundKind::Ask { .. } | OutboundKind::CommentBatch { .. }
             );
             let first_delta_len = first_delta.len();
-            let annotation_id = match &outbound {
+            let (annotation_id, response_message_id) = match &outbound {
                 OutboundKind::Ask {
                     annotation_id,
                     user_message_id,
@@ -3275,7 +3729,10 @@ pub(crate) fn handle_agent_event(
                     {
                         annotation.delivery_state = DeliveryState::Sent;
                     }
-                    Some(annotation_id.clone())
+                    (
+                        Some(annotation_id.clone()),
+                        Some(assistant_message_id.clone()),
+                    )
                 }
                 OutboundKind::CommentBatch { annotation_ids } => {
                     storage.mark_comments_delivery(annotation_ids, DeliveryState::Sent)?;
@@ -3288,7 +3745,7 @@ pub(crate) fn handle_agent_event(
                             annotation.submitted = true;
                         }
                     }
-                    None
+                    (None, None)
                 }
                 OutboundKind::ContextDraft => {
                     if state
@@ -3297,21 +3754,21 @@ pub(crate) fn handle_agent_event(
                     {
                         state.context_editor.apply_generation_partial(&outbound_id);
                     }
-                    None
+                    (None, None)
                 }
                 OutboundKind::Context { work_item_id } => {
                     storage.mark_context_sent(work_item_id)?;
                     state.pending_context = false;
-                    None
+                    (None, None)
                 }
                 OutboundKind::Chat | OutboundKind::Correction => {
                     storage.delete_queued_chat(&outbound_id)?;
-                    None
+                    (None, None)
                 }
             };
             if !matches!(&outbound, OutboundKind::ContextDraft) {
                 state.chat.push(ChatEntry {
-                    id: uuid::Uuid::new_v4().to_string(),
+                    id: response_message_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     role: "copilot".into(),
                     text: first_delta,
                     streaming: true,
@@ -3356,24 +3813,31 @@ pub(crate) fn handle_agent_event(
                 state.context_editor.apply_generation_partial(&outbound_id);
             }
             let mut changes_review = false;
+            let mut ask_update = None;
             if let Some(message) = state.chat.iter_mut().find(|message| {
                 message.streaming && message.outbound_id.as_deref() == Some(outbound_id.as_str())
             }) {
                 message.text.push_str(&delta);
                 if let Some(annotation_id) = &message.annotation_id {
                     changes_review = true;
-                    storage.update_latest_ask_response(annotation_id, &message.text)?;
+                    let response_message_id = message.id.clone();
                     if let Some(response) =
                         state.ask_threads.get_mut(annotation_id).and_then(|thread| {
                             thread
                                 .iter_mut()
-                                .rev()
-                                .find(|entry| entry.role == "assistant")
+                                .find(|entry| entry.id == response_message_id)
                         })
                     {
-                        response.text = message.text.clone();
+                        response.text.push_str(&delta);
+                        ask_update = Some(AskResponseUpdate::Delta {
+                            message_id: response.id.clone(),
+                            text: delta.clone(),
+                        });
                     }
                 }
+            }
+            if let Some(update) = ask_update {
+                persist_ask_response(update)?;
             }
             follow_chat(state);
             if changes_review {
@@ -3392,24 +3856,36 @@ pub(crate) fn handle_agent_event(
                 state.context_editor.apply_generation_partial(&outbound_id);
             }
             let mut changes_review = false;
+            let mut ask_update = None;
             if let Some(message) = state.chat.iter_mut().find(|message| {
                 message.streaming && message.outbound_id.as_deref() == Some(outbound_id.as_str())
             }) {
-                message.text = text;
-                if let Some(annotation_id) = &message.annotation_id {
+                if let Some(annotation_id) = message.annotation_id.clone() {
                     changes_review = true;
-                    storage.update_latest_ask_response(annotation_id, &message.text)?;
+                    let response_message_id = message.id.clone();
+                    message.text = text.clone();
                     if let Some(response) =
-                        state.ask_threads.get_mut(annotation_id).and_then(|thread| {
-                            thread
-                                .iter_mut()
-                                .rev()
-                                .find(|entry| entry.role == "assistant")
-                        })
+                        state
+                            .ask_threads
+                            .get_mut(&annotation_id)
+                            .and_then(|thread| {
+                                thread
+                                    .iter_mut()
+                                    .find(|entry| entry.id == response_message_id)
+                            })
                     {
-                        response.text = message.text.clone();
+                        response.text = text.clone();
+                        ask_update = Some(AskResponseUpdate::Snapshot {
+                            message_id: response.id.clone(),
+                            text,
+                        });
                     }
+                } else {
+                    message.text = text;
                 }
+            }
+            if let Some(update) = ask_update {
+                persist_ask_response(update)?;
             }
             follow_chat(state);
             if changes_review {
@@ -3490,13 +3966,14 @@ pub(crate) fn handle_agent_event(
         }
         AgentEvent::StopSettledAlreadyIdle => {
             if let Some(outbound_id) = state.agent_progress.active_outbound_id.clone() {
-                handle_agent_event(
+                handle_agent_event_with_persistence(
                     state,
                     storage,
                     AgentEvent::ResponseComplete {
                         outbound_id,
                         aborted: false,
                     },
+                    persist_ask_response,
                 )?;
             }
             state.agent_activity.clear();
@@ -7410,10 +7887,12 @@ mod tests {
 
     use super::{
         copy_to_clipboard_with_writer, finish_ready_prune, handle_agent_envelope,
-        handle_agent_event, handle_effect, handle_effect_failure, load_model_preferences,
-        load_ui_preferences, markdown_to_html, mouse_scroll_effects, open_browser_preview, render,
-        review_row_lines, run_clipboard_candidate, search_ranges, table_cells,
-        NavigationBurstLimiter, MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST,
+        handle_agent_event, handle_agent_event_with_persistence, handle_effect,
+        handle_effect_failure, load_model_preferences, load_ui_preferences, markdown_to_html,
+        mouse_scroll_effects, open_browser_preview, render, review_row_lines,
+        run_clipboard_candidate, search_ranges, table_cells, wait_for_ask_retry_signal,
+        AskResponseUpdate, AskResponseWriter, AskResponseWriterSignal, NavigationBurstLimiter,
+        MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST,
     };
     use crate::app::{
         tests_support::state_for_ui, AgentPhase, ChatEntry, ComposeTarget, DiffLayout, Effect,
@@ -9331,6 +9810,279 @@ mod tests {
         assert_eq!(state.chat[4].text, "New answer");
         assert!(!state.chat[4].streaming);
         assert!(state.pending_outbound_ids.is_empty());
+    }
+
+    #[test]
+    fn stale_ask_event_updates_its_exact_assistant_message() {
+        let storage = Storage::in_memory().unwrap();
+        let mut state = state_for_ui();
+        state.chat = vec![
+            ChatEntry {
+                id: "assistant-a".into(),
+                role: "copilot".into(),
+                text: "older ".into(),
+                streaming: true,
+                annotation_id: Some("ask".into()),
+                outbound_id: Some("outbound-a".into()),
+                error: None,
+            },
+            ChatEntry {
+                id: "assistant-b".into(),
+                role: "copilot".into(),
+                text: "newer".into(),
+                streaming: true,
+                annotation_id: Some("ask".into()),
+                outbound_id: Some("outbound-b".into()),
+                error: None,
+            },
+        ];
+        state.ask_threads.insert(
+            "ask".into(),
+            vec![
+                AskMessage {
+                    id: "assistant-a".into(),
+                    annotation_id: "ask".into(),
+                    seq: 1,
+                    role: "assistant".into(),
+                    text: "older ".into(),
+                    sent: true,
+                    delivery_state: DeliveryState::Sent,
+                    ts: now(),
+                },
+                AskMessage {
+                    id: "assistant-b".into(),
+                    annotation_id: "ask".into(),
+                    seq: 3,
+                    role: "assistant".into(),
+                    text: "newer".into(),
+                    sent: true,
+                    delivery_state: DeliveryState::Sent,
+                    ts: now(),
+                },
+            ],
+        );
+        let updates = Mutex::new(Vec::new());
+
+        handle_agent_event_with_persistence(
+            &mut state,
+            &storage,
+            AgentEvent::ResponseDelta {
+                outbound_id: "outbound-a".into(),
+                delta: "event".into(),
+            },
+            &|update| {
+                updates.lock().unwrap().push(update);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.ask_threads["ask"][0].text, "older event");
+        assert_eq!(state.ask_threads["ask"][1].text, "newer");
+        assert!(matches!(
+            &updates.lock().unwrap()[0],
+            AskResponseUpdate::Delta { message_id, text }
+                if message_id == "assistant-a" && text == "event"
+        ));
+    }
+
+    #[test]
+    fn streamed_ask_persistence_coalesces_bursts_off_the_event_thread() {
+        let temp = tempdir().unwrap();
+        let database = temp.path().join("rq-tui.db");
+        let storage = Storage::open(&database).unwrap();
+        let state = state_for_ui();
+        let repo = &state.work_item.repos[0];
+        storage.upsert_work_item(&state.work_item.item).unwrap();
+        storage.upsert_repo(&repo.record).unwrap();
+        storage.upsert_version(&repo.version).unwrap();
+        storage
+            .add_annotation(
+                &Annotation {
+                    id: "streamed-ask".into(),
+                    repo_id: repo.record.id.clone(),
+                    kind: AnnotationKind::Ask,
+                    file_path: PathBuf::from("src/lib.rs"),
+                    anchor_snippet: "line".into(),
+                    anchor_hash: "hash".into(),
+                    anchor_start_offset: 0,
+                    anchor_line_count: 1,
+                    text: None,
+                    submitted: false,
+                    delivery_state: DeliveryState::Pending,
+                    created_at: now(),
+                },
+                &Placement {
+                    annotation_id: "streamed-ask".into(),
+                    version_id: repo.version.id.clone(),
+                    side: AnchorSide::New,
+                    line_start: 1,
+                    line_end: 1,
+                    outdated: false,
+                    ambiguous: false,
+                },
+            )
+            .unwrap();
+        storage
+            .append_ask_message(&AskMessage {
+                id: "streamed-user".into(),
+                annotation_id: "streamed-ask".into(),
+                seq: 0,
+                role: "user".into(),
+                text: "why?".into(),
+                sent: false,
+                delivery_state: DeliveryState::Pending,
+                ts: now(),
+            })
+            .unwrap();
+        storage
+            .acknowledge_ask_with_response_start(
+                "streamed-user",
+                &AskMessage {
+                    id: "streamed-assistant".into(),
+                    annotation_id: "streamed-ask".into(),
+                    seq: 1,
+                    role: "assistant".into(),
+                    text: String::new(),
+                    sent: true,
+                    delivery_state: DeliveryState::Sent,
+                    ts: now(),
+                },
+            )
+            .unwrap();
+
+        let writer = AskResponseWriter::start(database).unwrap();
+        let mut expected = String::new();
+        for index in 0..10_000 {
+            let delta = format!("{index},");
+            expected.push_str(&delta);
+            writer
+                .persist(AskResponseUpdate::Delta {
+                    message_id: "streamed-assistant".into(),
+                    text: delta,
+                })
+                .unwrap();
+        }
+        writer.flush(std::time::Duration::from_secs(2)).unwrap();
+
+        let thread = storage.ask_messages_for_annotation("streamed-ask").unwrap();
+        assert_eq!(thread.last().unwrap().text, expected);
+        assert!(writer.take_error().is_none());
+
+        storage
+            .append_ask_message(&AskMessage {
+                id: "second-user".into(),
+                annotation_id: "streamed-ask".into(),
+                seq: 2,
+                role: "user".into(),
+                text: "follow up".into(),
+                sent: false,
+                delivery_state: DeliveryState::Pending,
+                ts: now(),
+            })
+            .unwrap();
+        storage
+            .acknowledge_ask_with_response_start(
+                "second-user",
+                &AskMessage {
+                    id: "second-assistant".into(),
+                    annotation_id: "streamed-ask".into(),
+                    seq: 3,
+                    role: "assistant".into(),
+                    text: String::new(),
+                    sent: true,
+                    delivery_state: DeliveryState::Sent,
+                    ts: now(),
+                },
+            )
+            .unwrap();
+        writer
+            .persist(AskResponseUpdate::Delta {
+                message_id: "streamed-assistant".into(),
+                text: "older response only".into(),
+            })
+            .unwrap();
+        writer.flush(std::time::Duration::from_secs(2)).unwrap();
+
+        let thread = storage.ask_messages_for_annotation("streamed-ask").unwrap();
+        assert!(thread[1].text.ends_with("older response only"));
+        assert_eq!(
+            thread[3].text, "",
+            "a delayed older response must never overwrite the latest follow-up"
+        );
+    }
+
+    #[test]
+    fn ask_persistence_recovers_after_transient_startup_failure() {
+        let temp = tempdir().unwrap();
+        let database = temp.path().join("temporarily-a-directory");
+        fs::create_dir(&database).unwrap();
+        let writer = AskResponseWriter::start(database.clone()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let error = loop {
+            if let Some(error) = writer.take_error() {
+                break error;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the failed writer must report its degraded state"
+            );
+            std::thread::yield_now();
+        };
+
+        assert!(error.contains("cannot open"));
+        fs::remove_dir(&database).unwrap();
+        let recovery_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let recovered = loop {
+            if let Some(status) = writer.take_error() {
+                if status == "Ask response persistence recovered" {
+                    break status;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < recovery_deadline,
+                "the writer must recover after its database path becomes available"
+            );
+            std::thread::yield_now();
+        };
+        assert_eq!(recovered, "Ask response persistence recovered");
+    }
+
+    #[test]
+    fn ask_persistence_flush_reports_failed_writes_truthfully() {
+        let temp = tempdir().unwrap();
+        let database = temp.path().join("rq-tui.db");
+        let _storage = Storage::open(&database).unwrap();
+        let writer = AskResponseWriter::start(database).unwrap();
+        writer
+            .persist(AskResponseUpdate::Snapshot {
+                message_id: "missing-assistant".into(),
+                text: "cannot be saved".into(),
+            })
+            .unwrap();
+
+        let error = writer
+            .flush(std::time::Duration::from_secs(2))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("missing-assistant"));
+        assert!(error.contains("no longer exists"));
+    }
+
+    #[test]
+    fn ask_persistence_backoff_absorbs_streaming_wakes() {
+        let (signal, signals) = std::sync::mpsc::sync_channel(1);
+        signal.send(AskResponseWriterSignal::Wake).unwrap();
+        let started = std::time::Instant::now();
+
+        let next = wait_for_ask_retry_signal(&signals, std::time::Duration::from_millis(40), true);
+
+        assert!(matches!(next, Some(AskResponseWriterSignal::Wake)));
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(35),
+            "queued token wakeups must not bypass persistence retry backoff"
+        );
     }
 
     #[test]
