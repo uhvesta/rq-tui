@@ -4828,7 +4828,7 @@ fn render_picker(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     }
     let focused = state.focus == crate::app::Focus::FilePicker;
     let selected_row = rows.iter().position(|(_, selected)| *selected);
-    let viewport = usize::from(area.height.saturating_sub(1)).max(1);
+    let viewport = usize::from(area.height.saturating_sub(2)).max(1);
     let start = selected_row
         .map(|selected| {
             selected
@@ -4869,7 +4869,7 @@ fn render_picker(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 } else {
                     Color::DarkGray
                 }))
-                .borders(Borders::RIGHT),
+                .borders(Borders::ALL),
         ),
         area,
     );
@@ -4970,22 +4970,23 @@ fn render_unified(
     let current_row = usize::from(row_count > 0)
         .saturating_add(state.review_cursor.min(row_count.saturating_sub(1)));
     let focused = state.focus == crate::app::Focus::Diff;
-    frame.render_widget(
-        Paragraph::new(format!("unified · ln {current_row}/{row_count}")).style(
-            Style::default()
-                .fg(if focused {
-                    Color::Cyan
-                } else {
-                    Color::DarkGray
-                })
-                .add_modifier(Modifier::BOLD),
-        ),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-    if area.height == 1 {
+    let border_style = Style::default()
+        .fg(if focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        })
+        .add_modifier(Modifier::BOLD);
+    let block = Block::default()
+        .title(format!(" unified · ln {current_row}/{row_count} "))
+        .title_style(border_style)
+        .border_style(border_style)
+        .borders(Borders::ALL);
+    let body = block.inner(area);
+    frame.render_widget(block, area);
+    if body.height == 0 || body.width == 0 {
         return;
     }
-    let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
     state.viewport_height = body.height.max(1) as usize;
     state.compose_wrap_width = body.width.saturating_sub(4).max(1) as usize;
     state.set_review_content_width(body.width.saturating_sub(9) as usize);
@@ -5033,16 +5034,30 @@ fn render_split(
     if area.height <= 5 && render_compact_inline_composer(frame, state, area) {
         return;
     }
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
+    let stream = state.review_stream();
+    let row_count = stream.rows().len();
+    let current_row = usize::from(row_count > 0)
+        .saturating_add(state.review_cursor.min(row_count.saturating_sub(1)));
     let focused = state.focus == crate::app::Focus::Diff;
     let diff_border = Style::default().fg(if focused {
         Color::Cyan
     } else {
         Color::DarkGray
     });
+    let block = Block::default()
+        .title(format!(" split · ln {current_row}/{row_count} "))
+        .title_style(diff_border.add_modifier(Modifier::BOLD))
+        .border_style(diff_border)
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
     frame.render_widget(
         Paragraph::new("- old").style(diff_border.add_modifier(Modifier::BOLD)),
         Rect::new(columns[0].x, columns[0].y, columns[0].width, 1),
@@ -5051,11 +5066,11 @@ fn render_split(
         Paragraph::new("+ new").style(diff_border.add_modifier(Modifier::BOLD)),
         Rect::new(columns[1].x, columns[1].y, columns[1].width, 1),
     );
-    if area.height == 1 {
+    if inner.height == 1 {
         return;
     }
 
-    let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+    let body = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
     let body_columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -5068,7 +5083,6 @@ fn render_split(
             .saturating_sub(7)
             .min(body_columns[1].width.saturating_sub(6)) as usize,
     );
-    let stream = state.review_stream();
     sync_active_follow_up_cursor(state, stream.rows());
     let selection_side = state.review_selection_side();
     let layout = state.review_display_layout(stream.rows(), body.width.max(1) as usize);
@@ -7382,6 +7396,13 @@ mod tests {
         assert!(content.contains("Focus: files → diff"));
         assert!(content.contains("unified · ln "));
         assert!(!content.contains("❯ unified"));
+        assert!(content.contains('┌'));
+        assert!(content.contains('┘'));
+        assert_eq!(
+            terminal.backend().buffer()[(0, 2)].fg,
+            Color::Cyan,
+            "the focused diff pane border must carry the focus color"
+        );
         assert!(content.contains("a ask"));
     }
 

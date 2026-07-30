@@ -1517,7 +1517,7 @@ mod tests {
 
         assert!(output.contains("src/module_9.rs"));
         assert!(output.contains("+1 -0"));
-        assert!(output.contains("files · 8-10/13"));
+        assert!(output.contains("files · 9-10/13"));
     }
 
     #[test]
