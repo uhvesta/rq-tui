@@ -22,6 +22,7 @@ RUNTIME_DEPS = crate_deps([
     "serde",
     "serde_json",
     "sha2",
+    "signal-hook",
     "similar",
     "syntect",
     "tempfile",

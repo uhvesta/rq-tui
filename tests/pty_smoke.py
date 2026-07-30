@@ -565,6 +565,23 @@ def main() -> int:
         finally:
             setup.close()
 
+        terminated = Child(binary, old_repo, root / "terminated-app")
+        try:
+            terminated.resize(80, 18)
+            terminated.wait_for("entering TUI", timeout=8)
+            terminated.wait_for("Review", timeout=8)
+            os.kill(terminated.pid, signal.SIGTERM)
+            if terminated.wait_for_exit(timeout=4) != 128 + signal.SIGTERM:
+                raise AssertionError(
+                    terminated.failure("SIGTERM did not preserve the conventional exit status")
+                )
+            if b"\x1b[?1049l" not in bytes(terminated.output):
+                raise AssertionError(
+                    terminated.failure("SIGTERM did not restore the alternate screen")
+                )
+        finally:
+            terminated.close()
+
         # A repository-scale source file guards the real input-latency path.
         # Rendering must syntax-highlight only the viewport; a full-diff pass
         # here starves Crossterm input for many seconds.

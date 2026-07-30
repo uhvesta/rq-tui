@@ -20,6 +20,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
+use signal_hook::consts::signal::{SIGHUP, SIGQUIT, SIGTERM};
+use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
 use crate::annotations::{
     anchor_from_diff, create_local_annotation, create_snapshot, self_contained_ask,
@@ -234,32 +236,21 @@ pub(crate) fn run(
                 | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
         )
     ) {
-        disable_raw_mode().ok();
-        execute!(
-            io::stdout(),
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            PopKeyboardEnhancementFlags,
-            LeaveAlternateScreen,
-            Show
-        )
-        .ok();
+        restore_process_terminal();
         return Err(error.into());
     }
+    let signal_guard = match TerminalSignalGuard::install() {
+        Ok(guard) => guard,
+        Err(error) => {
+            restore_process_terminal();
+            return Err(error);
+        }
+    };
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = match Terminal::new(backend) {
         Ok(terminal) => terminal,
         Err(error) => {
-            disable_raw_mode().ok();
-            execute!(
-                io::stdout(),
-                DisableBracketedPaste,
-                DisableMouseCapture,
-                PopKeyboardEnhancementFlags,
-                LeaveAlternateScreen,
-                Show
-            )
-            .ok();
+            restore_process_terminal();
             return Err(error.into());
         }
     };
@@ -267,16 +258,7 @@ pub(crate) fn run(
 
     let previous_panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|panic_info| {
-        disable_raw_mode().ok();
-        execute!(
-            io::stdout(),
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            PopKeyboardEnhancementFlags,
-            LeaveAlternateScreen,
-            Show
-        )
-        .ok();
+        restore_process_terminal();
         eprintln!("{panic_info}");
     }));
     let result = run_loop(
@@ -298,11 +280,49 @@ pub(crate) fn run(
         LeaveAlternateScreen
     );
     let cursor_result = terminal.show_cursor();
+    drop(signal_guard);
     result?;
     raw_result.context("cannot disable terminal raw mode")?;
     screen_result.context("cannot leave terminal alternate screen")?;
     cursor_result.context("cannot restore terminal cursor")?;
     Ok(())
+}
+
+fn restore_process_terminal() {
+    disable_raw_mode().ok();
+    execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen,
+        Show
+    )
+    .ok();
+}
+
+struct TerminalSignalGuard {
+    handle: SignalHandle,
+}
+
+impl TerminalSignalGuard {
+    fn install() -> Result<Self> {
+        let mut signals = Signals::new([SIGTERM, SIGHUP, SIGQUIT])?;
+        let handle = signals.handle();
+        std::thread::spawn(move || {
+            if let Some(signal) = signals.forever().next() {
+                restore_process_terminal();
+                std::process::exit(128 + signal);
+            }
+        });
+        Ok(Self { handle })
+    }
+}
+
+impl Drop for TerminalSignalGuard {
+    fn drop(&mut self) {
+        self.handle.close();
+    }
 }
 
 fn run_loop<B: Backend>(
