@@ -338,6 +338,7 @@ fn run_loop<B: Backend>(
     let mut next_periodic_redraw = std::time::Instant::now();
     let mut navigation_limiter = NavigationBurstLimiter::default();
     let mut terminal_burst_continues = false;
+    let mut terminal_backlog = std::collections::VecDeque::new();
     while !state.should_quit {
         // A noisy tool or streaming source must not starve drawing and input.
         // Bound both the count and wall-clock slice: some events synchronously
@@ -406,14 +407,22 @@ fn run_loop<B: Backend>(
                 .saturating_duration_since(std::time::Instant::now())
                 .min(std::time::Duration::from_millis(100))
         };
-        let terminal_burst = read_terminal_burst(poll_timeout)?;
+        let terminal_burst = read_terminal_burst(if terminal_backlog.is_empty() {
+            poll_timeout
+        } else {
+            std::time::Duration::ZERO
+        })?;
         navigation_limiter.begin_burst(terminal_burst_continues);
-        for terminal_event in terminal_burst.events {
+        terminal_backlog.extend(terminal_burst.events);
+        let terminal_slice_started = std::time::Instant::now();
+        let mut actionable_events = 0;
+        while let Some(terminal_event) = terminal_backlog.pop_front() {
             match terminal_event {
                 Event::Key(key) => {
                     if !navigation_limiter.allow(state, key) {
                         continue;
                     }
+                    actionable_events += 1;
                     let effects = state.handle_key(key);
                     for effect in effects {
                         if let Err(error) =
@@ -425,6 +434,7 @@ fn run_loop<B: Backend>(
                     redraw = true;
                 }
                 Event::Mouse(mouse) => {
+                    actionable_events += 1;
                     for effect in mouse_scroll_effects(state, mouse.kind) {
                         if let Err(error) =
                             handle_effect(state, storage, paths, bridge, effect.clone())
@@ -435,6 +445,7 @@ fn run_loop<B: Backend>(
                     redraw = true;
                 }
                 Event::Paste(text) => {
+                    actionable_events += 1;
                     let effects = state.handle_paste(&text);
                     for effect in effects {
                         if let Err(error) =
@@ -447,10 +458,18 @@ fn run_loop<B: Backend>(
                 }
                 // Resize/focus events can change terminal geometry or visual
                 // state without producing an application effect.
-                _ => redraw = true,
+                _ => {
+                    actionable_events += 1;
+                    redraw = true;
+                }
+            }
+            if actionable_events >= MAX_ACTIONABLE_TERMINAL_EVENTS_PER_FRAME
+                || terminal_slice_started.elapsed() >= MAX_TERMINAL_EVENT_SLICE
+            {
+                break;
             }
         }
-        terminal_burst_continues = terminal_burst.saturated;
+        terminal_burst_continues = terminal_burst.saturated || !terminal_backlog.is_empty();
     }
     // Give the latest coalesced snapshots a small, strictly bounded durability
     // window without making terminal shutdown depend on SQLite's busy timeout.
@@ -850,6 +869,8 @@ fn update_ask_writer_health(
 
 const MAX_AGENT_EVENTS_PER_FRAME: usize = 256;
 const MAX_AGENT_EVENT_SLICE: std::time::Duration = std::time::Duration::from_millis(8);
+const MAX_ACTIONABLE_TERMINAL_EVENTS_PER_FRAME: usize = 256;
+const MAX_TERMINAL_EVENT_SLICE: std::time::Duration = std::time::Duration::from_millis(8);
 // Read the entire common auto-repeat backlog in one pass so the navigation
 // limiter below can discard stale repeats and reach a trailing actionable key
 // without forcing an expensive Review redraw between chunks.
