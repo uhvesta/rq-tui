@@ -184,10 +184,12 @@ index. Remote versions use a bare cache plus detached worktrees. New versions
 carry annotations forward by content, follow renames, and mark missing or
 ambiguous anchors.
 
-Outbound asks, comment batches, and accepted context are persisted as pending
-before send and marked sent when the response begins. A restart never silently
-replays pending work: a recovery screen requires an explicit resend, discard,
-or defer decision.
+Outbound MAIN Chat prompts, asks, comment batches, and accepted context are
+persisted as pending before send and acknowledged when delivery begins. Queue
+edits update the Chat outbox atomically and cancellation removes the matching
+record. A restart never silently replays pending work: a recovery screen
+requires an explicit resend, discard, or defer decision. SIDE remains
+deliberately ephemeral and is not recovered as MAIN work.
 
 ## Deterministic UI inspection and tests
 

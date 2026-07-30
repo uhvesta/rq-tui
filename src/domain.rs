@@ -21,6 +21,14 @@ pub(crate) struct SessionRecord {
     pub(crate) created_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingChat {
+    pub(crate) id: String,
+    pub(crate) work_item_id: String,
+    pub(crate) text: String,
+    pub(crate) created_at: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ReviewContext {
     pub(crate) work_item_id: String,

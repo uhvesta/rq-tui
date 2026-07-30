@@ -330,6 +330,8 @@ impl TuiHarness {
 
     /// Simulates a fresh process reading the same persisted review database.
     pub fn restart(&mut self) -> Result<()> {
+        self.agent.pending.lock().expect("agent lock").clear();
+        self.active_stream = None;
         let work_item = self.state.work_item.clone();
         let mut state = AppState::new(work_item);
         for repo in &state.work_item.repos {
@@ -348,6 +350,7 @@ impl TuiHarness {
         state.pending_asks = self
             .storage
             .pending_ask_messages(&state.work_item.item.id)?;
+        state.pending_chats = self.storage.pending_chats(&state.work_item.item.id)?;
         state.pending_comment_ids = self
             .storage
             .pending_comment_delivery_ids(&state.work_item.item.id)?;
@@ -356,6 +359,7 @@ impl TuiHarness {
             .context_for_work_item(&state.work_item.item.id)?
             .is_some_and(|context| context.delivery_state == DeliveryState::Pending);
         if !state.pending_asks.is_empty()
+            || !state.pending_chats.is_empty()
             || !state.pending_comment_ids.is_empty()
             || state.pending_context
         {
@@ -469,6 +473,20 @@ impl TuiHarness {
                     parent_id: parent_id.into(),
                     side_id,
                     cleanup_warning: None,
+                },
+                activity: None,
+            },
+        )
+    }
+
+    pub fn inject_side_failed(&mut self, message: impl Into<String>) -> Result<()> {
+        crate::ui::handle_agent_envelope(
+            &mut self.state,
+            &self.storage,
+            AgentEventEnvelope {
+                lane: AgentLane::Main,
+                event: LaneEvent::SideFailed {
+                    message: message.into(),
                 },
                 activity: None,
             },
@@ -945,6 +963,7 @@ fn parse_key_spec(spec: &str) -> Result<KeyEvent> {
 ///   quiet <seconds>   backdate active progress for quiet/warning rendering
 ///   disconnect <text> inject a visible SDK disconnect/error
 ///   side-start        complete deterministic SIDE creation
+///   side-fail <text>  fail deterministic SIDE creation
 ///   side-exit         complete deterministic SIDE teardown
 ///   snapshot [label]  render the current frame into the output now
 pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Result<String> {
@@ -1130,6 +1149,9 @@ pub fn run_ui_script(fixture: &str, width: u16, height: u16, script: &str) -> Re
             }
             "side-start" => {
                 harness.inject_side_started("script-main", "script-side")?;
+            }
+            "side-fail" => {
+                harness.inject_side_failed(argument)?;
             }
             "side-exit" => {
                 harness.inject_side_exited("script-main", "script-side")?;
@@ -1835,6 +1857,41 @@ mod tests {
         let frame = harness.render().unwrap();
         assert!(frame.contains("Delivery recovery"));
         assert!(frame.contains("resend"));
+    }
+
+    #[test]
+    fn queued_chat_survives_restart_and_requires_an_explicit_recovery_choice() {
+        let mut harness =
+            TuiHarness::from_unified_diff("chat-recovery", workflow_diff(), 100, 24).unwrap();
+        harness.key(key(KeyCode::Tab)).unwrap();
+        harness.key(key(KeyCode::Char('i'))).unwrap();
+        type_text(&mut harness, "durable queued chat");
+        harness.key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            harness
+                .storage
+                .pending_chats(&harness.state.work_item.item.id)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        harness.restart().unwrap();
+        let recovery = harness.render().unwrap();
+        assert!(recovery.contains("Delivery recovery"));
+        assert!(recovery.contains("queued Chat"));
+        assert!(recovery.contains("durable queued chat"));
+        assert!(harness.agent.pending.lock().expect("agent lock").is_empty());
+
+        harness.key(key(KeyCode::Char('r'))).unwrap();
+        assert_eq!(harness.state.screen, crate::app::Screen::Review);
+        assert_eq!(harness.agent.pending.lock().expect("agent lock").len(), 1);
+        harness.stream_next_response(&["recovered answer"]).unwrap();
+        assert!(harness
+            .storage
+            .pending_chats(&harness.state.work_item.item.id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -11,7 +11,8 @@ use crate::chat_selection::{
 use crate::copilot::{ModelOption, ModelSelection};
 use crate::diff::{DiffFile, DiffSet, LineKind};
 use crate::domain::{
-    AnchorSide, Annotation, AnnotationKind, AskMessage, DeliveryState, Placement, Version,
+    AnchorSide, Annotation, AnnotationKind, AskMessage, DeliveryState, PendingChat, Placement,
+    Version,
 };
 use crate::review_stream::{
     InlineAnnotation, ReviewFile, ReviewRow, ReviewStream, SourceSide, StreamMovement,
@@ -134,6 +135,8 @@ pub(crate) enum Effect {
     AbortAgent,
     ResendPendingAsk(AskMessage),
     DiscardPendingAsk(String),
+    ResendPendingChat(PendingChat),
+    DiscardPendingChat(String),
     ResendPendingComments,
     DiscardPendingComments,
     ResendPendingContext,
@@ -532,6 +535,7 @@ pub(crate) struct AppState {
     pub(crate) pending_prefix: String,
     pub(crate) pending_prefix_started: Option<Instant>,
     pub(crate) pending_asks: Vec<AskMessage>,
+    pub(crate) pending_chats: Vec<PendingChat>,
     pub(crate) pending_comment_ids: Vec<String>,
     pub(crate) pending_context: bool,
     pub(crate) recovery_index: usize,
@@ -620,6 +624,7 @@ impl AppState {
             pending_prefix: String::new(),
             pending_prefix_started: None,
             pending_asks: Vec::new(),
+            pending_chats: Vec::new(),
             pending_comment_ids: Vec::new(),
             pending_context: false,
             recovery_index: 0,
@@ -1023,6 +1028,7 @@ impl AppState {
                 }
             })
             || self.pending_context
+            || !self.pending_chats.is_empty()
             || !self.pending_comment_ids.is_empty()
             || !self.pending_outbound_ids.is_empty()
             || self.chat.iter().any(|message| message.streaming)
@@ -2220,6 +2226,14 @@ impl AppState {
             });
         }
         let mut index = self.recovery_index.saturating_sub(self.pending_asks.len());
+        if let Some(chat) = self.pending_chats.get(index) {
+            return Some(if resend {
+                Effect::ResendPendingChat(chat.clone())
+            } else {
+                Effect::DiscardPendingChat(chat.id.clone())
+            });
+        }
+        index = index.saturating_sub(self.pending_chats.len());
         if !self.pending_comment_ids.is_empty() {
             if index == 0 {
                 return Some(if resend {
@@ -2239,6 +2253,7 @@ impl AppState {
 
     fn recovery_count(&self) -> usize {
         self.pending_asks.len()
+            + self.pending_chats.len()
             + usize::from(!self.pending_comment_ids.is_empty())
             + usize::from(self.pending_context)
     }

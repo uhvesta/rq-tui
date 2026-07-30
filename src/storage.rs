@@ -6,12 +6,13 @@ use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::domain::{
-    AnchorSide, Annotation, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState, Placement,
-    Repo, ReviewContext, SessionRecord, Version, VersionKind, WorkItem,
+    AnchorSide, Annotation, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState,
+    PendingChat, Placement, Repo, ReviewContext, SessionRecord, Version, VersionKind, WorkItem,
 };
 
 const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
 const MIGRATION_2: &str = include_str!("../migrations/0002_placement_side.sql");
+const MIGRATION_3: &str = include_str!("../migrations/0003_chat_outbox.sql");
 
 pub(crate) struct Storage {
     connection: Connection,
@@ -96,7 +97,7 @@ impl Storage {
                 applied_at TEXT NOT NULL
             );",
         )?;
-        for (version, sql) in [(1, MIGRATION_1), (2, MIGRATION_2)] {
+        for (version, sql) in [(1, MIGRATION_1), (2, MIGRATION_2), (3, MIGRATION_3)] {
             let applied = tx
                 .query_row(
                     "SELECT 1 FROM schema_migrations WHERE version = ?1",
@@ -524,6 +525,61 @@ impl Storage {
                 },
             )
             .optional()?)
+    }
+
+    pub(crate) fn enqueue_chat(&self, chat: &PendingChat) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO chat_outbox(id, work_item_id, text, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET text = excluded.text",
+            params![chat.id, chat.work_item_id, chat.text, chat.created_at],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn replace_queued_chat(
+        &self,
+        old_id: &str,
+        replacement: &PendingChat,
+    ) -> Result<()> {
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute("DELETE FROM chat_outbox WHERE id = ?1", [old_id])?;
+        tx.execute(
+            "INSERT INTO chat_outbox(id, work_item_id, text, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                replacement.id,
+                replacement.work_item_id,
+                replacement.text,
+                replacement.created_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_queued_chat(&self, id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM chat_outbox WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub(crate) fn pending_chats(&self, work_item_id: &str) -> Result<Vec<PendingChat>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, work_item_id, text, created_at
+             FROM chat_outbox
+             WHERE work_item_id = ?1
+             ORDER BY created_at, id",
+        )?;
+        let rows = statement.query_map([work_item_id], |row| {
+            Ok(PendingChat {
+                id: row.get(0)?,
+                work_item_id: row.get(1)?,
+                text: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub(crate) fn upsert_context(&self, context: &ReviewContext) -> Result<()> {
@@ -1298,7 +1354,7 @@ mod tests {
     use super::Storage;
     use crate::domain::{
         AnchorSide, Annotation, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState,
-        Placement, Repo, Version, VersionKind, WorkItem,
+        PendingChat, Placement, Repo, Version, VersionKind, WorkItem,
     };
 
     #[test]
@@ -1311,16 +1367,17 @@ mod tests {
                  WHERE type IN ('table', 'index')
                    AND name IN (
                      'work_items', 'sessions', 'repos', 'contexts', 'versions',
+                     'chat_outbox',
                      'annotations', 'placements', 'ask_messages', 'settings',
                      'versions_repo_version', 'placements_version',
                      'annotations_repo_submitted', 'ask_messages_annotation_seq',
-                     'work_items_last_opened'
+                     'work_items_last_opened', 'chat_outbox_work_item_created'
                    )",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 14);
+        assert_eq!(count, 16);
     }
 
     #[test]
@@ -1348,12 +1405,12 @@ mod tests {
         let count: i64 = storage
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2)",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2, 3)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
     }
 
     #[test]
@@ -1369,6 +1426,42 @@ mod tests {
         };
         storage.upsert_work_item(&item).unwrap();
         assert_eq!(storage.list_work_items().unwrap(), vec![item]);
+    }
+
+    #[test]
+    fn chat_outbox_replaces_and_clears_atomically() {
+        let storage = Storage::in_memory().unwrap();
+        let item = WorkItem {
+            id: "work-chat".into(),
+            name: "demo".into(),
+            workspace_root: PathBuf::from("/tmp/demo"),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            last_opened_at: None,
+        };
+        storage.upsert_work_item(&item).unwrap();
+        let original = PendingChat {
+            id: "chat-1".into(),
+            work_item_id: item.id.clone(),
+            text: "original".into(),
+            created_at: "1".into(),
+        };
+        storage.enqueue_chat(&original).unwrap();
+        assert_eq!(storage.pending_chats(&item.id).unwrap(), vec![original]);
+
+        let replacement = PendingChat {
+            id: "chat-2".into(),
+            work_item_id: item.id.clone(),
+            text: "replacement".into(),
+            created_at: "2".into(),
+        };
+        storage.replace_queued_chat("chat-1", &replacement).unwrap();
+        assert_eq!(
+            storage.pending_chats(&item.id).unwrap(),
+            vec![replacement.clone()]
+        );
+        storage.delete_queued_chat(&replacement.id).unwrap();
+        assert!(storage.pending_chats(&item.id).unwrap().is_empty());
     }
 
     #[test]

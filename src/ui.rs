@@ -39,8 +39,8 @@ use crate::copilot::{
 };
 use crate::diff::{DiffLine, LineKind};
 use crate::domain::{
-    AnnotationKind, AskMessage, BaseBranchSource, DeliveryState, Placement, ReviewContext,
-    SessionRecord,
+    AnnotationKind, AskMessage, BaseBranchSource, DeliveryState, PendingChat, Placement,
+    ReviewContext, SessionRecord,
 };
 use crate::export::{CommentExport, ExportFormat, ReviewArchive};
 use crate::git::Git;
@@ -78,11 +78,13 @@ pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> R
     load_version_choices(&mut state, storage)?;
     prompt_unseen_remote_version(&mut state);
     state.pending_asks = storage.pending_ask_messages(&state.work_item.item.id)?;
+    state.pending_chats = storage.pending_chats(&state.work_item.item.id)?;
     state.pending_comment_ids = storage.pending_comment_delivery_ids(&state.work_item.item.id)?;
     state.pending_context = storage
         .context_for_work_item(&state.work_item.item.id)?
         .is_some_and(|context| context.delivery_state == DeliveryState::Pending);
     let pending_deliveries = state.pending_asks.len()
+        + state.pending_chats.len()
         + usize::from(!state.pending_comment_ids.is_empty())
         + usize::from(state.pending_context);
     if pending_deliveries > 0 {
@@ -441,6 +443,14 @@ pub(crate) fn handle_effect(
         Effect::SendChat(text) => {
             if !text.trim().is_empty() {
                 let outbound = Outbound::new(OutboundKind::Chat, text.clone());
+                if !state.side_active && !state.side_starting {
+                    storage.enqueue_chat(&PendingChat {
+                        id: outbound.id.clone(),
+                        work_item_id: state.work_item.item.id.clone(),
+                        text: text.clone(),
+                        created_at: now(),
+                    })?;
+                }
                 let outbound_id = queue_outbound(state, bridge, outbound)?;
                 let entry = ChatEntry {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -901,6 +911,35 @@ pub(crate) fn handle_effect(
             );
             finish_recovery_item(state, &message.id);
             state.status = "Pending ask intentionally resent".into();
+        }
+        Effect::ResendPendingChat(chat) => {
+            let outbound = Outbound {
+                id: chat.id.clone(),
+                kind: OutboundKind::Chat,
+                text: chat.text.clone(),
+            };
+            let outbound_id = queue_outbound(state, bridge, outbound)?;
+            push_outbound_entry(
+                state,
+                ChatEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: "you (resent)".into(),
+                    text: chat.text,
+                    streaming: false,
+                    annotation_id: None,
+                    outbound_id: Some(outbound_id),
+                    error: None,
+                },
+            );
+            state.pending_chats.retain(|pending| pending.id != chat.id);
+            finish_recovery(state);
+            state.status = "Pending Chat prompt intentionally resent".into();
+        }
+        Effect::DiscardPendingChat(id) => {
+            storage.delete_queued_chat(&id)?;
+            state.pending_chats.retain(|pending| pending.id != id);
+            finish_recovery(state);
+            state.status = "Pending Chat prompt discarded without resending".into();
         }
         Effect::DiscardPendingAsk(message_id) => {
             storage.discard_pending_ask(&message_id)?;
@@ -1769,6 +1808,7 @@ fn finish_recovery_item(state: &mut AppState, message_id: &str) {
 
 fn finish_recovery(state: &mut AppState) {
     let count = state.pending_asks.len()
+        + state.pending_chats.len()
         + usize::from(!state.pending_comment_ids.is_empty())
         + usize::from(state.pending_context);
     state.recovery_index = state.recovery_index.min(count.saturating_sub(1));
@@ -2194,6 +2234,7 @@ pub(crate) fn handle_agent_event(
             state.status = format!("Agent message queued at position {}", position + 1);
         }
         AgentEvent::QueueCancelled { outbound_id } => {
+            storage.delete_queued_chat(&outbound_id)?;
             state.pending_outbound_ids.remove(&outbound_id);
             state.side_outbound_ids.remove(&outbound_id);
             state.agent_progress.queue_depth = state.agent_progress.queue_depth.saturating_sub(1);
@@ -2231,6 +2272,28 @@ pub(crate) fn handle_agent_event(
             replacement_id,
             position,
         } => {
+            let replacement_text = state
+                .chat
+                .iter()
+                .chain(state.pending_side_entries.iter())
+                .chain(state.main_chat.iter().flatten())
+                .find(|message| message.outbound_id.as_deref() == Some(replacement_id.as_str()))
+                .map(|message| message.text.clone());
+            if storage
+                .pending_chats(&state.work_item.item.id)?
+                .iter()
+                .any(|chat| chat.id == outbound_id)
+            {
+                storage.replace_queued_chat(
+                    &outbound_id,
+                    &PendingChat {
+                        id: replacement_id.clone(),
+                        work_item_id: state.work_item.item.id.clone(),
+                        text: replacement_text.unwrap_or_default(),
+                        created_at: now(),
+                    },
+                )?;
+            }
             if let Some(message) = state
                 .chat
                 .iter_mut()
@@ -2385,7 +2448,11 @@ pub(crate) fn handle_agent_event(
                     state.pending_context = false;
                     None
                 }
-                OutboundKind::Chat | OutboundKind::Correction => None,
+                OutboundKind::Chat => {
+                    storage.delete_queued_chat(&outbound_id)?;
+                    None
+                }
+                OutboundKind::Correction => None,
             };
             state.chat.push(ChatEntry {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -2479,6 +2546,7 @@ pub(crate) fn handle_agent_event(
             outbound_id,
             aborted,
         } => {
+            storage.delete_queued_chat(&outbound_id)?;
             state.pending_outbound_ids.remove(&outbound_id);
             state.side_outbound_ids.remove(&outbound_id);
             let completed_visible_turn = state.agent_progress.active_outbound_id.as_deref()
@@ -2528,6 +2596,9 @@ pub(crate) fn handle_agent_event(
             message,
             response_started,
         } => {
+            if response_started {
+                storage.delete_queued_chat(&outbound_id)?;
+            }
             state.pending_outbound_ids.remove(&outbound_id);
             state.side_outbound_ids.remove(&outbound_id);
             if outbound == OutboundKind::ContextDraft {
@@ -2888,6 +2959,18 @@ fn render_recovery(frame: &mut ratatui::Frame, state: &AppState) {
         })
         .collect::<Vec<_>>();
     let mut next_index = state.pending_asks.len();
+    for chat in &state.pending_chats {
+        let marker = if next_index == state.recovery_index {
+            "▶"
+        } else {
+            " "
+        };
+        items.push(ListItem::new(format!(
+            "{marker} queued Chat — {}",
+            chat.text.replace('\n', " ")
+        )));
+        next_index += 1;
+    }
     if !state.pending_comment_ids.is_empty() {
         let marker = if next_index == state.recovery_index {
             "▶"
@@ -2913,7 +2996,7 @@ fn render_recovery(frame: &mut ratatui::Frame, state: &AppState) {
     frame.render_widget(
         List::new(items).block(
             Block::default()
-                .title("Delivery recovery — these asks may not have been delivered")
+                .title("Delivery recovery — these messages may not have been delivered")
                 .borders(Borders::ALL),
         ),
         frame.area(),
@@ -5264,6 +5347,7 @@ mod tests {
         let storage = Storage::in_memory().unwrap();
         let agent = FakeAgent::default();
         let mut state = state_for_ui();
+        storage.upsert_work_item(&state.work_item.item).unwrap();
         handle_effect(
             &mut state,
             &storage,
