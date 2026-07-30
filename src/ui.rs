@@ -1569,6 +1569,7 @@ fn copy_to_clipboard(text: &str) -> Result<ClipboardDelivery> {
 }
 
 fn copy_with_native_clipboard(text: &str) -> Result<&'static str> {
+    const CLIPBOARD_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
     let candidates: &[(&'static str, &[&str])] = if cfg!(target_os = "macos") {
         &[("pbcopy", &[])]
     } else {
@@ -1579,22 +1580,50 @@ fn copy_with_native_clipboard(text: &str) -> Result<&'static str> {
         ]
     };
     for (program, args) in candidates {
-        let Ok(mut child) = Command::new(program)
-            .args(*args)
-            .stdin(Stdio::piped())
-            .spawn()
-        else {
-            continue;
-        };
-        let wrote = child
-            .stdin
-            .take()
-            .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
-        if wrote && child.wait().is_ok_and(|status| status.success()) {
+        if run_clipboard_candidate(program, args, text, CLIPBOARD_TIMEOUT) {
             return Ok(program);
         }
     }
     anyhow::bail!("no native clipboard backend accepted the text")
+}
+
+fn run_clipboard_candidate(
+    program: &str,
+    args: &[&str],
+    text: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    let Ok(mut child) = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .spawn()
+    else {
+        return false;
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    };
+    let payload = text.as_bytes().to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&payload).is_ok());
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return status.success() && writer.join().unwrap_or(false);
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = writer.join();
+                return false;
+            }
+        }
+    }
 }
 
 fn markdown_preview_source(state: &AppState) -> Result<String> {
@@ -4914,7 +4943,7 @@ mod tests {
 
     use super::{
         handle_agent_envelope, handle_agent_event, handle_effect, handle_effect_failure,
-        markdown_to_html, parse_review_context, render,
+        markdown_to_html, parse_review_context, render, run_clipboard_candidate,
     };
     use crate::app::{tests_support::state_for_ui, ChatEntry, Effect, Focus, Screen};
     use crate::config::AppPaths;
@@ -5141,6 +5170,22 @@ mod tests {
             state.focus,
             Focus::Diff,
             "a stale MAIN snapshot must not restore during a later layout reset"
+        );
+    }
+
+    #[test]
+    fn hung_clipboard_backend_is_killed_within_the_timeout() {
+        let started = std::time::Instant::now();
+        let copied = run_clipboard_candidate(
+            "sh",
+            &["-c", "sleep 5"],
+            &"x".repeat(1_000_000),
+            std::time::Duration::from_millis(50),
+        );
+        assert!(!copied);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "clipboard timeout must not stall the TUI"
         );
     }
 
