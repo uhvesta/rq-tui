@@ -4354,20 +4354,6 @@ impl AppState {
         self.scroll = 0;
     }
 
-    fn toggle_review_chat(&mut self) {
-        self.screen = match self.screen {
-            Screen::Review => Screen::Chat,
-            Screen::Chat => Screen::Review,
-            other => other,
-        };
-        self.focus = if self.screen == Screen::Chat {
-            Focus::Chat
-        } else {
-            Focus::Diff
-        };
-        self.clear_visual_selection();
-    }
-
     fn move_review_focus(&mut self, direction: char) {
         if self.screen != Screen::Review {
             self.status = "CTRL-W only moves Review windows · use Tab/gc/gr for Chat".into();
@@ -4970,11 +4956,10 @@ impl AppState {
     }
 
     fn cursor_on_fold(&self) -> bool {
-        self.current_file()
-            .and_then(|file| file.visible_lines().nth(self.cursor))
-            .is_some_and(|line| {
-                line.kind == LineKind::Meta && line.content.contains("unchanged lines")
-            })
+        matches!(
+            self.review_stream().rows().get(self.review_cursor),
+            Some(ReviewRow::Fold { .. })
+        )
     }
 
     pub(crate) fn next_context_lines(&mut self, all: bool) -> usize {
@@ -5032,37 +5017,32 @@ impl AppState {
                 .chat_layout
                 .as_ref()
                 .map_or_else(String::new, |layout| {
-                    let selection = self.chat_selection.clone().or_else(|| {
-                        let message_id = self
-                            .chat_navigation
-                            .as_ref()
-                            .map(|cursor| cursor.point.message_id.clone())
-                            .or_else(|| {
-                                self.chat
-                                    .get(self.chat_cursor)
-                                    .map(|entry| ChatMessageId::new(entry.id.clone()))
-                            })?;
-                        let mut rows = layout
-                            .rows
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, row)| row.message_id == message_id)
-                            .filter_map(|(row, _)| layout.row_bounds(row));
-                        let (start, mut end) = rows.next()?;
-                        for (_, row_end) in rows {
-                            end = row_end;
-                        }
-                        let mut selection = ChatSelection::character(start);
-                        selection.active = end;
-                        Some(selection)
-                    });
-                    selection.map_or_else(String::new, |selection| {
-                        selection.copy(
+                    if let Some(selection) = self.chat_selection.clone() {
+                        return selection.copy(
                             layout,
                             CopyPolicy {
                                 include_speaker_labels: true,
                             },
+                        );
+                    }
+                    let message_id = self
+                        .chat_navigation
+                        .as_ref()
+                        .map(|cursor| cursor.point.message_id.clone())
+                        .or_else(|| {
+                            self.chat
+                                .get(self.chat_cursor)
+                                .map(|entry| ChatMessageId::new(entry.id.clone()))
+                        });
+                    message_id.map_or_else(String::new, |message_id| {
+                        ChatSelection::copy_message(
+                            layout,
+                            &message_id,
+                            CopyPolicy {
+                                include_speaker_labels: true,
+                            },
                         )
+                        .unwrap_or_default()
                     })
                 });
             self.input_mode = InputMode::Normal;
@@ -5429,6 +5409,7 @@ mod tests {
     use crate::context_editor::ContextField;
     use crate::diff::{DiffLine, LineKind};
     use crate::domain::{AskMessage, DeliveryState};
+    use crate::review_stream::ReviewRow;
 
     fn state() -> AppState {
         state_for_ui()
@@ -5721,13 +5702,26 @@ mod tests {
                 content: "⋯ 6 unchanged lines".into(),
             },
         ];
+        app.invalidate_review_cache();
         app.sync_review_cursor_to_current_file();
         app.screen = Screen::Review;
         app.focus = Focus::Diff;
         app.input_mode = InputMode::Normal;
 
-        app.handle_key(key(KeyCode::Char('j')));
+        let fold_cursor = app
+            .review_stream()
+            .rows()
+            .iter()
+            .position(|row| matches!(row, ReviewRow::Fold { .. }))
+            .expect("fixture includes a semantic fold row");
+        app.review_cursor = fold_cursor;
+        let fold_row = app.review_stream().rows()[fold_cursor].clone();
+        app.sync_source_from_review_row(&fold_row);
         assert_eq!(app.cursor, 1, "the fold must map after the prior hunk line");
+        assert!(
+            app.cursor_on_fold(),
+            "semantic review cursor must identify the fold"
+        );
         assert_eq!(
             app.handle_key(key(KeyCode::Char('o'))),
             vec![Effect::ExpandContext { all: false }]

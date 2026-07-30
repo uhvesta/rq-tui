@@ -7,7 +7,8 @@ use base64::Engine as _;
 use crossterm::cursor::Show;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -224,13 +225,21 @@ pub(crate) fn run(
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        // Ask terminals that implement the kitty keyboard protocol to report
+        // repeat/release events. Unsupported terminals ignore this private
+        // CSI sequence and continue through the bounded legacy fallback.
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+        )
     ) {
         disable_raw_mode().ok();
         execute!(
             io::stdout(),
             DisableBracketedPaste,
             DisableMouseCapture,
+            PopKeyboardEnhancementFlags,
             LeaveAlternateScreen,
             Show
         )
@@ -246,6 +255,7 @@ pub(crate) fn run(
                 io::stdout(),
                 DisableBracketedPaste,
                 DisableMouseCapture,
+                PopKeyboardEnhancementFlags,
                 LeaveAlternateScreen,
                 Show
             )
@@ -262,6 +272,7 @@ pub(crate) fn run(
             io::stdout(),
             DisableBracketedPaste,
             DisableMouseCapture,
+            PopKeyboardEnhancementFlags,
             LeaveAlternateScreen,
             Show
         )
@@ -283,6 +294,7 @@ pub(crate) fn run(
         terminal.backend_mut(),
         DisableBracketedPaste,
         DisableMouseCapture,
+        PopKeyboardEnhancementFlags,
         LeaveAlternateScreen
     );
     let cursor_result = terminal.show_cursor();
@@ -303,6 +315,8 @@ fn run_loop<B: Backend>(
 ) -> Result<()> {
     let mut redraw = true;
     let mut next_periodic_redraw = std::time::Instant::now();
+    let mut navigation_limiter = NavigationBurstLimiter::default();
+    let mut terminal_burst_continues = false;
     while !state.should_quit {
         // A noisy tool or streaming source must not starve drawing and input.
         // Bound both the count and wall-clock slice: some events synchronously
@@ -352,9 +366,10 @@ fn run_loop<B: Backend>(
                 .saturating_duration_since(std::time::Instant::now())
                 .min(std::time::Duration::from_millis(100))
         };
-        let events = read_terminal_burst(poll_timeout)?;
-        let mut navigation_limiter = NavigationBurstLimiter::default();
-        for terminal_event in events {
+        let terminal_burst = read_terminal_burst(poll_timeout)?;
+        let has_terminal_events = !terminal_burst.events.is_empty();
+        navigation_limiter.begin_burst(terminal_burst_continues, has_terminal_events);
+        for terminal_event in terminal_burst.events {
             match terminal_event {
                 Event::Key(key) => {
                     if !navigation_limiter.allow(state, key) {
@@ -396,6 +411,7 @@ fn run_loop<B: Backend>(
                 _ => redraw = true,
             }
         }
+        terminal_burst_continues = terminal_burst.saturated;
     }
     Ok(())
 }
@@ -411,30 +427,66 @@ const MAX_TERMINAL_BURST: usize = 4_096;
 // sequences while bounding stale held-key backlogs to a tiny amount of work.
 const MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST: usize = 32;
 
-fn read_terminal_burst(timeout: std::time::Duration) -> Result<Vec<Event>> {
+struct TerminalBurst {
+    events: Vec<Event>,
+    saturated: bool,
+}
+
+fn read_terminal_burst(timeout: std::time::Duration) -> Result<TerminalBurst> {
     if !event::poll(timeout)? {
-        return Ok(Vec::new());
+        return Ok(TerminalBurst {
+            events: Vec::new(),
+            saturated: false,
+        });
     }
     let mut events = Vec::with_capacity(16);
     events.push(event::read()?);
     while events.len() < MAX_TERMINAL_BURST && event::poll(std::time::Duration::ZERO)? {
         events.push(event::read()?);
     }
-    Ok(events)
+    Ok(TerminalBurst {
+        saturated: events.len() == MAX_TERMINAL_BURST,
+        events,
+    })
 }
 
 #[derive(Default)]
 struct NavigationBurstLimiter {
     counts: Vec<(KeyCode, KeyModifiers, usize)>,
+    held: Option<(KeyCode, KeyModifiers)>,
 }
 
 impl NavigationBurstLimiter {
+    fn begin_burst(&mut self, continuation: bool, has_events: bool) {
+        if !continuation {
+            self.counts.clear();
+        }
+        if !has_events {
+            self.held = None;
+        }
+    }
+
     fn allow(&mut self, state: &AppState, key: KeyEvent) -> bool {
         if key.kind == KeyEventKind::Release {
+            if self.held == Some((key.code, key.modifiers)) {
+                self.held = None;
+            }
+            self.counts
+                .retain(|(code, modifiers, _)| *code != key.code || *modifiers != key.modifiers);
             return false;
         }
         if !is_navigation_key(state, &key) {
             return true;
+        }
+        let current = (key.code, key.modifiers);
+        match key.kind {
+            KeyEventKind::Press => self.held = Some(current),
+            KeyEventKind::Repeat if self.held != Some(current) => {
+                // A repeat without a preceding press is stale input from
+                // before this reducer started observing the stream.
+                return false;
+            }
+            KeyEventKind::Repeat | KeyEventKind::Release => {}
         }
         if let Some((_, _, count)) = self
             .counts
@@ -5327,11 +5379,16 @@ fn review_row_lines_with_search(
         ReviewRow::Fold {
             hidden_lines, text, ..
         } => {
-            let label = if text.contains("unchanged lines") {
-                text.clone()
-            } else {
-                format!("··· {hidden_lines} unchanged lines ···  {text}")
-            };
+            // Fold text can come from either the parser or a persisted/mock
+            // row. Rebuild the visible label from the semantic count and keep
+            // only the action hint, so a preformatted label can never be
+            // emitted twice in unified mode.
+            let hint = text
+                .split_once('(')
+                .and_then(|(_, suffix)| suffix.strip_suffix(')'))
+                .filter(|suffix| suffix.contains("o expand") && suffix.contains("O expand"))
+                .unwrap_or("o expand 10 · O expand all");
+            let label = format!("··· {hidden_lines} unchanged lines ··· ({hint})");
             vec![styled_full_row(
                 format!("{} {label}", if selected { "❯" } else { " " }),
                 width,
@@ -7173,7 +7230,7 @@ mod tests {
     use anyhow::Result;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
     use ratatui::backend::TestBackend;
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Modifier};
     use ratatui::Terminal;
 
     use super::{
@@ -7287,6 +7344,165 @@ mod tests {
         assert!(content.contains("demo — Review"));
         assert!(content.contains("unified"));
         assert!(content.contains("a ask"));
+    }
+
+    #[test]
+    fn production_review_renderer_keeps_ask_follow_up_inside_the_block() {
+        let mut state = state_for_ui();
+        state.annotations.push((
+            Annotation {
+                id: "production-ask".into(),
+                repo_id: "r".into(),
+                kind: AnnotationKind::Ask,
+                file_path: "a.rs".into(),
+                anchor_snippet: "two".into(),
+                anchor_hash: "hash".into(),
+                anchor_start_offset: 0,
+                anchor_line_count: 1,
+                text: None,
+                submitted: true,
+                delivery_state: DeliveryState::Sent,
+                created_at: "2026-01-01T00:00:00Z".into(),
+            },
+            Placement {
+                annotation_id: "production-ask".into(),
+                version_id: "v".into(),
+                side: AnchorSide::New,
+                line_start: 2,
+                line_end: 2,
+                outdated: false,
+                ambiguous: false,
+            },
+        ));
+        state.ask_threads.insert(
+            "production-ask".into(),
+            vec![
+                AskMessage {
+                    id: "ask-question".into(),
+                    annotation_id: "production-ask".into(),
+                    seq: 0,
+                    role: "user".into(),
+                    text: "why?".into(),
+                    sent: true,
+                    delivery_state: DeliveryState::Sent,
+                    ts: "2026-01-01T00:00:00Z".into(),
+                },
+                AskMessage {
+                    id: "ask-answer".into(),
+                    annotation_id: "production-ask".into(),
+                    seq: 1,
+                    role: "assistant".into(),
+                    text: "because it keeps the boundary explicit".into(),
+                    sent: true,
+                    delivery_state: DeliveryState::Sent,
+                    ts: "2026-01-01T00:00:01Z".into(),
+                },
+            ],
+        );
+        state.invalidate_review_cache();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut highlighter = PlainHighlighter;
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Ask · a.rs R2"));
+        assert!(content.contains("because it keeps the boundary explicit"));
+        assert!(content.contains("❯ follow up · press i or Enter"));
+    }
+
+    #[test]
+    fn production_chat_renderer_keeps_markdown_semantics_tables_and_yy_bytes() {
+        let mut state = state_for_ui();
+        state.screen = Screen::Chat;
+        state.focus = Focus::Chat;
+        state.chat.push(ChatEntry {
+            id: "production-j5-j8".into(),
+            role: "copilot".into(),
+            text: "# SemanticJ6Heading\n\n**SemanticJ6Bold**\n\n| J7 A | Status |\n| --- | --- |\n| row | aligned |\n".into(),
+            streaming: false,
+            annotation_id: None,
+            outbound_id: None,
+            error: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut highlighter = PlainHighlighter;
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let lines = (0..24)
+            .map(|row| {
+                (0..100)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        let heading_row = lines
+            .iter()
+            .position(|line| line.contains("SemanticJ6Heading"))
+            .expect("heading is present in the production Chat frame");
+        let heading_column = lines[heading_row]
+            .find("SemanticJ6Heading")
+            .expect("heading column");
+        let heading_cell = &buffer[(heading_column as u16, heading_row as u16)];
+        assert_eq!(heading_cell.fg, Color::LightYellow);
+        assert!(heading_cell.modifier.contains(Modifier::BOLD));
+
+        let bold_row = lines
+            .iter()
+            .position(|line| line.contains("SemanticJ6Bold"))
+            .expect("emphasis is present in the production Chat frame");
+        let bold_column = lines[bold_row]
+            .find("SemanticJ6Bold")
+            .expect("emphasis column");
+        let bold_cell = &buffer[(bold_column as u16, bold_row as u16)];
+        assert!(bold_cell.modifier.contains(Modifier::BOLD));
+
+        let table_rows = lines
+            .iter()
+            .filter(|line| line.contains("J7 A") || line.contains("│ row") || line.contains('├'))
+            .collect::<Vec<_>>();
+        assert_eq!(table_rows.len(), 3, "table snapshot: {table_rows:?}");
+        let table_boundaries = |line: &str| {
+            line.chars()
+                .enumerate()
+                .filter_map(|(column, character)| {
+                    matches!(character, '│' | '├' | '┼' | '┤').then_some(column)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            table_boundaries(table_rows[0]),
+            table_boundaries(table_rows[1]),
+            "table header and separator boundaries differ: {table_rows:?}"
+        );
+        assert_eq!(
+            table_boundaries(table_rows[0]),
+            table_boundaries(table_rows[2]),
+            "table body and header boundaries differ: {table_rows:?}"
+        );
+        assert!(table_rows[1].contains("├") && table_rows[1].contains("┼"));
+        assert!(!table_rows.iter().any(|line| line.contains('·')));
+
+        let first_yank = state.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(first_yank.is_empty());
+        let second_yank = state.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(
+            second_yank,
+            vec![Effect::Yank(
+                "SemanticJ6Heading\n\nSemanticJ6Bold\n\nJ7 A Status\n\nrow aligned\n".into()
+            )]
+        );
     }
 
     #[test]
@@ -8115,6 +8331,11 @@ mod tests {
     fn held_navigation_is_bounded_per_ready_terminal_burst() {
         let state = state_for_ui();
         let mut limiter = NavigationBurstLimiter::default();
+        limiter.begin_burst(false, true);
+        assert!(limiter.allow(
+            &state,
+            KeyEvent::new_with_kind(KeyCode::Char('j'), KeyModifiers::NONE, KeyEventKind::Press,)
+        ));
         let repeated = (0..100)
             .filter(|_| {
                 limiter.allow(
@@ -8127,7 +8348,21 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(repeated, MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST);
+        assert_eq!(repeated, MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST - 1);
+        // A burst that filled the terminal read buffer can continue in the
+        // next loop iteration. Keep the limiter's cap across that continuation
+        // instead of resetting it and replaying the stale backlog forever.
+        limiter.begin_burst(true, true);
+        assert!((0..100).all(|_| {
+            !limiter.allow(
+                &state,
+                KeyEvent::new_with_kind(
+                    KeyCode::Char('j'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Repeat,
+                ),
+            )
+        }));
         assert!(!limiter.allow(
             &state,
             KeyEvent::new_with_kind(
@@ -8135,6 +8370,15 @@ mod tests {
                 KeyModifiers::NONE,
                 KeyEventKind::Release,
             )
+        ));
+        assert!(!limiter.allow(
+            &state,
+            KeyEvent::new_with_kind(KeyCode::Char('j'), KeyModifiers::NONE, KeyEventKind::Repeat,)
+        ));
+        limiter.begin_burst(false, false);
+        assert!(limiter.allow(
+            &state,
+            KeyEvent::new_with_kind(KeyCode::Char('j'), KeyModifiers::NONE, KeyEventKind::Press,)
         ));
 
         let mut composing = state_for_ui();
@@ -8166,7 +8410,7 @@ mod tests {
             hunk: 0,
             line: 4,
             hidden_lines: 173,
-            text: "··· 173 unchanged lines ··· (o expand 10 · O expand all)".into(),
+            text: "··· 173 unchanged lines ···  ··· 173 unchanged lines ··· (o expand 10 · O expand all)".into(),
         };
         let mut highlighter = PlainHighlighter;
         let rendered = review_row_lines(&row, None, 100, 0, &mut highlighter);
@@ -8176,6 +8420,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert_eq!(text.matches("173 unchanged lines").count(), 1);
+        assert_eq!(text.matches("o expand 10").count(), 1);
     }
 
     #[test]

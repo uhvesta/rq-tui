@@ -1156,14 +1156,14 @@ fn rendered_message_bounds(
     layout: &ChatLayout,
     message_id: &ChatMessageId,
 ) -> Option<(usize, usize, usize, usize)> {
-    let rows = layout
+    let mut rows = layout
         .rows
         .iter()
         .enumerate()
         .filter(|(_, row)| row.message_id == *message_id)
         .filter_map(|(index, _)| layout.row_bounds(index).map(|bounds| (index, bounds)));
     let (first_row, (start, _)) = rows.clone().next()?;
-    let (last_row, (_, end)) = rows.last()?;
+    let (last_row, (_, end)) = rows.next_back()?;
     let first_source = layout.rows[first_row]
         .cells
         .iter()
