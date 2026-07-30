@@ -7195,8 +7195,8 @@ mod tests {
     };
     use crate::diff::{DiffLine, LineKind};
     use crate::domain::{
-        AnchorSide, Annotation, AnnotationKind, DeliveryState, PendingChat, Placement, Version,
-        VersionKind, WorkItem,
+        AnchorSide, Annotation, AnnotationKind, AskMessage, DeliveryState, PendingChat, Placement,
+        Version, VersionKind, WorkItem,
     };
     use crate::highlight::{Highlighter, PlainHighlighter, StyledSegment};
     use crate::review_stream::{ReviewRow, ReviewRowKey};

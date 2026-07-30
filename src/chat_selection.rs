@@ -6,6 +6,7 @@
 //! terminal width changes.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 
@@ -253,6 +254,7 @@ impl ChatSelection {
             return String::new();
         };
         let mut messages = Vec::<CopiedMessage>::new();
+        let mut pending_breaks = HashMap::<ChatMessageId, usize>::new();
 
         for row in selected.clone() {
             let Some(row_data) = layout.rows.get(row) else {
@@ -278,6 +280,12 @@ impl ChatSelection {
                 }
             }
             if chunks.is_empty() {
+                if row_data.break_after == RowBreak::Hard {
+                    pending_breaks
+                        .entry(row_data.message_id.clone())
+                        .and_modify(|breaks| *breaks = (*breaks).max(1))
+                        .or_insert(1);
+                }
                 continue;
             }
 
@@ -295,6 +303,23 @@ impl ChatSelection {
                 });
                 messages.last_mut().expect("message was just pushed")
             };
+            let explicit_breaks = entry
+                .chunks
+                .last()
+                .and_then(|previous| {
+                    layout
+                        .message(&message_id)
+                        .and_then(|message| message.text.get(previous.end..chunks[0].start))
+                })
+                .map(|gap| gap.bytes().filter(|byte| *byte == b'\n').count())
+                .unwrap_or_default();
+            let break_count = pending_breaks
+                .remove(&message_id)
+                .unwrap_or_default()
+                .max(explicit_breaks);
+            if break_count > 0 && !entry.chunks.is_empty() {
+                entry.hard_breaks.push((entry.chunks.len(), break_count));
+            }
             entry.chunks.extend(chunks);
             if row_data.break_after == RowBreak::Hard
                 && row.saturating_add(1) < selected.end
@@ -303,7 +328,10 @@ impl ChatSelection {
                     .get(row.saturating_add(1))
                     .is_some_and(|next_row| next_row.message_id == message_id)
             {
-                entry.hard_breaks.push(entry.chunks.len());
+                pending_breaks
+                    .entry(message_id)
+                    .and_modify(|breaks| *breaks = (*breaks).max(1))
+                    .or_insert(1);
             }
         }
 
@@ -328,8 +356,24 @@ impl ChatSelection {
                 continue;
             };
             for (chunk_index, source_range) in message.chunks.iter().enumerate() {
-                if chunk_index > 0 && message.hard_breaks.contains(&chunk_index) {
-                    output.push('\n');
+                if let Some((_, count)) = message
+                    .hard_breaks
+                    .iter()
+                    .find(|(break_index, _)| *break_index == chunk_index)
+                {
+                    output.extend(std::iter::repeat_n('\n', *count));
+                } else if chunk_index > 0 {
+                    let previous_end = message.chunks[chunk_index - 1].end;
+                    if source_message
+                        .text
+                        .get(previous_end..source_range.start)
+                        .is_some_and(|gap| gap.contains('|'))
+                    {
+                        // Pipe-table separators are Markdown decoration, but
+                        // the cell boundary still needs one plain-text space
+                        // when a whole row is copied.
+                        output.push(' ');
+                    }
                 }
                 let start = source_range.start.min(source_message.text.len());
                 let end = source_range.end.min(source_message.text.len());
@@ -341,10 +385,65 @@ impl ChatSelection {
                 }
             }
         }
+        if self.mode != ChatSelectionMode::Line
+            && messages.len() == 1
+            && rendered_message_bounds(layout, &messages[0].message_id).is_some_and(
+                |(first_row, last_row, first_source, last_source)| {
+                    let (low, high) = layout.ordered_points(&self.anchor, &self.active);
+                    self.anchor.message_id == messages[0].message_id
+                        && self.active.message_id == messages[0].message_id
+                        && selected.start == first_row
+                        && selected.end == last_row.saturating_add(1)
+                        && low.byte_offset == first_source
+                        && high.byte_offset == last_source
+                },
+            )
+        {
+            let (_, _, first_source, last_source) =
+                rendered_message_bounds(layout, &messages[0].message_id)
+                    .expect("whole-message bounds were checked above");
+            if let Some(source_message) = layout.message(&messages[0].message_id) {
+                let leading_breaks = source_message.text[..first_source]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count();
+                let trailing_breaks = source_message.text[last_source..]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count();
+                if leading_breaks > 0 {
+                    output = format!("{}{}", "\n".repeat(leading_breaks), output);
+                }
+                output.extend(std::iter::repeat_n('\n', trailing_breaks));
+            }
+        }
         if self.mode == ChatSelectionMode::Line && !output.is_empty() && !output.ends_with('\n') {
             output.push('\n');
         }
         output
+    }
+
+    /// Copy every selectable cell belonging to one transcript message.
+    ///
+    /// `yy` is a semantic whole-message operation, not a visual-row
+    /// operation. Markdown can create empty display rows for blank lines and
+    /// can leave the final newline without a selectable cell, so the whole
+    /// message helper preserves those explicit source newlines while still
+    /// omitting Markdown-only decoration.
+    pub fn copy_message(
+        layout: &ChatLayout,
+        message_id: &ChatMessageId,
+        policy: CopyPolicy,
+    ) -> Option<String> {
+        layout.message(message_id)?;
+        let (first_row, last_row, _, _) = rendered_message_bounds(layout, message_id)?;
+        let (start, end) = (
+            layout.row_bounds(first_row)?.0,
+            layout.row_bounds(last_row)?.1,
+        );
+        let mut selection = Self::character(start);
+        selection.active = end;
+        Some(selection.copy(layout, policy))
     }
 
     fn selected_rows(&self, layout: &ChatLayout) -> Option<Range<usize>> {
@@ -1050,7 +1149,36 @@ impl ChatLayout {
 struct CopiedMessage {
     message_id: ChatMessageId,
     chunks: Vec<SourceRange>,
-    hard_breaks: Vec<usize>,
+    hard_breaks: Vec<(usize, usize)>,
+}
+
+fn rendered_message_bounds(
+    layout: &ChatLayout,
+    message_id: &ChatMessageId,
+) -> Option<(usize, usize, usize, usize)> {
+    let rows = layout
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.message_id == *message_id)
+        .filter_map(|(index, _)| layout.row_bounds(index).map(|bounds| (index, bounds)));
+    let (first_row, (start, _)) = rows.clone().next()?;
+    let (last_row, (_, end)) = rows.last()?;
+    let first_source = layout.rows[first_row]
+        .cells
+        .iter()
+        .filter_map(|cell| cell.source)
+        .map(|source| source.start)
+        .min()?;
+    let last_source = layout.rows[last_row]
+        .cells
+        .iter()
+        .filter_map(|cell| cell.source)
+        .map(|source| source.end)
+        .max()?;
+    debug_assert_eq!(start.byte_offset, first_source);
+    debug_assert_eq!(end.byte_offset, last_source);
+    Some((first_row, last_row, first_source, last_source))
 }
 
 fn is_word_char(character: char) -> bool {
@@ -1509,6 +1637,52 @@ mod tests {
                 }
             ),
             "hello\nthere\n\nanswer"
+        );
+    }
+
+    #[test]
+    fn whole_message_copy_preserves_markdown_line_breaks_and_trailing_newline() {
+        let text = "# Heading\n\n**bold**\n";
+        let layout = ChatLayout::new(
+            40,
+            vec![message("m", "copilot", text)],
+            vec![
+                ChatRow::new(
+                    "m",
+                    BlockId(0),
+                    vec![ChatCell::source(SourceRange::new(2, 9), 7)],
+                    RowBreak::Soft,
+                ),
+                ChatRow::new("m", BlockId(0), Vec::new(), RowBreak::Soft),
+                ChatRow::new(
+                    "m",
+                    BlockId(0),
+                    vec![ChatCell::source(SourceRange::new(13, 17), 4)],
+                    RowBreak::End,
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            ChatSelection::copy_message(&layout, &ChatMessageId::new("m"), CopyPolicy::default()),
+            Some("Heading\n\nbold\n".into())
+        );
+    }
+
+    #[test]
+    fn whole_message_copy_returns_none_when_markdown_has_no_selectable_cells() {
+        let text = "```rust\n```";
+        let layout = ChatLayout::new(
+            40,
+            vec![message("m", "copilot", text)],
+            vec![ChatRow::new("m", BlockId(0), Vec::new(), RowBreak::End)],
+        )
+        .unwrap();
+
+        assert_eq!(
+            ChatSelection::copy_message(&layout, &ChatMessageId::new("m"), CopyPolicy::default()),
+            None
         );
     }
 
