@@ -4384,10 +4384,10 @@ fn handle_session_event(
                 .map(str::to_owned);
         }
         send_activity(
-                active,
-                AgentActivity {
-                    kind: ActivityKind::Intent,
-                    label: "Assistant turn started".into(),
+            active,
+            AgentActivity {
+                kind: ActivityKind::Intent,
+                label: "Assistant turn started".into(),
                 tool: None,
                 detail: event
                     .data

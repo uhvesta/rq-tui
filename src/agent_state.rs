@@ -18,16 +18,11 @@ pub(crate) enum AgentLane {
     Side,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum VisibleLane {
+    #[default]
     Main,
     Side,
-}
-
-impl Default for VisibleLane {
-    fn default() -> Self {
-        Self::Main
-    }
 }
 
 impl VisibleLane {
@@ -642,7 +637,8 @@ impl AgentState {
         detail: impl Into<String>,
         now: Instant,
     ) -> bool {
-        self.record_activity_for(lane, None, outbound_id, phase, summary, detail, now)
+        self.lane_mut(lane)
+            .record_activity(now, outbound_id, phase, summary, detail)
     }
 
     pub(crate) fn record_activity_side(
@@ -654,29 +650,8 @@ impl AgentState {
         detail: impl Into<String>,
         now: Instant,
     ) -> bool {
-        self.record_activity_for(
-            AgentLane::Side,
-            Some(generation),
-            outbound_id,
-            phase,
-            summary,
-            detail,
-            now,
-        )
-    }
-
-    fn record_activity_for(
-        &mut self,
-        lane: AgentLane,
-        generation: Option<&SideGeneration>,
-        outbound_id: Option<&str>,
-        phase: AgentPhase,
-        summary: impl Into<String>,
-        detail: impl Into<String>,
-        now: Instant,
-    ) -> bool {
-        let state = self.lane_mut(lane);
-        state.accepts_generation(generation)
+        let state = self.lane_mut(AgentLane::Side);
+        state.accepts_generation(Some(generation))
             && state.record_activity(now, outbound_id, phase, summary, detail)
     }
 
@@ -761,6 +736,15 @@ mod tests {
         assert!(state.fail_side(&side, "side-1", "tool crashed", at(8)));
         assert_eq!(state.main().progress().phase, main_phase);
         assert_eq!(state.main().progress().last_event_at, main_last_event);
+        assert_eq!(state.side().lifecycle(), LaneLifecycle::Failed);
+        assert_eq!(
+            state
+                .side()
+                .failed_turns()
+                .next_back()
+                .map(|turn| turn.message.as_str()),
+            Some("tool crashed")
+        );
         assert_eq!(
             state.queue_label(AgentLane::Side, "side-1"),
             QueueLabel::Failed
@@ -835,13 +819,21 @@ mod tests {
         let mut state = AgentState::new(at(0));
         state.connect(AgentLane::Main, at(1));
         let side = state.begin_side("side-session", at(2));
+        let main_activity_at = at(3);
         state.record_activity(
             AgentLane::Main,
             None,
             AgentPhase::Responding,
             "Streaming",
             "Receiving tokens",
-            at(3),
+            main_activity_at,
+        );
+        assert_eq!(
+            state
+                .main()
+                .progress()
+                .elapsed(main_activity_at + Duration::from_secs(7)),
+            Duration::from_secs(7)
         );
         state.record_activity_side(
             &side,
@@ -862,6 +854,41 @@ mod tests {
         }
         assert_eq!(state.main().progress().last_event_at, main_last);
         assert_eq!(state.side().progress().last_event_at, side_last);
+    }
+
+    #[test]
+    fn successful_main_and_side_turns_settle_and_side_generation_closes() {
+        let mut state = AgentState::new(at(0));
+        state.connect(AgentLane::Main, at(1));
+        assert!(state.enqueue(AgentLane::Main, "main-1", at(2)));
+        assert_eq!(
+            state.start_next(AgentLane::Main, at(3)).as_deref(),
+            Some("main-1")
+        );
+        assert!(state.complete(AgentLane::Main, "main-1", at(4)));
+        assert_eq!(state.main().lifecycle(), LaneLifecycle::Idle);
+
+        let side = state.begin_side("side-session", at(5));
+        assert!(state.enqueue_side(&side, "side-1", at(6)));
+        assert_eq!(
+            state.start_next_side(&side, at(7)).as_deref(),
+            Some("side-1")
+        );
+        assert_eq!(
+            state.request_stop_side(&side, at(8)).as_deref(),
+            Some("side-1")
+        );
+        assert!(state.complete_side(&side, "side-1", at(9)));
+        assert!(state.end_side(&side, at(10)));
+        assert_eq!(state.side().connection(), LaneConnection::Disconnected);
+        assert_eq!(state.side().lifecycle(), LaneLifecycle::Idle);
+        assert!(!state.end_side(
+            &SideGeneration {
+                session_id: "stale".into(),
+                generation: side.generation,
+            },
+            at(11)
+        ));
     }
 
     #[test]

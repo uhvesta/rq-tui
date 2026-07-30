@@ -555,16 +555,21 @@ def main() -> int:
                 "COMMAND MODE · Command palette", BURST_RESPONSE_TIMEOUT
             )
             child.send(b"\x1b")
-            child.wait_for_screen("NORMAL", timeout=4)
+            # A generic NORMAL marker can survive in a differential terminal
+            # model while the command popup is still closing. Require the
+            # reducer's explicit acknowledgement before sending the next key;
+            # this also catches Escape-sequence timing regressions.
+            child.wait_for_screen("Command palette closed", timeout=4)
 
             # PTY-31: the key that changes mode and the text following it can
             # arrive in one terminal read. Process that burst online so the
             # composer receives every character instead of dropping the text
             # against the previous Normal-mode snapshot.
             child.send(b"aIMMEDIATE_INPUT")
+            child.wait_for_screen("INSERT  Enter/Ctrl-S", timeout=2)
             child.wait_for_screen("IMMEDIATE_INPUT", timeout=2)
             child.send(b"\x03")
-            child.wait_for_screen("NORMAL", timeout=4)
+            child.wait_for_screen("Draft cancelled", timeout=4)
 
             # PTY-30: the spec-required Ctrl-W focus chord must acknowledge
             # its pending state and then move between the file tree and diff.
