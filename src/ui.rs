@@ -6174,6 +6174,28 @@ fn fit_terminal_text(text: &str, width: usize) -> String {
     result
 }
 
+fn truncate_terminal_text(text: &str, width: usize) -> String {
+    if cell_width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let content_width = width.saturating_sub(1);
+    let mut result = String::new();
+    let mut used = 0usize;
+    for (_, grapheme) in grapheme_indices(text) {
+        let grapheme_width = cell_width(grapheme);
+        if used.saturating_add(grapheme_width) > content_width {
+            break;
+        }
+        result.push_str(grapheme);
+        used = used.saturating_add(grapheme_width);
+    }
+    result.push('…');
+    result
+}
+
 fn truncate_styled_line(mut line: Line<'static>, width: usize) -> Line<'static> {
     if line.width() <= width {
         return line;
@@ -7164,6 +7186,11 @@ fn render_chat_composer(frame: &mut ratatui::Frame, state: &mut AppState, area: 
             (title, Color::DarkGray)
         }
     };
+    let title = if area.width >= 60 {
+        truncate_terminal_text(&title, area.width.saturating_sub(4) as usize)
+    } else {
+        title
+    };
     let display = if state.input_mode == InputMode::Command {
         let command = terminal_text_tail(&state.command, inner_width.saturating_sub(2));
         vec![Line::styled(
@@ -7911,9 +7938,9 @@ mod tests {
         handle_agent_event, handle_agent_event_with_persistence, handle_effect,
         handle_effect_failure, load_model_preferences, load_ui_preferences, markdown_to_html,
         mouse_scroll_effects, open_browser_preview, render, review_row_lines,
-        run_clipboard_candidate, search_ranges, table_cells, wait_for_ask_retry_signal,
-        AskResponseUpdate, AskResponseWriter, AskResponseWriterSignal, NavigationBurstLimiter,
-        MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST,
+        run_clipboard_candidate, search_ranges, table_cells, truncate_terminal_text,
+        wait_for_ask_retry_signal, AskResponseUpdate, AskResponseWriter, AskResponseWriterSignal,
+        NavigationBurstLimiter, MAX_IDENTICAL_NAVIGATION_KEYS_PER_BURST,
     };
     use crate::app::{
         tests_support::state_for_ui, AgentPhase, ChatEntry, ComposeTarget, DiffLayout, Effect,
@@ -8234,6 +8261,15 @@ mod tests {
     fn unicode_search_highlights_map_folded_bytes_back_to_source_bytes() {
         assert_eq!(search_ranges("AİB", "i\u{307}"), vec![1..3]);
         assert_eq!(search_ranges("Éclair", "é"), vec![0..2]);
+    }
+
+    #[test]
+    fn terminal_titles_end_with_an_ellipsis_instead_of_hard_clipping() {
+        assert_eq!(
+            truncate_terminal_text(" INSERT · Enter send · Shift-Enter newline ", 20),
+            " INSERT · Enter sen…"
+        );
+        assert_eq!(truncate_terminal_text("短い", 8), "短い");
     }
 
     #[test]
