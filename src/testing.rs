@@ -3880,7 +3880,8 @@ mod tests {
             }]))
             .unwrap();
         let markdown = harness.render().unwrap();
-        assert!(markdown.contains("# Result"));
+        assert!(markdown.contains("Result"));
+        assert!(!markdown.contains("# Result"));
         assert!(markdown.contains("• safe item"));
         assert!(markdown.contains("guide↗"));
         assert!(markdown.contains("│ Check │ Status │"));

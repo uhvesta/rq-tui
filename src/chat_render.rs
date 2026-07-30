@@ -102,9 +102,9 @@ pub(crate) fn render_markdown_mapped(
         elided: Vec::new(),
     };
     let mut fence: Option<Fence> = None;
-    let mut table_columns = None;
     let mut source_line_start = 0usize;
     let source_lines = text.split('\n').collect::<Vec<_>>();
+    let table_lines = table_line_layouts(&source_lines);
 
     // `split` (rather than `lines`) deliberately retains a final empty item,
     // which makes explicit trailing blank lines visible in the transcript.
@@ -114,7 +114,6 @@ pub(crate) fn render_markdown_mapped(
             .is_some_and(|active_fence| is_fence(source_line, active_fence.marker))
         {
             fence = None;
-            table_columns = None;
             mapped.elided.push(SourceRange::new(
                 source_line_start,
                 source_line_start + source_line.len(),
@@ -123,7 +122,6 @@ pub(crate) fn render_markdown_mapped(
             continue;
         }
         if let Some(active_fence) = fence.as_mut() {
-            table_columns = None;
             let expanded = expand_tabs_with_sources(source_line, source_line_start);
             let segments = highlighter
                 .highlight_line(&active_fence.path, active_fence.line_number, &expanded.text)
@@ -137,7 +135,6 @@ pub(crate) fn render_markdown_mapped(
         }
 
         if let Some((marker, info)) = opening_fence(source_line) {
-            table_columns = None;
             fence = Some(Fence {
                 marker,
                 path: synthetic_path(info),
@@ -151,28 +148,12 @@ pub(crate) fn render_markdown_mapped(
             continue;
         }
 
-        let separator_columns = table_separator_columns(source_line);
-        let row_columns = table_column_count(source_line);
-        let next_separator_columns = source_lines
-            .get(index + 1)
-            .and_then(|next| table_separator_columns(next));
-        let table_kind = if separator_columns.is_some() && separator_columns == table_columns {
-            Some(TableLineKind::Separator)
-        } else if row_columns.is_some()
-            && (row_columns == table_columns || row_columns == next_separator_columns)
-        {
-            table_columns = row_columns;
-            Some(TableLineKind::Row)
-        } else {
-            table_columns = None;
-            None
-        };
         render_text_line_mapped(
             source_line,
             source_line_start,
             width,
             &mut mapped,
-            table_kind,
+            table_lines[index].as_ref(),
         );
         source_line_start = source_line_start.saturating_add(source_line.len() + 1);
     }
@@ -198,7 +179,7 @@ fn render_text_line_mapped(
     source_line_start: usize,
     width: usize,
     mapped: &mut MappedMarkdown,
-    table_kind: Option<TableLineKind>,
+    table_line: Option<&TableLine>,
 ) {
     if source_line.is_empty() {
         mapped.rows.push(MappedRow {
@@ -212,7 +193,7 @@ fn render_text_line_mapped(
         source_line,
         source_line_start,
         &mut mapped.elided,
-        table_kind,
+        table_line,
     );
     atoms = coalesce_display_clusters(atoms);
     push_wrapped_atoms(&mut mapped.rows, atoms, width);
@@ -222,42 +203,48 @@ fn markdown_atoms(
     line: &str,
     source_line_start: usize,
     elided: &mut Vec<SourceRange>,
-    table_kind: Option<TableLineKind>,
+    table_line: Option<&TableLine>,
 ) -> Vec<RenderAtom> {
     let leading = line.len() - line.trim_start_matches(' ').len();
     let (indent, rest) = line.split_at(leading);
     let normal = Style::default().fg(Color::Rgb(210, 210, 210));
 
-    match table_kind {
-        Some(TableLineKind::Separator) => {
-            let mut atoms = direct_atoms_at(indent, source_line_start, 0, normal);
-            atoms.extend(table_separator_atoms(rest, source_line_start + leading));
-            return atoms;
+    if let Some(table_line) = table_line {
+        match table_line.kind {
+            TableLineKind::Separator => {
+                let mut atoms = direct_atoms_at(indent, source_line_start, 0, normal);
+                atoms.extend(table_separator_atoms(
+                    rest,
+                    source_line_start + leading,
+                    &table_line.layout,
+                ));
+                return atoms;
+            }
+            TableLineKind::Row => {
+                let mut atoms = direct_atoms_at(indent, source_line_start, 0, normal);
+                atoms.extend(table_row_atoms(
+                    rest,
+                    source_line_start + leading,
+                    normal,
+                    elided,
+                    &table_line.layout,
+                ));
+                return atoms;
+            }
         }
-        Some(TableLineKind::Row) => {
-            let mut atoms = direct_atoms_at(indent, source_line_start, 0, normal);
-            atoms.extend(table_row_atoms(
-                rest,
-                source_line_start + leading,
-                leading,
-                normal,
-                elided,
-            ));
-            return atoms;
-        }
-        None => {}
     }
 
     if let Some((level, content)) = heading(rest) {
         let content_offset = line.len().saturating_sub(content.len());
-        let style = Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD);
-        let mut atoms = decoration_atoms(
-            format!("{}{} ", indent, "#".repeat(level)),
-            SourceRange::new(source_line_start, source_line_start + content_offset),
-            style,
-        );
+        let style = heading_style(level);
+        // Markdown syntax is source-only. Keeping it in `elided` means
+        // source-Markdown copy can still recover it without leaking literal
+        // heading markers into the terminal presentation.
+        elided.push(SourceRange::new(
+            source_line_start + leading,
+            source_line_start + content_offset,
+        ));
+        let mut atoms = direct_atoms_at(indent, source_line_start, 0, style);
         atoms.extend(inline_atoms(
             content,
             source_line_start + content_offset,
@@ -336,6 +323,18 @@ fn markdown_atoms(
     atoms
 }
 
+fn heading_style(level: usize) -> Style {
+    let color = match level {
+        1 => Color::LightYellow,
+        2 => Color::Yellow,
+        3 => Color::LightCyan,
+        4 => Color::Cyan,
+        5 => Color::LightBlue,
+        _ => Color::Blue,
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
 fn quote_content(line: &str) -> Option<(usize, &str)> {
     let mut depth = 0;
     let mut content = line;
@@ -346,118 +345,310 @@ fn quote_content(line: &str) -> Option<(usize, &str)> {
     (depth > 0).then_some((depth, content))
 }
 
-fn table_separator_columns(line: &str) -> Option<usize> {
-    let cells = table_cell_texts(line)?;
-    cells
-        .iter()
-        .all(|cell| {
-            let rule = cell.trim().trim_matches(':');
-            rule.len() >= 3 && rule.bytes().all(|byte| byte == b'-')
-        })
-        .then_some(cells.len())
+#[derive(Clone, Debug)]
+struct TableCell {
+    start: usize,
+    end: usize,
+    separator_before: Option<usize>,
+    separator_after: Option<usize>,
 }
 
-fn table_column_count(line: &str) -> Option<usize> {
-    table_cell_texts(line).map(|cells| cells.len())
+#[derive(Clone, Debug)]
+struct ParsedTableRow {
+    cells: Vec<TableCell>,
 }
 
-fn table_cell_texts(line: &str) -> Option<Vec<String>> {
-    let mut trimmed = line.trim();
-    if let Some(without_prefix) = trimmed.strip_prefix('|') {
-        trimmed = without_prefix;
-    }
-    if let Some(without_suffix) = trimmed.strip_suffix('|') {
-        trimmed = without_suffix;
-    }
-    let mut cells = Vec::new();
-    let mut cell = String::new();
-    for (offset, character) in trimmed.char_indices() {
-        if character == '|' && !escaped_pipe(trimmed, offset) {
-            cells.push(cell.trim().to_owned());
-            cell.clear();
-        } else {
-            cell.push(character);
-        }
-    }
-    cells.push(cell.trim().to_owned());
-    (cells.len() >= 2).then_some(cells)
+#[derive(Clone, Debug)]
+struct TableLayout {
+    widths: Vec<usize>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum TableLineKind {
     Row,
     Separator,
 }
 
-fn table_separator_atoms(line: &str, source_start: usize) -> Vec<RenderAtom> {
-    let style = Style::default().fg(Color::DarkGray);
-    let mut atoms = Vec::new();
-    for (offset, character) in line.char_indices() {
-        let rendered = match character {
-            '|' => "┼",
-            '-' => "─",
-            ':' => "·",
-            _ => {
-                atoms.extend(direct_atoms_at(
-                    &line[offset..offset + character.len_utf8()],
-                    source_start + offset,
-                    offset,
-                    style,
-                ));
-                continue;
+#[derive(Clone, Debug)]
+struct TableLine {
+    kind: TableLineKind,
+    layout: TableLayout,
+}
+
+fn table_line_layouts(lines: &[&str]) -> Vec<Option<TableLine>> {
+    let mut output = vec![None; lines.len()];
+    let mut fence = None;
+    let mut index = 0;
+    while index < lines.len() {
+        if let Some(marker) = fence {
+            if is_fence(lines[index], marker) {
+                fence = None;
             }
+            index += 1;
+            continue;
+        }
+        if let Some((marker, _)) = opening_fence(lines[index]) {
+            fence = Some(marker);
+            index += 1;
+            continue;
+        }
+
+        let Some(header) = parse_table_row(lines[index]) else {
+            index += 1;
+            continue;
         };
-        atoms.extend(decoration_atoms(
-            rendered,
-            SourceRange::new(
-                source_start + offset,
-                source_start + offset + character.len_utf8(),
-            ),
-            style,
-        ));
+        let Some(separator) = lines
+            .get(index + 1)
+            .and_then(|line| parse_table_row(line))
+            .filter(|row| table_separator_row(lines[index + 1], row))
+        else {
+            index += 1;
+            continue;
+        };
+        if header.cells.len() != separator.cells.len() {
+            index += 1;
+            continue;
+        }
+
+        let table_start = index;
+        let mut table_end = index + 2;
+        while let Some(row) = lines.get(table_end).and_then(|line| parse_table_row(line)) {
+            if row.cells.len() != header.cells.len() || table_separator_row(lines[table_end], &row)
+            {
+                break;
+            }
+            table_end += 1;
+        }
+        let layout = table_layout(&lines[table_start..table_end], 1);
+        for (line_index, output_line) in output
+            .iter_mut()
+            .enumerate()
+            .take(table_end)
+            .skip(table_start)
+        {
+            *output_line = Some(TableLine {
+                kind: if line_index == table_start + 1 {
+                    TableLineKind::Separator
+                } else {
+                    TableLineKind::Row
+                },
+                layout: layout.clone(),
+            });
+        }
+        index = table_end;
     }
+    output
+}
+
+fn table_layout(lines: &[&str], separator_index: usize) -> TableLayout {
+    let columns = parse_table_row(lines[0])
+        .map(|row| row.cells.len())
+        .unwrap_or_default();
+    let mut widths = vec![1; columns];
+    for (line_index, line) in lines.iter().enumerate() {
+        if line_index == separator_index {
+            continue;
+        }
+        let Some(row) = parse_table_row(line) else {
+            continue;
+        };
+        for (column, cell) in row.cells.iter().enumerate() {
+            let mut ignored = Vec::new();
+            let atoms = inline_atoms(
+                &line[cell.start..cell.end],
+                cell.start,
+                0,
+                Style::default(),
+                &mut ignored,
+            );
+            let width = atoms
+                .iter()
+                .map(|atom| terminal_cell_width_text(&atom.text))
+                .sum::<usize>();
+            widths[column] = widths[column].max(width.max(1));
+        }
+    }
+    TableLayout { widths }
+}
+
+fn table_separator_row(line: &str, row: &ParsedTableRow) -> bool {
+    row.cells.iter().all(|cell| {
+        let rule = line[cell.start..cell.end].trim_matches(':');
+        rule.len() >= 3 && rule.bytes().all(|byte| byte == b'-')
+    })
+}
+
+#[cfg(test)]
+fn table_cell_texts(line: &str) -> Option<Vec<String>> {
+    parse_table_row(line).map(|row| {
+        row.cells
+            .iter()
+            .map(|cell| line[cell.start..cell.end].to_owned())
+            .collect()
+    })
+}
+
+fn parse_table_row(line: &str) -> Option<ParsedTableRow> {
+    let content_start = line.len() - line.trim_start().len();
+    let content_end = line.trim_end().len();
+    if content_start >= content_end {
+        return None;
+    }
+
+    let mut body_start = content_start;
+    let leading_pipe = line.as_bytes().get(body_start) == Some(&b'|');
+    let separator_before = leading_pipe.then(|| {
+        let offset = body_start;
+        body_start += 1;
+        offset
+    });
+    let mut body_end = content_end;
+    let trailing_pipe = body_end > body_start
+        && line.as_bytes().get(body_end - 1) == Some(&b'|')
+        && !escaped_pipe(line, body_end - 1);
+    let separator_after_last = trailing_pipe.then(|| {
+        body_end -= 1;
+        body_end
+    });
+
+    let mut cells = Vec::new();
+    let mut cell_start = body_start;
+    let mut cell_separator_before = separator_before;
+    for (offset, character) in line[body_start..body_end].char_indices() {
+        if character != '|' || escaped_pipe(line, body_start + offset) {
+            continue;
+        }
+        let separator = body_start + offset;
+        let (start, end) = trimmed_range(line, cell_start, separator);
+        cells.push(TableCell {
+            start,
+            end,
+            separator_before: cell_separator_before,
+            separator_after: Some(separator),
+        });
+        cell_start = separator + 1;
+        cell_separator_before = Some(separator);
+    }
+    let (start, end) = trimmed_range(line, cell_start, body_end);
+    cells.push(TableCell {
+        start,
+        end,
+        separator_before: cell_separator_before,
+        separator_after: separator_after_last,
+    });
+    (cells.len() >= 2).then_some(ParsedTableRow { cells })
+}
+
+fn trimmed_range(line: &str, start: usize, end: usize) -> (usize, usize) {
+    let mut start = start;
+    let mut end = end;
+    while start < end && line.as_bytes()[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && line.as_bytes()[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    (start, end)
+}
+
+fn table_separator_atoms(line: &str, source_start: usize, layout: &TableLayout) -> Vec<RenderAtom> {
+    let style = Style::default().fg(Color::DarkGray);
+    let Some(row) = parse_table_row(line) else {
+        return Vec::new();
+    };
+    let mut atoms = Vec::new();
+    let first_source = row
+        .cells
+        .first()
+        .and_then(|cell| cell.separator_before)
+        .map(|offset| source_range(source_start, offset, offset + 1));
+    push_table_glyph(&mut atoms, "├", first_source, style);
+    for (column, cell) in row.cells.iter().enumerate() {
+        let cell_source = Some(source_range(source_start, cell.start, cell.end));
+        for _ in 0..layout.widths[column].saturating_add(2) {
+            push_table_glyph(&mut atoms, "─", cell_source.clone(), style);
+        }
+        if column + 1 < row.cells.len() {
+            let junction = row.cells[column]
+                .separator_after
+                .or(row.cells[column + 1].separator_before)
+                .map(|offset| source_range(source_start, offset, offset + 1));
+            push_table_glyph(&mut atoms, "┼", junction, style);
+        }
+    }
+    let last_source = row
+        .cells
+        .last()
+        .and_then(|cell| cell.separator_after)
+        .map(|offset| source_range(source_start, offset, offset + 1));
+    push_table_glyph(&mut atoms, "┤", last_source, style);
     atoms
+}
+
+fn push_table_glyph(
+    atoms: &mut Vec<RenderAtom>,
+    glyph: &str,
+    source: Option<SourceRange>,
+    style: Style,
+) {
+    if let Some(source) = source {
+        atoms.extend(decoration_atoms(glyph, source, style));
+    } else {
+        atoms.push(RenderAtom::synthetic(glyph, style));
+    }
 }
 
 fn table_row_atoms(
     line: &str,
     source_start: usize,
-    initial_source_column: usize,
     style: Style,
     elided: &mut Vec<SourceRange>,
+    layout: &TableLayout,
 ) -> Vec<RenderAtom> {
+    let Some(row) = parse_table_row(line) else {
+        return direct_atoms_at(line, source_start, 0, style);
+    };
     let mut atoms = Vec::new();
-    let mut segment_start = 0;
-    for (offset, character) in line.char_indices() {
-        if character != '|' || escaped_pipe(line, offset) {
-            continue;
-        }
-        if segment_start < offset {
-            atoms.extend(inline_atoms(
-                &line[segment_start..offset],
-                source_start + segment_start,
-                source_column_at(line, segment_start, initial_source_column),
-                style,
-                elided,
-            ));
-        }
-        atoms.extend(decoration_atoms(
-            "│",
-            SourceRange::new(source_start + offset, source_start + offset + 1),
-            Style::default().fg(Color::Cyan),
-        ));
-        segment_start = offset + 1;
-    }
-    if segment_start < line.len() {
-        atoms.extend(inline_atoms(
-            &line[segment_start..],
-            source_start + segment_start,
-            source_column_at(line, segment_start, initial_source_column),
+    let border_style = Style::default().fg(Color::Cyan);
+    let first_border = row
+        .cells
+        .first()
+        .and_then(|cell| cell.separator_before)
+        .map(|offset| source_range(source_start, offset, offset + 1));
+    push_table_glyph(&mut atoms, "│", first_border, border_style);
+    for (column, cell) in row.cells.iter().enumerate() {
+        atoms.push(RenderAtom::synthetic(" ", style));
+        let cell_atoms = inline_atoms(
+            &line[cell.start..cell.end],
+            source_start + cell.start,
+            0,
             style,
             elided,
-        ));
+        );
+        let cell_width = cell_atoms
+            .iter()
+            .map(|atom| terminal_cell_width_text(&atom.text))
+            .sum::<usize>();
+        atoms.extend(cell_atoms);
+        for _ in 0..layout.widths[column].saturating_sub(cell_width) {
+            atoms.push(RenderAtom::synthetic(" ", style));
+        }
+        atoms.push(RenderAtom::synthetic(" ", style));
+        let border = if column + 1 < row.cells.len() {
+            row.cells[column]
+                .separator_after
+                .or(row.cells[column + 1].separator_before)
+        } else {
+            cell.separator_after
+        }
+        .map(|offset| source_range(source_start, offset, offset + 1));
+        push_table_glyph(&mut atoms, "│", border, border_style);
     }
     atoms
+}
+
+fn source_range(source_start: usize, start: usize, end: usize) -> SourceRange {
+    SourceRange::new(source_start + start, source_start + end)
 }
 
 fn escaped_pipe(line: &str, offset: usize) -> bool {
@@ -699,6 +890,8 @@ fn inline_atoms(
             )
         } else if rest.starts_with("**") {
             ("**", base_style.add_modifier(Modifier::BOLD))
+        } else if rest.starts_with("__") {
+            ("__", base_style.add_modifier(Modifier::BOLD))
         } else if rest.starts_with('`') {
             (
                 "`",
@@ -964,7 +1157,7 @@ fn push_wrapped_atoms(rows: &mut Vec<MappedRow>, atoms: Vec<RenderAtom>, width: 
             emitted = true;
         }
         let column_start = current_width;
-        current.push(Span::styled(atom.text, atom.style));
+        append_styled_span(&mut current, atom.text, atom.style);
         if atom_width > 0 {
             cells.push(MappedCell {
                 columns: column_start..column_start + atom_width,
@@ -979,6 +1172,14 @@ fn push_wrapped_atoms(rows: &mut Vec<MappedRow>, atoms: Vec<RenderAtom>, width: 
             line: Line::from(current),
             cells,
         });
+    }
+}
+
+fn append_styled_span(spans: &mut Vec<Span<'static>>, text: String, style: Style) {
+    if let Some(previous) = spans.last_mut().filter(|span| span.style == style) {
+        previous.content.to_mut().push_str(&text);
+    } else {
+        spans.push(Span::styled(text, style));
     }
 }
 
@@ -1179,7 +1380,7 @@ mod tests {
         assert_eq!(
             rendered,
             [
-                "# Heading",
+                "Heading",
                 "",
                 "☑ done",
                 "2. next",
@@ -1190,15 +1391,77 @@ mod tests {
         assert!(lines[5]
             .spans
             .iter()
-            .any(|span| { span.style.add_modifier.contains(Modifier::BOLD) }));
+            .any(|span| span.content.as_ref() == "bold"
+                && span.style.add_modifier.contains(Modifier::BOLD)));
         assert!(lines[5]
             .spans
             .iter()
-            .any(|span| { span.style.add_modifier.contains(Modifier::ITALIC) }));
+            .any(|span| span.content.as_ref() == "italic"
+                && span.style.add_modifier.contains(Modifier::ITALIC)));
         assert!(lines[5]
             .spans
             .iter()
             .any(|span| span.style.bg == Some(Color::Rgb(40, 45, 55))));
+    }
+
+    #[test]
+    fn headings_hide_markers_and_keep_semantic_styles_and_mappings() {
+        let source = "# Heading\n## **Bold _heading_**";
+        let mut highlighter = RecordingHighlighter::default();
+        let mapped = render_markdown_mapped(source, 80, &mut highlighter);
+
+        assert_eq!(mapped_text(&mapped), "Heading\nBold heading");
+        assert!(!mapped_text(&mapped).contains('#'));
+        assert!(mapped.rows[0].line.spans.iter().any(|span| {
+            span.content.as_ref() == "Heading"
+                && span.style.fg == Some(Color::LightYellow)
+                && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(mapped.rows[1].line.spans.iter().any(|span| {
+            span.content.as_ref() == "Bold "
+                && span.style.fg == Some(Color::Yellow)
+                && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(mapped.rows[1].line.spans.iter().any(|span| {
+            span.content.as_ref() == "heading"
+                && span.style.add_modifier.contains(Modifier::BOLD)
+                && span.style.add_modifier.contains(Modifier::ITALIC)
+        }));
+        assert!(mapped.elided.contains(&SourceRange::new(0, 2)));
+        for range in [
+            SourceRange::new(10, 13),
+            SourceRange::new(13, 15),
+            SourceRange::new(20, 21),
+            SourceRange::new(28, 29),
+            SourceRange::new(29, 31),
+        ] {
+            assert!(mapped.elided.contains(&range), "missing {range:?}");
+        }
+        for offset in 2..9 {
+            assert!(source_ranges(&mapped).contains(&SourceRange::new(offset, offset + 1)));
+        }
+        let bold_start = source.find("Bold").unwrap();
+        for offset in bold_start..bold_start + "Bold".len() {
+            assert!(source_ranges(&mapped).contains(&SourceRange::new(offset, offset + 1)));
+        }
+    }
+
+    #[test]
+    fn double_underscore_bold_and_single_underscore_emphasis_keep_distinct_styles() {
+        let mut highlighter = RecordingHighlighter::default();
+        let mapped = render_markdown_mapped("__bold__ and _emphasis_", 80, &mut highlighter);
+        assert_eq!(mapped_text(&mapped), "bold and emphasis");
+        let row = mapped.rows.first().unwrap();
+        assert!(row.line.spans.iter().any(|span| {
+            span.content.as_ref() == "bold"
+                && span.style.add_modifier.contains(Modifier::BOLD)
+                && !span.style.add_modifier.contains(Modifier::ITALIC)
+        }));
+        assert!(row.line.spans.iter().any(|span| {
+            span.content.as_ref() == "emphasis"
+                && span.style.add_modifier.contains(Modifier::ITALIC)
+                && !span.style.add_modifier.contains(Modifier::BOLD)
+        }));
     }
 
     #[test]
@@ -1277,10 +1540,14 @@ mod tests {
 
         assert_eq!(mapped_text(&mapped), "See docs↗ now");
         let row = mapped.rows.first().expect("one link row");
-        assert!(row.line.spans[4..8].iter().all(|span| {
-            span.style.add_modifier.contains(Modifier::BOLD)
-                && span.style.add_modifier.contains(Modifier::UNDERLINED)
-        }));
+        let docs_span = row
+            .line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "docs")
+            .expect("semantic link label span");
+        assert!(docs_span.style.add_modifier.contains(Modifier::BOLD));
+        assert!(docs_span.style.add_modifier.contains(Modifier::UNDERLINED));
         let label_start = source.find("docs").unwrap();
         for offset in label_start..label_start + "docs".len() {
             assert!(
@@ -1380,14 +1647,21 @@ mod tests {
 
         assert_eq!(mapped_text(&mapped), "bold nested");
         let row = mapped.rows.first().unwrap();
-        assert!(row.line.spans[..5]
+        let outer_span = row
+            .line
+            .spans
             .iter()
-            .all(|span| span.style.add_modifier.contains(Modifier::BOLD)));
-        assert!(row.line.spans[5..].iter().all(|span| span
-            .style
-            .add_modifier
-            .contains(Modifier::BOLD)
-            && span.style.add_modifier.contains(Modifier::ITALIC)));
+            .find(|span| span.content.as_ref() == "bold ")
+            .expect("outer emphasis span");
+        assert!(outer_span.style.add_modifier.contains(Modifier::BOLD));
+        let nested_span = row
+            .line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "nested")
+            .expect("nested emphasis span");
+        assert!(nested_span.style.add_modifier.contains(Modifier::BOLD));
+        assert!(nested_span.style.add_modifier.contains(Modifier::ITALIC));
     }
 
     #[test]
@@ -1398,9 +1672,9 @@ mod tests {
         let rendered = mapped_text(&mapped);
 
         assert!(rendered.contains("│ Name │ Result │"));
-        assert!(rendered.contains("┼ ·─── ┼ ───· ┼"));
-        assert!(rendered.contains("│ api │ safe │"));
-        assert!(rendered.contains("│ a|b │ exact │"));
+        assert!(rendered.contains("├──────┼────────┤"));
+        assert!(rendered.contains("│ api  │ safe   │"));
+        assert!(rendered.contains("│ a|b  │ exact  │"));
         assert!(rendered.contains("│ │ nested quote"));
         for needle in ["Name", "Result", "api", "safe", "exact", "nested quote"] {
             let start = source.find(needle).unwrap();
@@ -1415,6 +1689,47 @@ mod tests {
         assert!(mapped
             .elided
             .contains(&SourceRange::new(escape, escape + 1)));
+    }
+
+    #[test]
+    fn table_separator_uses_the_same_column_boundaries_as_rows() {
+        let source = "| short | much longer |\n| --- | --- |\n| x | y |";
+        let mut highlighter = RecordingHighlighter::default();
+        let mapped = render_markdown_mapped(source, 80, &mut highlighter);
+        let rendered = mapped
+            .rows
+            .iter()
+            .map(|row| text(&row.line))
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered[0], "│ short │ much longer │");
+        assert_eq!(rendered[1], "├───────┼─────────────┤");
+        assert_eq!(rendered[2], "│ x     │ y           │");
+        let vertical_columns = |line: &str| {
+            line.chars()
+                .enumerate()
+                .filter_map(|(column, character)| (character == '│').then_some(column))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(vertical_columns(&rendered[0]), vec![0, 8, 22]);
+        assert_eq!(
+            rendered[1]
+                .chars()
+                .enumerate()
+                .filter_map(
+                    |(column, character)| (matches!(character, '├' | '┼' | '┤')).then_some(column),
+                )
+                .collect::<Vec<_>>(),
+            vec![0, 8, 22]
+        );
+        assert_eq!(vertical_columns(&rendered[2]), vec![0, 8, 22]);
+        let long_start = source.find("much longer").unwrap();
+        for offset in long_start..long_start + "much longer".len() {
+            assert!(source_ranges(&mapped).contains(&SourceRange::new(offset, offset + 1)));
+        }
+        assert!(source_ranges(&mapped).iter().any(|range| range.start
+            == source.find("---").unwrap()
+            && range.end >= range.start + 3));
     }
 
     #[test]
@@ -1441,7 +1756,10 @@ mod tests {
         let source = "A | B\n--- | ---\n文 | 档";
         let mut highlighter = RecordingHighlighter::default();
         let mapped = render_markdown_mapped(source, 80, &mut highlighter);
-        assert_eq!(mapped_text(&mapped), "A │ B\n─── ┼ ───\n文 │ 档");
+        assert_eq!(
+            mapped_text(&mapped),
+            "│ A  │ B  │\n├────┼────┤\n│ 文 │ 档 │"
+        );
 
         let mismatch = "| A | B |\n| --- | --- | --- |\n| one | two |";
         let mut highlighter = RecordingHighlighter::default();
@@ -1451,7 +1769,10 @@ mod tests {
         let indented = "  | A | B |\n  | --- | --- |\n  | one | two |";
         let mut highlighter = RecordingHighlighter::default();
         let mapped = render_markdown_mapped(indented, 80, &mut highlighter);
-        assert!(mapped_text(&mapped).contains("\n  ┼ ─── ┼ ─── ┼\n"));
+        assert_eq!(
+            mapped_text(&mapped),
+            "  │ A   │ B   │\n  ├─────┼─────┤\n  │ one │ two │"
+        );
         assert!(source_ranges(&mapped).contains(&SourceRange::new(12, 13)));
         assert!(source_ranges(&mapped).contains(&SourceRange::new(13, 14)));
     }
