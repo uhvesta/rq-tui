@@ -685,8 +685,8 @@ pub fn render_ui_scenario(name: &str, width: u16, height: u16) -> Result<String>
     if name == "all" {
         let mut gallery = String::new();
         for scenario in [
-            "review", "ask", "command", "composer", "quiet", "queue", "side", "model", "markdown",
-            "tiny",
+            "review", "ask", "command", "composer", "quiet", "queue", "side", "model", "settings",
+            "markdown", "tiny",
         ] {
             gallery.push_str(&format!("\n===== {scenario} =====\n"));
             gallery.push_str(&render_ui_scenario(scenario, width, height)?);
@@ -804,6 +804,15 @@ pub fn render_ui_scenario(name: &str, width: u16, height: u16) -> Result<String>
                 },
             ]))?;
         }
+        "settings" => {
+            press(&mut harness, crossterm::event::KeyCode::Char(':'))?;
+            type_into(&mut harness, "settings")?;
+            press(&mut harness, crossterm::event::KeyCode::Enter)?;
+            harness.state.cache_directory = harness.paths.prs.display().to_string();
+            harness.state.storage_path = harness.paths.database.display().to_string();
+            harness.state.skill_directories = harness.paths.skills.display().to_string();
+            harness.state.settings_index = 9;
+        }
         "markdown" => {
             press(&mut harness, crossterm::event::KeyCode::Tab)?;
             harness.inject_agent_event(AgentEvent::HistoryLoaded(vec![HistoryEntry {
@@ -815,7 +824,7 @@ pub fn render_ui_scenario(name: &str, width: u16, height: u16) -> Result<String>
             harness.resize(width.min(20), height.min(5));
         }
         other => anyhow::bail!(
-            "unknown UI snapshot state {other:?}; use review, ask, command, composer, quiet, queue, side, model, markdown, tiny, or all"
+            "unknown UI snapshot state {other:?}; use review, ask, command, composer, quiet, queue, side, model, settings, markdown, tiny, or all"
         ),
     }
     harness.render()

@@ -14,7 +14,7 @@ Evidence abbreviations:
 - `PTY-xx` refers to [`audit/pty-smoke.md`](audit/pty-smoke.md).
 - Other test names identify their Rust module directly.
 
-Current-evidence boundary: the deterministic harness baseline is 126 regular
+Current-evidence boundary: the deterministic harness baseline is 195 regular
 tests passing with 1 authenticated live test ignored by default. The ignored
 stream/resume test was also run explicitly against the installed Copilot CLI
 and passed. PTY-16 through PTY-21 are current compiled-binary evidence; earlier
@@ -71,9 +71,9 @@ PTY references remain useful historical records.
 | R-18 | Structured local context generation, editing, acceptance, persistence | Partially working | Parser/editor/effects and controlled-agent shape exist; no complete attach/restart workflow test. |
 | R-19 | Split and unified review layouts with inline annotations and no rail | Working in deterministic tests | Unified is the default. Both layouts retain one diff cursor and render Comment/Ask content inline; split blocks span both columns. `WF::file_switch_clears_visual_mode_and_split_unified_render_selection` and `WF::normal_and_visual_comments_persist_without_contacting_agent`. Navigation through individual block rows remains a follow-up. |
 | R-20 | Multi-repo grouped file/folder picker ordered by activity | Partially working | Repo grouping, collapse/expand, fuzzy filtering, and Enter work; folder hierarchy and complete activity-order workflow are absent. |
-| R-21 | Full Chat panel with streaming, queue/activity/usage, model/session controls | Partially working | Streaming, queue/activity, usage, scrolling, composer, model capability picker, steering, and status paths are covered by deterministic `WF::*` tests. Durable queue recovery across process restart and character-wise terminal selection remain gaps. |
+| R-21 | Full Chat panel with streaming, queue/activity/usage, model/session controls | Partially working | Streaming, durable queued-chat recovery, activity, usage, scrolling, composer, character/line/block selection, model capability picker, steering, and status paths are covered by deterministic `WF::*` tests. Compiled-PTY coverage for the complete Chat acceptance sequence remains incomplete. |
 | R-22 | Top command palette with autocomplete and execution | Working end-to-end | `WF::narrow_terminal_keeps_selection_composer_and_top_palette_visible`; PTY-08. |
-| R-23 | Settings screen | Partially working | Model, base, and context-step edits work; keybinding editing and several global preferences are informational/not implemented. |
+| R-23 | Settings screen | Partially working | Model, base, and context-step edits work. Diff-layout, file-tree, and Markdown launch defaults persist in SQLite; cache, skills, and storage paths are visible; compact viewports keep the selected row visible. Keybinding viewing/editing and detailed `gh auth` identity remain incomplete. |
 | R-24 | Generated context editor six-field presentation | Partially working | Parser and editor render; complete accept-to-session workflow untested. |
 | R-25 | Prune reviewed history, optional export, git/cache cleanup | Partially working | Review-scoped storage query and delete/export effects exist; no destructive workflow test, PR-state enrichment, or Copilot transcript deletion/path report. |
 | R-26 | Markdown/JSON comment export and one structured session batch | Working end-to-end | Export format tests and `WF::comment_export_queues_one_batch_and_acknowledges_delivery`. |
@@ -145,7 +145,7 @@ Source-line policy established by the audit:
 | `]a` / `[a` | Untested | Global wrap implementation exists; no complete workflow test. |
 | `e` | Working end-to-end | Annotation edit workflow. |
 | `dd` / `u` | Working end-to-end | Delete/undo persistence workflow. |
-| `gm` | Partially working | Markdown generation is tested; external browser launch is not. |
+| `gm` | Partially working | Inline Markdown generation, scrolling, persisted inline/browser default selection, and an in-overlay browser-fallback action are tested. The external browser process launch is not exercised by the deterministic suite. |
 | `za` | Untested | Fold state/render implementation exists; no complete workflow evidence. |
 | `Tab`, `gc`, `gr` | Working end-to-end for `Tab`; partially working for prefixes | PTY-07 and headless Chat tests; `gc`/`gr` only reducer-tested. |
 | `-`, `,e` | Partially working | Picker opens/closes and Enter is reducer-tested; full tree workflow evidence is absent. |
@@ -166,7 +166,7 @@ Source-line policy established by the audit:
 | `:generate-context` | Partially working | Controlled generation shape and editor exist; acceptance/restart test missing. |
 | `:export [markdown|json]` | Working end-to-end | Export workflow and format tests. |
 | `:prune` | Partially working | Review-scoped query/delete implementation; destructive workflow deliberately not run. |
-| `:settings` | Partially working | Screen and three editable settings; remaining rows informational. |
+| `:settings` | Partially working | Model/base/context editing and persisted diff-layout, file-tree, and Markdown defaults are tested. Keybinding editing and detailed `gh auth` identity remain incomplete. |
 | `:sync` | Untested | Requires local/remote repository mutation during an open review. |
 | `:base ...` | Partially working | Effect exists; full multi-repo base-change workflow absent. |
 | `:stop` / `:abort` | Working end-to-end at agent-event level | Deterministic abort test and reusable-session handling; no PTY capture. |
@@ -181,8 +181,8 @@ Source-line policy established by the audit:
   multi-PR version update, remote carry-forward, and old-version materializing
   remain explicitly **Untested** or **Partially working**.
 - Session deletion/path reporting during prune is **Not implemented**.
-- Settings keybinding editing, folder hierarchy in the picker, and several
-  preference rows are incomplete.
+- Settings keybinding editing, detailed `gh auth` identity, and folder
+  hierarchy in the picker are incomplete.
 - Interdiff and live file-watcher policy remain explicitly deferred by v2.
 
 ## Current TUI/chat UX addendum
@@ -211,7 +211,7 @@ matrix so that new evidence is not confused with the earlier PTY run.
 The current checked-in regular-test baseline is:
 
 ```text
-126 regular tests passed; 1 authenticated live Copilot test ignored by default
+195 regular tests passed; 1 authenticated live Copilot test ignored by default
 ```
 
 The regular baseline includes the reducer/effect, storage, rendering, SDK

@@ -38,7 +38,7 @@ pub(crate) enum Command {
     /// Render a deterministic mocked UI state for visual inspection.
     #[command(hide = true)]
     UiSnapshot {
-        /// State name: review, ask, command, composer, quiet, queue, side, model, markdown, tiny, or all.
+        /// State name: review, ask, command, composer, quiet, queue, side, model, settings, markdown, tiny, or all.
         #[arg(long, default_value = "all")]
         state: String,
         #[arg(long, default_value_t = 100)]

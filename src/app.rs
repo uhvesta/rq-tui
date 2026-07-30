@@ -67,6 +67,31 @@ pub(crate) enum DiffLayout {
     Unified,
 }
 
+impl DiffLayout {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Split => "split",
+            Self::Unified => "unified",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MarkdownPreview {
+    #[default]
+    Inline,
+    Browser,
+}
+
+impl MarkdownPreview {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::Browser => "browser",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ModelPickerStage {
     #[default]
@@ -151,6 +176,9 @@ pub(crate) enum Effect {
         repo: Option<String>,
     },
     SetExpandStep(usize),
+    SetDefaultDiffLayout(DiffLayout),
+    SetFileTreeDefault(bool),
+    SetMarkdownPreview(MarkdownPreview),
     Preview,
     PreviewBrowser,
     Yank(String),
@@ -466,7 +494,13 @@ pub(crate) struct AppState {
     pub(crate) input_mode: InputMode,
     pub(crate) focus: Focus,
     pub(crate) layout: DiffLayout,
+    pub(crate) default_layout: DiffLayout,
     pub(crate) picker_open: bool,
+    pub(crate) file_tree_default_open: bool,
+    pub(crate) markdown_preview: MarkdownPreview,
+    pub(crate) cache_directory: String,
+    pub(crate) storage_path: String,
+    pub(crate) skill_directories: String,
     pub(crate) repo_index: usize,
     pub(crate) file_index: usize,
     pub(crate) cursor: usize,
@@ -560,7 +594,13 @@ impl AppState {
             input_mode: InputMode::Normal,
             focus: Focus::Diff,
             layout: DiffLayout::Unified,
+            default_layout: DiffLayout::Unified,
             picker_open: false,
+            file_tree_default_open: true,
+            markdown_preview: MarkdownPreview::Inline,
+            cache_directory: "runtime default".into(),
+            storage_path: "runtime default".into(),
+            skill_directories: "runtime default".into(),
             repo_index: 0,
             file_index: 0,
             cursor: 0,
@@ -1707,6 +1747,9 @@ impl AppState {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.close_preview();
             }
+            KeyCode::Char('o') if key.modifiers.is_empty() => {
+                return vec![Effect::PreviewBrowser];
+            }
             KeyCode::Char('j') | KeyCode::Down if key.modifiers.is_empty() => {
                 self.preview_scroll = self.preview_scroll.saturating_add(1);
                 self.clamp_preview_scroll();
@@ -1857,7 +1900,7 @@ impl AppState {
     }
 
     fn handle_settings_key(&mut self, key: KeyEvent) -> Vec<Effect> {
-        const SETTING_COUNT: usize = 7;
+        const SETTING_COUNT: usize = 12;
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 self.settings_index = cmp::min(
@@ -1878,7 +1921,7 @@ impl AppState {
                     return vec![Effect::LoadModels];
                 }
                 let target = match self.settings_index {
-                    2 => Some((
+                    3 => Some((
                         ComposeTarget::SettingBase,
                         self.work_item
                             .repos
@@ -1886,7 +1929,7 @@ impl AppState {
                             .and_then(|repo| repo.record.base_branch.clone())
                             .unwrap_or_default(),
                     )),
-                    4 => Some((
+                    7 => Some((
                         ComposeTarget::SettingExpandStep,
                         self.expand_step.to_string(),
                     )),
@@ -1900,7 +1943,21 @@ impl AppState {
                     self.compose_cursor = self.compose.len();
                     self.status = "Edit value and press Ctrl-S or Ctrl-Enter to save".into();
                 } else {
-                    self.status = "This setting is informational".into();
+                    return match self.settings_index {
+                        2 => vec![Effect::SetDefaultDiffLayout(match self.default_layout {
+                            DiffLayout::Unified => DiffLayout::Split,
+                            DiffLayout::Split => DiffLayout::Unified,
+                        })],
+                        8 => vec![Effect::SetFileTreeDefault(!self.file_tree_default_open)],
+                        9 => vec![Effect::SetMarkdownPreview(match self.markdown_preview {
+                            MarkdownPreview::Inline => MarkdownPreview::Browser,
+                            MarkdownPreview::Browser => MarkdownPreview::Inline,
+                        })],
+                        _ => {
+                            self.status = "This setting is informational".into();
+                            Vec::new()
+                        }
+                    };
                 }
             }
             KeyCode::Char('q') | KeyCode::Esc => {
@@ -2120,7 +2177,12 @@ impl AppState {
                 self.focus = Focus::Diff;
                 self.clear_visual_selection();
             }
-            ("g", 'm') => return vec![Effect::Preview],
+            ("g", 'm') => {
+                return vec![match self.markdown_preview {
+                    MarkdownPreview::Inline => Effect::Preview,
+                    MarkdownPreview::Browser => Effect::PreviewBrowser,
+                }]
+            }
             ("ctrl-w", direction @ ('h' | 'j' | 'k' | 'l')) => {
                 self.move_review_focus(direction);
             }
@@ -3598,7 +3660,8 @@ mod tests {
 
     use super::tests_support::state_for_ui;
     use super::{
-        AgentPhase, AppState, ComposeTarget, DiffLayout, Effect, Focus, InputMode, Screen,
+        AgentPhase, AppState, ComposeTarget, DiffLayout, Effect, Focus, InputMode, MarkdownPreview,
+        Screen,
     };
     use crate::domain::{AskMessage, DeliveryState};
 
@@ -3902,13 +3965,55 @@ mod tests {
     fn settings_screen_edits_the_expansion_step() {
         let mut app = state();
         app.screen = Screen::Settings;
-        app.settings_index = 4;
+        app.settings_index = 7;
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.input_mode, InputMode::Compose);
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
             vec![Effect::SetExpandStep(10)]
         );
+    }
+
+    #[test]
+    fn settings_screen_exposes_persistent_launch_preferences() {
+        let mut app = state();
+        app.screen = Screen::Settings;
+
+        app.settings_index = 2;
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            vec![Effect::SetDefaultDiffLayout(DiffLayout::Split)]
+        );
+
+        app.settings_index = 8;
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            vec![Effect::SetFileTreeDefault(false)]
+        );
+
+        app.settings_index = 9;
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            vec![Effect::SetMarkdownPreview(MarkdownPreview::Browser)]
+        );
+    }
+
+    #[test]
+    fn markdown_default_controls_gm_and_inline_preview_can_open_browser() {
+        let mut app = state();
+        app.markdown_preview = MarkdownPreview::Browser;
+        app.pending_prefix = "g".into();
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('m'))),
+            vec![Effect::PreviewBrowser]
+        );
+
+        app.open_preview("# Result".into());
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('o'))),
+            vec![Effect::PreviewBrowser]
+        );
+        assert_eq!(app.screen, Screen::Preview);
     }
 
     #[test]

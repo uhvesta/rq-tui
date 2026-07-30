@@ -8,7 +8,7 @@ chat.
 
 ## Requirements
 
-- Bazel 9 through Bazelisk; `.bazelversion` pins `9.1.0`.
+- Bazel 9 through Bazelisk; `.bazelversion` pins `9.2.0`.
 - `git` for local review targets.
 - `gh` authenticated with GitHub for remote PR reviews.
 - `copilot` on `PATH`, or `COPILOT_CLI_PATH=/absolute/path/to/copilot`, for
@@ -100,6 +100,11 @@ returns to the latest content and resumes live-following. The application owns
 mouse wheel events for Chat and diff scrolling. To select and copy arbitrary
 terminal text with the terminal emulator, hold `Shift` while dragging; the
 terminal then receives the selection gesture instead of the TUI.
+
+`gm` previews Markdown with the persisted Settings default. Inline preview is
+the default and scrolls inside the TUI; `o` requests the system browser while
+keeping the inline preview open as a reliable fallback. Settings also persists
+the launch diff layout and whether the file tree starts open.
 
 The Chat composer is a sticky bordered rectangle. It wraps, expands with the
 draft, supports multiple lines, moves through wrapped visual rows, keeps its
@@ -209,10 +214,10 @@ bazel run //:rq-tui -- ui-snapshot --state quiet --width 110 --height 26
 ```
 
 The `all` gallery includes `review`, `ask`, `command`, `composer`, `quiet`,
-`queue`, `side`, `model`, `markdown`, and `tiny` states. It prints the terminal
-buffer, making mode labels, palette selection, composer wrapping, Markdown
-rows, progress diagnostics, lane isolation, and minimum-terminal behavior easy
-to inspect or snapshot in a test harness.
+`queue`, `side`, `model`, `settings`, `markdown`, and `tiny` states. It prints
+the terminal buffer, making mode labels, palette selection, composer wrapping,
+persisted preferences, Markdown rows, progress diagnostics, lane isolation,
+and minimum-terminal behavior easy to inspect or snapshot in a test harness.
 
 For multi-step inspection, the hidden `ui-script` command reads a deterministic
 script from stdin. Commands include `key`, `type`, `resize`, `stream`,

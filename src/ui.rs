@@ -25,7 +25,7 @@ use crate::annotations::{
 };
 use crate::app::{
     command_matches, AgentPhase, AppState, ChatEntry, ComposeTarget, DiffLayout, Effect, InputMode,
-    ModelPickerStage, PruneChoice, Screen, VersionChoice,
+    MarkdownPreview, ModelPickerStage, PruneChoice, Screen, VersionChoice,
 };
 use crate::chat_render::{render_markdown_mapped, CellSource, MappedMarkdown, MappedRow};
 use crate::chat_selection::{
@@ -50,6 +50,37 @@ use crate::review_stream::{AnnotationRowPart, ReviewRow};
 use crate::storage::{now, Storage};
 use crate::terminal_text::{cell_width, floor_grapheme_boundary, grapheme_indices};
 use crate::work_item::{combine_resolved, resolve_local};
+
+fn load_ui_preferences(state: &mut AppState, storage: &Storage, paths: &AppPaths) -> Result<()> {
+    state.reasoning_effort = storage
+        .setting("model.reasoning_effort")?
+        .filter(|value| !value.trim().is_empty());
+    state.context_tier = storage
+        .setting("model.context_tier")?
+        .filter(|value| !value.trim().is_empty());
+    state.expand_step = storage
+        .setting("diff.expand_step")?
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|step| *step > 0)
+        .unwrap_or(10);
+    state.default_layout = match storage.setting("diff.layout.default")?.as_deref() {
+        Some("split") => DiffLayout::Split,
+        _ => DiffLayout::Unified,
+    };
+    state.layout = state.default_layout;
+    state.file_tree_default_open = !matches!(
+        storage.setting("file_tree.default")?.as_deref(),
+        Some("closed")
+    );
+    state.picker_open = state.file_tree_default_open;
+    state.markdown_preview = match storage.setting("markdown.preview")?.as_deref() {
+        Some("browser") => MarkdownPreview::Browser,
+        _ => MarkdownPreview::Inline,
+    };
+    state.cache_directory = paths.prs.display().to_string();
+    state.storage_path = paths.database.display().to_string();
+    Ok(())
+}
 
 pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> Result<()> {
     for repo in &state.work_item.repos {
@@ -97,17 +128,7 @@ pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> R
         .setting("model")?
         .unwrap_or_else(|| "gpt-5".to_owned());
     state.model = model.clone();
-    state.reasoning_effort = storage
-        .setting("model.reasoning_effort")?
-        .filter(|value| !value.trim().is_empty());
-    state.context_tier = storage
-        .setting("model.context_tier")?
-        .filter(|value| !value.trim().is_empty());
-    state.expand_step = storage
-        .setting("diff.expand_step")?
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|step| *step > 0)
-        .unwrap_or(10);
+    load_ui_preferences(&mut state, storage, paths)?;
     let existing_session_id = storage
         .active_session(&state.work_item.item.id)?
         .map(|session| session.id);
@@ -121,6 +142,11 @@ pub(crate) fn run(mut state: AppState, storage: &Storage, paths: &AppPaths) -> R
         let skills = root.join(".rq-tui").join("skills");
         skills.is_dir().then_some(skills)
     }));
+    state.skill_directories = skill_directories
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut plugin_directories = vec![paths.plugins.clone()];
     plugin_directories.extend(state.work_item.repos.iter().filter_map(|repo| {
         let root = repo
@@ -1220,14 +1246,37 @@ pub(crate) fn handle_effect(
             state.expand_step = step;
             state.status = format!("Diff expansion step changed to {step}");
         }
+        Effect::SetDefaultDiffLayout(layout) => {
+            storage.set_setting("diff.layout.default", layout.label())?;
+            state.default_layout = layout;
+            state.status = format!(
+                "Default diff layout: {} · current review unchanged",
+                layout.label()
+            );
+        }
+        Effect::SetFileTreeDefault(open) => {
+            storage.set_setting("file_tree.default", if open { "open" } else { "closed" })?;
+            state.file_tree_default_open = open;
+            state.status = format!(
+                "File tree will start {} · press t to change the current review",
+                if open { "open" } else { "closed" }
+            );
+        }
+        Effect::SetMarkdownPreview(preview) => {
+            storage.set_setting("markdown.preview", preview.label())?;
+            state.markdown_preview = preview;
+            state.status = format!(
+                "Markdown preview: {} · gm uses this default",
+                preview.label()
+            );
+        }
         Effect::Preview => match markdown_preview_source(state) {
             Ok(markdown) => state.open_preview(markdown),
             Err(error) => state.status = error.to_string(),
         },
-        Effect::PreviewBrowser => match preview_markdown(state, paths) {
-            Ok(path) => state.status = format!("Opened browser preview {}", path.display()),
-            Err(error) => state.status = error.to_string(),
-        },
+        Effect::PreviewBrowser => {
+            open_browser_preview(state, paths, platform_preview_opener());
+        }
         Effect::Yank(text) => {
             state.status = match copy_to_clipboard(&text)? {
                 ClipboardDelivery::Native(program) => {
@@ -1712,12 +1761,53 @@ fn markdown_preview_source(state: &AppState) -> Result<String> {
     Ok(markdown)
 }
 
-fn preview_markdown(state: &AppState, paths: &AppPaths) -> Result<std::path::PathBuf> {
-    let markdown = markdown_preview_source(state)?;
+fn open_browser_preview(state: &mut AppState, paths: &AppPaths, opener: &str) {
+    let source = if state.screen == Screen::Preview {
+        state
+            .preview_markdown
+            .clone()
+            .context("inline Markdown preview is empty")
+    } else {
+        markdown_preview_source(state)
+    };
+    let markdown = match source {
+        Ok(markdown) => markdown,
+        Err(error) => {
+            state.status = error.to_string();
+            return;
+        }
+    };
+    if state.screen != Screen::Preview {
+        state.open_preview(markdown.clone());
+    }
+    match write_markdown_preview(&markdown, &state.work_item.item.id, paths) {
+        Ok(path) => match Command::new(opener).arg(&path).spawn() {
+            Ok(_) => {
+                state.status = format!(
+                    "Browser preview requested with {opener} · inline fallback remains open"
+                );
+            }
+            Err(error) => {
+                state.status =
+                    format!("Browser preview unavailable: {error:#} · inline preview remains open");
+            }
+        },
+        Err(error) => {
+            state.status =
+                format!("Cannot write browser preview: {error:#} · inline preview remains open");
+        }
+    }
+}
+
+fn write_markdown_preview(
+    markdown: &str,
+    work_item_id: &str,
+    paths: &AppPaths,
+) -> Result<std::path::PathBuf> {
     let preview_dir = paths.cache.join("previews");
     std::fs::create_dir_all(&preview_dir)?;
-    let path = preview_dir.join(format!("{}.html", state.work_item.item.id));
-    let rendered = markdown_to_html(&markdown);
+    let path = preview_dir.join(format!("{work_item_id}.html"));
+    let rendered = markdown_to_html(markdown);
     std::fs::write(
         &path,
         format!(
@@ -1727,13 +1817,15 @@ fn preview_markdown(state: &AppState, paths: &AppPaths) -> Result<std::path::Pat
              code{{font-family:ui-monospace,monospace}}</style><body>{rendered}</body>"
         ),
     )?;
-    let opener = if cfg!(target_os = "macos") {
+    Ok(path)
+}
+
+fn platform_preview_opener() -> &'static str {
+    if cfg!(target_os = "macos") {
         "open"
     } else {
         "xdg-open"
-    };
-    Command::new(opener).arg(&path).spawn()?;
-    Ok(path)
+    }
 }
 
 fn markdown_to_html(markdown: &str) -> String {
@@ -2978,9 +3070,9 @@ fn render_markdown_preview(
     );
     if footer_height > 0 {
         let footer = if inner.width < 60 {
-            " j/k scroll · C-u/d · C-f/b · gg/G · q/Esc close "
+            " j/k · C-u/d · C-f/b · gg/G · o browser · q/Esc "
         } else {
-            " j/k · C-u/d half · C-f/b page · gg/G · q/Esc · :preview-browser "
+            " j/k · C-u/d half · C-f/b page · gg/G · o browser · q/Esc "
         };
         frame.render_widget(
             Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
@@ -3093,6 +3185,7 @@ fn render_context_editor(frame: &mut ratatui::Frame, state: &AppState) {
 }
 
 fn render_settings(frame: &mut ratatui::Frame, state: &AppState) {
+    let area = frame.area();
     let base = state
         .work_item
         .repos
@@ -3110,37 +3203,100 @@ fn render_settings(frame: &mut ratatui::Frame, state: &AppState) {
             state.context_tier.as_deref().unwrap_or("runtime default"),
         ),
         "Ask tool scope    read/search only (fixed)".into(),
+        format!(
+            "Diff layout       {} (launch default)",
+            state.default_layout.label()
+        ),
         format!("Base branch       {base} (per repository)"),
-        "Keybindings       vim".into(),
+        format!("Cache dir         {}", state.cache_directory),
+        "gh auth           managed by gh CLI for remote reviews".into(),
+        "Keybindings       vim (built in)".into(),
         format!(
             "Diff context      6 lines · expand step {}",
             state.expand_step
         ),
-        "Markdown preview  system browser".into(),
-        "Storage           SQLite (WAL)".into(),
+        format!(
+            "File tree default {}",
+            if state.file_tree_default_open {
+                "open"
+            } else {
+                "closed"
+            }
+        ),
+        format!(
+            "Markdown preview  {} (o always opens browser)",
+            state.markdown_preview.label()
+        ),
+        format!("Skills dir        {}", state.skill_directories),
+        format!("Storage           SQLite (WAL) · {}", state.storage_path),
     ];
+    let row_count = rows.len();
+    let visible_rows = usize::from(area.height.saturating_sub(2)).max(1);
+    let first_row = state
+        .settings_index
+        .saturating_add(1)
+        .saturating_sub(visible_rows);
+    let last_row = (first_row + visible_rows).min(row_count);
     let items = rows
         .into_iter()
         .enumerate()
+        .skip(first_row)
+        .take(visible_rows)
         .map(|(index, row)| {
-            ListItem::new(format!(
+            let line = format!(
                 "{} {row}",
                 if index == state.settings_index {
-                    "▶"
+                    "❯"
                 } else {
                     " "
                 }
+            );
+            ListItem::new(truncate_terminal_line(
+                &line,
+                usize::from(area.width.saturating_sub(2)),
             ))
         })
         .collect::<Vec<_>>();
+    let title = if area.width < 80 {
+        format!(
+            "Settings {}-{}/{} · Enter · j/k · q",
+            first_row + 1,
+            last_row,
+            row_count
+        )
+    } else {
+        format!(
+            "Settings · rows {}-{}/{} · Enter edit/toggle · j/k · q",
+            first_row + 1,
+            last_row,
+            row_count
+        )
+    };
     frame.render_widget(
-        List::new(items).block(
-            Block::default()
-                .title("Settings · Enter edits model/base/diff step · q back")
-                .borders(Borders::ALL),
-        ),
-        frame.area(),
+        List::new(items).block(Block::default().title(title).borders(Borders::ALL)),
+        area,
     );
+}
+
+fn truncate_terminal_line(text: &str, max_cells: usize) -> String {
+    if cell_width(text) <= max_cells {
+        return text.to_owned();
+    }
+    if max_cells == 0 {
+        return String::new();
+    }
+    let mut rendered = String::new();
+    let mut used: usize = 0;
+    for (_, grapheme) in grapheme_indices(text) {
+        let width = cell_width(grapheme);
+        if used.saturating_add(width).saturating_add(1) > max_cells {
+            break;
+        }
+        rendered.push_str(grapheme);
+        used += width;
+    }
+    rendered.push('…');
+    rendered
 }
 
 fn render_model_picker(frame: &mut ratatui::Frame, state: &AppState) {
@@ -5075,9 +5231,12 @@ mod tests {
 
     use super::{
         handle_agent_envelope, handle_agent_event, handle_effect, handle_effect_failure,
-        markdown_to_html, parse_review_context, render, run_clipboard_candidate,
+        load_ui_preferences, markdown_to_html, open_browser_preview, parse_review_context, render,
+        run_clipboard_candidate,
     };
-    use crate::app::{tests_support::state_for_ui, ChatEntry, Effect, Focus, Screen};
+    use crate::app::{
+        tests_support::state_for_ui, ChatEntry, DiffLayout, Effect, Focus, MarkdownPreview, Screen,
+    };
     use crate::config::AppPaths;
     use crate::copilot::{
         AgentCommand, AgentEvent, AgentEventEnvelope, AgentLane, AgentSink, HistoryEntry,
@@ -5138,6 +5297,95 @@ mod tests {
         assert!(content.contains("demo — Review"));
         assert!(content.contains("unified"));
         assert!(content.contains("a ask"));
+    }
+
+    #[test]
+    fn settings_preferences_persist_and_restore_launch_behavior() {
+        let storage = Storage::in_memory().unwrap();
+        let agent = FakeAgent::default();
+        let mut state = state_for_ui();
+
+        handle_effect(
+            &mut state,
+            &storage,
+            &paths(),
+            &agent,
+            Effect::SetDefaultDiffLayout(DiffLayout::Split),
+        )
+        .unwrap();
+        handle_effect(
+            &mut state,
+            &storage,
+            &paths(),
+            &agent,
+            Effect::SetFileTreeDefault(false),
+        )
+        .unwrap();
+        handle_effect(
+            &mut state,
+            &storage,
+            &paths(),
+            &agent,
+            Effect::SetMarkdownPreview(MarkdownPreview::Browser),
+        )
+        .unwrap();
+
+        let mut restarted = state_for_ui();
+        load_ui_preferences(&mut restarted, &storage, &paths()).unwrap();
+        assert_eq!(restarted.layout, DiffLayout::Split);
+        assert_eq!(restarted.default_layout, DiffLayout::Split);
+        assert!(!restarted.picker_open);
+        assert!(!restarted.file_tree_default_open);
+        assert_eq!(restarted.markdown_preview, MarkdownPreview::Browser);
+        assert_eq!(restarted.cache_directory, "/tmp/rq-tui-test/cache/prs");
+        assert_eq!(restarted.storage_path, "/tmp/rq-tui-test/data/db");
+    }
+
+    #[test]
+    fn settings_panel_is_truthful_and_fully_navigable() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = state_for_ui();
+        state.screen = Screen::Settings;
+        state.settings_index = 9;
+        load_ui_preferences(&mut state, &Storage::in_memory().unwrap(), &paths()).unwrap();
+        let mut highlighter = PlainHighlighter;
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Diff layout       unified (launch default)"));
+        assert!(content.contains("File tree default open"));
+        assert!(content.contains("❯ Markdown preview  inline"));
+        assert!(content.contains("Cache dir"));
+        assert!(content.contains("Skills dir"));
+        assert!(!content.contains("Markdown preview  system browser"));
+
+        let compact_backend = TestBackend::new(72, 9);
+        let mut compact_terminal = Terminal::new(compact_backend).unwrap();
+        state.settings_index = 11;
+        state.storage_path =
+            "/a/very/long/storage/path/that/cannot/fit/in/the/minimum/settings/viewport/review.db"
+                .into();
+        compact_terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        let compact = compact_terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(compact.contains("Settings 6-12/12"));
+        assert!(compact.contains("❯ Storage"));
+        assert!(compact.contains('…'));
     }
 
     #[test]
@@ -5468,6 +5716,22 @@ mod tests {
             state.preview_markdown.as_deref(),
             Some("# In TUI\n\npreview me")
         );
+    }
+
+    #[test]
+    fn failed_browser_request_keeps_a_truthful_inline_fallback() {
+        let mut state = state_for_ui();
+        state.open_preview("# Browser fallback".into());
+
+        open_browser_preview(&mut state, &paths(), "rq-tui-opener-that-does-not-exist");
+
+        assert_eq!(state.screen, Screen::Preview);
+        assert_eq!(
+            state.preview_markdown.as_deref(),
+            Some("# Browser fallback")
+        );
+        assert!(state.status.contains("Browser preview unavailable"));
+        assert!(state.status.contains("inline preview remains open"));
     }
 
     #[test]
