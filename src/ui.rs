@@ -4166,6 +4166,15 @@ fn handle_agent_event_with_persistence(
                 )
             };
         }
+        AgentEvent::ModelsListFailed(message) => {
+            state.agent_progress.record(
+                AgentPhase::Failed,
+                "Model listing failed",
+                message.clone(),
+                state.agent_progress.active_outbound_id.clone(),
+            );
+            state.status = format!("Could not load Copilot models: {message} · retry with :model");
+        }
         AgentEvent::ModelSelectionChanged(selection) => {
             persist_model_preferences(state, storage, &selection)?;
             state.model = selection.model_id.clone();
@@ -8129,6 +8138,9 @@ mod tests {
                 text: None,
                 submitted: true,
                 delivery_state: DeliveryState::Sent,
+                status: crate::domain::AnnotationStatus::Active,
+                status_reason: None,
+                status_changed_at: None,
                 created_at: "2026-01-01T00:00:00Z".into(),
             },
             Placement {
@@ -8381,6 +8393,9 @@ mod tests {
                         text: Some(id.into()),
                         submitted: false,
                         delivery_state: DeliveryState::Draft,
+                        status: crate::domain::AnnotationStatus::Active,
+                        status_reason: None,
+                        status_changed_at: None,
                         created_at: now(),
                     },
                     &Placement {
@@ -10128,6 +10143,9 @@ mod tests {
                     text: None,
                     submitted: false,
                     delivery_state: DeliveryState::Pending,
+                    status: crate::domain::AnnotationStatus::Active,
+                    status_reason: None,
+                    status_changed_at: None,
                     created_at: now(),
                 },
                 &Placement {

@@ -87,7 +87,7 @@ enum RevCommand {
         width: u16,
         #[arg(long, default_value_t = 28)]
         height: u16,
-        /// review, split, markdown, expanded, files, panes, visual, questions, cleared-question, edit-feedback, question-models, command, composer, history, help, help-bottom, or streaming
+        /// review, split, markdown, expanded, files, panes, visual, questions, cleared-question, edit-feedback, question-models, model-search, resolve-confirm, resolved-history, stale-dismissed, command, composer, history, help, help-bottom, or streaming
         #[arg(long, default_value = "review")]
         state: String,
     },

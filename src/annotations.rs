@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use crate::diff::{DiffFile, DiffLine, LineKind};
 use crate::domain::{
-    AnchorSide, Annotation, AnnotationKind, AskMessage, DeliveryState, Placement, Repo, Version,
-    VersionKind,
+    AnchorSide, Annotation, AnnotationKind, AnnotationStatus, AskMessage, DeliveryState, Placement,
+    Repo, Version, VersionKind,
 };
 use crate::git::Git;
 use crate::storage::{now, Storage};
@@ -34,6 +34,12 @@ pub(crate) struct CreatedAnnotation {
     pub(crate) placement: Placement,
     pub(crate) snapshot: Option<Version>,
     pub(crate) ask_message: Option<AskMessage>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReanchorOutcome {
+    pub(crate) placement: Placement,
+    pub(crate) selected_text_changed: bool,
 }
 
 pub(crate) struct AnnotationRequest<'a> {
@@ -149,6 +155,9 @@ pub(crate) fn create_local_annotation(
         } else {
             DeliveryState::Draft
         },
+        status: AnnotationStatus::Active,
+        status_reason: None,
+        status_changed_at: None,
         created_at: now(),
     };
     let placement = Placement {
@@ -231,7 +240,7 @@ pub(crate) fn create_snapshot(storage: &Storage, git: &Git, repo: &Repo) -> Resu
         version
     };
     let working_tree_id = format!("{}:working-tree", repo.id);
-    for (annotation, placement) in storage.annotations_for_version(&working_tree_id)? {
+    for (annotation, placement) in storage.annotation_history_for_version(&working_tree_id)? {
         storage.upsert_placement(&Placement {
             annotation_id: annotation.id,
             version_id: version.id.clone(),
@@ -241,16 +250,29 @@ pub(crate) fn create_snapshot(storage: &Storage, git: &Git, repo: &Repo) -> Resu
     Ok(version)
 }
 
+#[cfg(test)]
 pub(crate) fn reanchor(
     annotation: &Annotation,
     previous: &Placement,
     version_id: &str,
     new_content: &str,
 ) -> Placement {
+    reanchor_outcome(annotation, previous, version_id, new_content).placement
+}
+
+pub(crate) fn reanchor_outcome(
+    annotation: &Annotation,
+    previous: &Placement,
+    version_id: &str,
+    new_content: &str,
+) -> ReanchorOutcome {
     let snippet_lines = annotation.anchor_snippet.lines().collect::<Vec<_>>();
     let content_lines = new_content.lines().collect::<Vec<_>>();
     if snippet_lines.is_empty() || content_lines.is_empty() {
-        return outdated_placement(annotation, previous, version_id);
+        return ReanchorOutcome {
+            placement: outdated_placement(annotation, previous, version_id),
+            selected_text_changed: true,
+        };
     }
 
     let window_size = snippet_lines.len().min(content_lines.len());
@@ -270,7 +292,10 @@ pub(crate) fn reanchor(
         .filter(|(_, score)| *score >= FUZZY_THRESHOLD)
         .collect::<Vec<_>>();
     if candidates.is_empty() {
-        return outdated_placement(annotation, previous, version_id);
+        return ReanchorOutcome {
+            placement: outdated_placement(annotation, previous, version_id),
+            selected_text_changed: true,
+        };
     }
     candidates.sort_by(|left, right| {
         right
@@ -290,15 +315,33 @@ pub(crate) fn reanchor(
     let snippet_start = candidates[0].0;
     let selected_start = snippet_start + annotation.anchor_start_offset.max(0) as usize;
     let count = annotation.anchor_line_count.max(1) as usize;
-    Placement {
-        annotation_id: annotation.id.clone(),
-        version_id: version_id.to_owned(),
-        side: previous.side,
-        line_start: (selected_start + 1) as i64,
-        line_end: (selected_start + count) as i64,
-        outdated: false,
-        ambiguous: tied > 1,
+    let original_start = annotation.anchor_start_offset.max(0) as usize;
+    let original_selected = snippet_lines
+        .get(original_start..original_start.saturating_add(count))
+        .unwrap_or_default()
+        .join("\n");
+    let candidate_selected = content_lines
+        .get(selected_start..selected_start.saturating_add(count))
+        .unwrap_or_default()
+        .join("\n");
+    ReanchorOutcome {
+        placement: Placement {
+            annotation_id: annotation.id.clone(),
+            version_id: version_id.to_owned(),
+            side: previous.side,
+            line_start: (selected_start + 1) as i64,
+            line_end: (selected_start + count) as i64,
+            outdated: false,
+            ambiguous: tied > 1,
+        },
+        selected_text_changed: normalize(&candidate_selected) != normalize(&original_selected),
     }
+}
+
+pub(crate) fn should_auto_dismiss(previous: &Placement, outcome: &ReanchorOutcome) -> bool {
+    previous.side == AnchorSide::New
+        && !outcome.placement.ambiguous
+        && (outcome.placement.outdated || outcome.selected_text_changed)
 }
 
 pub(crate) fn follow_rename(
@@ -397,9 +440,11 @@ fn sha256(value: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{anchor_from_diff, reanchor};
+    use super::{anchor_from_diff, reanchor, reanchor_outcome, should_auto_dismiss};
     use crate::diff::{DiffFile, DiffLine, FileStatus, Hunk, LineKind};
-    use crate::domain::{AnchorSide, Annotation, AnnotationKind, DeliveryState, Placement};
+    use crate::domain::{
+        AnchorSide, Annotation, AnnotationKind, AnnotationStatus, DeliveryState, Placement,
+    };
 
     fn annotation(snippet: &str, offset: i64, count: i64) -> Annotation {
         Annotation {
@@ -414,6 +459,9 @@ mod tests {
             text: Some("note".into()),
             submitted: false,
             delivery_state: DeliveryState::Draft,
+            status: AnnotationStatus::Active,
+            status_reason: None,
+            status_changed_at: None,
             created_at: String::new(),
         }
     }
@@ -471,6 +519,54 @@ mod tests {
         );
         assert_eq!(placement.line_start, 4);
         assert!(!placement.outdated);
+    }
+
+    #[test]
+    fn selected_code_change_is_dismissible_but_moved_code_is_not() {
+        let annotation = annotation("before\ntarget\nafter", 1, 1);
+        let previous = Placement {
+            annotation_id: "a".into(),
+            version_id: "v1".into(),
+            side: AnchorSide::New,
+            line_start: 2,
+            line_end: 2,
+            outdated: false,
+            ambiguous: false,
+        };
+        let moved = reanchor_outcome(&annotation, &previous, "v2", "new\nbefore\ntarget\nafter");
+        assert!(!moved.selected_text_changed);
+        assert!(!should_auto_dismiss(&previous, &moved));
+
+        let edited = reanchor_outcome(
+            &annotation,
+            &previous,
+            "v3",
+            "before\ntarget changed\nafter",
+        );
+        assert!(edited.selected_text_changed || edited.placement.outdated);
+        assert!(should_auto_dismiss(&previous, &edited));
+    }
+
+    #[test]
+    fn old_side_and_ambiguous_anchors_never_auto_dismiss() {
+        let annotation = annotation("target", 0, 1);
+        let mut previous = Placement {
+            annotation_id: "a".into(),
+            version_id: "v1".into(),
+            side: AnchorSide::New,
+            line_start: 1,
+            line_end: 1,
+            outdated: false,
+            ambiguous: false,
+        };
+        let ambiguous = reanchor_outcome(&annotation, &previous, "v2", "target\nx\ntarget");
+        assert!(ambiguous.placement.ambiguous);
+        assert!(!should_auto_dismiss(&previous, &ambiguous));
+
+        previous.side = AnchorSide::Old;
+        let missing = reanchor_outcome(&annotation, &previous, "v3", "different");
+        assert!(missing.placement.outdated);
+        assert!(!should_auto_dismiss(&previous, &missing));
     }
 
     #[test]

@@ -176,6 +176,38 @@ impl TryFrom<&str> for AnnotationKind {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AnnotationStatus {
+    #[default]
+    Active,
+    Resolved,
+    AutoDismissed,
+}
+
+impl AnnotationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Resolved => "resolved",
+            Self::AutoDismissed => "auto_dismissed",
+        }
+    }
+}
+
+impl TryFrom<&str> for AnnotationStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "active" => Ok(Self::Active),
+            "resolved" => Ok(Self::Resolved),
+            "auto_dismissed" => Ok(Self::AutoDismissed),
+            other => anyhow::bail!("invalid annotation status: {other}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeliveryState {
     #[default]
     Draft,
@@ -248,6 +280,12 @@ pub struct Annotation {
     pub text: Option<String>,
     pub submitted: bool,
     pub delivery_state: DeliveryState,
+    #[serde(default)]
+    pub status: AnnotationStatus,
+    #[serde(default)]
+    pub status_reason: Option<String>,
+    #[serde(default)]
+    pub status_changed_at: Option<String>,
     pub created_at: String,
 }
 

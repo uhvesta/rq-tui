@@ -461,6 +461,7 @@ pub(crate) enum AgentEvent {
         session_id: String,
     },
     ModelsListed(Vec<ModelOption>),
+    ModelsListFailed(String),
     /// Detailed selection acknowledgement for staged pickers.
     ModelSelectionChanged(ModelSelection),
     ModelSelectionFailed {
@@ -675,6 +676,48 @@ pub(crate) fn start_agent(config: BridgeConfig) -> Box<dyn AgentRuntime> {
     } else {
         Box::new(CopilotBridge::start(config))
     }
+}
+
+pub(crate) fn start_model_catalog(session_root: PathBuf) -> Receiver<Result<Vec<ModelOption>>> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        if env::var_os("RQ_TUI_CONTROLLED_AGENT").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            sender.send(Ok(controlled_models())).ok();
+            return;
+        }
+        let result = (|| -> Result<Vec<ModelOption>> {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(async {
+                let cli = find_copilot_cli().context(
+                    "cannot locate the Copilot CLI; set COPILOT_CLI_PATH or install `copilot` on PATH",
+                )?;
+                let mut options = ClientOptions::default();
+                options.program = CliProgram::Path(cli);
+                options.working_directory = session_root;
+                options
+                    .env
+                    .push(("COPILOT_PLUGIN_DIR_ONLY".into(), "true".into()));
+                let client = sdk_startup_call(
+                    &EventPublisher::new(
+                        std::sync::mpsc::channel().0,
+                        AgentLane::Main,
+                    ),
+                    "Copilot model catalog startup",
+                    Client::start(options),
+                )
+                .await?;
+                let models = sdk_call("Copilot model listing", client.list_models())
+                    .await
+                    .map(|models| models.iter().map(model_option).collect::<Vec<_>>());
+                sdk_call("Copilot model catalog shutdown", client.stop())
+                    .await
+                    .ok();
+                models
+            })
+        })();
+        sender.send(result).ok();
+    });
+    receiver
 }
 
 /// Delete all SDK sessions and local data for one closed Work Item through
@@ -4589,12 +4632,9 @@ async fn worker(
                             Ok(models) => events.emit(AgentEvent::ModelsListed(
                                 models.iter().map(model_option).collect(),
                             )),
-                            Err(error) => events.activity(
-                                None,
-                                AgentActivity::other(format!(
-                                    "Could not list Copilot models: {error}"
-                                )),
-                            ),
+                            Err(error) => {
+                                events.emit(AgentEvent::ModelsListFailed(error.to_string()))
+                            }
                         }
                     }
                     AgentCommand::Send(outbound) => {

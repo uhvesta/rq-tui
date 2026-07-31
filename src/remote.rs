@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::annotations::{follow_rename, reanchor};
+use crate::annotations::{follow_rename, reanchor_outcome, should_auto_dismiss};
 use crate::config::AppPaths;
 use crate::diff::parse_unified;
 use crate::domain::{
@@ -399,29 +399,53 @@ impl<R: ProcessRunner> RemoteResolver<R> {
             })
             .collect::<std::collections::HashMap<_, _>>();
 
-        for (mut annotation, previous_placement) in storage.annotations_for_version(&previous.id)? {
+        for (mut annotation, previous_placement) in
+            storage.annotation_history_for_version(&previous.id)?
+        {
             let previous_path = annotation.file_path.clone();
             let renamed_to = rename_map.get(&annotation.file_path);
             if renamed_to.is_some() {
                 follow_rename(storage, &mut annotation, renamed_to.map(PathBuf::as_path))?;
             }
-            let content = match previous_placement.side {
+            let (content, allow_dismiss) = match previous_placement.side {
                 crate::domain::AnchorSide::Old => {
                     let object = format!("{base_sha}:{}", previous_path.display());
-                    self.git_dir_stdout(bare, ["show", object.as_str()])
-                        .unwrap_or_default()
+                    (
+                        self.git_dir_stdout(bare, ["show", object.as_str()])
+                            .unwrap_or_default(),
+                        false,
+                    )
                 }
                 crate::domain::AnchorSide::New => {
-                    fs::read_to_string(current_worktree.join(&annotation.file_path))
-                        .unwrap_or_default()
+                    match fs::read_to_string(current_worktree.join(&annotation.file_path)) {
+                        Ok(content) => (content, true),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            (String::new(), true)
+                        }
+                        Err(_) => (String::new(), false),
+                    }
                 }
             };
-            storage.upsert_placement(&reanchor(
-                &annotation,
-                &previous_placement,
-                &current.id,
-                &content,
-            ))?;
+            let outcome = reanchor_outcome(&annotation, &previous_placement, &current.id, &content);
+            let manual_override = annotation
+                .status_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("Auto-dismiss override:"));
+            let reason = (annotation.status == crate::domain::AnnotationStatus::Active
+                && allow_dismiss
+                && !manual_override
+                && should_auto_dismiss(&previous_placement, &outcome))
+            .then(|| {
+                format!(
+                    "Auto-dismissed after the selected new-side code changed or disappeared in PR revision {}",
+                    current.version_num
+                )
+            });
+            storage.carry_forward_placement(
+                &outcome.placement,
+                reason.as_deref(),
+                annotation.status_changed_at.as_deref(),
+            )?;
         }
         Ok(())
     }

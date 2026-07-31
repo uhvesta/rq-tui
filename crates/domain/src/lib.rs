@@ -3,20 +3,35 @@ mod domain;
 
 pub use diff::{parse_unified, DiffFile, DiffLine, DiffSet, FileStatus, Hunk, LineKind};
 pub use domain::{
-    AnchorSide, Annotation, AnnotationKind, AskMessage, BaseBranchSource,
+    AnchorSide, Annotation, AnnotationKind, AnnotationStatus, AskMessage, BaseBranchSource,
     DeliveryState, EphemeralSessionRecord, PendingChat, Placement, Repo, ReviewContext,
     SessionRecord, Version, VersionKind, WorkItem,
 };
 
 #[cfg(test)]
 mod tests {
-    use super::{BaseBranchSource, DeliveryState, ReviewContext, VersionKind};
+    use super::{AnnotationStatus, BaseBranchSource, DeliveryState, ReviewContext, VersionKind};
 
     #[test]
     fn enum_values_round_trip_through_the_domain_boundary() {
-        assert_eq!(BaseBranchSource::try_from("per_repo").unwrap().as_str(), "per_repo");
-        assert_eq!(VersionKind::try_from("working_tree").unwrap().as_str(), "working_tree");
-        assert_eq!(DeliveryState::try_from("pending").unwrap().as_str(), "pending");
+        assert_eq!(
+            BaseBranchSource::try_from("per_repo").unwrap().as_str(),
+            "per_repo"
+        );
+        assert_eq!(
+            VersionKind::try_from("working_tree").unwrap().as_str(),
+            "working_tree"
+        );
+        assert_eq!(
+            DeliveryState::try_from("pending").unwrap().as_str(),
+            "pending"
+        );
+        assert_eq!(
+            AnnotationStatus::try_from("auto_dismissed")
+                .unwrap()
+                .as_str(),
+            "auto_dismissed"
+        );
     }
 
     #[test]
@@ -24,6 +39,7 @@ mod tests {
         assert!(BaseBranchSource::try_from("not-a-source").is_err());
         assert!(VersionKind::try_from("not-a-version").is_err());
         assert!(DeliveryState::try_from("not-a-state").is_err());
+        assert!(AnnotationStatus::try_from("not-a-status").is_err());
     }
 
     #[test]

@@ -6,9 +6,9 @@ use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use rq_tui_domain::{
-    AnchorSide, Annotation, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState,
-    EphemeralSessionRecord, PendingChat, Placement, Repo, ReviewContext, SessionRecord, Version,
-    VersionKind, WorkItem,
+    AnchorSide, Annotation, AnnotationKind, AnnotationStatus, AskMessage, BaseBranchSource,
+    DeliveryState, EphemeralSessionRecord, PendingChat, Placement, Repo, ReviewContext,
+    SessionRecord, Version, VersionKind, WorkItem,
 };
 
 pub const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
@@ -19,6 +19,7 @@ pub const MIGRATION_5: &str = include_str!("../migrations/0005_prune_journal.sql
 pub const MIGRATION_6: &str = include_str!("../migrations/0006_outbox_metadata.sql");
 pub const MIGRATION_7: &str = include_str!("../migrations/0007_session_ephemeral.sql");
 pub const MIGRATION_8: &str = include_str!("../migrations/0008_rev_question_sessions.sql");
+pub const MIGRATION_9: &str = include_str!("../migrations/0009_annotation_status.sql");
 
 pub struct Storage {
     connection: Connection,
@@ -171,6 +172,7 @@ impl Storage {
             (6, MIGRATION_6),
             (7, MIGRATION_7),
             (8, MIGRATION_8),
+            (9, MIGRATION_9),
         ] {
             let applied = tx
                 .query_row(
@@ -1779,8 +1781,10 @@ impl Storage {
             "INSERT INTO annotations(
                 id, repo_id, kind, file_path, anchor_snippet, anchor_hash,
                 anchor_start_offset, anchor_line_count, text, submitted,
-                delivery_state, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                delivery_state, status, status_reason, status_changed_at, created_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+             )",
             params![
                 annotation.id,
                 annotation.repo_id,
@@ -1793,6 +1797,9 @@ impl Storage {
                 annotation.text,
                 annotation.submitted as i64,
                 annotation.delivery_state.as_str(),
+                annotation.status.as_str(),
+                annotation.status_reason,
+                annotation.status_changed_at,
                 annotation.created_at,
             ],
         )?;
@@ -1818,17 +1825,34 @@ impl Storage {
         &self,
         version_id: &str,
     ) -> Result<Vec<(Annotation, Placement)>> {
+        self.annotations_for_version_matching(version_id, false)
+    }
+
+    pub fn annotation_history_for_version(
+        &self,
+        version_id: &str,
+    ) -> Result<Vec<(Annotation, Placement)>> {
+        self.annotations_for_version_matching(version_id, true)
+    }
+
+    fn annotations_for_version_matching(
+        &self,
+        version_id: &str,
+        include_inactive: bool,
+    ) -> Result<Vec<(Annotation, Placement)>> {
         let mut statement = self.connection.prepare(
             "SELECT a.id, a.repo_id, a.kind, a.file_path, a.anchor_snippet,
                     a.anchor_hash, a.anchor_start_offset, a.anchor_line_count,
-                    a.text, a.submitted, a.delivery_state, a.created_at,
+                    a.text, a.submitted, a.delivery_state, a.status,
+                    a.status_reason, a.status_changed_at, a.created_at,
                     p.side, p.line_start, p.line_end, p.outdated, p.ambiguous
              FROM annotations a
              JOIN placements p ON p.annotation_id = a.id
              WHERE p.version_id = ?1
+               AND (?2 = 1 OR a.status = 'active')
              ORDER BY a.file_path, p.line_start, a.created_at",
         )?;
-        let rows = statement.query_map([version_id], |row| {
+        let rows = statement.query_map(params![version_id, include_inactive as i64], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1842,11 +1866,14 @@ impl Storage {
                 row.get::<_, i64>(9)?,
                 row.get::<_, String>(10)?,
                 row.get::<_, String>(11)?,
-                row.get::<_, String>(12)?,
-                row.get::<_, i64>(13)?,
-                row.get::<_, i64>(14)?,
-                row.get::<_, i64>(15)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, String>(14)?,
+                row.get::<_, String>(15)?,
                 row.get::<_, i64>(16)?,
+                row.get::<_, i64>(17)?,
+                row.get::<_, i64>(18)?,
+                row.get::<_, i64>(19)?,
             ))
         })?;
         rows.map(|row| {
@@ -1862,6 +1889,9 @@ impl Storage {
                 text,
                 submitted,
                 delivery_state,
+                status,
+                status_reason,
+                status_changed_at,
                 created_at,
                 side,
                 line_start,
@@ -1882,6 +1912,9 @@ impl Storage {
                     text,
                     submitted: submitted != 0,
                     delivery_state: DeliveryState::try_from(delivery_state.as_str())?,
+                    status: AnnotationStatus::try_from(status.as_str())?,
+                    status_reason,
+                    status_changed_at,
                     created_at,
                 },
                 Placement {
@@ -1904,7 +1937,7 @@ impl Storage {
             .query_row(
                 "SELECT id, repo_id, kind, file_path, anchor_snippet, anchor_hash,
                         anchor_start_offset, anchor_line_count, text, submitted,
-                        delivery_state, created_at
+                        delivery_state, status, status_reason, status_changed_at, created_at
                  FROM annotations WHERE id = ?1",
                 [annotation_id],
                 |row| {
@@ -1921,6 +1954,9 @@ impl Storage {
                         row.get::<_, i64>(9)?,
                         row.get::<_, String>(10)?,
                         row.get::<_, String>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                        row.get::<_, String>(14)?,
                     ))
                 },
             )
@@ -1938,6 +1974,9 @@ impl Storage {
                 text,
                 submitted,
                 delivery_state,
+                status,
+                status_reason,
+                status_changed_at,
                 created_at,
             )| {
                 Ok(Annotation {
@@ -1952,6 +1991,9 @@ impl Storage {
                     text,
                     submitted: submitted != 0,
                     delivery_state: DeliveryState::try_from(delivery_state.as_str())?,
+                    status: AnnotationStatus::try_from(status.as_str())?,
+                    status_reason,
+                    status_changed_at,
                     created_at,
                 })
             },
@@ -1981,6 +2023,58 @@ impl Storage {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn carry_forward_placement(
+        &self,
+        placement: &Placement,
+        auto_dismiss_reason: Option<&str>,
+        expected_status_changed_at: Option<&str>,
+    ) -> Result<Option<String>> {
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO placements(
+                annotation_id, version_id, side, line_start, line_end, outdated, ambiguous
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(annotation_id, version_id) DO UPDATE SET
+                side = excluded.side,
+                line_start = excluded.line_start,
+                line_end = excluded.line_end,
+                outdated = excluded.outdated,
+                ambiguous = excluded.ambiguous",
+            params![
+                placement.annotation_id,
+                placement.version_id,
+                placement.side.as_str(),
+                placement.line_start,
+                placement.line_end,
+                placement.outdated as i64,
+                placement.ambiguous as i64,
+            ],
+        )?;
+        let changed_at = if let Some(reason) = auto_dismiss_reason {
+            let changed_at = now();
+            let updated = tx.execute(
+                "UPDATE annotations
+                 SET status = 'auto_dismissed',
+                     status_reason = ?2,
+                     status_changed_at = ?3
+                 WHERE id = ?1
+                   AND status = 'active'
+                   AND status_changed_at IS ?4",
+                params![
+                    placement.annotation_id,
+                    reason,
+                    changed_at,
+                    expected_status_changed_at
+                ],
+            )?;
+            (updated == 1).then_some(changed_at)
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok(changed_at)
     }
 
     pub fn update_annotation_file_path(&self, annotation_id: &str, path: &Path) -> Result<()> {
@@ -2016,6 +2110,23 @@ impl Storage {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn set_annotation_status(
+        &self,
+        annotation_id: &str,
+        status: AnnotationStatus,
+        reason: Option<&str>,
+    ) -> Result<String> {
+        let changed_at = now();
+        let updated = self.connection.execute(
+            "UPDATE annotations
+             SET status = ?2, status_reason = ?3, status_changed_at = ?4
+             WHERE id = ?1",
+            params![annotation_id, status.as_str(), reason, changed_at],
+        )?;
+        anyhow::ensure!(updated == 1, "Annotation {annotation_id} no longer exists");
+        Ok(changed_at)
     }
 
     pub fn placements_for_annotation(&self, annotation_id: &str) -> Result<Vec<Placement>> {
@@ -2056,7 +2167,8 @@ impl Storage {
         let mut statement = self.connection.prepare(
             "SELECT a.id, a.repo_id, a.file_path, a.anchor_snippet, a.anchor_hash,
                     a.anchor_start_offset, a.anchor_line_count, a.text, a.submitted,
-                    a.delivery_state, a.created_at,
+                    a.delivery_state, a.status, a.status_reason, a.status_changed_at,
+                    a.created_at,
                     r.work_item_id, r.name, r.path, r.remote_pr_url, r.pr_meta_json,
                     r.base_branch, r.base_branch_source, r.last_activity_at
              FROM annotations a
@@ -2064,6 +2176,7 @@ impl Storage {
              WHERE r.work_item_id = ?1
                AND a.kind = 'comment'
                AND a.submitted = 0
+               AND a.status = 'active'
              ORDER BY r.name, a.file_path, a.created_at",
         )?;
         let rows = statement.query_map([work_item_id], |row| {
@@ -2079,14 +2192,17 @@ impl Storage {
                 row.get::<_, i64>(8)?,
                 row.get::<_, String>(9)?,
                 row.get::<_, String>(10)?,
-                row.get::<_, String>(11)?,
-                row.get::<_, String>(12)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
                 row.get::<_, String>(13)?,
-                row.get::<_, Option<String>>(14)?,
-                row.get::<_, Option<String>>(15)?,
-                row.get::<_, Option<String>>(16)?,
-                row.get::<_, String>(17)?,
+                row.get::<_, String>(14)?,
+                row.get::<_, String>(15)?,
+                row.get::<_, String>(16)?,
+                row.get::<_, Option<String>>(17)?,
                 row.get::<_, Option<String>>(18)?,
+                row.get::<_, Option<String>>(19)?,
+                row.get::<_, String>(20)?,
+                row.get::<_, Option<String>>(21)?,
             ))
         })?;
         rows.map(|row| {
@@ -2101,6 +2217,9 @@ impl Storage {
                 text,
                 submitted,
                 delivery_state,
+                status,
+                status_reason,
+                status_changed_at,
                 created_at,
                 repo_work_item_id,
                 repo_name,
@@ -2124,6 +2243,9 @@ impl Storage {
                     text,
                     submitted: submitted != 0,
                     delivery_state: DeliveryState::try_from(delivery_state.as_str())?,
+                    status: AnnotationStatus::try_from(status.as_str())?,
+                    status_reason,
+                    status_changed_at,
                     created_at,
                 },
                 Repo {
@@ -2150,6 +2272,7 @@ impl Storage {
              WHERE r.work_item_id = ?1
                AND a.kind = 'comment'
                AND a.delivery_state = 'pending'
+               AND a.status = 'active'
              ORDER BY a.created_at",
         )?;
         let rows = statement.query_map([work_item_id], |row| row.get(0))?;
@@ -2253,10 +2376,13 @@ impl Storage {
         let allowed = if let Some(expected_session_id) = expected_session_id {
             tx.query_row(
                 "SELECT EXISTS(
-                    SELECT 1 FROM rev_question_sessions
-                    WHERE annotation_id = ?1
-                      AND session_id = ?2
-                      AND state != 'cleared'
+                    SELECT 1
+                    FROM rev_question_sessions q
+                    JOIN annotations a ON a.id = q.annotation_id
+                    WHERE q.annotation_id = ?1
+                      AND q.session_id = ?2
+                      AND q.state != 'cleared'
+                      AND a.status = 'active'
                 )",
                 params![message.annotation_id, expected_session_id],
                 |row| row.get::<_, i64>(0),
@@ -2267,6 +2393,7 @@ impl Storage {
                     SELECT 1 FROM annotations a
                     WHERE a.id = ?1
                       AND a.kind = 'ask'
+                      AND a.status = 'active'
                       AND a.delivery_state = 'draft'
                       AND NOT EXISTS (
                           SELECT 1 FROM ask_messages m
@@ -2378,7 +2505,9 @@ impl Storage {
              FROM ask_messages m
              JOIN annotations a ON a.id = m.annotation_id
              JOIN repos r ON r.id = a.repo_id
-             WHERE r.work_item_id = ?1 AND m.delivery_state = 'pending'
+             WHERE r.work_item_id = ?1
+               AND m.delivery_state = 'pending'
+               AND a.status = 'active'
              ORDER BY m.ts, m.annotation_id, m.seq",
         )?;
         let rows = statement.query_map([work_item_id], |row| {
@@ -2479,6 +2608,12 @@ impl Storage {
             })
             .optional()?)
     }
+
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM settings WHERE key = ?1", [key])?;
+        Ok(())
+    }
 }
 
 pub fn now() -> String {
@@ -2493,13 +2628,182 @@ mod tests {
 
     use super::{
         RevQuestionSession, SideSessionRecord, Storage, MIGRATION_1, MIGRATION_2, MIGRATION_3,
-        MIGRATION_4, MIGRATION_5, MIGRATION_6,
+        MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8,
     };
     use rq_tui_domain::{
-        AnchorSide, Annotation, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState,
-        EphemeralSessionRecord, PendingChat, Placement, Repo, SessionRecord, Version, VersionKind,
-        WorkItem,
+        AnchorSide, Annotation, AnnotationKind, AnnotationStatus, AskMessage, BaseBranchSource,
+        DeliveryState, EphemeralSessionRecord, PendingChat, Placement, Repo, SessionRecord,
+        Version, VersionKind, WorkItem,
     };
+
+    fn seed_status_annotation(storage: &Storage) {
+        storage
+            .upsert_work_item(&WorkItem {
+                id: "status-work".into(),
+                name: "status".into(),
+                workspace_root: "/status".into(),
+                created_at: "now".into(),
+                updated_at: "now".into(),
+                last_opened_at: Some("now".into()),
+            })
+            .unwrap();
+        storage
+            .upsert_repo(&Repo {
+                id: "status-repo".into(),
+                work_item_id: "status-work".into(),
+                name: "repo".into(),
+                path: "/status".into(),
+                remote_pr_url: None,
+                pr_meta_json: None,
+                base_branch: Some("main".into()),
+                base_branch_source: BaseBranchSource::Auto,
+                last_activity_at: None,
+            })
+            .unwrap();
+        storage
+            .upsert_version(&Version {
+                id: "status-version".into(),
+                repo_id: "status-repo".into(),
+                version_num: 0,
+                kind: VersionKind::WorkingTree,
+                created_at: "now".into(),
+                head_sha: "head".into(),
+                worktree_path: None,
+                last_opened_at: Some("now".into()),
+            })
+            .unwrap();
+        storage
+            .add_annotation(
+                &Annotation {
+                    id: "status-annotation".into(),
+                    repo_id: "status-repo".into(),
+                    kind: AnnotationKind::Comment,
+                    file_path: "src/lib.rs".into(),
+                    anchor_snippet: "selected".into(),
+                    anchor_hash: "hash".into(),
+                    anchor_start_offset: 0,
+                    anchor_line_count: 1,
+                    text: Some("change this".into()),
+                    submitted: false,
+                    delivery_state: DeliveryState::Draft,
+                    status: AnnotationStatus::Active,
+                    status_reason: None,
+                    status_changed_at: None,
+                    created_at: "now".into(),
+                },
+                &Placement {
+                    annotation_id: "status-annotation".into(),
+                    version_id: "status-version".into(),
+                    side: AnchorSide::New,
+                    line_start: 1,
+                    line_end: 1,
+                    outdated: false,
+                    ambiguous: false,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn inactive_annotations_leave_inline_queries_but_remain_in_history() {
+        let storage = Storage::in_memory().unwrap();
+        seed_status_annotation(&storage);
+        let changed_at = storage
+            .set_annotation_status(
+                "status-annotation",
+                AnnotationStatus::Resolved,
+                Some("fixed"),
+            )
+            .unwrap();
+
+        assert!(storage
+            .annotations_for_version("status-version")
+            .unwrap()
+            .is_empty());
+        let history = storage
+            .annotation_history_for_version("status-version")
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0.status, AnnotationStatus::Resolved);
+        assert_eq!(history[0].0.status_reason.as_deref(), Some("fixed"));
+        assert_eq!(
+            history[0].0.status_changed_at.as_deref(),
+            Some(changed_at.as_str())
+        );
+        assert!(storage
+            .pending_comments_for_work_item("status-work")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn carry_forward_preserves_inactive_history_and_cannot_overwrite_reopen() {
+        let storage = Storage::in_memory().unwrap();
+        seed_status_annotation(&storage);
+        storage
+            .upsert_version(&Version {
+                id: "status-version-2".into(),
+                repo_id: "status-repo".into(),
+                version_num: 1,
+                kind: VersionKind::Snapshot,
+                created_at: "later".into(),
+                head_sha: "head-2".into(),
+                worktree_path: None,
+                last_opened_at: Some("later".into()),
+            })
+            .unwrap();
+        let resolved_at = storage
+            .set_annotation_status(
+                "status-annotation",
+                AnnotationStatus::Resolved,
+                Some("fixed"),
+            )
+            .unwrap();
+        let next = Placement {
+            annotation_id: "status-annotation".into(),
+            version_id: "status-version-2".into(),
+            side: AnchorSide::New,
+            line_start: 4,
+            line_end: 4,
+            outdated: true,
+            ambiguous: false,
+        };
+        storage
+            .carry_forward_placement(&next, None, Some(&resolved_at))
+            .unwrap();
+        assert!(storage
+            .annotations_for_version("status-version-2")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            storage
+                .annotation_history_for_version("status-version-2")
+                .unwrap()[0]
+                .0
+                .status,
+            AnnotationStatus::Resolved
+        );
+
+        storage
+            .set_annotation_status(
+                "status-annotation",
+                AnnotationStatus::Active,
+                Some("Auto-dismiss override: reopened manually"),
+            )
+            .unwrap();
+        storage
+            .carry_forward_placement(&next, Some("stale worker dismissal"), Some(&resolved_at))
+            .unwrap();
+        let annotation = storage
+            .annotation_by_id("status-annotation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(annotation.status, AnnotationStatus::Active);
+        assert_eq!(
+            annotation.status_reason.as_deref(),
+            Some("Auto-dismiss override: reopened manually")
+        );
+    }
 
     #[test]
     fn migrations_create_expected_tables_and_indexes() {
@@ -3028,12 +3332,85 @@ mod tests {
         let count: i64 = storage
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8)",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 9",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 8);
+        assert_eq!(count, 9);
+    }
+
+    #[test]
+    fn schema_eight_annotation_rows_upgrade_to_active_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("review.db");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        for (version, sql) in [
+            (1, MIGRATION_1),
+            (2, MIGRATION_2),
+            (3, MIGRATION_3),
+            (4, MIGRATION_4),
+            (5, MIGRATION_5),
+            (6, MIGRATION_6),
+            (7, MIGRATION_7),
+            (8, MIGRATION_8),
+        ] {
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, 'now')",
+                    [version],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO work_items(
+                    id, name, workspace_root, created_at, updated_at
+                 ) VALUES ('work', 'work', '/work', 'now', 'now');
+                 INSERT INTO repos(
+                    id, work_item_id, name, path, base_branch_source
+                 ) VALUES ('repo', 'work', 'repo', '/work', 'auto');
+                 INSERT INTO versions(
+                    id, repo_id, version_num, kind, created_at, head_sha
+                 ) VALUES ('version', 'repo', 0, 'working_tree', 'now', 'head');
+                 INSERT INTO annotations(
+                    id, repo_id, kind, file_path, anchor_snippet, anchor_hash,
+                    anchor_start_offset, anchor_line_count, submitted,
+                    delivery_state, created_at
+                 ) VALUES (
+                    'annotation', 'repo', 'comment', 'src/lib.rs', 'line', 'hash',
+                    0, 1, 0, 'draft', 'now'
+                 );
+                 INSERT INTO placements(
+                    annotation_id, version_id, side, line_start, line_end,
+                    outdated, ambiguous
+                 ) VALUES ('annotation', 'version', 'new', 1, 1, 0, 0);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let storage = Storage::open(&database).unwrap();
+        let annotation = storage.annotation_by_id("annotation").unwrap().unwrap();
+        assert_eq!(annotation.status, AnnotationStatus::Active);
+        assert!(annotation.status_reason.is_none());
+        assert!(annotation.status_changed_at.is_none());
+        assert_eq!(storage.annotations_for_version("version").unwrap().len(), 1);
+        assert_eq!(
+            storage
+                .annotation_history_for_version("version")
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -3069,7 +3446,7 @@ mod tests {
         let migrations_applied: i64 = storage
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (5, 6, 7, 8)",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 5 AND 9",
                 [],
                 |row| row.get(0),
             )
@@ -3084,7 +3461,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migrations_applied, 4);
+        assert_eq!(migrations_applied, 5);
         assert_eq!(tables, 2);
     }
 
@@ -3552,6 +3929,9 @@ mod tests {
                     text: None,
                     submitted: false,
                     delivery_state: DeliveryState::Pending,
+                    status: AnnotationStatus::Active,
+                    status_reason: None,
+                    status_changed_at: None,
                     created_at: "now".into(),
                 },
                 &Placement {
@@ -3576,6 +3956,21 @@ mod tests {
             ts: "now".into(),
         };
         storage.append_ask_message(&user).unwrap();
+        assert_eq!(
+            storage.pending_ask_messages("work").unwrap(),
+            vec![user.clone()]
+        );
+        storage
+            .set_annotation_status(
+                "annotation",
+                AnnotationStatus::AutoDismissed,
+                Some("selected code changed"),
+            )
+            .unwrap();
+        assert!(storage.pending_ask_messages("work").unwrap().is_empty());
+        storage
+            .set_annotation_status("annotation", AnnotationStatus::Active, Some("reopened"))
+            .unwrap();
         assert_eq!(storage.pending_ask_messages("work").unwrap(), vec![user]);
         storage
             .acknowledge_ask_with_response_start(

@@ -1684,6 +1684,9 @@ mod tests {
                 text: Some("retain this historical note".into()),
                 submitted: false,
                 delivery_state: DeliveryState::Draft,
+                status: crate::domain::AnnotationStatus::Active,
+                status_reason: None,
+                status_changed_at: None,
                 created_at: "2026-07-30T00:00:00Z".into(),
             },
             Placement {

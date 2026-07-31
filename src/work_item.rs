@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::annotations::{follow_rename, reanchor};
+use crate::annotations::{follow_rename, reanchor_outcome, should_auto_dismiss};
 use crate::config::AppPaths;
 use crate::diff::{parse_unified, DiffSet, FileStatus};
 use crate::domain::{BaseBranchSource, Repo, Version, VersionKind, WorkItem};
@@ -211,16 +211,39 @@ fn refresh_local_placements(
     version: &Version,
     diff: &DiffSet,
 ) -> Result<()> {
-    for (mut annotation, previous) in storage.annotations_for_version(&version.id)? {
+    for (mut annotation, previous) in storage.annotation_history_for_version(&version.id)? {
         let renamed_to = diff.files.iter().find_map(|file| {
             (file.status == FileStatus::Renamed
                 && file.old_path.as_ref() == Some(&annotation.file_path))
             .then_some(file.display_path.as_path())
         });
         follow_rename(storage, &mut annotation, renamed_to)?;
-        let content =
-            std::fs::read_to_string(repo.path.join(&annotation.file_path)).unwrap_or_default();
-        storage.upsert_placement(&reanchor(&annotation, &previous, &version.id, &content))?;
+        let content_result = std::fs::read_to_string(repo.path.join(&annotation.file_path));
+        let allow_dismiss = match &content_result {
+            Ok(_) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        };
+        let content = content_result.unwrap_or_default();
+        let outcome = reanchor_outcome(&annotation, &previous, &version.id, &content);
+        let manual_override = annotation
+            .status_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("Auto-dismiss override:"));
+        let reason = (annotation.status == crate::domain::AnnotationStatus::Active
+            && allow_dismiss
+            && !manual_override
+            && should_auto_dismiss(&previous, &outcome))
+        .then(|| {
+            format!(
+                "Auto-dismissed after the selected new-side code in {} changed or disappeared",
+                annotation.file_path.display()
+            )
+        });
+        storage.carry_forward_placement(
+            &outcome.placement,
+            reason.as_deref(),
+            annotation.status_changed_at.as_deref(),
+        )?;
     }
     Ok(())
 }

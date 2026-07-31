@@ -206,7 +206,7 @@ impl ReviewArchive {
         let mut unique = HashMap::<String, (Annotation, String)>::new();
         for repo in storage.repos_for_work_item(&item.id)? {
             for version in storage.versions_for_repo(&repo.id)? {
-                for (annotation, _) in storage.annotations_for_version(&version.id)? {
+                for (annotation, _) in storage.annotation_history_for_version(&version.id)? {
                     unique
                         .entry(annotation.id.clone())
                         .or_insert_with(|| (annotation, repo.name.clone()));
@@ -279,19 +279,40 @@ impl ReviewArchive {
                 current_file = &entry.annotation.file_path;
                 let _ = write!(output, "\n### `{}`\n", current_file.display());
             }
-            let flags = match (entry.placement.outdated, entry.placement.ambiguous) {
+            let placement_flags = match (entry.placement.outdated, entry.placement.ambiguous) {
                 (true, _) => " — **outdated**",
                 (false, true) => " — **re-anchored; verify**",
                 _ => "",
             };
+            let lifecycle = if entry.annotation.status == crate::domain::AnnotationStatus::Active {
+                String::new()
+            } else {
+                format!(
+                    " — **{}**",
+                    entry.annotation.status.as_str().replace('_', "-")
+                )
+            };
             let _ = writeln!(
                 output,
-                "\n#### {} at lines {}–{}{}",
+                "\n#### {} at lines {}–{}{}{}",
                 entry.annotation.kind.as_str(),
                 entry.placement.line_start,
                 entry.placement.line_end,
-                flags
+                placement_flags,
+                lifecycle
             );
+            if let Some(reason) = &entry.annotation.status_reason {
+                let _ = writeln!(
+                    output,
+                    "\nLifecycle: {} ({})",
+                    reason,
+                    entry
+                        .annotation
+                        .status_changed_at
+                        .as_deref()
+                        .unwrap_or("time unavailable")
+                );
+            }
             if let Some(text) = &entry.annotation.text {
                 let _ = writeln!(output, "\n{text}");
             }
@@ -338,7 +359,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{ArchivedAnnotation, CommentExport, ExportFormat, ExportedComment, ReviewArchive};
-    use crate::domain::{Annotation, AnnotationKind, AskMessage, DeliveryState, Placement};
+    use crate::domain::{
+        Annotation, AnnotationKind, AnnotationStatus, AskMessage, DeliveryState, Placement,
+    };
 
     fn export() -> CommentExport {
         CommentExport {
@@ -393,6 +416,9 @@ mod tests {
                     text: None,
                     submitted: false,
                     delivery_state: DeliveryState::Sent,
+                    status: AnnotationStatus::Active,
+                    status_reason: None,
+                    status_changed_at: None,
                     created_at: "now".into(),
                 },
                 repo: "api".into(),

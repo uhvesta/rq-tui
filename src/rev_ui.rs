@@ -28,12 +28,13 @@ use crate::chat_render::{render_markdown_mapped, CellSource, MappedRow};
 use crate::cmux::MarkdownSurface;
 use crate::config::AppPaths;
 use crate::copilot::{
-    start_agent, AgentCommand, AgentEvent, AgentRuntime, BridgeConfig, ModelOption, ModelSelection,
-    Outbound, OutboundKind,
+    start_agent, start_model_catalog, AgentCommand, AgentEvent, AgentRuntime, BridgeConfig,
+    ModelOption, ModelSelection, Outbound, OutboundKind,
 };
 use crate::diff::{DiffFile, DiffLine, FileStatus, Hunk, LineKind};
 use crate::domain::{
-    AnchorSide, Annotation, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState, Placement,
+    AnchorSide, Annotation, AnnotationKind, AnnotationStatus, AskMessage, BaseBranchSource,
+    DeliveryState, Placement,
 };
 use crate::export::CommentExport;
 use crate::git::Git;
@@ -49,6 +50,7 @@ use crate::work_item::{resolve_local, ResolvedWorkItem, ReviewRepo};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_EVENTS_PER_TICK: usize = 128;
+const REV_DEFAULT_MODEL_SETTING: &str = "rev.model.default.v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RevMode {
@@ -62,6 +64,7 @@ enum RevMode {
     Questions,
     Help,
     ConfirmClear,
+    ConfirmResolve,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -108,6 +111,12 @@ enum PickerStage {
     Context,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PickerScope {
+    Thread,
+    GlobalDefault,
+}
+
 #[derive(Clone, Debug)]
 struct ModelPicker {
     models: Vec<ModelOption>,
@@ -116,10 +125,16 @@ struct ModelPicker {
     index: usize,
     model_index: usize,
     reasoning_effort: Option<String>,
+    query: String,
+    scope: PickerScope,
 }
 
 impl ModelPicker {
-    fn new(models: Vec<ModelOption>, initial_selection: ModelSelection) -> Self {
+    fn new(
+        models: Vec<ModelOption>,
+        initial_selection: ModelSelection,
+        scope: PickerScope,
+    ) -> Self {
         let model_index = models
             .iter()
             .position(|model| model.id == initial_selection.model_id)
@@ -131,7 +146,23 @@ impl ModelPicker {
             index: model_index,
             model_index,
             reasoning_effort: None,
+            query: String::new(),
+            scope,
         }
+    }
+
+    fn filtered_model_indices(&self) -> Vec<usize> {
+        let query = self.query.trim().to_ascii_lowercase();
+        self.models
+            .iter()
+            .enumerate()
+            .filter(|(_, model)| {
+                query.is_empty()
+                    || model.id.to_ascii_lowercase().contains(&query)
+                    || model.name.to_ascii_lowercase().contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect()
     }
 
     fn model(&self) -> &ModelOption {
@@ -140,18 +171,19 @@ impl ModelPicker {
 
     fn option_count(&self) -> usize {
         match self.stage {
-            PickerStage::Model => self.models.len(),
+            PickerStage::Model => self.filtered_model_indices().len(),
             PickerStage::Reasoning => self.model().supported_reasoning_efforts.len() + 1,
-            PickerStage::Context => self.model().context_tiers.len().max(1),
+            PickerStage::Context => self.model().context_tiers.len() + 1,
         }
     }
 
     fn selection(&self) -> ModelSelection {
         let model = self.model();
         let context_tier = match self.stage {
-            PickerStage::Context => model
-                .context_tiers
-                .get(self.index)
+            PickerStage::Context => self
+                .index
+                .checked_sub(1)
+                .and_then(|index| model.context_tiers.get(index))
                 .map(|tier| tier.id.clone()),
             _ => None,
         };
@@ -258,6 +290,9 @@ struct RevState {
     threads: HashMap<String, Vec<AskMessage>>,
     question_sessions: HashMap<String, RevQuestionSession>,
     picker: Option<ModelPicker>,
+    model_catalog: Option<Receiver<Result<Vec<ModelOption>>>>,
+    model_catalog_started: Option<Instant>,
+    default_model: Option<ModelSelection>,
     agent: Option<RevAgentSlot>,
     queued_questions: VecDeque<QuestionLaunch>,
     streaming: bool,
@@ -267,6 +302,7 @@ struct RevState {
     render_cache: Option<RenderCache>,
     history_cursor: usize,
     history_delete_armed: Option<String>,
+    pending_resolve: Option<String>,
     refresh: Option<Receiver<Result<ResolvedWorkItem>>>,
     refresh_started: Option<Instant>,
     markdown_preview: bool,
@@ -294,7 +330,7 @@ impl RevState {
         let mut threads = HashMap::new();
         let mut question_sessions = HashMap::new();
         for repo in &workspace.repos {
-            for pair in storage.annotations_for_version(&repo.version.id)? {
+            for pair in storage.annotation_history_for_version(&repo.version.id)? {
                 let annotation = &pair.0;
                 if annotation.kind == AnnotationKind::Ask {
                     threads.insert(
@@ -352,6 +388,13 @@ impl RevState {
             threads,
             question_sessions,
             picker: None,
+            model_catalog: None,
+            model_catalog_started: None,
+            default_model: storage
+                .setting(REV_DEFAULT_MODEL_SETTING)?
+                .map(|value| serde_json::from_str(&value))
+                .transpose()
+                .context("saved rev default model is invalid")?,
             agent: None,
             queued_questions: VecDeque::new(),
             streaming: false,
@@ -361,6 +404,7 @@ impl RevState {
             render_cache: None,
             history_cursor: 0,
             history_delete_armed: None,
+            pending_resolve: None,
             refresh: None,
             refresh_started: None,
             markdown_preview: false,
@@ -494,11 +538,9 @@ fn recover_pending_questions(
 ) -> Result<()> {
     let pending = storage.pending_ask_messages(&state.workspace.item.id)?;
     for message in pending {
-        let Some((annotation, placement)) = state
-            .annotations
-            .iter()
-            .find(|(annotation, _)| annotation.id == message.annotation_id)
-        else {
+        let Some((annotation, placement)) = state.annotations.iter().find(|(annotation, _)| {
+            annotation.id == message.annotation_id && annotation.status == AnnotationStatus::Active
+        }) else {
             continue;
         };
         let Some(repo) = state
@@ -540,7 +582,7 @@ fn recover_pending_questions(
                     assistant_message_id: Uuid::new_v4().to_string(),
                     assistant_seq: message.seq + 1,
                     prompt,
-                    needs_model_picker: existing.is_none(),
+                    needs_model_picker: existing.is_none() && state.default_model.is_none(),
                 }),
                 existing,
             },
@@ -577,6 +619,7 @@ fn run_loop<B: Backend>(
     loop {
         drain_refresh(state, storage)?;
         drain_agent_events(state, storage, paths)?;
+        drain_model_catalog(state)?;
         drain_cmux_preview(state);
         if let Err(error) = sync_markdown_preview(state, paths) {
             state.status =
@@ -621,7 +664,8 @@ fn run_loop<B: Backend>(
                             state.command.selected =
                                 (state.command.selected + 1).min(count.saturating_sub(1));
                         }
-                        RevMode::Model | RevMode::ConfirmClear => {}
+                        RevMode::Model => move_model_picker(state, 3),
+                        RevMode::ConfirmClear | RevMode::ConfirmResolve => {}
                     },
                     MouseEventKind::ScrollUp => match state.mode {
                         RevMode::Normal | RevMode::Visual => move_row(state, highlighter, -3),
@@ -637,7 +681,8 @@ fn run_loop<B: Backend>(
                         RevMode::Command => {
                             state.command.selected = state.command.selected.saturating_sub(1)
                         }
-                        RevMode::Model | RevMode::ConfirmClear => {}
+                        RevMode::Model => move_model_picker(state, -3),
+                        RevMode::ConfirmClear | RevMode::ConfirmResolve => {}
                     },
                     _ => {}
                 },
@@ -744,6 +789,18 @@ fn handle_key(
                 KeyCode::Char('n') | KeyCode::Esc => {
                     state.mode = RevMode::Normal;
                     state.status = "Clear cancelled".into();
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        RevMode::ConfirmResolve => {
+            match key.code {
+                KeyCode::Char('y') => resolve_pending_annotation(state, storage)?,
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    state.pending_resolve = None;
+                    state.mode = RevMode::Normal;
+                    state.status = "Resolve cancelled".into();
                 }
                 _ => {}
             }
@@ -907,10 +964,14 @@ fn handle_review_key(
             }
         }
         KeyCode::Char('r') => {
-            state.mode = RevMode::History;
-            state.history_cursor = 0;
-            state.status =
-                "HISTORY · j/k move · d d deletes saved feedback only · Esc return".into();
+            if let Some(id) = current_annotation_id(state, highlighter) {
+                begin_resolve(state, id);
+            } else {
+                state.mode = RevMode::History;
+                state.history_cursor = 0;
+                state.status =
+                    "HISTORY · j/k move · u reopens · d d deletes feedback · Esc return".into();
+            }
         }
         KeyCode::Char('e') => copy_feedback_prompt(state, storage)?,
         KeyCode::Char('C') => {
@@ -1116,7 +1177,9 @@ fn question_ids(state: &RevState) -> Vec<String> {
     state
         .annotations
         .iter()
-        .filter(|(annotation, _)| annotation.kind == AnnotationKind::Ask)
+        .filter(|(annotation, _)| {
+            annotation.kind == AnnotationKind::Ask && annotation.status == AnnotationStatus::Active
+        })
         .map(|(annotation, _)| annotation.id.clone())
         .collect()
 }
@@ -1339,6 +1402,7 @@ fn contextual_annotation(
         .rev()
         .filter(|(annotation, placement)| {
             annotation.kind == kind
+                && annotation.status == AnnotationStatus::Active
                 && annotation.repo_id == repo.record.id
                 && annotation.file_path == file.display_path
                 && !placement.outdated
@@ -1463,6 +1527,101 @@ fn start_model_switch(state: &mut RevState, paths: &AppPaths, annotation_id: &st
     );
 }
 
+fn start_global_model_picker(state: &mut RevState) {
+    if state.agent.is_some() || !state.queued_questions.is_empty() {
+        state.mode = RevMode::Normal;
+        state.status =
+            "Finish or cancel active and queued questions before changing the global default"
+                .into();
+        return;
+    }
+    if state.model_catalog.is_some() {
+        state.status = "Global model choices are already loading · UI remains responsive".into();
+        return;
+    }
+    state.model_catalog = Some(start_model_catalog(state.workspace.session_root.clone()));
+    state.model_catalog_started = Some(Instant::now());
+    state.mode = RevMode::Normal;
+    state.agent_activity =
+        "Loading Copilot model catalog without creating a question session…".into();
+    state.agent_last_event = Instant::now();
+    state.status =
+        "Loading global model choices in the background · navigation remains active".into();
+}
+
+fn drain_model_catalog(state: &mut RevState) -> Result<()> {
+    let Some(receiver) = state.model_catalog.as_ref() else {
+        return Ok(());
+    };
+    let result = match receiver.try_recv() {
+        Ok(result) => result,
+        Err(TryRecvError::Empty) => {
+            if state
+                .model_catalog_started
+                .is_some_and(|started| started.elapsed() >= Duration::from_secs(2))
+            {
+                let elapsed = state
+                    .model_catalog_started
+                    .map_or(0, |started| started.elapsed().as_secs());
+                state.status = format!(
+                    "Loading global Copilot models · {elapsed}s elapsed · navigation remains active"
+                );
+                state.agent_activity =
+                    format!("Copilot model catalog is still loading · {elapsed}s elapsed");
+            }
+            return Ok(());
+        }
+        Err(TryRecvError::Disconnected) => {
+            state.model_catalog = None;
+            state.model_catalog_started = None;
+            state.status = "Copilot model catalog stopped unexpectedly".into();
+            return Ok(());
+        }
+    };
+    state.model_catalog = None;
+    state.model_catalog_started = None;
+    let models = match result {
+        Ok(models) => models,
+        Err(error) => {
+            state.status = format!("Could not load Copilot models: {error:#}");
+            state.agent_activity =
+                "Model catalog failed · existing defaults and question sessions are unchanged"
+                    .into();
+            return Ok(());
+        }
+    };
+    if models.is_empty() {
+        state.status =
+            "Copilot returned no selectable models · existing defaults are unchanged".into();
+        state.agent_activity = "Model catalog completed with no selectable models".into();
+        return Ok(());
+    }
+    if state.agent.is_some() || !state.queued_questions.is_empty() {
+        state.status =
+            "Model catalog loaded, but question work started · run :model again when it finishes"
+                .into();
+        state.agent_activity =
+            "Global model change deferred so active question sessions remain isolated".into();
+        return Ok(());
+    }
+    let initial_selection = state
+        .default_model
+        .clone()
+        .unwrap_or_else(|| ModelSelection {
+            model_id: models[0].id.clone(),
+            reasoning_effort: None,
+            context_tier: None,
+        });
+    state.picker = Some(ModelPicker::new(
+        models,
+        initial_selection,
+        PickerScope::GlobalDefault,
+    ));
+    state.mode = RevMode::Model;
+    state.status = "GLOBAL MODEL 1/3 · type to search · ↑/↓ choose · Enter deeper".into();
+    Ok(())
+}
+
 fn begin_compose(state: &mut RevState, highlighter: &mut dyn Highlighter, target: ComposeTarget) {
     if matches!(target, ComposeTarget::Feedback | ComposeTarget::NewQuestion) {
         let Some((start, end)) = selected_source_range(state, highlighter) else {
@@ -1576,6 +1735,7 @@ fn command_candidates(state: &RevState) -> Vec<String> {
         "help".to_owned(),
         "history".to_owned(),
         "model".to_owned(),
+        "model reset".to_owned(),
         "questions".to_owned(),
         "refresh".to_owned(),
         "render markdown".to_owned(),
@@ -1620,13 +1780,24 @@ fn execute_command(
         }
         "questions" | "threads" => open_questions(state),
         "model" => {
-            if let Some(id) = current_question_id_from_cache(state) {
-                start_model_switch(state, paths, &id);
-            } else {
+            start_global_model_picker(state);
+        }
+        "model reset" => {
+            if state.agent.is_some()
+                || !state.queued_questions.is_empty()
+                || state.model_catalog.is_some()
+            {
                 state.mode = RevMode::Normal;
                 state.status =
-                    "Move onto a question thread or use :questions before running :model".into();
+                    "Finish question work and model loading before resetting the global default"
+                        .into();
+                return Ok(());
             }
+            storage.delete_setting(REV_DEFAULT_MODEL_SETTING)?;
+            state.default_model = None;
+            state.mode = RevMode::Normal;
+            state.status =
+                "Global question model reset · new threads will ask you to choose".into();
         }
         "diff unified" | "unified" => {
             state.diff_layout = RevDiffLayout::Unified;
@@ -2103,7 +2274,25 @@ fn handle_compose_key(
             state.compose_scroll = u16::MAX;
             Ok(())
         }
-        KeyCode::Enter => submit_compose(state, storage, paths),
+        KeyCode::Enter => {
+            if state.compose.trim() == "/model" {
+                let Some(ComposeTarget::FollowUp(annotation_id)) =
+                    state.compose_target.as_ref().cloned()
+                else {
+                    state.status =
+                        "/model is available while continuing an existing question thread".into();
+                    return Ok(());
+                };
+                state.compose_target = None;
+                state.compose.clear();
+                state.compose_cursor = 0;
+                state.compose_scroll = 0;
+                state.mode = RevMode::Normal;
+                start_model_switch(state, paths, &annotation_id);
+                return Ok(());
+            }
+            submit_compose(state, storage, paths)
+        }
         KeyCode::Backspace => {
             if state.compose_cursor > 0 {
                 let previous = previous_grapheme_boundary(&state.compose, state.compose_cursor);
@@ -2373,7 +2562,7 @@ fn create_question(
                 assistant_message_id: Uuid::new_v4().to_string(),
                 assistant_seq: 1,
                 prompt,
-                needs_model_picker: true,
+                needs_model_picker: state.default_model.is_none(),
             }),
             existing: None,
         },
@@ -2510,6 +2699,7 @@ fn start_question_agent(state: &mut RevState, paths: &AppPaths, launch: Question
             reasoning_effort: session.reasoning_effort.clone(),
             context_tier: session.context_tier.clone(),
         })
+        .or_else(|| state.default_model.clone())
         .unwrap_or_else(|| ModelSelection {
             model_id: "gpt-5".into(),
             reasoning_effort: None,
@@ -2661,7 +2851,19 @@ fn handle_agent_event(
         }
         AgentEvent::ModelsListed(models) => {
             if models.is_empty() {
-                anyhow::bail!("Copilot returned no selectable models");
+                if send_with_startup_model(state)? {
+                    state.status =
+                        "No model choices were returned · question sent with the startup model"
+                            .into();
+                    state.agent_activity =
+                        "Copilot is answering with the session's startup model".into();
+                } else {
+                    state.status =
+                        "Copilot returned no selectable models · current thread is unchanged"
+                            .into();
+                    finish_active_question(state, paths);
+                }
+                return Ok(());
             }
             let initial_selection = state
                 .agent
@@ -2675,9 +2877,31 @@ fn handle_agent_event(
             {
                 state.model_return_mode = RevMode::Normal;
             }
-            state.picker = Some(ModelPicker::new(models, initial_selection));
+            state.picker = Some(ModelPicker::new(
+                models,
+                initial_selection,
+                PickerScope::Thread,
+            ));
             state.mode = RevMode::Model;
             state.status = "MODEL 1/3 · choose a model for this question".into();
+        }
+        AgentEvent::ModelsListFailed(message) => {
+            let model_switch_only = state
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.model_switch_only);
+            if !model_switch_only && send_with_startup_model(state)? {
+                state.agent_activity =
+                    format!("Model picker failed; answering with the startup model: {message}");
+                state.status =
+                    "Model choices unavailable · question sent with the session's startup model"
+                        .into();
+            } else {
+                state.agent_activity = format!("Could not load Copilot models: {message}");
+                state.status =
+                    format!("Model picker failed: {message} · this thread keeps its current model");
+                finish_active_question(state, paths);
+            }
         }
         AgentEvent::ModelSelectionChanged(selection) => {
             let (question_id, session_id, expected_message_id, pending, model_switch_only) = {
@@ -2795,6 +3019,7 @@ fn handle_agent_event(
             if let Some((message_id, text)) = active_response(state, &outbound_id) {
                 storage.update_ask_message_text(&message_id, &text)?;
             }
+            settle_unsent_question(state, storage)?;
             state.streaming = false;
             state.agent_activity = if aborted {
                 "Question cancelled".into()
@@ -2812,6 +3037,7 @@ fn handle_agent_event(
             if let Some((message_id, text)) = active_response(state, &outbound_id) {
                 storage.update_ask_message_text(&message_id, &text).ok();
             }
+            settle_unsent_question(state, storage)?;
             state.streaming = false;
             state.agent_activity = format!("Question failed: {message}");
             state.status = state.agent_activity.clone();
@@ -2826,17 +3052,33 @@ fn handle_agent_event(
             state.status = format!("Model selection failed: {message}");
         }
         AgentEvent::Error(message) => {
+            settle_unsent_question(state, storage)?;
             state.streaming = false;
             state.agent_activity = format!("Copilot error: {message}");
             state.status = state.agent_activity.clone();
             finish_active_question(state, paths);
         }
         AgentEvent::Stopped => {
+            settle_unsent_question(state, storage)?;
             if state.streaming {
                 state.streaming = false;
                 state.status = "Copilot stopped before the answer completed".into();
             }
             finish_active_question(state, paths);
+        }
+        AgentEvent::StopSettledAlreadyIdle => {
+            if state
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.needs_model_picker)
+            {
+                settle_unsent_question(state, storage)?;
+                state.streaming = false;
+                state.status =
+                    "Question startup cancelled · unsent prompt retained as a draft".into();
+                state.agent_activity = "Copilot cancellation settled while loading models".into();
+                finish_active_question(state, paths);
+            }
         }
         AgentEvent::HistoryLoaded(_)
         | AgentEvent::Queued { .. }
@@ -2845,7 +3087,6 @@ fn handle_agent_event(
         | AgentEvent::QueueReplaceRejected { .. }
         | AgentEvent::SteeringAccepted { .. }
         | AgentEvent::SteeringFailed { .. }
-        | AgentEvent::StopSettledAlreadyIdle
         | AgentEvent::Forked { .. }
         | AgentEvent::ModelChanged(_)
         | AgentEvent::Compacted
@@ -2857,6 +3098,64 @@ fn handle_agent_event(
         | AgentEvent::PruneRecovery { .. } => {}
     }
     Ok(())
+}
+
+fn settle_unsent_question(state: &mut RevState, storage: &Storage) -> Result<()> {
+    let Some(pending) = state
+        .agent
+        .as_ref()
+        .and_then(|agent| agent.pending.as_ref())
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let response_started = state
+        .threads
+        .get(&pending.annotation_id)
+        .is_some_and(|thread| {
+            thread
+                .iter()
+                .any(|message| message.id == pending.assistant_message_id)
+        });
+    if response_started {
+        return Ok(());
+    }
+    storage.discard_pending_ask(&pending.user_message_id)?;
+    if let Some(message) = state
+        .threads
+        .get_mut(&pending.annotation_id)
+        .and_then(|thread| {
+            thread
+                .iter_mut()
+                .find(|message| message.id == pending.user_message_id)
+        })
+    {
+        message.delivery_state = DeliveryState::Draft;
+        message.sent = false;
+    }
+    if let Some((annotation, _)) = state
+        .annotations
+        .iter_mut()
+        .find(|(annotation, _)| annotation.id == pending.annotation_id)
+    {
+        annotation.delivery_state = DeliveryState::Draft;
+    }
+    Ok(())
+}
+
+fn send_with_startup_model(state: &mut RevState) -> Result<bool> {
+    let Some(agent) = state.agent.as_mut() else {
+        return Ok(false);
+    };
+    let Some(pending) = agent.pending.take() else {
+        return Ok(false);
+    };
+    agent.needs_model_picker = false;
+    send_pending(agent, pending)?;
+    state.picker = None;
+    state.mode = RevMode::Normal;
+    state.streaming = true;
+    Ok(true)
 }
 
 fn send_pending(agent: &mut RevAgentSlot, pending: PendingSend) -> Result<()> {
@@ -2967,47 +3266,24 @@ fn handle_model_key(
     paths: &AppPaths,
     key: KeyEvent,
 ) -> Result<()> {
-    let picker = state.picker.as_mut().context("model mode has no picker")?;
-    match key.code {
-        KeyCode::Esc => {
-            let model_switch_only = state
-                .agent
-                .as_ref()
-                .is_some_and(|agent| agent.model_switch_only);
-            if let Some(message_id) = state
-                .agent
-                .as_ref()
-                .and_then(|agent| agent.pending.as_ref())
-                .map(|pending| pending.user_message_id.clone())
-            {
-                storage.discard_pending_ask(&message_id)?;
-            }
-            state.mode = if model_switch_only {
-                state.model_return_mode
-            } else {
-                RevMode::Normal
-            };
-            state.agent.take();
-            state.picker = None;
-            state.status = if model_switch_only {
-                "Model change cancelled · the question keeps its previous model".into()
-            } else {
-                "Question kept as a draft; model selection cancelled".into()
-            };
-            if let Some(next) = state.queued_questions.pop_front() {
-                start_question_agent(state, paths, next);
-            }
-        }
-        KeyCode::Char('j') | KeyCode::Down => {
-            picker.index = (picker.index + 1).min(picker.option_count().saturating_sub(1));
-        }
-        KeyCode::Char('k') | KeyCode::Up => picker.index = picker.index.saturating_sub(1),
-        KeyCode::Enter => match picker.stage {
-            PickerStage::Model => {
-                picker.model_index = picker.index;
-                picker.index = if picker.model().id == picker.initial_selection.model_id {
-                    picker
-                        .initial_selection
+    let scope = state
+        .picker
+        .as_ref()
+        .context("model mode has no picker")?
+        .scope
+        .clone();
+    if key.code == KeyCode::Esc {
+        let stage = state
+            .picker
+            .as_ref()
+            .context("model mode has no picker")?
+            .stage;
+        if stage != PickerStage::Model {
+            let picker = state.picker.as_mut().context("model mode has no picker")?;
+            match stage {
+                PickerStage::Context => {
+                    picker.stage = PickerStage::Reasoning;
+                    picker.index = picker
                         .reasoning_effort
                         .as_ref()
                         .and_then(|current| {
@@ -3017,53 +3293,259 @@ fn handle_model_key(
                                 .iter()
                                 .position(|effort| effort == current)
                         })
-                        .map_or(0, |index| index + 1)
-                } else {
-                    0
-                };
-                picker.stage = PickerStage::Reasoning;
-                state.status = "MODEL 2/3 · choose thinking level".into();
+                        .map_or(0, |index| index + 1);
+                    state.status = "MODEL 2/3 · choose thinking level · Esc goes back".into();
+                }
+                PickerStage::Reasoning => {
+                    picker.stage = PickerStage::Model;
+                    picker.index = picker
+                        .filtered_model_indices()
+                        .iter()
+                        .position(|index| *index == picker.model_index)
+                        .unwrap_or(0);
+                    state.status = "MODEL 1/3 · type to search · ↑/↓ choose · Esc cancels".into();
+                }
+                PickerStage::Model => unreachable!(),
             }
-            PickerStage::Reasoning => {
-                picker.reasoning_effort = picker
-                    .index
-                    .checked_sub(1)
-                    .and_then(|index| picker.model().supported_reasoning_efforts.get(index))
-                    .cloned();
-                picker.index = if picker.model().id == picker.initial_selection.model_id {
-                    picker
-                        .initial_selection
-                        .context_tier
-                        .as_ref()
-                        .and_then(|current| {
-                            picker
-                                .model()
-                                .context_tiers
-                                .iter()
-                                .position(|tier| &tier.id == current)
-                        })
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
-                picker.stage = PickerStage::Context;
-                state.status = "MODEL 3/3 · choose context window".into();
+            return Ok(());
+        }
+        if scope == PickerScope::GlobalDefault {
+            state.mode = RevMode::Normal;
+            state.picker = None;
+            state.status = "Global model selection cancelled · the default is unchanged".into();
+            return Ok(());
+        }
+        let model_switch_only = state
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.model_switch_only);
+        if !model_switch_only {
+            let startup_model = state
+                .agent
+                .as_ref()
+                .map(|agent| agent.selection.model_id.clone())
+                .unwrap_or_else(|| "runtime default".into());
+            if send_with_startup_model(state)? {
+                state.status = format!(
+                    "Model picker closed · question sent with startup model {startup_model}"
+                );
+                state.agent_activity =
+                    format!("Copilot is answering with startup model {startup_model}");
+                return Ok(());
             }
-            PickerStage::Context => {
-                let selection = picker.selection();
-                let agent = state
-                    .agent
-                    .as_ref()
-                    .context("picker has no question agent")?;
-                agent
-                    .runtime
-                    .send(AgentCommand::SelectModel(selection.clone()))?;
-                state.status = format!("Applying {} to this question session…", selection.model_id);
-                let _ = storage;
-            }
-        },
-        _ => {}
+        }
+        if let Some(message_id) = state
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.pending.as_ref())
+            .map(|pending| pending.user_message_id.clone())
+        {
+            storage.discard_pending_ask(&message_id)?;
+        }
+        state.mode = if model_switch_only {
+            state.model_return_mode
+        } else {
+            RevMode::Normal
+        };
+        state.agent.take();
+        state.picker = None;
+        state.status = if model_switch_only {
+            "Model change cancelled · the question keeps its previous model".into()
+        } else {
+            "Question kept as a draft; model selection cancelled".into()
+        };
+        if let Some(next) = state.queued_questions.pop_front() {
+            start_question_agent(state, paths, next);
+        }
+        return Ok(());
     }
+
+    let mut completed = None;
+    {
+        let picker = state.picker.as_mut().context("model mode has no picker")?;
+        match key.code {
+            KeyCode::Down => {
+                picker.index = (picker.index + 1).min(picker.option_count().saturating_sub(1));
+            }
+            KeyCode::Char('j') if picker.stage != PickerStage::Model => {
+                picker.index = (picker.index + 1).min(picker.option_count().saturating_sub(1));
+            }
+            KeyCode::Up => {
+                picker.index = picker.index.saturating_sub(1);
+            }
+            KeyCode::Char('k') if picker.stage != PickerStage::Model => {
+                picker.index = picker.index.saturating_sub(1);
+            }
+            KeyCode::Home => picker.index = 0,
+            KeyCode::End => picker.index = picker.option_count().saturating_sub(1),
+            KeyCode::Backspace if picker.stage == PickerStage::Model => {
+                let previous = previous_grapheme_boundary(&picker.query, picker.query.len());
+                picker.query.truncate(previous);
+                picker.index = 0;
+            }
+            KeyCode::Char('u')
+                if picker.stage == PickerStage::Model
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                picker.query.clear();
+                picker.index = 0;
+            }
+            KeyCode::Char(character)
+                if picker.stage == PickerStage::Model
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                picker.query.push(character);
+                picker.index = 0;
+            }
+            KeyCode::Enter => match picker.stage {
+                PickerStage::Model => {
+                    let filtered = picker.filtered_model_indices();
+                    let Some(model_index) = filtered.get(picker.index).copied() else {
+                        state.status =
+                            "No matching models · edit the search before continuing".into();
+                        return Ok(());
+                    };
+                    picker.model_index = model_index;
+                    picker.index = if picker.model().id == picker.initial_selection.model_id {
+                        picker
+                            .initial_selection
+                            .reasoning_effort
+                            .as_ref()
+                            .and_then(|current| {
+                                picker
+                                    .model()
+                                    .supported_reasoning_efforts
+                                    .iter()
+                                    .position(|effort| effort == current)
+                            })
+                            .map_or(0, |index| index + 1)
+                    } else {
+                        0
+                    };
+                    picker.stage = PickerStage::Reasoning;
+                    state.status = "MODEL 2/3 · choose thinking level".into();
+                }
+                PickerStage::Reasoning => {
+                    picker.reasoning_effort = picker
+                        .index
+                        .checked_sub(1)
+                        .and_then(|index| picker.model().supported_reasoning_efforts.get(index))
+                        .cloned();
+                    picker.index = if picker.model().id == picker.initial_selection.model_id {
+                        picker
+                            .initial_selection
+                            .context_tier
+                            .as_ref()
+                            .and_then(|current| {
+                                picker
+                                    .model()
+                                    .context_tiers
+                                    .iter()
+                                    .position(|tier| &tier.id == current)
+                            })
+                            .map_or(0, |index| index + 1)
+                    } else {
+                        0
+                    };
+                    picker.stage = PickerStage::Context;
+                    state.status = "MODEL 3/3 · choose context window".into();
+                }
+                PickerStage::Context => completed = Some(picker.selection()),
+            },
+            _ => {}
+        }
+    }
+
+    if let Some(selection) = completed {
+        if scope == PickerScope::GlobalDefault {
+            storage.set_setting(
+                REV_DEFAULT_MODEL_SETTING,
+                &serde_json::to_string(&selection)?,
+            )?;
+            state.default_model = Some(selection.clone());
+            state.picker = None;
+            state.mode = RevMode::Normal;
+            state.agent_activity = format!("Global default model is now {}", selection.model_id);
+            state.status = format!(
+                "Global default changed to {} · existing question threads keep their own models",
+                selection.model_id
+            );
+        } else {
+            let agent = state
+                .agent
+                .as_ref()
+                .context("picker has no question agent")?;
+            agent
+                .runtime
+                .send(AgentCommand::SelectModel(selection.clone()))?;
+            state.status = format!("Applying {} to this question session…", selection.model_id);
+        }
+    }
+    Ok(())
+}
+
+fn move_model_picker(state: &mut RevState, delta: isize) {
+    let Some(picker) = state.picker.as_mut() else {
+        return;
+    };
+    if delta >= 0 {
+        picker.index = (picker.index + delta as usize).min(picker.option_count().saturating_sub(1));
+    } else {
+        picker.index = picker.index.saturating_sub(delta.unsigned_abs());
+    }
+}
+
+fn begin_resolve(state: &mut RevState, annotation_id: String) {
+    if state.agent.is_some() || !state.queued_questions.is_empty() {
+        state.status =
+            "Finish or cancel active and queued questions before resolving a review item".into();
+        return;
+    }
+    let Some((annotation, placement)) = state.annotation(&annotation_id) else {
+        state.status = "This review item no longer exists".into();
+        return;
+    };
+    if annotation.status != AnnotationStatus::Active {
+        state.status = "This review item is already inactive · use history to reopen it".into();
+        return;
+    }
+    let status = format!(
+        "Resolve this {} at {}:{}-{}? y/n",
+        annotation.kind.as_str(),
+        annotation.file_path.display(),
+        placement.line_start,
+        placement.line_end
+    );
+    state.pending_resolve = Some(annotation_id);
+    state.mode = RevMode::ConfirmResolve;
+    state.status = status;
+}
+
+fn resolve_pending_annotation(state: &mut RevState, storage: &Storage) -> Result<()> {
+    let annotation_id = state
+        .pending_resolve
+        .take()
+        .context("resolve confirmation lost its review item")?;
+    let reason = "Resolved manually from the inline review";
+    let changed_at =
+        storage.set_annotation_status(&annotation_id, AnnotationStatus::Resolved, Some(reason))?;
+    let annotation = state
+        .annotations
+        .iter_mut()
+        .find(|(annotation, _)| annotation.id == annotation_id)
+        .map(|(annotation, _)| annotation)
+        .context("resolved review item disappeared from memory")?;
+    annotation.status = AnnotationStatus::Resolved;
+    annotation.status_reason = Some(reason.into());
+    annotation.status_changed_at = Some(changed_at);
+    state.mode = RevMode::Normal;
+    state.visual_anchor = None;
+    state.visual_row_anchor = None;
+    state.invalidate_rows();
+    state.status =
+        "Resolved · hidden inline and retained in history · r on source opens history".into();
     Ok(())
 }
 
@@ -3082,6 +3564,26 @@ fn handle_history_key(state: &mut RevState, storage: &Storage, key: KeyEvent) ->
         KeyCode::Char('k') | KeyCode::Up => {
             state.history_cursor = state.history_cursor.saturating_sub(1);
             state.history_delete_armed = None;
+        }
+        KeyCode::Char('u') => {
+            if let Some((annotation, _)) = state.annotations.get_mut(state.history_cursor) {
+                if annotation.status == AnnotationStatus::Active {
+                    state.status = "This review item is already active".into();
+                    return Ok(());
+                }
+                let changed_at = storage.set_annotation_status(
+                    &annotation.id,
+                    AnnotationStatus::Active,
+                    Some("Auto-dismiss override: reopened manually from review history"),
+                )?;
+                annotation.status = AnnotationStatus::Active;
+                annotation.status_reason =
+                    Some("Auto-dismiss override: reopened manually from review history".into());
+                annotation.status_changed_at = Some(changed_at);
+                state.invalidate_rows();
+                state.status =
+                    "Reopened · item is active inline again at its latest saved placement".into();
+            }
         }
         KeyCode::Char('d') => {
             if state.agent.is_some() || !state.queued_questions.is_empty() {
@@ -3425,7 +3927,8 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
         .annotations
         .iter()
         .filter(|(annotation, _)| {
-            annotation.repo_id == repo.record.id
+            annotation.status == AnnotationStatus::Active
+                && annotation.repo_id == repo.record.id
                 && annotation.file_path.to_string_lossy() == file_path
         })
         .collect::<Vec<_>>();
@@ -3613,11 +4116,23 @@ fn render(frame: &mut Frame, state: &mut RevState, highlighter: &mut dyn Highlig
     }
     render_footer(frame, state, vertical[3]);
     if state.mode == RevMode::Model {
-        render_model_picker(frame, state, vertical[1]);
+        render_model_picker(frame, state, area);
     } else if state.mode == RevMode::Command {
         render_command_palette(frame, state, vertical[1]);
     } else if state.mode == RevMode::ConfirmClear {
-        render_confirmation(frame, vertical[1]);
+        render_confirmation(
+            frame,
+            area,
+            " confirm clear ",
+            "Clear all persisted comments and questions for this workspace?",
+        );
+    } else if state.mode == RevMode::ConfirmResolve {
+        render_confirmation(
+            frame,
+            area,
+            " confirm resolve ",
+            "Hide this item from the active review while retaining it in history?",
+        );
     }
 }
 
@@ -4258,7 +4773,8 @@ fn decorate_markdown_annotations(
             continue;
         };
         for (annotation, placement) in &state.annotations {
-            if annotation.repo_id != repo_id
+            if annotation.status != AnnotationStatus::Active
+                || annotation.repo_id != repo_id
                 || annotation.file_path != path
                 || placement.side != side
                 || placement.line_end != source_line as i64
@@ -4293,7 +4809,8 @@ fn decorate_markdown_annotations(
     }
     if let (Some(repo_id), Some(path)) = (current_repo_id, current_path) {
         for (annotation, placement) in &state.annotations {
-            if annotation.repo_id != repo_id
+            if annotation.status != AnnotationStatus::Active
+                || annotation.repo_id != repo_id
                 || annotation.file_path != path
                 || !shown_annotations.insert(annotation.id.clone())
             {
@@ -4534,7 +5051,10 @@ fn help_lines() -> Vec<Line<'static>> {
             "open or close the right-side question-thread panel",
         ),
         key("d d", "delete only the saved feedback under the cursor"),
-        key("r", "open persisted review history"),
+        key(
+            "r",
+            "on an inline item, confirm resolve; on source, open history",
+        ),
         key(
             "e",
             "copy the structured feedback prompt using native clipboard or OSC 52",
@@ -4560,6 +5080,10 @@ fn help_lines() -> Vec<Line<'static>> {
             "inside a follow-up, clear only that thread and reset its context",
         ),
         key(
+            "/model",
+            "inside a follow-up, change only that question thread's model",
+        ),
+        key(
             "Esc",
             "cancel; an empty anchored box retains selection until Esc again",
         ),
@@ -4569,14 +5093,16 @@ fn help_lines() -> Vec<Line<'static>> {
             "Ctrl-C",
             "request cancellation of the active question from any mode",
         ),
+        key("↑ / ↓", "move through model, thinking, and context options"),
+        key("j / k", "also move on thinking and context stages"),
         key(
-            "j/k / ↑/↓",
-            "move through model, thinking, and context options",
+            "type / Backspace",
+            "search runtime model IDs and names on the first picker stage",
         ),
         key("Enter", "choose one picker stage and continue to the next"),
         key(
             "Esc",
-            "cancel; a draft stays saved or an existing thread keeps its model",
+            "go back a stage; at models, existing threads cancel and new questions use the startup model",
         ),
         key(
             "queue",
@@ -4602,7 +5128,12 @@ fn help_lines() -> Vec<Line<'static>> {
             "d, then d",
             "permanently delete selected saved feedback; questions are retained",
         ),
+        key("u", "reopen a resolved or auto-dismissed item"),
         key("r / Esc", "return to the review"),
+        key(
+            "auto-dismiss",
+            "new-side items hide only when selected code changes/disappears; moved, ambiguous, old-side, and manually reopened anchors stay active",
+        ),
         Line::raw(""),
         section("Command palette"),
         key("type", "filter commands and branch completions"),
@@ -4635,10 +5166,8 @@ fn help_lines() -> Vec<Line<'static>> {
             "refresh local changes or fetch the latest GitHub PR revision in the background",
         ),
         key(":questions", "open the right-side question-thread panel"),
-        key(
-            ":model",
-            "switch the model for the question under the cursor",
-        ),
+        key(":model", "set the global default for new question sessions"),
+        key(":model reset", "ask for a model on each new question again"),
         key(":export feedback", "copy the structured feedback prompt"),
         key(":clear", "clear this workspace's saved review history"),
         key(":quit", "quit"),
@@ -4918,7 +5447,7 @@ fn render_footer(frame: &mut Frame, state: &RevState, area: Rect) {
         RevMode::FilePicker => "FILES",
         RevMode::Questions => "QUESTIONS",
         RevMode::Help => "HELP",
-        RevMode::ConfirmClear => "CONFIRM",
+        RevMode::ConfirmClear | RevMode::ConfirmResolve => "CONFIRM",
     };
     let first = if area.width < 80 {
         format!("{mode} · {}", state.status)
@@ -5254,18 +5783,24 @@ fn render_model_picker(frame: &mut Frame, state: &RevState, area: Rect) {
     let Some(picker) = state.picker.as_ref() else {
         return;
     };
-    let popup = centered_rect(
-        area,
-        72.min(area.width.saturating_sub(2)),
-        14.min(area.height),
-    );
+    let popup_width = if area.width < 50 {
+        area.width
+    } else {
+        72.min(area.width.saturating_sub(2))
+    };
+    let popup = centered_rect(area, popup_width, 18.min(area.height));
     frame.render_widget(Clear, popup);
     let (title, options) = match picker.stage {
         PickerStage::Model => (
-            " model 1/3 ",
+            if picker.scope == PickerScope::GlobalDefault {
+                " global model 1/3 "
+            } else {
+                " question model 1/3 "
+            },
             picker
-                .models
+                .filtered_model_indices()
                 .iter()
+                .map(|index| &picker.models[*index])
                 .map(|model| {
                     let context = model
                         .max_context_tokens
@@ -5291,28 +5826,42 @@ fn render_model_picker(frame: &mut Frame, state: &RevState, area: Rect) {
         }
         PickerStage::Context => (
             " context 3/3 ",
-            if picker.model().context_tiers.is_empty() {
-                vec!["Runtime default".into()]
-            } else {
-                picker
-                    .model()
-                    .context_tiers
-                    .iter()
-                    .map(|tier| {
-                        tier.max_context_tokens
-                            .map(|tokens| format!("{} · {tokens} tokens", tier.id))
-                            .unwrap_or_else(|| tier.id.clone())
-                    })
-                    .collect()
-            },
+            std::iter::once("Runtime default".into())
+                .chain(picker.model().context_tiers.iter().map(|tier| {
+                    tier.max_context_tokens
+                        .map(|tokens| format!("{} · {tokens} tokens", tier.id))
+                        .unwrap_or_else(|| tier.id.clone())
+                }))
+                .collect(),
         ),
     };
+    let title = if popup.width < 60 {
+        format!(
+            " model {}/3 · ↵ next · Esc back ",
+            match picker.stage {
+                PickerStage::Model => 1,
+                PickerStage::Reasoning => 2,
+                PickerStage::Context => 3,
+            }
+        )
+    } else {
+        format!("{title} · ↑/↓ choose · Enter deeper · Esc back/cancel ")
+    };
     let block = Block::default()
-        .title(format!("{title} · ↑/↓ scroll · Enter deeper "))
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(popup);
-    let viewport = inner.height.max(1) as usize;
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(if picker.stage == PickerStage::Model {
+            [Constraint::Min(1), Constraint::Length(3)]
+        } else {
+            [Constraint::Min(1), Constraint::Length(0)]
+        })
+        .split(inner);
+    let list_area = sections[0];
+    let viewport = list_area.height.max(1) as usize;
     let start = picker
         .index
         .saturating_add(1)
@@ -5342,17 +5891,53 @@ fn render_model_picker(frame: &mut Frame, state: &RevState, area: Rect) {
         })
         .collect::<Vec<_>>();
     frame.render_widget(block, popup);
-    frame.render_widget(Paragraph::new(lines), inner);
+    if options.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matching models · Backspace or Ctrl-U clears search")
+                .style(Style::default().fg(Color::Yellow)),
+            list_area,
+        );
+    } else {
+        frame.render_widget(Paragraph::new(lines), list_area);
+    }
+    if picker.stage == PickerStage::Model {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "❯ {}",
+                if picker.query.is_empty() {
+                    "Search models…"
+                } else {
+                    picker.query.as_str()
+                }
+            ))
+            .block(
+                Block::default()
+                    .title(format!(" search · {} match(es) ", options.len()))
+                    .borders(Borders::TOP),
+            ),
+            sections[1],
+        );
+    }
 }
 
 fn render_history(frame: &mut Frame, state: &RevState, area: Rect) {
     let block = Block::default()
-        .title(" persisted review history · d d deletes saved feedback only ")
+        .title(" persisted review history · u reopen · d d deletes feedback ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Magenta));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let viewport = inner.height as usize;
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(if inner.height >= 8 {
+            [Constraint::Min(2), Constraint::Length(4)]
+        } else {
+            [Constraint::Min(1), Constraint::Length(0)]
+        })
+        .split(inner);
+    let list_area = sections[0];
+    let detail_area = sections[1];
+    let viewport = list_area.height as usize;
     let start = state
         .history_cursor
         .saturating_add(1)
@@ -5365,6 +5950,11 @@ fn render_history(frame: &mut Frame, state: &RevState, area: Rect) {
         .skip(start)
         .take(viewport)
         .map(|(index, (annotation, placement))| {
+            let lifecycle = match annotation.status {
+                AnnotationStatus::Active => "active",
+                AnnotationStatus::Resolved => "resolved",
+                AnnotationStatus::AutoDismissed => "auto-dismissed",
+            };
             let summary = if annotation.kind == AnnotationKind::Ask {
                 state
                     .threads
@@ -5378,12 +5968,13 @@ fn render_history(frame: &mut Frame, state: &RevState, area: Rect) {
             Line::styled(
                 fit_text(
                     &format!(
-                        "{} {}:{}-{} · {} · {}",
+                        "{} [{}] {}:{}-{} · {} · {}",
                         if index == state.history_cursor {
                             "❯"
                         } else {
                             " "
                         },
+                        lifecycle,
                         annotation.file_path.display(),
                         placement.line_start,
                         placement.line_end,
@@ -5400,17 +5991,50 @@ fn render_history(frame: &mut Frame, state: &RevState, area: Rect) {
             )
         })
         .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(rows), inner);
+    frame.render_widget(Paragraph::new(rows), list_area);
+    if detail_area.height > 0 {
+        let detail = state
+            .annotations
+            .get(state.history_cursor)
+            .map(|(annotation, _)| {
+                let changed = annotation
+                    .status_changed_at
+                    .as_deref()
+                    .unwrap_or("not changed");
+                let reason = annotation
+                    .status_reason
+                    .as_deref()
+                    .unwrap_or("Active review item");
+                format!(
+                    "{} · {}\n{}\nu reopens inactive items · Esc returns",
+                    annotation.status.as_str(),
+                    changed,
+                    reason
+                )
+            })
+            .unwrap_or_else(|| "No saved review items".into());
+        frame.render_widget(
+            Paragraph::new(detail)
+                .wrap(Wrap { trim: false })
+                .block(Block::default().title(" lifecycle ").borders(Borders::TOP)),
+            detail_area,
+        );
+    }
 }
 
-fn render_confirmation(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(area, 62.min(area.width), 5);
+fn render_confirmation(frame: &mut Frame, area: Rect, title: &str, question: &str) {
+    let width = 62.min(area.width);
+    let height = (wrapped_row_count(question, width.saturating_sub(2) as usize) + 4)
+        .try_into()
+        .unwrap_or(u16::MAX);
+    let popup = centered_rect(area, width, height.max(6).min(area.height.max(1)));
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new("Clear all persisted comments and questions for this workspace?\n\ny = clear · n/Esc = cancel")
+        Paragraph::new(format!("{question}\ny = confirm · n/Esc = cancel"))
+            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
-                    .title(" confirm clear ")
+                    .title(title)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Red)),
             ),
@@ -5547,7 +6171,7 @@ pub(crate) fn render_snapshot(width: u16, height: u16, snapshot: &str) -> Result
                 "EDIT FEEDBACK · original selection restored · Enter saves · Esc keeps selection"
                     .into();
         }
-        "question-models" => {
+        "question-models" | "model-search" => {
             state.mode = RevMode::Model;
             state.status = "MODEL 1/3 · choose a model for this question".into();
             state.picker = Some(ModelPicker::new(
@@ -5582,7 +6206,13 @@ pub(crate) fn render_snapshot(width: u16, height: u16, snapshot: &str) -> Result
                     reasoning_effort: Some("high".into()),
                     context_tier: None,
                 },
+                PickerScope::Thread,
             ));
+            if snapshot == "model-search" {
+                state.picker.as_mut().unwrap().query = "claude".into();
+                state.status =
+                    "MODEL 1/3 · searching runtime models · ↑/↓ choose · Enter deeper".into();
+            }
         }
         "visual" => {
             state.mode = RevMode::Visual;
@@ -5600,6 +6230,26 @@ pub(crate) fn render_snapshot(width: u16, height: u16, snapshot: &str) -> Result
                 .join("\n");
             state.compose_cursor = state.compose.len();
             state.compose_scroll = u16::MAX;
+        }
+        "resolve-confirm" => {
+            seed_snapshot_feedback(&mut state);
+            state.mode = RevMode::ConfirmResolve;
+            state.pending_resolve = Some("feedback-architecture".into());
+            state.status = "Resolve this feedback? y/n".into();
+        }
+        "resolved-history" | "stale-dismissed" => {
+            seed_snapshot_feedback(&mut state);
+            let annotation = &mut state.annotations[0].0;
+            if snapshot == "resolved-history" {
+                annotation.status = AnnotationStatus::Resolved;
+                annotation.status_reason = Some("Resolved manually from the inline review".into());
+            } else {
+                annotation.status = AnnotationStatus::AutoDismissed;
+                annotation.status_reason =
+                    Some("Selected new-side code changed or disappeared".into());
+            }
+            annotation.status_changed_at = Some("2026-07-30T12:00:00Z".into());
+            state.mode = RevMode::History;
         }
         "history" => state.mode = RevMode::History,
         "help" => {
@@ -5739,6 +6389,9 @@ fn seed_snapshot_questions(state: &mut RevState) {
                 text: None,
                 submitted: true,
                 delivery_state: DeliveryState::Sent,
+                status: AnnotationStatus::Active,
+                status_reason: None,
+                status_changed_at: None,
                 created_at: created_at.clone(),
             },
             Placement {
@@ -5810,6 +6463,9 @@ fn seed_snapshot_feedback(state: &mut RevState) {
             text: Some("Keep isolated question sessions so follow-ups cannot leak context.".into()),
             submitted: false,
             delivery_state: DeliveryState::Draft,
+            status: AnnotationStatus::Active,
+            status_reason: None,
+            status_changed_at: None,
             created_at: now(),
         },
         Placement {
@@ -5833,20 +6489,21 @@ mod tests {
     use ratatui::Terminal;
 
     use super::{
-        close_file_picker, close_questions, current_item_yank_text, execute_command,
+        build_rows, close_file_picker, close_questions, current_item_yank_text, execute_command,
         finish_active_question, handle_agent_event, handle_compose_key, handle_file_picker_key,
         handle_help_key, handle_history_key, handle_key, handle_question_key, handle_review_key,
-        help_lines, merge_touching_hunks, open_file_picker, open_questions, queue_question_launch,
-        render, render_snapshot, rendered_markdown_diff, row_count, seed_snapshot_feedback,
-        seed_snapshot_questions, snapshot_workspace, visual_selection_yank_text, ComposeTarget,
-        ModelPicker, PendingSend, QuestionLaunch, RevAgentSlot, RevMode, RevState,
+        help_lines, merge_touching_hunks, open_file_picker, open_questions, question_ids,
+        queue_question_launch, render, render_snapshot, rendered_markdown_diff, row_count,
+        seed_snapshot_feedback, seed_snapshot_questions, snapshot_workspace,
+        visual_selection_yank_text, ComposeTarget, ModelPicker, PendingSend, PickerScope,
+        PickerStage, QuestionLaunch, RevAgentSlot, RevMode, RevState,
     };
     use crate::config::AppPaths;
     use crate::copilot::{
         AgentCommand, AgentEvent, AgentRuntime, AgentSink, ModelOption, ModelSelection,
     };
     use crate::diff::{parse_unified, DiffLine, Hunk, LineKind};
-    use crate::domain::{AnchorSide, AnnotationKind};
+    use crate::domain::{AnchorSide, AnnotationKind, AnnotationStatus};
     use crate::highlight::PlainHighlighter;
     use crate::storage::{RevQuestionSession, Storage};
 
@@ -5992,6 +6649,32 @@ mod tests {
         assert!(models.contains("GPT-5.2 · 128000 ctx · current"));
         assert!(models.contains("Claude Sonnet 4.5 · 200000 ctx"));
         assert!(models.contains("Gemini 3 Pro · 1000000 ctx"));
+
+        let model_search = render_snapshot(100, 28, "model-search").unwrap();
+        assert!(model_search.contains("claude"));
+        assert!(model_search.contains("1 match(es)"));
+        assert!(model_search.contains("Claude Sonnet 4.5"));
+        assert!(!model_search.contains("Gemini 3 Pro"));
+
+        let resolve = render_snapshot(100, 28, "resolve-confirm").unwrap();
+        assert!(resolve.contains("confirm resolve"));
+        assert!(resolve.contains("y = confirm"));
+        let narrow_resolve = render_snapshot(36, 9, "resolve-confirm").unwrap();
+        assert!(narrow_resolve.contains("y = confirm"));
+        assert!(narrow_resolve.contains("n/Esc = cancel"));
+
+        let resolved = render_snapshot(100, 28, "resolved-history").unwrap();
+        assert!(resolved.contains("[resolved]"));
+        assert!(resolved.contains("Resolved manually"));
+
+        let stale = render_snapshot(100, 28, "stale-dismissed").unwrap();
+        assert!(stale.contains("[auto-dismissed]"));
+        assert!(stale.contains("changed or disappeared"));
+
+        let narrow_model = render_snapshot(36, 9, "model-search").unwrap();
+        assert!(narrow_model.contains("↵ next"));
+        assert!(narrow_model.contains("Esc back"));
+        assert!(narrow_model.contains("claude"));
 
         let composer = render_snapshot(100, 28, "composer").unwrap();
         assert!(composer.contains("rows 13-30 of 30"));
@@ -6832,6 +7515,9 @@ mod tests {
                 text: Some("Review the removed flow".into()),
                 submitted: false,
                 delivery_state: crate::domain::DeliveryState::Draft,
+                status: crate::domain::AnnotationStatus::Active,
+                status_reason: None,
+                status_changed_at: None,
                 created_at: crate::storage::now(),
             },
             crate::domain::Placement {
@@ -6875,6 +7561,9 @@ mod tests {
             text: Some("Original feedback".into()),
             submitted: false,
             delivery_state: crate::domain::DeliveryState::Draft,
+            status: crate::domain::AnnotationStatus::Active,
+            status_reason: None,
+            status_changed_at: None,
             created_at: crate::storage::now(),
         };
         let placement = crate::domain::Placement {
@@ -7301,11 +7990,275 @@ mod tests {
                 reasoning_effort: Some("high".into()),
                 context_tier: None,
             },
+            PickerScope::Thread,
         );
 
         assert_eq!(picker.index, 1);
         assert_eq!(picker.model_index, 1);
         assert_eq!(picker.model().id, "deep");
+    }
+
+    #[test]
+    fn model_picker_searches_ids_and_names_without_losing_stable_indices() {
+        let mut picker = ModelPicker::new(
+            vec![
+                ModelOption {
+                    id: "gpt-fast".into(),
+                    name: "GPT Fast".into(),
+                    supported_reasoning_efforts: vec![],
+                    default_reasoning_effort: None,
+                    max_context_tokens: None,
+                    context_tiers: vec![],
+                },
+                ModelOption {
+                    id: "claude-deep".into(),
+                    name: "Claude Sonnet".into(),
+                    supported_reasoning_efforts: vec![],
+                    default_reasoning_effort: None,
+                    max_context_tokens: None,
+                    context_tiers: vec![],
+                },
+            ],
+            ModelSelection {
+                model_id: "gpt-fast".into(),
+                reasoning_effort: None,
+                context_tier: None,
+            },
+            PickerScope::GlobalDefault,
+        );
+        picker.query = "SONNET".into();
+
+        assert_eq!(picker.filtered_model_indices(), vec![1]);
+        picker.query = "claude-deep".into();
+        assert_eq!(picker.filtered_model_indices(), vec![1]);
+        picker.query = "missing".into();
+        assert!(picker.filtered_model_indices().is_empty());
+    }
+
+    #[test]
+    fn model_picker_escape_goes_back_then_uses_startup_model_for_new_question() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        let models = vec![ModelOption {
+            id: "startup".into(),
+            name: "Startup".into(),
+            supported_reasoning_efforts: vec!["high".into()],
+            default_reasoning_effort: Some("high".into()),
+            max_context_tokens: None,
+            context_tiers: vec![],
+        }];
+        let selection = ModelSelection {
+            model_id: "startup".into(),
+            reasoning_effort: None,
+            context_tier: None,
+        };
+        let mut picker = ModelPicker::new(models, selection.clone(), PickerScope::Thread);
+        picker.stage = PickerStage::Context;
+        state.picker = Some(picker);
+        state.mode = RevMode::Model;
+        state.agent = Some(RevAgentSlot {
+            question_id: "new-question".into(),
+            runtime: Box::new(NoopAgent),
+            pending: Some(PendingSend {
+                annotation_id: "new-question".into(),
+                user_message_id: "user".into(),
+                assistant_message_id: "assistant".into(),
+                assistant_seq: 1,
+                prompt: "original question".into(),
+                needs_model_picker: true,
+            }),
+            outbound_id: None,
+            session_id: Some("session".into()),
+            selection,
+            needs_model_picker: true,
+            model_switch_only: false,
+        });
+        let paths = test_paths("rev-model-cancel");
+
+        super::handle_model_key(
+            &mut state,
+            &storage,
+            &paths,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.picker.as_ref().unwrap().stage, PickerStage::Reasoning);
+        super::handle_model_key(
+            &mut state,
+            &storage,
+            &paths,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.picker.as_ref().unwrap().stage, PickerStage::Model);
+        super::handle_model_key(
+            &mut state,
+            &storage,
+            &paths,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(state.mode, RevMode::Normal);
+        assert!(state.streaming);
+        assert!(state.picker.is_none());
+        let agent = state.agent.as_ref().unwrap();
+        assert!(agent.outbound_id.is_some());
+        assert!(agent.pending.is_some());
+        assert!(!agent.needs_model_picker);
+        assert!(state.status.contains("startup model"));
+    }
+
+    #[test]
+    fn global_model_picker_persists_only_after_the_context_stage() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        state.mode = RevMode::Model;
+        let mut picker = ModelPicker::new(
+            vec![ModelOption {
+                id: "deep".into(),
+                name: "Deep".into(),
+                supported_reasoning_efforts: vec!["high".into()],
+                default_reasoning_effort: Some("high".into()),
+                max_context_tokens: Some(128_000),
+                context_tiers: vec![],
+            }],
+            ModelSelection {
+                model_id: "deep".into(),
+                reasoning_effort: Some("high".into()),
+                context_tier: None,
+            },
+            PickerScope::GlobalDefault,
+        );
+        picker.stage = PickerStage::Context;
+        state.picker = Some(picker);
+        let paths = test_paths("rev-global-model");
+
+        super::handle_model_key(
+            &mut state,
+            &storage,
+            &paths,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(state.mode, RevMode::Normal);
+        assert_eq!(state.default_model.as_ref().unwrap().model_id, "deep");
+        let persisted: ModelSelection = serde_json::from_str(
+            &storage
+                .setting(super::REV_DEFAULT_MODEL_SETTING)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.model_id, "deep");
+    }
+
+    #[test]
+    fn resolving_inline_feedback_requires_confirmation_and_keeps_history() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        seed_snapshot_feedback(&mut state);
+        let (annotation, placement) = state.annotation("feedback-architecture").unwrap().clone();
+        storage.add_annotation(&annotation, &placement).unwrap();
+        let mut highlighter = PlainHighlighter;
+        row_count(&mut state, &mut highlighter);
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    &row.kind,
+                    super::RevRowKind::Annotation { annotation_id, .. }
+                        if annotation_id == "feedback-architecture"
+                )
+            })
+            .unwrap();
+        let paths = test_paths("rev-resolve-confirmation");
+
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, RevMode::ConfirmResolve);
+        assert_eq!(
+            storage
+                .annotation_by_id("feedback-architecture")
+                .unwrap()
+                .unwrap()
+                .status,
+            AnnotationStatus::Active
+        );
+
+        handle_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            storage
+                .annotation_by_id("feedback-architecture")
+                .unwrap()
+                .unwrap()
+                .status,
+            AnnotationStatus::Resolved
+        );
+        assert!(state
+            .annotations
+            .iter()
+            .any(|(annotation, _)| annotation.id == "feedback-architecture"));
+        assert!(!build_rows(&state, 80, &mut highlighter).iter().any(|row| {
+            matches!(
+                &row.kind,
+                super::RevRowKind::Annotation { annotation_id, .. }
+                    if annotation_id == "feedback-architecture"
+            )
+        }));
+    }
+
+    #[test]
+    fn inactive_question_leaves_panel_and_reopen_restores_it() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        seed_snapshot_questions(&mut state);
+        let (annotation, placement) = state.annotations[0].clone();
+        storage.add_annotation(&annotation, &placement).unwrap();
+        let changed_at = storage
+            .set_annotation_status(
+                &annotation.id,
+                AnnotationStatus::AutoDismissed,
+                Some("selected code changed"),
+            )
+            .unwrap();
+        state.annotations[0].0.status = AnnotationStatus::AutoDismissed;
+        state.annotations[0].0.status_reason = Some("selected code changed".into());
+        state.annotations[0].0.status_changed_at = Some(changed_at);
+
+        assert!(!question_ids(&state).contains(&annotation.id));
+        state.mode = RevMode::History;
+        state.history_cursor = 0;
+        handle_history_key(
+            &mut state,
+            &storage,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(question_ids(&state).contains(&annotation.id));
+        assert_eq!(state.annotations[0].0.status, AnnotationStatus::Active);
     }
 
     #[test]
