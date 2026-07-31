@@ -227,6 +227,7 @@ struct RevState {
     files: Vec<(usize, usize)>,
     file_index: usize,
     row_cursor: usize,
+    file_row_cursors: HashMap<usize, usize>,
     visual_anchor: Option<usize>,
     visual_row_anchor: Option<usize>,
     pending_yank: bool,
@@ -309,6 +310,7 @@ impl RevState {
             files,
             file_index: 0,
             row_cursor: 0,
+            file_row_cursors: HashMap::new(),
             visual_anchor: None,
             visual_row_anchor: None,
             pending_yank: false,
@@ -373,32 +375,41 @@ impl RevState {
         self.row_cursor = self.row_cursor.min(row_count.saturating_sub(1));
     }
 
+    fn switch_file(&mut self, target: usize) -> bool {
+        if target >= self.files.len() || target == self.file_index {
+            return false;
+        }
+        self.file_row_cursors
+            .insert(self.file_index, self.row_cursor);
+        self.file_index = target;
+        self.row_cursor = self.file_row_cursors.get(&target).copied().unwrap_or(0);
+        self.visual_anchor = None;
+        self.visual_row_anchor = None;
+        self.pending_yank = false;
+        self.render_cache = None;
+        sync_file_picker_cursor(self);
+        true
+    }
+
     fn move_file(&mut self, forward: bool) {
         if self.files.is_empty() {
             return;
         }
-        let previous = self.file_index;
-        self.file_index = if forward {
+        let target = if forward {
             (self.file_index + 1).min(self.files.len() - 1)
         } else {
             self.file_index.saturating_sub(1)
         };
-        self.row_cursor = 0;
-        self.visual_anchor = None;
-        self.visual_row_anchor = None;
-        self.pending_yank = false;
-        sync_file_picker_cursor(self);
-        self.mode = RevMode::Normal;
-        self.render_cache = None;
-        self.status = if previous == self.file_index {
-            if forward {
+        if !self.switch_file(target) {
+            self.status = if forward {
                 "Already at the last file".into()
             } else {
                 "Already at the first file".into()
-            }
-        } else {
-            "Changed file with h/l · j/k remain bounded here".into()
-        };
+            };
+            return;
+        }
+        self.mode = RevMode::Normal;
+        self.status = "Changed file with h/l · restored this file's previous position".into();
     }
 
     fn annotation(&self, id: &str) -> Option<&(Annotation, Placement)> {
@@ -906,7 +917,7 @@ fn open_file_picker(state: &mut RevState) {
             )
         })
         .unwrap_or(0);
-    state.status = "FILES · j/k previews immediately · h/l fold · t returns to editor".into();
+    state.status = "FILES · j/k previews immediately · h/l fold · Enter/t returns to editor".into();
 }
 
 fn close_file_picker(state: &mut RevState) {
@@ -970,15 +981,9 @@ fn preview_file_picker_selection(state: &mut RevState) {
     let Some(FilePickerRow::File { flat_index, .. }) = selected_file_picker_row(state) else {
         return;
     };
-    if state.file_index != flat_index {
-        state.file_index = flat_index;
-        state.row_cursor = 0;
-        state.visual_anchor = None;
-        state.visual_row_anchor = None;
-        state.pending_yank = false;
-        state.render_cache = None;
-    }
-    state.status = "FILES · preview updated · j/k moves · t returns to editor".into();
+    state.switch_file(flat_index);
+    state.status =
+        "FILES · preview updated at this file's last position · Enter/t returns to editor".into();
 }
 
 fn file_picker_rows(state: &RevState) -> Vec<FilePickerRow> {
@@ -1057,29 +1062,11 @@ fn expand_picker_repo(state: &mut RevState) {
 }
 
 fn activate_file_picker_row(state: &mut RevState) {
-    match selected_file_picker_row(state) {
-        Some(FilePickerRow::Repo(repo_index)) => {
-            if state.collapsed_repos.remove(&repo_index) {
-                state.status = "Repository expanded".into();
-            } else {
-                state.collapsed_repos.insert(repo_index);
-                state.status = "Repository collapsed".into();
-            }
-            state.file_picker_cursor = file_picker_rows(state)
-                .iter()
-                .position(|row| matches!(row, FilePickerRow::Repo(index) if *index == repo_index))
-                .unwrap_or(0);
-        }
-        Some(FilePickerRow::File { flat_index, .. }) => {
-            state.file_index = flat_index;
-            state.row_cursor = 0;
-            state.visual_anchor = None;
-            state.visual_row_anchor = None;
-            state.render_cache = None;
-            state.status = "FILES · previewing selected file · t returns to editor".into();
-        }
-        None => close_file_picker(state),
+    if let Some(FilePickerRow::File { flat_index, .. }) = selected_file_picker_row(state) {
+        state.switch_file(flat_index);
     }
+    close_file_picker(state);
+    state.status = "Back to the previewed file at its previous position".into();
 }
 
 fn question_ids(state: &RevState) -> Vec<String> {
@@ -1222,7 +1209,7 @@ fn focus_question(
         state.status = "This historical question's file is no longer in the current diff".into();
         return false;
     };
-    state.file_index = file_index;
+    state.switch_file(file_index);
     state.row_cursor = 0;
     state.visual_anchor = None;
     state.visual_row_anchor = None;
@@ -3719,8 +3706,8 @@ fn help_lines() -> Vec<Line<'static>> {
         ),
         key("h/l / ←/→", "collapse or expand the selected repository"),
         key("g/G / Home/End", "jump to the first or last tree row"),
-        key("Enter", "toggle a repository or keep previewing a file"),
-        key("t / Esc", "close the tree and return to the editor"),
+        key("Enter", "return to the previewed file"),
+        key("t / Esc", "return to the previewed file"),
         Line::raw(""),
         section("Review actions"),
         key(
@@ -4298,7 +4285,9 @@ fn render_file_picker(frame: &mut Frame, state: &RevState, area: Rect) {
         String::new()
     };
     let block = Block::default()
-        .title(format!(" files{range} · j/k preview · h/l fold · t close "))
+        .title(format!(
+            " files{range} · j/k preview · h/l fold · ↵/t close "
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if state.mode == RevMode::FilePicker {
             Color::Cyan
@@ -5196,6 +5185,7 @@ mod tests {
             skills: "/tmp/rev-files/skills".into(),
             plugins: "/tmp/rev-files/plugins".into(),
         };
+        state.row_cursor = 2;
 
         handle_review_key(
             &mut state,
@@ -5217,15 +5207,37 @@ mod tests {
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
-        assert_eq!(state.mode, RevMode::FilePicker);
+        assert_eq!(state.mode, RevMode::Normal);
         assert_eq!(state.file_index, 1);
         assert_eq!(state.row_cursor, 0);
 
+        state.row_cursor = 1;
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle_file_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        );
+        assert_eq!(state.file_index, 0);
+        assert_eq!(state.row_cursor, 2);
+        handle_file_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        assert_eq!(state.file_index, 1);
+        assert_eq!(state.row_cursor, 1);
         handle_file_picker_key(
             &mut state,
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
         );
         assert_eq!(state.mode, RevMode::Normal);
+        assert_eq!(state.row_cursor, 1);
 
         handle_review_key(
             &mut state,
@@ -6658,5 +6670,37 @@ mod tests {
         assert_eq!(state.row_cursor, count - 1);
         assert!(state.status.contains("press l"));
         assert_eq!(state.mode, RevMode::Normal);
+
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.file_index, 1);
+        assert_eq!(state.row_cursor, 0);
+        state.row_cursor = 1;
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.file_index, 0);
+        assert_eq!(state.row_cursor, count - 1);
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.file_index, 1);
+        assert_eq!(state.row_cursor, 1);
     }
 }

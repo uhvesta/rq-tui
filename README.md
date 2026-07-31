@@ -83,9 +83,10 @@ bazel run //:rev -- delete . --export --yes
 Inside `rev`, `j/k` stop at the first/last rendered row of the current file,
 including its inline questions and answers; only `h/l` changes files. `t`
 opens a persistent grouped repository/file tree on the left; moving through
-file rows previews each file immediately, and `t` closes the tree back to the
-editor. `q` (or `Q`) opens the question-thread panel on the right and never
-quits; only `:q`/`:quit` exit. Both side panes can remain visible together.
+file rows previews each file immediately. `Enter` on a file or `t` closes the
+tree back to that file, restoring the last review-row position kept separately
+for every file. `q` (or `Q`) opens the question-thread panel on the right and
+never quits; only `:q`/`:quit` exit. Both side panes can remain visible together.
 `v` selects code or rendered chat, `y` copies a visual selection, and `yy`
 copies the current source line or complete chat message. `d d` deletes only
 the saved feedback under the cursor. In the question panel, `a`/`i` continues

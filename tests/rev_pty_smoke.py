@@ -40,6 +40,14 @@ def main() -> int:
             )
             child.send(b"j")
             child.wait_for_screen("file 2/2", timeout=4)
+            child.send(b"\r")
+            child.wait_for_screen_state(
+                required=("NORMAL", "src/demo.rs"),
+                forbidden=("files · j/k preview",),
+                timeout=4,
+            )
+            child.send(b"t")
+            child.wait_for_screen("files · j/k preview", timeout=4)
             child.send(b"t")
             child.wait_for_screen_state(
                 required=("NORMAL", "src/demo.rs"),
@@ -74,7 +82,10 @@ def main() -> int:
         finally:
             child.close()
 
-    print("REV_PTY_SMOKE_OK: tree-live-preview q-questions command-only-quit")
+    print(
+        "REV_PTY_SMOKE_OK: tree-live-preview enter-and-t-return "
+        "q-questions command-only-quit"
+    )
     return 0
 
 
