@@ -7427,10 +7427,36 @@ fn format_duration(duration: Duration) -> String {
 
 pub(crate) fn render_snapshot(width: u16, height: u16, snapshot: &str) -> Result<String> {
     let storage = Storage::in_memory()?;
-    let workspace = snapshot_workspace(&storage)?;
+    let mut workspace = snapshot_workspace(&storage)?;
+    if matches!(snapshot, "github-review" | "github-description") {
+        workspace.repos[0].record.remote_pr_url =
+            Some("https://github.com/acme/demo/pull/17".into());
+        storage.upsert_pull_request_snapshot(
+            &workspace.repos[0].version.id,
+            &snapshot_pull_request(&workspace.repos[0].version.head_sha),
+        )?;
+    }
     let mut state = RevState::load(workspace, &storage)?;
     match snapshot {
         "review" => {}
+        "github-review" => {
+            state.status =
+                "GITHUB REVIEW · @reviewer · outdated threads remain version-associated".into();
+            let mut highlighter = PlainHighlighter;
+            let width = width.saturating_sub(2).max(1) as usize;
+            let rows = ensure_rows(&mut state, width, &mut highlighter);
+            state.row_cursor = rows
+                .iter()
+                .position(|row| {
+                    matches!(
+                        &row.kind,
+                        RevRowKind::Annotation { annotation_id, .. }
+                            if is_remote_annotation_id(annotation_id)
+                    )
+                })
+                .unwrap_or(0);
+        }
+        "github-description" => open_pr_description(&mut state),
         "split" => state.diff_layout = RevDiffLayout::Split,
         "markdown" => {
             state.file_index = 1;
@@ -7628,6 +7654,40 @@ pub(crate) fn render_snapshot(width: u16, height: u16, snapshot: &str) -> Result
         .collect::<Vec<_>>()
         .join("\n")
         + "\n")
+}
+
+fn snapshot_pull_request(head_sha: &str) -> PullRequestSnapshot {
+    PullRequestSnapshot {
+        node_id: "PR_17".into(),
+        title: "Review the renderer".into(),
+        body:
+            "# Description\n\nThis is **rendered** Markdown.\n\n```mermaid\ngraph LR\nA --> B\n```"
+                .into(),
+        url: "https://github.com/acme/demo/pull/17".into(),
+        author: "author".into(),
+        head_sha: head_sha.into(),
+        base_sha: "base".into(),
+        updated_at: now(),
+        threads: vec![ReviewThread {
+            node_id: "thread-17".into(),
+            path: "src/lib.rs".into(),
+            line: Some(11),
+            original_line: Some(11),
+            side: GitHubDiffSide::Right,
+            is_outdated: true,
+            is_resolved: false,
+            viewer_can_reply: true,
+            comments: vec![rq_tui_github_review::ReviewComment {
+                node_id: "comment-17".into(),
+                database_id: Some(170),
+                author: "reviewer".into(),
+                body: "Can this state transition be simpler?".into(),
+                created_at: now(),
+                url: "https://github.com/acme/demo/pull/17#discussion_r170".into(),
+                reply_to: None,
+            }],
+        }],
+    }
 }
 
 fn snapshot_workspace(storage: &Storage) -> Result<ResolvedWorkItem> {
@@ -9996,6 +10056,19 @@ mod tests {
         assert_eq!(ids, vec!["feedback-architecture"]);
         assert_eq!(submission.comments[0].path, "src/lib.rs");
         assert_eq!(submission.comments[0].side, GitHubDiffSide::Right);
+    }
+
+    #[test]
+    fn github_review_and_description_snapshots_are_agent_inspectable() {
+        let review = render_snapshot(100, 28, "github-review").unwrap();
+        assert!(review.contains("GitHub · @reviewer · outdated"));
+        assert!(review.contains("Can this state transition be simpler?"));
+        assert!(review.contains("Enter reply"));
+
+        let description = render_snapshot(100, 28, "github-description").unwrap();
+        assert!(description.contains("PR_DESCRIPTION.md"));
+        assert!(description.contains("Description"));
+        assert!(description.contains("rendered"));
     }
 
     #[test]
