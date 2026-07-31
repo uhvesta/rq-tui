@@ -1623,6 +1623,7 @@ dependencies = [
  "ratatui",
  "rq-tui-app",
  "rq-tui-domain",
+ "rq-tui-github-review",
  "rq-tui-storage",
  "rq-tui-text",
  "serde",
@@ -1646,6 +1647,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
+]
+
+[[package]]
+name = "rq-tui-github-review"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

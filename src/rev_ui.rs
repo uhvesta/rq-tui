@@ -367,12 +367,10 @@ impl RevState {
             .repos
             .iter()
             .flat_map(|repo| {
-                repo.diff.files.iter().map(move |file| {
-                    (
-                        review_file_key(&repo.record.id, file.path()),
-                        file.clone(),
-                    )
-                })
+                repo.diff
+                    .files
+                    .iter()
+                    .map(move |file| (review_file_key(&repo.record.id, file.path()), file.clone()))
             })
             .collect();
         Ok(Self {
@@ -481,11 +479,7 @@ impl RevState {
             .insert(self.file_index, self.review_scroll);
         self.file_index = target;
         self.row_cursor = self.file_row_cursors.get(&target).copied().unwrap_or(0);
-        self.review_scroll = self
-            .file_review_scrolls
-            .get(&target)
-            .copied()
-            .unwrap_or(0);
+        self.review_scroll = self.file_review_scrolls.get(&target).copied().unwrap_or(0);
         self.visual_anchor = None;
         self.visual_row_anchor = None;
         self.pending_yank = false;
@@ -2508,10 +2502,7 @@ fn review_file_key(repo_id: &str, path: &Path) -> String {
     format!("{repo_id}\0{}", path.display())
 }
 
-fn retract_selected_context(
-    state: &mut RevState,
-    highlighter: &mut dyn Highlighter,
-) -> Result<()> {
+fn retract_selected_context(state: &mut RevState, highlighter: &mut dyn Highlighter) -> Result<()> {
     let (start, end) = selected_source_range(state, highlighter)
         .context("select source lines before retracting expanded context")?;
     let (repo_index, file_index) = state.current_indices().context("no current file")?;
@@ -2520,9 +2511,7 @@ fn retract_selected_context(
     let selected = file
         .visible_lines()
         .enumerate()
-        .filter(|(index, line)| {
-            (start..=end).contains(index) && is_expanded_context(state, line)
-        })
+        .filter(|(index, line)| (start..=end).contains(index) && is_expanded_context(state, line))
         .map(|(_, line)| diff_line_identity(line))
         .collect::<HashSet<_>>();
     if selected.is_empty() {
@@ -2575,7 +2564,9 @@ fn rebuild_file_without_expanded_lines(
             lines: vec![line],
         });
     }
-    rebuilt.hunks.sort_by_key(|hunk| (hunk.new_start, hunk.old_start));
+    rebuilt
+        .hunks
+        .sort_by_key(|hunk| (hunk.new_start, hunk.old_start));
     merge_touching_hunks(&mut rebuilt.hunks);
     state.workspace.repos[repo_index].diff.files[file_index] = rebuilt;
     Ok(())

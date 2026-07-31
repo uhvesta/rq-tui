@@ -49,6 +49,7 @@ rust_library(
     deps = RUNTIME_DEPS + [
         "//crates/app:app_lib",
         "//crates/domain:domain_lib",
+        "//crates/github_review:github_review_lib",
         "//crates/storage:storage_lib",
         "//crates/tui_text:tui_text_lib",
     ],
@@ -101,6 +102,7 @@ rust_test(
     deps = RUNTIME_DEPS + [
         "//crates/app:app_lib",
         "//crates/domain:domain_lib",
+        "//crates/github_review:github_review_lib",
         "//crates/storage:storage_lib",
         "//crates/tui_text:tui_text_lib",
     ] + crate_deps(["pretty_assertions"], package_name = ""),

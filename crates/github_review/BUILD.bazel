@@ -1,0 +1,29 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@crates//:defs.bzl", "crate_deps")
+
+DEPS = crate_deps(
+    ["anyhow", "serde", "serde_json"],
+    package_name = "crates/github_review",
+)
+
+rust_library(
+    name = "github_review_lib",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "rq_tui_github_review",
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    deps = DEPS,
+    visibility = [
+        "//crates/storage:__pkg__",
+        "//src:__pkg__",
+    ],
+)
+
+rust_test(
+    name = "github_review_tests",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    deps = DEPS,
+    visibility = ["//visibility:private"],
+)

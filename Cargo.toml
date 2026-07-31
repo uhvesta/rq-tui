@@ -13,7 +13,7 @@ path = "src/rev_main.rs"
 
 [workspace]
 resolver = "2"
-members = ["crates/app", "crates/domain", "crates/storage", "crates/tui_text"]
+members = ["crates/app", "crates/domain", "crates/github_review", "crates/storage", "crates/tui_text"]
 
 [dependencies]
 anyhow = "1"
@@ -25,6 +25,7 @@ crossterm = "0.28"
 dirs = "6"
 github-copilot-sdk = { version = "1.0.8", default-features = false }
 rq-tui-domain = { path = "crates/domain" }
+rq-tui-github-review = { path = "crates/github_review" }
 rq-tui-app = { path = "crates/app" }
 rq-tui-storage = { path = "crates/storage" }
 rq-tui-text = { path = "crates/tui_text" }
