@@ -2364,6 +2364,7 @@ fn command_candidates(state: &RevState) -> Vec<String> {
         "export feedback".to_owned(),
         "help".to_owned(),
         "github unlock".to_owned(),
+        "hide all".to_owned(),
         "hide comments".to_owned(),
         "hide questions".to_owned(),
         "history".to_owned(),
@@ -2376,6 +2377,9 @@ fn command_candidates(state: &RevState) -> Vec<String> {
         "render markdown".to_owned(),
         "render markdown close".to_owned(),
         "clear".to_owned(),
+        "unhide all".to_owned(),
+        "unhide comments".to_owned(),
+        "unhide questions".to_owned(),
         "show comments".to_owned(),
         "show questions".to_owned(),
         "submit approve".to_owned(),
@@ -2505,6 +2509,16 @@ fn execute_command(
             state.mode = RevMode::Normal;
             expand_hunk_edge(state, false)?;
         }
+        "hide all" => {
+            preserve_source_focus(state);
+            state.show_comments = false;
+            state.show_questions = false;
+            state.invalidate_rows();
+            state.mode = RevMode::Normal;
+            state.status =
+                "All comments and questions hidden from the diff · :unhide all restores them"
+                    .into();
+        }
         "hide comments" => {
             preserve_source_focus(state);
             state.show_comments = false;
@@ -2531,6 +2545,28 @@ fn execute_command(
                     .into();
         }
         "show questions" => {
+            preserve_source_focus(state);
+            state.show_questions = true;
+            state.invalidate_rows();
+            state.mode = RevMode::Normal;
+            state.status = "Questions are visible in the diff".into();
+        }
+        "unhide all" => {
+            preserve_source_focus(state);
+            state.show_comments = true;
+            state.show_questions = true;
+            state.invalidate_rows();
+            state.mode = RevMode::Normal;
+            state.status = "All comments and questions are visible in the diff".into();
+        }
+        "unhide comments" => {
+            preserve_source_focus(state);
+            state.show_comments = true;
+            state.invalidate_rows();
+            state.mode = RevMode::Normal;
+            state.status = "Comments are visible in the diff".into();
+        }
+        "unhide questions" => {
             preserve_source_focus(state);
             state.show_questions = true;
             state.invalidate_rows();
@@ -6945,6 +6981,10 @@ fn help_lines() -> Vec<Line<'static>> {
         key(":expand below", "reveal five lines below the active hunk"),
         key(":retract all", "retract expanded context in every file"),
         key(
+            ":hide all",
+            "hide local comments and question threads from the diff without deleting them",
+        ),
+        key(
             ":hide comments",
             "hide local feedback from the diff without deleting it",
         ),
@@ -6954,6 +6994,9 @@ fn help_lines() -> Vec<Line<'static>> {
         ),
         key(":show comments", "show hidden local feedback again"),
         key(":show questions", "show hidden local question threads again"),
+        key(":unhide all", "show hidden comments and question threads again"),
+        key(":unhide comments", "show hidden local feedback again"),
+        key(":unhide questions", "show hidden local question threads again"),
         key(
             ":pr description",
             "open the versioned PR description in the shared review renderer",
@@ -10619,6 +10662,39 @@ mod tests {
         assert!(build_rows(&state, 80, &mut highlighter)
             .iter()
             .any(|row| matches!(row.kind, RevRowKind::Annotation { .. })));
+
+        execute_command(&mut state, &storage, &paths, "hide all").unwrap();
+        assert!(!state.show_comments);
+        assert!(!state.show_questions);
+        assert!(!build_rows(&state, 80, &mut highlighter)
+            .iter()
+            .any(|row| matches!(row.kind, RevRowKind::Annotation { .. })));
+
+        execute_command(&mut state, &storage, &paths, "unhide comments").unwrap();
+        assert!(state.show_comments);
+        assert!(!state.show_questions);
+        assert!(build_rows(&state, 80, &mut highlighter).iter().any(|row| {
+            matches!(
+                &row.kind,
+                RevRowKind::Annotation { annotation_id, .. }
+                    if annotation_id == "feedback-architecture"
+            )
+        }));
+        assert!(!build_rows(&state, 80, &mut highlighter).iter().any(|row| {
+            matches!(
+                &row.kind,
+                RevRowKind::Annotation { annotation_id, .. }
+                    if annotation_id == "question-architecture"
+            )
+        }));
+
+        execute_command(&mut state, &storage, &paths, "unhide questions").unwrap();
+        assert!(state.show_comments);
+        assert!(state.show_questions);
+        execute_command(&mut state, &storage, &paths, "hide all").unwrap();
+        execute_command(&mut state, &storage, &paths, "unhide all").unwrap();
+        assert!(state.show_comments);
+        assert!(state.show_questions);
     }
 
     #[test]
