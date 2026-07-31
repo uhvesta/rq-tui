@@ -82,10 +82,15 @@ bazel run //:rev -- delete . --export --yes
 
 Inside `rev`, `j/k` stop at the first/last rendered row of the current file,
 including its inline questions and answers; only `h/l` changes files. `t`
-opens a grouped repository/file tree, and `v` enters a clearly labeled visual
-line-selection mode. `Q` opens the right-side question-thread panel; `i`
-continues its selected thread and `m` changes that thread's model, reasoning
-level, and context tier. The same controls work on an inline question, and
+opens a persistent grouped repository/file tree on the left; moving through
+file rows previews each file immediately, and `t` closes the tree back to the
+editor. `q` (or `Q`) opens the question-thread panel on the right and never
+quits; only `:q`/`:quit` exit. Both side panes can remain visible together.
+`v` selects code or rendered chat, `y` copies a visual selection, and `yy`
+copies the current source line or complete chat message. `d d` deletes only
+the saved feedback under the cursor. In the question panel, `a`/`i` continues
+the selected thread and `m` changes that thread's model, reasoning level, and
+context tier. The same controls work on an inline question, and
 `:questions`/`:model` expose them through the command palette. Pressing `a`
 on a source selection that already owns a question continues that exact
 thread; otherwise it creates a new isolated question. `c` follows the same
@@ -120,6 +125,7 @@ bazel run //:rev -- ui-snapshot --state review --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state split --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state expanded --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state files --width 100 --height 28
+bazel run //:rev -- ui-snapshot --state panes --width 140 --height 30
 bazel run //:rev -- ui-snapshot --state visual --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state questions --width 120 --height 30
 bazel run //:rev -- ui-snapshot --state cleared-question --width 100 --height 28

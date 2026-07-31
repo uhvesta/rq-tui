@@ -2622,12 +2622,12 @@ pub(crate) fn finish_ready_prune(state: &mut AppState, storage: &Storage) -> Res
 }
 
 #[derive(Debug)]
-enum ClipboardDelivery {
+pub(crate) enum ClipboardDelivery {
     Native(&'static str),
     Osc52,
 }
 
-fn copy_to_clipboard(text: &str) -> Result<ClipboardDelivery> {
+pub(crate) fn copy_to_clipboard(text: &str) -> Result<ClipboardDelivery> {
     let forced_osc52 = std::env::var_os("RQ_TUI_CLIPBOARD")
         .is_some_and(|value| value == std::ffi::OsStr::new("osc52"));
     let mut stdout = io::stdout();

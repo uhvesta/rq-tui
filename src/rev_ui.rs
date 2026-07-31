@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use base64::Engine as _;
 use crossterm::cursor::Show;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -41,6 +40,7 @@ use crate::terminal_text::{
     cell_width, floor_grapheme_boundary, grapheme_indices, next_grapheme_boundary,
     previous_grapheme_boundary,
 };
+use crate::ui::{copy_to_clipboard, ClipboardDelivery};
 use crate::work_item::{resolve_local, ResolvedWorkItem, ReviewRepo};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -203,6 +203,8 @@ enum RevRowKind {
 struct RevRow {
     kind: RevRowKind,
     line: Option<Line<'static>>,
+    yank_text: String,
+    item_text: String,
 }
 
 struct RenderCache {
@@ -226,6 +228,8 @@ struct RevState {
     file_index: usize,
     row_cursor: usize,
     visual_anchor: Option<usize>,
+    visual_row_anchor: Option<usize>,
+    pending_yank: bool,
     mode: RevMode,
     diff_layout: RevDiffLayout,
     command: CommandPalette,
@@ -238,9 +242,11 @@ struct RevState {
     help_scroll: u16,
     file_picker_cursor: usize,
     file_picker_return_mode: RevMode,
+    file_tree_open: bool,
     collapsed_repos: HashSet<usize>,
     question_cursor: usize,
     question_return_mode: RevMode,
+    questions_open: bool,
     model_return_mode: RevMode,
     status: String,
     annotations: Vec<(Annotation, Placement)>,
@@ -304,6 +310,8 @@ impl RevState {
             file_index: 0,
             row_cursor: 0,
             visual_anchor: None,
+            visual_row_anchor: None,
+            pending_yank: false,
             mode: RevMode::Normal,
             diff_layout: RevDiffLayout::Unified,
             command: CommandPalette::default(),
@@ -316,9 +324,11 @@ impl RevState {
             help_scroll: 0,
             file_picker_cursor: 0,
             file_picker_return_mode: RevMode::Normal,
+            file_tree_open: false,
             collapsed_repos: HashSet::new(),
             question_cursor: 0,
             question_return_mode: RevMode::Normal,
+            questions_open: false,
             model_return_mode: RevMode::Normal,
             status: "j/k stay in this file · h/l change files".into(),
             annotations,
@@ -375,6 +385,9 @@ impl RevState {
         };
         self.row_cursor = 0;
         self.visual_anchor = None;
+        self.visual_row_anchor = None;
+        self.pending_yank = false;
+        sync_file_picker_cursor(self);
         self.mode = RevMode::Normal;
         self.render_cache = None;
         self.status = if previous == self.file_index {
@@ -605,6 +618,41 @@ fn handle_key(
             "Cancelling the active question · the UI remains responsive until it settles".into();
         return Ok(());
     }
+    if key.code == KeyCode::Char('q')
+        && matches!(
+            state.mode,
+            RevMode::Normal
+                | RevMode::Visual
+                | RevMode::History
+                | RevMode::FilePicker
+                | RevMode::Questions
+                | RevMode::Help
+        )
+    {
+        state.pending_yank = false;
+        state.history_delete_armed = None;
+        if state.questions_open {
+            close_questions(state);
+        } else {
+            open_questions(state);
+        }
+        return Ok(());
+    }
+    if key.code == KeyCode::Char('t')
+        && matches!(
+            state.mode,
+            RevMode::Normal | RevMode::Visual | RevMode::FilePicker | RevMode::Questions
+        )
+    {
+        state.pending_yank = false;
+        state.history_delete_armed = None;
+        if state.file_tree_open {
+            close_file_picker(state);
+        } else {
+            open_file_picker(state);
+        }
+        return Ok(());
+    }
     match state.mode {
         RevMode::Compose => handle_compose_key(state, storage, paths, key),
         RevMode::Command => handle_command_key(state, storage, paths, key),
@@ -661,10 +709,33 @@ fn handle_review_key(
     highlighter: &mut dyn Highlighter,
     key: KeyEvent,
 ) -> Result<()> {
+    if key.code != KeyCode::Char('y') {
+        state.pending_yank = false;
+    }
+    if key.code != KeyCode::Char('d') {
+        state.history_delete_armed = None;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         state.visual_anchor = None;
+        state.visual_row_anchor = None;
         state.mode = RevMode::Normal;
         state.status = "Selection cleared".into();
+        return Ok(());
+    }
+    if state.mode == RevMode::Visual
+        && state.visual_row_anchor.is_some()
+        && matches!(
+            key.code,
+            KeyCode::Char('a')
+                | KeyCode::Char('c')
+                | KeyCode::Char('C')
+                | KeyCode::Char('d')
+                | KeyCode::Char('i')
+                | KeyCode::Enter
+        )
+    {
+        state.status =
+            "VISUAL TEXT is copy-only · y copies · v/Esc clears before code actions".into();
         return Ok(());
     }
     match key.code {
@@ -686,16 +757,64 @@ fn handle_review_key(
         KeyCode::Char('v') => {
             if state.mode == RevMode::Visual {
                 state.visual_anchor = None;
+                state.visual_row_anchor = None;
                 state.mode = RevMode::Normal;
                 state.status = "Selection cleared".into();
-            } else if let Some(source) = current_source_index(state, highlighter) {
-                state.visual_anchor = Some(source);
-                state.mode = RevMode::Visual;
-                state.status = "Selection started · j/k extends · a asks · c saves feedback".into();
+            } else {
+                let cursor = state.row_cursor;
+                let width = cached_row_width(state);
+                let annotation_row = ensure_rows(state, width, highlighter)
+                    .get(cursor)
+                    .is_some_and(|row| matches!(row.kind, RevRowKind::Annotation { .. }));
+                if annotation_row {
+                    state.visual_row_anchor = Some(cursor);
+                    state.visual_anchor = None;
+                    state.mode = RevMode::Visual;
+                    state.status =
+                        "VISUAL TEXT · j/k extends through chat and code · y copies · Esc clears"
+                            .into();
+                } else if let Some(source) = current_source_index(state, highlighter) {
+                    state.visual_anchor = Some(source);
+                    state.visual_row_anchor = None;
+                    state.mode = RevMode::Visual;
+                    state.status =
+                        "VISUAL LINE · j/k extends · y copies · a asks · c saves feedback".into();
+                }
             }
         }
-        KeyCode::Char('t') => open_file_picker(state),
-        KeyCode::Char('Q') => open_questions(state),
+        KeyCode::Char('t') => {
+            if state.file_tree_open {
+                close_file_picker(state);
+            } else {
+                open_file_picker(state);
+            }
+        }
+        KeyCode::Char('q') => {
+            if state.questions_open {
+                close_questions(state);
+            } else {
+                open_questions(state);
+            }
+        }
+        KeyCode::Char('Q') => {
+            if state.questions_open {
+                close_questions(state);
+            } else {
+                open_questions(state);
+            }
+        }
+        KeyCode::Char('y') => {
+            if state.mode == RevMode::Visual {
+                yank_visual_selection(state, highlighter)?;
+            } else if state.pending_yank {
+                yank_current_item(state, highlighter)?;
+            } else {
+                state.pending_yank = true;
+                state.status =
+                    "YANK · press y again to copy the current line or chat message".into();
+            }
+        }
+        KeyCode::Char('d') => delete_contextual_comment(state, storage, highlighter)?,
         KeyCode::Char('m') => {
             if let Some(id) = current_question_id_from_cache(state) {
                 start_model_switch(state, paths, &id);
@@ -736,7 +855,8 @@ fn handle_review_key(
         KeyCode::Char('r') => {
             state.mode = RevMode::History;
             state.history_cursor = 0;
-            state.status = "HISTORY · j/k move · d delete item · Esc return".into();
+            state.status =
+                "HISTORY · j/k move · d d deletes saved feedback only · Esc return".into();
         }
         KeyCode::Char('e') => copy_feedback_prompt(state, storage)?,
         KeyCode::Char('C') => {
@@ -754,18 +874,10 @@ fn handle_review_key(
             state.command = CommandPalette::default();
             state.status = "COMMAND · type to filter · ↑/↓ select · Enter run · Esc return".into();
         }
-        KeyCode::Char('q') => {
-            if state.agent.is_some() || !state.queued_questions.is_empty() {
-                state.status =
-                    "Questions are active or queued · Ctrl-C cancels the active one before quit"
-                        .into();
-            } else {
-                state.status = "quit".into();
-            }
-        }
         KeyCode::Esc => {
             state.mode = RevMode::Normal;
             state.visual_anchor = None;
+            state.visual_row_anchor = None;
             state.status = "NORMAL".into();
         }
         _ => {}
@@ -783,6 +895,7 @@ fn open_file_picker(state: &mut RevState) {
     if let Some((repo_index, _)) = state.current_indices() {
         state.collapsed_repos.remove(&repo_index);
     }
+    state.file_tree_open = true;
     state.mode = RevMode::FilePicker;
     state.file_picker_cursor = file_picker_rows(state)
         .iter()
@@ -793,16 +906,26 @@ fn open_file_picker(state: &mut RevState) {
             )
         })
         .unwrap_or(0);
-    state.status = "j/k move · h/l collapse/expand · Enter open · t/Esc close".into();
+    state.status = "FILES · j/k previews immediately · h/l fold · t returns to editor".into();
 }
 
 fn close_file_picker(state: &mut RevState) {
-    state.mode =
-        if state.file_picker_return_mode == RevMode::Visual && state.visual_anchor.is_some() {
-            RevMode::Visual
-        } else {
-            RevMode::Normal
-        };
+    state.file_tree_open = false;
+    if state.questions_open
+        && state.file_picker_return_mode == RevMode::Visual
+        && (state.visual_anchor.is_some() || state.visual_row_anchor.is_some())
+    {
+        state.question_return_mode = RevMode::Visual;
+    }
+    state.mode = if state.questions_open {
+        RevMode::Questions
+    } else if state.file_picker_return_mode == RevMode::Visual
+        && (state.visual_anchor.is_some() || state.visual_row_anchor.is_some())
+    {
+        RevMode::Visual
+    } else {
+        RevMode::Normal
+    };
     state.status = if state.mode == RevMode::Visual {
         "Selection retained · j/k extends · v/Esc clears".into()
     } else {
@@ -812,12 +935,16 @@ fn close_file_picker(state: &mut RevState) {
 
 fn handle_file_picker_key(state: &mut RevState, key: KeyEvent) {
     match key.code {
-        KeyCode::Char('t') | KeyCode::Esc | KeyCode::Char('q') => close_file_picker(state),
+        KeyCode::Char('t') | KeyCode::Esc => close_file_picker(state),
         KeyCode::Char('j') | KeyCode::Down => move_file_picker(state, 1),
         KeyCode::Char('k') | KeyCode::Up => move_file_picker(state, -1),
-        KeyCode::Char('g') | KeyCode::Home => state.file_picker_cursor = 0,
+        KeyCode::Char('g') | KeyCode::Home => {
+            state.file_picker_cursor = 0;
+            preview_file_picker_selection(state);
+        }
         KeyCode::Char('G') | KeyCode::End => {
-            state.file_picker_cursor = file_picker_rows(state).len().saturating_sub(1)
+            state.file_picker_cursor = file_picker_rows(state).len().saturating_sub(1);
+            preview_file_picker_selection(state);
         }
         KeyCode::Char('h') | KeyCode::Left => collapse_picker_repo(state),
         KeyCode::Char('l') | KeyCode::Right => expand_picker_repo(state),
@@ -836,6 +963,22 @@ fn move_file_picker(state: &mut RevState, delta: isize) {
             .file_picker_cursor
             .saturating_sub(delta.unsigned_abs());
     }
+    preview_file_picker_selection(state);
+}
+
+fn preview_file_picker_selection(state: &mut RevState) {
+    let Some(FilePickerRow::File { flat_index, .. }) = selected_file_picker_row(state) else {
+        return;
+    };
+    if state.file_index != flat_index {
+        state.file_index = flat_index;
+        state.row_cursor = 0;
+        state.visual_anchor = None;
+        state.visual_row_anchor = None;
+        state.pending_yank = false;
+        state.render_cache = None;
+    }
+    state.status = "FILES · preview updated · j/k moves · t returns to editor".into();
 }
 
 fn file_picker_rows(state: &RevState) -> Vec<FilePickerRow> {
@@ -864,6 +1007,25 @@ fn selected_file_picker_row(state: &RevState) -> Option<FilePickerRow> {
     let rows = file_picker_rows(state);
     rows.get(state.file_picker_cursor.min(rows.len().saturating_sub(1)))
         .copied()
+}
+
+fn sync_file_picker_cursor(state: &mut RevState) {
+    let Some((repo_index, _)) = state.current_indices() else {
+        state.file_picker_cursor = 0;
+        return;
+    };
+    if state.file_tree_open {
+        state.collapsed_repos.remove(&repo_index);
+    }
+    state.file_picker_cursor = file_picker_rows(state)
+        .iter()
+        .position(|row| {
+            matches!(
+                row,
+                FilePickerRow::File { flat_index, .. } if *flat_index == state.file_index
+            )
+        })
+        .unwrap_or(0);
 }
 
 fn selected_file_picker_repo(state: &RevState) -> Option<usize> {
@@ -909,16 +1071,12 @@ fn activate_file_picker_row(state: &mut RevState) {
                 .unwrap_or(0);
         }
         Some(FilePickerRow::File { flat_index, .. }) => {
-            if state.file_index == flat_index {
-                close_file_picker(state);
-                return;
-            }
             state.file_index = flat_index;
             state.row_cursor = 0;
             state.visual_anchor = None;
-            state.mode = RevMode::Normal;
+            state.visual_row_anchor = None;
             state.render_cache = None;
-            state.status = "Opened file from tree · j/k stay bounded · t reopens files".into();
+            state.status = "FILES · previewing selected file · t returns to editor".into();
         }
         None => close_file_picker(state),
     }
@@ -958,15 +1116,12 @@ fn current_question_id_from_cache(state: &RevState) -> Option<String> {
 
 fn open_questions(state: &mut RevState) {
     let ids = question_ids(state);
-    if ids.is_empty() {
-        if state.mode == RevMode::Command {
-            state.mode = RevMode::Normal;
-        }
-        state.status = "No question threads yet · select source lines and press a to ask".into();
-        return;
-    }
-    state.question_return_mode = if state.mode == RevMode::Visual {
+    state.question_return_mode = if state.mode == RevMode::FilePicker && state.file_tree_open {
+        RevMode::FilePicker
+    } else if state.mode == RevMode::Visual {
         RevMode::Visual
+    } else if matches!(state.mode, RevMode::History | RevMode::Help) {
+        state.mode
     } else {
         RevMode::Normal
     };
@@ -975,13 +1130,25 @@ fn open_questions(state: &mut RevState) {
     } else {
         state.question_cursor = state.question_cursor.min(ids.len().saturating_sub(1));
     }
+    state.questions_open = true;
     state.mode = RevMode::Questions;
-    state.status = "j/k choose · Enter jump · i continue · m switch model · Q/Esc close".into();
+    state.status = if ids.is_empty() {
+        "QUESTIONS · no threads yet · q/Esc closes · select code and press a to ask".into()
+    } else {
+        "QUESTIONS · j/k choose · Enter jump · a continue · m model · q/Esc close".into()
+    };
 }
 
 fn close_questions(state: &mut RevState) {
-    state.mode = if state.question_return_mode == RevMode::Visual && state.visual_anchor.is_some() {
+    state.questions_open = false;
+    state.mode = if state.question_return_mode == RevMode::FilePicker && state.file_tree_open {
+        RevMode::FilePicker
+    } else if state.question_return_mode == RevMode::Visual
+        && (state.visual_anchor.is_some() || state.visual_row_anchor.is_some())
+    {
         RevMode::Visual
+    } else if matches!(state.question_return_mode, RevMode::History | RevMode::Help) {
+        state.question_return_mode
     } else {
         RevMode::Normal
     };
@@ -1009,7 +1176,7 @@ fn handle_question_key(
     key: KeyEvent,
 ) {
     match key.code {
-        KeyCode::Char('Q') | KeyCode::Esc | KeyCode::Char('q') => close_questions(state),
+        KeyCode::Char('Q') | KeyCode::Esc => close_questions(state),
         KeyCode::Char('j') | KeyCode::Down => move_question_cursor(state, 1),
         KeyCode::Char('k') | KeyCode::Up => move_question_cursor(state, -1),
         KeyCode::Char('g') | KeyCode::Home => state.question_cursor = 0,
@@ -1058,6 +1225,8 @@ fn focus_question(
     state.file_index = file_index;
     state.row_cursor = 0;
     state.visual_anchor = None;
+    state.visual_row_anchor = None;
+    sync_file_picker_cursor(state);
     state.mode = RevMode::Normal;
     state.render_cache = None;
     let width = cached_row_width(state);
@@ -1186,6 +1355,7 @@ fn begin_edit_feedback(
         return;
     };
     state.visual_anchor = Some(start);
+    state.visual_row_anchor = None;
     state.mode = RevMode::Compose;
     state.compose_target = Some(ComposeTarget::EditFeedback(annotation_id));
     state.compose = annotation.text.unwrap_or_default();
@@ -1378,6 +1548,7 @@ fn command_candidates(state: &RevState) -> Vec<String> {
         "model".to_owned(),
         "questions".to_owned(),
         "clear".to_owned(),
+        "q".to_owned(),
         "quit".to_owned(),
     ];
     commands.extend(
@@ -1412,7 +1583,7 @@ fn execute_command(
         "help" | "?" => {
             state.mode = RevMode::Help;
             state.help_scroll = 0;
-            state.status = "j/k or arrows scroll · Esc/q close".into();
+            state.status = "j/k or arrows scroll · Esc closes · q opens questions".into();
         }
         "questions" | "threads" => open_questions(state),
         "model" => {
@@ -1451,13 +1622,23 @@ fn execute_command(
         "history" => {
             state.mode = RevMode::History;
             state.history_cursor = 0;
-            state.status = "HISTORY · j/k move · d delete item · Esc return".into();
+            state.status =
+                "HISTORY · j/k move · d d deletes saved feedback only · Esc return".into();
         }
         "clear" => {
             state.mode = RevMode::ConfirmClear;
             state.status = "Clear every saved comment and question here? y/n".into();
         }
-        "quit" | "q" => state.status = "quit".into(),
+        "quit" | "q" => {
+            if state.agent.is_some() || !state.queued_questions.is_empty() {
+                state.mode = RevMode::Normal;
+                state.status =
+                    "Questions are active or queued · Ctrl-C cancels the active one before :quit"
+                        .into();
+            } else {
+                state.status = "quit".into();
+            }
+        }
         _ if command.starts_with("base ") => {
             if state.streaming || state.agent.is_some() || !state.queued_questions.is_empty() {
                 state.mode = RevMode::Normal;
@@ -1909,6 +2090,7 @@ fn create_feedback(state: &mut RevState, storage: &Storage, text: &str) -> Resul
     ));
     state.mode = RevMode::Normal;
     state.visual_anchor = None;
+    state.visual_row_anchor = None;
     state.invalidate_rows();
     state.status =
         "Feedback saved · e copies a structured prompt · `rev feedback` prints it".into();
@@ -1936,6 +2118,7 @@ fn update_feedback(
     annotation.text = Some(text.to_owned());
     state.mode = RevMode::Normal;
     state.visual_anchor = None;
+    state.visual_row_anchor = None;
     state.invalidate_rows();
     state.status = "Feedback updated · e copies the refreshed structured prompt".into();
     Ok(())
@@ -2020,6 +2203,7 @@ fn create_question(
         },
     );
     state.visual_anchor = None;
+    state.visual_row_anchor = None;
     Ok(())
 }
 
@@ -2730,6 +2914,13 @@ fn handle_history_key(state: &mut RevState, storage: &Storage, key: KeyEvent) ->
                 return Ok(());
             }
             if let Some((annotation, _)) = state.annotations.get(state.history_cursor).cloned() {
+                if annotation.kind != AnnotationKind::Comment {
+                    state.history_delete_armed = None;
+                    state.status =
+                        "d deletes saved feedback only · /clear resets an individual question thread"
+                            .into();
+                    return Ok(());
+                }
                 if state.history_delete_armed.as_deref() != Some(&annotation.id) {
                     state.history_delete_armed = Some(annotation.id);
                     state.status =
@@ -2783,12 +2974,132 @@ fn copy_feedback_prompt(state: &mut RevState, storage: &Storage) -> Result<()> {
         return Ok(());
     }
     let prompt = export.structured_agent_prompt();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(prompt.as_bytes());
-    print!("\x1b]52;c;{encoded}\x07");
+    let delivery = copy_to_clipboard(&prompt)?;
     state.status = format!(
-        "Copied {} feedback item(s) · `rev feedback` also prints the prompt",
-        export.comments.len()
+        "Copied {} feedback item(s) {} · `rev feedback` also prints the prompt",
+        export.comments.len(),
+        clipboard_delivery_label(delivery)
     );
+    Ok(())
+}
+
+fn clipboard_delivery_label(delivery: ClipboardDelivery) -> String {
+    match delivery {
+        ClipboardDelivery::Native(program) => format!("with {program}"),
+        ClipboardDelivery::Osc52 => "via OSC 52 (terminal confirmation unavailable)".into(),
+    }
+}
+
+fn yank_current_item(state: &mut RevState, highlighter: &mut dyn Highlighter) -> Result<()> {
+    let text = current_item_yank_text(state, highlighter);
+    state.pending_yank = false;
+    if text.is_empty() {
+        state.status = "Nothing copyable on this row".into();
+        return Ok(());
+    }
+    let delivery = copy_to_clipboard(&text)?;
+    state.status = format!(
+        "Copied current item · {} character(s) {}",
+        text.chars().count(),
+        clipboard_delivery_label(delivery)
+    );
+    Ok(())
+}
+
+fn current_item_yank_text(state: &mut RevState, highlighter: &mut dyn Highlighter) -> String {
+    let cursor = state.row_cursor;
+    let width = cached_row_width(state);
+    ensure_rows(state, width, highlighter)
+        .get(cursor)
+        .map(|row| row.item_text.trim_end().to_owned())
+        .unwrap_or_default()
+}
+
+fn yank_visual_selection(state: &mut RevState, highlighter: &mut dyn Highlighter) -> Result<()> {
+    let text = visual_selection_yank_text(state, highlighter);
+    if text.is_empty() {
+        state.status = "Nothing copyable in this selection".into();
+        return Ok(());
+    }
+    let delivery = copy_to_clipboard(&text)?;
+    state.visual_anchor = None;
+    state.visual_row_anchor = None;
+    state.pending_yank = false;
+    state.mode = RevMode::Normal;
+    state.status = format!(
+        "Copied selection · {} line(s) {}",
+        text.lines().count(),
+        clipboard_delivery_label(delivery)
+    );
+    Ok(())
+}
+
+fn visual_selection_yank_text(state: &mut RevState, highlighter: &mut dyn Highlighter) -> String {
+    let width = cached_row_width(state);
+    let rows = ensure_rows(state, width, highlighter).to_vec();
+    if let Some(anchor) = state.visual_row_anchor {
+        let start = anchor.min(state.row_cursor);
+        let end = anchor.max(state.row_cursor);
+        rows[start..=end]
+            .iter()
+            .map(|row| row.yank_text.trim_end())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else if let Some(anchor) = state.visual_anchor {
+        let active = current_source_index_from_rows(&rows, state.row_cursor).unwrap_or(anchor);
+        let start = anchor.min(active);
+        let end = anchor.max(active);
+        rows.iter()
+            .filter_map(|row| match &row.kind {
+                RevRowKind::Source {
+                    visible_index,
+                    line,
+                } if (start..=end).contains(visible_index) => Some(line.content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        String::new()
+    }
+}
+
+fn delete_contextual_comment(
+    state: &mut RevState,
+    storage: &Storage,
+    highlighter: &mut dyn Highlighter,
+) -> Result<()> {
+    let id = match contextual_annotation(state, highlighter, AnnotationKind::Comment) {
+        ContextualAnnotationMatch::Match(id) => id,
+        ContextualAnnotationMatch::None => {
+            state.history_delete_armed = None;
+            state.status =
+                "Move onto saved feedback or select its exact original lines before deleting"
+                    .into();
+            return Ok(());
+        }
+        ContextualAnnotationMatch::Blocked(message) => {
+            state.history_delete_armed = None;
+            state.status = format!("d deletes saved feedback only · {message}");
+            return Ok(());
+        }
+    };
+    if state.history_delete_armed.as_deref() != Some(&id) {
+        state.history_delete_armed = Some(id);
+        state.status = "DELETE FEEDBACK · press d again to permanently delete this comment".into();
+        return Ok(());
+    }
+    storage.delete_annotation(&id)?;
+    state
+        .annotations
+        .retain(|(annotation, _)| annotation.id != id);
+    state.history_delete_armed = None;
+    state.visual_anchor = None;
+    state.visual_row_anchor = None;
+    state.mode = RevMode::Normal;
+    state.invalidate_rows();
+    state.status = "Deleted saved feedback · questions were not affected".into();
     Ok(())
 }
 
@@ -2798,7 +3109,7 @@ fn move_row(state: &mut RevState, highlighter: &mut dyn Highlighter, delta: isiz
     if rows.is_empty() {
         return;
     }
-    if state.mode == RevMode::Visual {
+    if state.mode == RevMode::Visual && state.visual_row_anchor.is_none() {
         let direction = delta.signum();
         let mut cursor = state.row_cursor;
         for _ in 0..delta.unsigned_abs().max(1) {
@@ -2823,7 +3134,13 @@ fn move_row(state: &mut RevState, highlighter: &mut dyn Highlighter, delta: isiz
     } else {
         state.row_cursor = state.row_cursor.saturating_sub(delta.unsigned_abs());
     }
-    state.status = if state.mode == RevMode::Visual {
+    state.status = if state.mode == RevMode::Visual && state.visual_row_anchor.is_some() {
+        let anchor = state.visual_row_anchor.unwrap_or(state.row_cursor);
+        format!(
+            "{} rendered row(s) selected · j/k extend through chat and code · y copy · Esc clear",
+            state.row_cursor.abs_diff(anchor) + 1
+        )
+    } else if state.mode == RevMode::Visual {
         let active = current_source_index_from_rows(&rows, state.row_cursor)
             .or(state.visual_anchor)
             .unwrap_or(0);
@@ -2945,6 +3262,8 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
                 line: line.clone(),
             },
             line: None,
+            yank_text: line.content.clone(),
+            item_text: line.content.clone(),
         });
         for (annotation, placement) in annotations.iter().filter(|(_, placement)| {
             let source_line = match placement.side {
@@ -2953,6 +3272,16 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
             };
             source_line.is_some_and(|source_line| placement.line_end == source_line as i64)
         }) {
+            let annotation_item_text = if annotation.kind == AnnotationKind::Ask {
+                state
+                    .threads
+                    .get(&annotation.id)
+                    .and_then(|messages| messages.iter().find(|message| message.role == "user"))
+                    .map(|message| message.text.clone())
+                    .unwrap_or_default()
+            } else {
+                annotation.text.clone().unwrap_or_default()
+            };
             let title = match annotation.kind {
                 AnnotationKind::Comment => format!(
                     "Feedback · lines {}-{} · {}",
@@ -2980,6 +3309,8 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
                         })
                         .add_modifier(Modifier::BOLD),
                 )),
+                yank_text: title,
+                item_text: annotation_item_text.clone(),
             });
             if annotation.kind == AnnotationKind::Ask {
                 for message in state.threads.get(&annotation.id).into_iter().flatten() {
@@ -2999,6 +3330,8 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
                                 .fg(Color::Magenta)
                                 .add_modifier(Modifier::BOLD),
                         )),
+                        yank_text: role.to_owned(),
+                        item_text: message.text.clone(),
                     });
                     for mapped in render_markdown_mapped(
                         &message.text,
@@ -3009,12 +3342,21 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
                     {
                         let mut line = Line::from(vec![Span::raw("│ ")]);
                         line.spans.extend(mapped.line.spans);
+                        let yank_text = line
+                            .spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>()
+                            .trim_start_matches("│ ")
+                            .to_owned();
                         rows.push(RevRow {
                             kind: RevRowKind::Annotation {
                                 annotation_id: annotation.id.clone(),
                                 anchor_visible_index: visible_index,
                             },
                             line: Some(line),
+                            yank_text,
+                            item_text: message.text.clone(),
                         });
                     }
                 }
@@ -3033,6 +3375,8 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
                         },
                         Style::default().fg(Color::DarkGray),
                     )),
+                    yank_text: String::new(),
+                    item_text: annotation_item_text.clone(),
                 });
             } else {
                 rows.push(RevRow {
@@ -3044,6 +3388,8 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
                         "╰─ saved · c/C edit · e copy structured prompt",
                         Style::default().fg(Color::DarkGray),
                     )),
+                    yank_text: String::new(),
+                    item_text: annotation_item_text,
                 });
             }
         }
@@ -3079,23 +3425,12 @@ fn render(frame: &mut Frame, state: &mut RevState, highlighter: &mut dyn Highlig
         ])
         .split(area);
     render_header(frame, state, vertical[0]);
-    if state.mode == RevMode::History {
+    if state.mode == RevMode::History && !state.questions_open {
         render_history(frame, state, vertical[1]);
-    } else if state.mode == RevMode::Help {
+    } else if state.mode == RevMode::Help && !state.questions_open {
         render_help(frame, state, vertical[1]);
-    } else if state.mode == RevMode::Questions {
-        if vertical[1].width >= 72 {
-            let horizontal = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(36), Constraint::Length(42)])
-                .split(vertical[1]);
-            render_review(frame, state, horizontal[0], highlighter);
-            render_questions(frame, state, horizontal[1]);
-        } else {
-            render_questions(frame, state, vertical[1]);
-        }
     } else {
-        render_review(frame, state, vertical[1], highlighter);
+        render_workspace_panes(frame, state, vertical[1], highlighter);
     }
     if state.mode == RevMode::Compose {
         render_composer(frame, state, vertical[2]);
@@ -3103,12 +3438,62 @@ fn render(frame: &mut Frame, state: &mut RevState, highlighter: &mut dyn Highlig
     render_footer(frame, state, vertical[3]);
     if state.mode == RevMode::Model {
         render_model_picker(frame, state, vertical[1]);
-    } else if state.mode == RevMode::FilePicker {
-        render_file_picker(frame, state, vertical[1]);
     } else if state.mode == RevMode::Command {
         render_command_palette(frame, state, vertical[1]);
     } else if state.mode == RevMode::ConfirmClear {
         render_confirmation(frame, vertical[1]);
+    }
+}
+
+fn render_workspace_panes(
+    frame: &mut Frame,
+    state: &mut RevState,
+    area: Rect,
+    highlighter: &mut dyn Highlighter,
+) {
+    let tree = state.file_tree_open;
+    let questions = state.questions_open;
+    if tree && questions && area.width >= 108 {
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(30),
+                Constraint::Min(36),
+                Constraint::Length(38),
+            ])
+            .split(area);
+        render_file_picker(frame, state, panes[0]);
+        render_review(frame, state, panes[1], highlighter);
+        render_questions(frame, state, panes[2]);
+    } else if questions && state.mode == RevMode::Questions {
+        if area.width >= 72 {
+            let panes = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(34), Constraint::Length(38)])
+                .split(area);
+            render_review(frame, state, panes[0], highlighter);
+            render_questions(frame, state, panes[1]);
+        } else {
+            render_questions(frame, state, area);
+        }
+    } else if tree && area.width >= 68 {
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(30), Constraint::Min(36)])
+            .split(area);
+        render_file_picker(frame, state, panes[0]);
+        render_review(frame, state, panes[1], highlighter);
+    } else if questions && area.width >= 72 {
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(34), Constraint::Length(38)])
+            .split(area);
+        render_review(frame, state, panes[0], highlighter);
+        render_questions(frame, state, panes[1]);
+    } else if tree && state.mode == RevMode::FilePicker {
+        render_file_picker(frame, state, area);
+    } else {
+        render_review(frame, state, area, highlighter);
     }
 }
 
@@ -3164,18 +3549,26 @@ fn render_review(
         .saturating_add(1)
         .saturating_sub(viewport)
         .min(rows.len().saturating_sub(viewport));
-    let selection = state
+    let source_selection = state
         .visual_anchor
         .zip(current_source_index_from_rows(&rows, state.row_cursor))
         .map(|(a, b)| (a.min(b), a.max(b)));
-    let title = if let Some((start, end)) = selection.filter(|_| editing_feedback) {
+    let row_selection = state
+        .visual_row_anchor
+        .map(|anchor| (anchor.min(state.row_cursor), anchor.max(state.row_cursor)));
+    let title = if let Some((start, end)) = source_selection.filter(|_| editing_feedback) {
         format!(
             " EDIT FEEDBACK · {} original line(s) selected · Enter saves · Esc cancels ",
             end.saturating_sub(start) + 1
         )
-    } else if let Some((start, end)) = selection.filter(|_| visual_mode) {
+    } else if let Some((start, end)) = row_selection.filter(|_| visual_mode) {
         format!(
-            " VISUAL LINE · {} selected · j/k extend · a ask · c feedback · v/Esc clear ",
+            " VISUAL TEXT · {} rendered row(s) · j/k extend · y copy · v/Esc clear ",
+            end.saturating_sub(start) + 1
+        )
+    } else if let Some((start, end)) = source_selection.filter(|_| visual_mode) {
+        format!(
+            " VISUAL LINE · {} selected · j/k extend · y copy · a ask · c feedback ",
             end.saturating_sub(start) + 1
         )
     } else {
@@ -3220,12 +3613,12 @@ fn render_review(
             &row.kind,
             RevRowKind::Source { line, .. } if is_expanded_context(state, line)
         );
-        let visually_selected = match &row.kind {
-            RevRowKind::Source { visible_index, .. } => {
-                selection.is_some_and(|(start, end)| (start..=end).contains(visible_index))
-            }
-            RevRowKind::Annotation { .. } => false,
-        };
+        let visually_selected =
+            match &row.kind {
+                RevRowKind::Source { visible_index, .. } => source_selection
+                    .is_some_and(|(start, end)| (start..=end).contains(visible_index)),
+                RevRowKind::Annotation { .. } => false,
+            } || row_selection.is_some_and(|(start, end)| (start..=end).contains(&index));
         if selected || visually_selected {
             line = line.style(Style::default().bg(if selection_mode {
                 Color::Rgb(52, 35, 63)
@@ -3242,7 +3635,7 @@ fn render_review(
 
 fn render_help(frame: &mut Frame, state: &mut RevState, area: Rect) {
     let block = Block::default()
-        .title(" help · j/k/↑/↓ scroll · PgUp/PgDn · g/G · Esc/q close ")
+        .title(" help · j/k/↑/↓ scroll · PgUp/PgDn · g/G · Esc close · q questions ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Magenta));
     let inner = block.inner(area);
@@ -3303,7 +3696,12 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::raw(""),
         section("Diff and selection"),
         key("t", "open or close the repository/file tree"),
-        key("v", "start or clear a source-line selection"),
+        key("v", "start or clear selection in code or rendered chat"),
+        key("y", "copy a visual selection"),
+        key(
+            "yy",
+            "copy the current source line or complete chat message",
+        ),
         key("Esc", "clear the current selection"),
         key(
             "Shift+↑",
@@ -3315,11 +3713,14 @@ fn help_lines() -> Vec<Line<'static>> {
         ),
         Line::raw(""),
         section("File tree"),
-        key("j/k / ↑/↓", "move through repository and file rows"),
+        key(
+            "j/k / ↑/↓",
+            "move through files and preview each one immediately",
+        ),
         key("h/l / ←/→", "collapse or expand the selected repository"),
         key("g/G / Home/End", "jump to the first or last tree row"),
-        key("Enter", "toggle a repository or open a file"),
-        key("t / Esc / q", "close the tree and return to the review"),
+        key("Enter", "toggle a repository or keep previewing a file"),
+        key("t / Esc", "close the tree and return to the editor"),
         Line::raw(""),
         section("Review actions"),
         key(
@@ -3333,12 +3734,19 @@ fn help_lines() -> Vec<Line<'static>> {
         key("C", "explicitly edit feedback on its exact saved selection"),
         key("i / Enter", "follow up on the question under the cursor"),
         key("m", "switch the model for the question under the cursor"),
-        key("Q", "open or close the right-side question-thread panel"),
+        key(
+            "q / Q",
+            "open or close the right-side question-thread panel",
+        ),
+        key("d d", "delete only the saved feedback under the cursor"),
         key("r", "open persisted review history"),
-        key("e", "copy the structured feedback prompt using OSC 52"),
+        key(
+            "e",
+            "copy the structured feedback prompt using native clipboard or OSC 52",
+        ),
         key("y / n", "confirm or cancel clearing saved review history"),
         key(":", "open the command palette"),
-        key("q", "quit when no questions are active or queued"),
+        key(":q / :quit", "quit; plain q never exits"),
         Line::raw(""),
         section("Question and feedback composer"),
         key("Enter", "submit"),
@@ -3391,7 +3799,10 @@ fn help_lines() -> Vec<Line<'static>> {
             "j/k / ↑/↓",
             "move through saved comments and question threads",
         ),
-        key("d, then d", "permanently delete the selected review item"),
+        key(
+            "d, then d",
+            "permanently delete selected saved feedback; questions are retained",
+        ),
         key("r / Esc", "return to the review"),
         Line::raw(""),
         section("Command palette"),
@@ -3698,7 +4109,7 @@ fn render_footer(frame: &mut Frame, state: &RevState, area: Rect) {
         format!("{mode} · {}", state.status)
     } else {
         format!(
-            "{mode} · t files · v select · Q threads · a ask · c feedback · : commands · q quit · {}",
+            "{mode} · t files · v select · y/yy copy · q questions · a ask · c feedback · : commands · {}",
             state.status,
         )
     };
@@ -3729,9 +4140,13 @@ fn render_questions(frame: &mut Frame, state: &RevState, area: Rect) {
     let ids = question_ids(state);
     let selected = state.question_cursor.min(ids.len().saturating_sub(1));
     let block = Block::default()
-        .title(" questions · j/k · ↵ · a/i ask · m model ")
+        .title(" questions · j/k · ↵ · a continue · m model · q close ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta));
+        .border_style(Style::default().fg(if state.mode == RevMode::Questions {
+            Color::Magenta
+        } else {
+            Color::DarkGray
+        }));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if ids.is_empty() {
@@ -3871,13 +4286,7 @@ fn question_style(selected: bool) -> Style {
 fn render_file_picker(frame: &mut Frame, state: &RevState, area: Rect) {
     let rows = file_picker_rows(state);
     let selected = state.file_picker_cursor.min(rows.len().saturating_sub(1));
-    let width = area.width.saturating_sub(2).clamp(1, 96);
-    let height = (rows.len() as u16 + 2)
-        .min(area.height.saturating_sub(2))
-        .max(3);
-    let popup = centered_rect(area, width, height);
-    frame.render_widget(Clear, popup);
-    let viewport = popup.height.saturating_sub(2).max(1) as usize;
+    let viewport = area.height.saturating_sub(2).max(1) as usize;
     let start = selected
         .saturating_add(1)
         .saturating_sub(viewport)
@@ -3889,13 +4298,15 @@ fn render_file_picker(frame: &mut Frame, state: &RevState, area: Rect) {
         String::new()
     };
     let block = Block::default()
-        .title(format!(
-            " files{range} · j/k move · h/l fold · Enter open · t/Esc close "
-        ))
+        .title(format!(" files{range} · j/k preview · h/l fold · t close "))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
+        .border_style(Style::default().fg(if state.mode == RevMode::FilePicker {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     let lines = rows
         .iter()
         .enumerate()
@@ -4119,7 +4530,7 @@ fn render_model_picker(frame: &mut Frame, state: &RevState, area: Rect) {
 
 fn render_history(frame: &mut Frame, state: &RevState, area: Rect) {
     let block = Block::default()
-        .title(" persisted review history · d deletes selected ")
+        .title(" persisted review history · d d deletes saved feedback only ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Magenta));
     let inner = block.inner(area);
@@ -4279,6 +4690,11 @@ pub(crate) fn render_snapshot(width: u16, height: u16, snapshot: &str) -> Result
             seed_snapshot_questions(&mut state);
             open_questions(&mut state);
         }
+        "panes" => {
+            seed_snapshot_questions(&mut state);
+            open_file_picker(&mut state);
+            open_questions(&mut state);
+        }
         "cleared-question" => {
             seed_snapshot_questions(&mut state);
             state
@@ -4366,12 +4782,12 @@ pub(crate) fn render_snapshot(width: u16, height: u16, snapshot: &str) -> Result
         "help" => {
             state.mode = RevMode::Help;
             state.help_scroll = 0;
-            state.status = "j/k or arrows scroll · Esc/q close".into();
+            state.status = "j/k or arrows scroll · Esc closes · q opens questions".into();
         }
         "help-bottom" => {
             state.mode = RevMode::Help;
             state.help_scroll = u16::MAX;
-            state.status = "j/k or arrows scroll · Esc/q close".into();
+            state.status = "j/k or arrows scroll · Esc closes · q opens questions".into();
         }
         "streaming" => {
             state.streaming = true;
@@ -4594,17 +5010,20 @@ mod tests {
     use ratatui::Terminal;
 
     use super::{
-        execute_command, finish_active_question, handle_agent_event, handle_compose_key,
-        handle_file_picker_key, handle_help_key, handle_question_key, handle_review_key,
-        help_lines, merge_touching_hunks, queue_question_launch, render, render_snapshot,
-        row_count, seed_snapshot_questions, snapshot_workspace, ComposeTarget, ModelPicker,
-        PendingSend, QuestionLaunch, RevAgentSlot, RevMode, RevState,
+        close_file_picker, close_questions, current_item_yank_text, execute_command,
+        finish_active_question, handle_agent_event, handle_compose_key, handle_file_picker_key,
+        handle_help_key, handle_history_key, handle_key, handle_question_key, handle_review_key,
+        help_lines, merge_touching_hunks, open_file_picker, open_questions, queue_question_launch,
+        render, render_snapshot, row_count, seed_snapshot_feedback, seed_snapshot_questions,
+        snapshot_workspace, visual_selection_yank_text, ComposeTarget, ModelPicker, PendingSend,
+        QuestionLaunch, RevAgentSlot, RevMode, RevState,
     };
     use crate::config::AppPaths;
     use crate::copilot::{
         AgentCommand, AgentEvent, AgentRuntime, AgentSink, ModelOption, ModelSelection,
     };
     use crate::diff::{parse_unified, DiffLine, Hunk, LineKind};
+    use crate::domain::AnnotationKind;
     use crate::highlight::PlainHighlighter;
     use crate::storage::{RevQuestionSession, Storage};
 
@@ -4659,7 +5078,7 @@ mod tests {
         assert!(command.contains("❯ diff split"));
 
         let files = render_snapshot(100, 28, "files").unwrap();
-        assert!(files.contains("files · j/k move · h/l fold"));
+        assert!(files.contains("files · j/k preview"));
         assert!(files.contains("▾ demo (2 files)"));
         assert!(files.contains("src/lib.rs +1 -0"));
         assert!(files.contains("README.md +1 -0"));
@@ -4669,14 +5088,29 @@ mod tests {
         assert!(visual.contains("VISUAL ·"));
 
         let questions = render_snapshot(120, 30, "questions").unwrap();
-        assert!(questions.contains("questions · j/k · ↵ · a/i ask · m model"));
+        assert!(questions.contains("questions · j/k · ↵ · a continue"));
         assert!(questions.contains("Why should every review"));
         assert!(questions.contains("gpt-5.2 · high"));
         assert!(questions.contains("claude-sonnet-4.5"));
 
+        let panes = render_snapshot(140, 30, "panes").unwrap();
+        assert!(panes.contains("files · j/k preview"));
+        assert!(panes.contains("questions · j/k"));
+        assert!(panes.contains("src/lib.rs"));
+        assert!(panes.contains("Why should every review"));
+
+        let responsive_panes = render_snapshot(107, 30, "panes").unwrap();
+        assert!(responsive_panes.contains("questions · j/k"));
+        assert!(responsive_panes.contains("Why should every review"));
+        assert!(!responsive_panes.contains("files · j/k preview"));
+
+        let narrow_focused_pane = render_snapshot(70, 24, "panes").unwrap();
+        assert!(narrow_focused_pane.contains("questions · j/k"));
+        assert!(narrow_focused_pane.contains("Why should every review"));
+        assert!(!narrow_focused_pane.contains("files · j/k preview"));
+
         let cleared = render_snapshot(100, 28, "cleared-question").unwrap();
         assert!(cleared.contains("cleared · a/i/Enter starts fresh"));
-        assert!(cleared.contains("Question thread"));
         assert!(cleared.contains("detached from its previous Copilot session"));
 
         let editing = render_snapshot(100, 28, "edit-feedback").unwrap();
@@ -4778,13 +5212,20 @@ mod tests {
             &mut state,
             KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
         );
+        assert_eq!(state.file_index, 1);
         handle_file_picker_key(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
-        assert_eq!(state.mode, RevMode::Normal);
+        assert_eq!(state.mode, RevMode::FilePicker);
         assert_eq!(state.file_index, 1);
         assert_eq!(state.row_cursor, 0);
+
+        handle_file_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        );
+        assert_eq!(state.mode, RevMode::Normal);
 
         handle_review_key(
             &mut state,
@@ -4852,6 +5293,394 @@ mod tests {
         assert_eq!(state.mode, RevMode::Visual);
         assert_eq!(state.visual_anchor, Some(0));
         assert!(state.status.contains("Selection retained"));
+    }
+
+    #[test]
+    fn q_toggles_questions_without_quitting_and_command_q_is_the_only_exit() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        let mut highlighter = PlainHighlighter;
+        let paths = test_paths("rev-q-only-questions");
+
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, RevMode::Questions);
+        assert!(state.questions_open);
+        assert_ne!(state.status, "quit");
+
+        handle_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, RevMode::Normal);
+        assert!(!state.questions_open);
+
+        state.mode = RevMode::History;
+        handle_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, RevMode::Questions);
+        handle_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, RevMode::History);
+
+        state.queued_questions.push_back(QuestionLaunch {
+            annotation_id: "queued-question".into(),
+            pending: None,
+            existing: None,
+        });
+        state.mode = RevMode::Command;
+        state.command.input = "q".into();
+        state.command.cursor = 1;
+        state.command.selected = 0;
+        handle_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_ne!(state.status, "quit");
+        assert!(state.status.contains("active or queued"));
+
+        state.queued_questions.clear();
+        state.mode = RevMode::Command;
+        state.command.input = "q".into();
+        state.command.cursor = 1;
+        state.command.selected = 0;
+        handle_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.status, "quit");
+    }
+
+    #[test]
+    fn left_and_right_panes_coexist_and_keep_independent_focus() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        seed_snapshot_questions(&mut state);
+        let mut highlighter = PlainHighlighter;
+        let paths = test_paths("rev-panes");
+
+        open_file_picker(&mut state);
+        assert!(state.file_tree_open);
+        handle_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.file_tree_open);
+        assert!(state.questions_open);
+        assert_eq!(state.mode, RevMode::Questions);
+
+        handle_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.file_tree_open);
+        assert!(!state.questions_open);
+        assert_eq!(state.mode, RevMode::FilePicker);
+
+        handle_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        state.question_cursor = 1;
+        handle_question_key(
+            &mut state,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(state.file_index, 1);
+        assert_eq!(state.file_picker_cursor, 2);
+    }
+
+    #[test]
+    fn visual_text_is_copy_only_and_visual_selection_survives_nested_panes() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        seed_snapshot_questions(&mut state);
+        let mut highlighter = PlainHighlighter;
+        let paths = test_paths("rev-visual-pane-order");
+
+        row_count(&mut state, &mut highlighter);
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| row.yank_text.starts_with("Question ·"))
+            .unwrap();
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.visual_row_anchor.is_some());
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, RevMode::Visual);
+        assert!(state.compose_target.is_none());
+        assert!(state.status.contains("copy-only"));
+
+        state.visual_row_anchor = None;
+        state.visual_anchor = Some(0);
+        state.row_cursor = 0;
+        open_file_picker(&mut state);
+        open_questions(&mut state);
+        close_file_picker(&mut state);
+        close_questions(&mut state);
+        assert_eq!(state.mode, RevMode::Visual);
+        assert_eq!(state.visual_anchor, Some(0));
+    }
+
+    #[test]
+    fn visual_chat_and_code_yanks_and_yy_copy_complete_items() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        seed_snapshot_questions(&mut state);
+        let mut highlighter = PlainHighlighter;
+        let paths = test_paths("rev-yank");
+
+        row_count(&mut state, &mut highlighter);
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| row.item_text.contains("It keeps model choice"))
+            .unwrap();
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.visual_row_anchor.is_some());
+        assert_eq!(
+            current_item_yank_text(&mut state, &mut highlighter),
+            "It keeps model choice, history, and follow-ups scoped to one thread."
+        );
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        let selected = visual_selection_yank_text(&mut state, &mut highlighter);
+        assert!(selected.contains("It keeps model choice"));
+        assert!(selected.lines().count() >= 1);
+
+        state.mode = RevMode::Normal;
+        state.visual_row_anchor = None;
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.pending_yank);
+        assert!(state.status.contains("press y again"));
+
+        state.pending_yank = false;
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| row.yank_text.starts_with("Question ·"))
+            .unwrap();
+        assert_eq!(
+            current_item_yank_text(&mut state, &mut highlighter),
+            "Why should every review question use an isolated session?"
+        );
+    }
+
+    #[test]
+    fn contextual_dd_deletes_comments_but_never_question_threads() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        seed_snapshot_feedback(&mut state);
+        let feedback = state.annotations.last().cloned().unwrap();
+        storage.add_annotation(&feedback.0, &feedback.1).unwrap();
+        seed_snapshot_questions(&mut state);
+        let mut highlighter = PlainHighlighter;
+        let paths = test_paths("rev-delete-comment");
+
+        row_count(&mut state, &mut highlighter);
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| row.item_text.contains("Keep isolated question sessions"))
+            .unwrap();
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            handle_key(
+                &mut state,
+                &storage,
+                &paths,
+                &mut highlighter,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(storage
+            .annotation_by_id("feedback-architecture")
+            .unwrap()
+            .is_some());
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(storage
+            .annotation_by_id("feedback-architecture")
+            .unwrap()
+            .is_none());
+        assert!(state
+            .annotations
+            .iter()
+            .all(|(annotation, _)| annotation.id != "feedback-architecture"));
+        assert_eq!(
+            state
+                .annotations
+                .iter()
+                .filter(|(annotation, _)| annotation.kind == AnnotationKind::Ask)
+                .count(),
+            2
+        );
+
+        row_count(&mut state, &mut highlighter);
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| row.yank_text.starts_with("Question ·"))
+            .unwrap();
+        for _ in 0..2 {
+            handle_review_key(
+                &mut state,
+                &storage,
+                &paths,
+                &mut highlighter,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            state
+                .annotations
+                .iter()
+                .filter(|(annotation, _)| annotation.kind == AnnotationKind::Ask)
+                .count(),
+            2
+        );
+        assert!(state.status.contains("saved feedback only"));
+
+        state.mode = RevMode::History;
+        state.history_cursor = 0;
+        for _ in 0..2 {
+            handle_history_key(
+                &mut state,
+                &storage,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            state
+                .annotations
+                .iter()
+                .filter(|(annotation, _)| annotation.kind == AnnotationKind::Ask)
+                .count(),
+            2
+        );
+        assert!(state.status.contains("saved feedback only"));
     }
 
     #[test]
