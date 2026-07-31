@@ -1,0 +1,3 @@
+markdown-it/*.min.js binary
+static/*.min.js binary
+upstream-source/*.js whitespace=-blank-at-eof

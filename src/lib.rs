@@ -16,6 +16,7 @@ pub(crate) mod export;
 pub(crate) mod git;
 pub(crate) use rq_tui_text::highlight;
 pub(crate) use rq_tui_text::markdown;
+pub(crate) mod markdown_preview;
 pub(crate) mod process_control;
 pub(crate) mod prune;
 pub(crate) mod remote;

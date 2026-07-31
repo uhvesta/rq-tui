@@ -39,6 +39,7 @@ use crate::domain::{
 use crate::export::CommentExport;
 use crate::git::Git;
 use crate::highlight::{Highlighter, PlainHighlighter, StyledSegment, SyntectHighlighter};
+use crate::markdown_preview::MarkdownPreviewServer;
 use crate::remote::{PrReference, RemoteResolver};
 use crate::storage::{now, RevQuestionSession, Storage};
 use crate::terminal_text::{
@@ -316,7 +317,7 @@ struct RevState {
     cmux_markdown: Option<MarkdownSurface>,
     cmux_open: Option<Receiver<Result<Option<MarkdownSurface>>>>,
     cmux_close: Option<Receiver<()>>,
-    cmux_preview_path: Option<PathBuf>,
+    markdown_server: Option<MarkdownPreviewServer>,
     markdown_sync_key: Option<String>,
     markdown_content_key: Option<String>,
     markdown_sides_cache: Option<MarkdownSides>,
@@ -425,7 +426,7 @@ impl RevState {
             cmux_markdown: None,
             cmux_open: None,
             cmux_close: None,
-            cmux_preview_path: None,
+            markdown_server: None,
             markdown_sync_key: None,
             markdown_content_key: None,
             markdown_sides_cache: None,
@@ -541,7 +542,7 @@ pub(crate) fn run(workspace: ResolvedWorkItem, storage: &Storage, paths: &AppPat
     if let Some(surface) = state.cmux_markdown.take() {
         surface.close_detached().ok();
     }
-    remove_cmux_preview_file(&mut state);
+    state.markdown_server = None;
     result
 }
 
@@ -1020,6 +1021,8 @@ fn handle_review_key(
         KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
             expand_hunk_edge(state, false)?;
         }
+        KeyCode::Char('o') if cursor_is_fold(state) => expand_fold(state, false)?,
+        KeyCode::Char('O') if cursor_is_fold(state) => expand_fold(state, true)?,
         KeyCode::Char('j') | KeyCode::Down => move_row(state, highlighter, 1),
         KeyCode::Char('k') | KeyCode::Up => move_row(state, highlighter, -1),
         KeyCode::Char('h') | KeyCode::Left => state.move_file(false),
@@ -2018,8 +2021,7 @@ fn execute_command(
             state.markdown_sync_key = None;
             sync_markdown_preview(state, paths)?;
             state.status = if state.cmux_open.is_some() || state.cmux_markdown.is_some() {
-                "MARKDOWN DIFF · terminal preview stays synchronized · one optional cmux pane opening"
-                    .into()
+                "MARKDOWN DIFF · one cmux browser pane opening · source-line sync stays live".into()
             } else {
                 "MARKDOWN DIFF · terminal preview active · cmux is unavailable".into()
             };
@@ -2180,7 +2182,7 @@ fn drain_refresh(state: &mut RevState, storage: &Storage) -> Result<()> {
             let cmux_markdown = state.cmux_markdown.take();
             let cmux_open = state.cmux_open.take();
             let cmux_close = state.cmux_close.take();
-            let cmux_preview_path = state.cmux_preview_path.take();
+            let markdown_server = state.markdown_server.take();
             let mut replacement = RevState::load(workspace, storage)?;
             replacement.diff_layout = layout;
             replacement.markdown_preview = markdown_preview;
@@ -2190,7 +2192,7 @@ fn drain_refresh(state: &mut RevState, storage: &Storage) -> Result<()> {
             replacement.cmux_markdown = cmux_markdown;
             replacement.cmux_open = cmux_open;
             replacement.cmux_close = cmux_close;
-            replacement.cmux_preview_path = cmux_preview_path;
+            replacement.markdown_server = markdown_server;
             if let Some(selected) = selected {
                 if let Some(index) = replacement.files.iter().position(|(repo, file)| {
                     replacement.workspace.repos[*repo].diff.files[*file].path() == selected
@@ -2206,6 +2208,103 @@ fn drain_refresh(state: &mut RevState, storage: &Storage) -> Result<()> {
             state.status = format!("Refresh failed after {elapsed}ms: {error:#}");
         }
     }
+    Ok(())
+}
+
+fn cursor_is_fold(state: &RevState) -> bool {
+    matches!(
+        state
+            .render_cache
+            .as_ref()
+            .and_then(|cache| cache.rows.get(state.row_cursor))
+            .map(|row| &row.kind),
+        Some(RevRowKind::Source { line, .. }) if is_expandable_fold(line)
+    )
+}
+
+fn is_expandable_fold(line: &DiffLine) -> bool {
+    line.kind == LineKind::Meta
+        && line.content.starts_with("··· ")
+        && line.content.contains(" unchanged lines ···")
+}
+
+fn expand_fold(state: &mut RevState, all: bool) -> Result<()> {
+    let visible_index = state
+        .render_cache
+        .as_ref()
+        .and_then(|cache| cache.rows.get(state.row_cursor))
+        .and_then(|row| match &row.kind {
+            RevRowKind::Source {
+                visible_index,
+                line,
+            } if is_expandable_fold(line) => Some(*visible_index),
+            _ => None,
+        })
+        .context("move onto an unchanged-lines fold before expanding it")?;
+    let (repo_index, file_index) = state.current_indices().context("no current file")?;
+    let repo = &state.workspace.repos[repo_index];
+    let file = &repo.diff.files[file_index];
+    let mut offset = 0usize;
+    let hunk_index = file
+        .hunks
+        .iter()
+        .position(|hunk| {
+            let contains = (offset..offset + hunk.lines.len()).contains(&visible_index);
+            offset += hunk.lines.len();
+            contains
+        })
+        .context("fold row is not part of a hunk")?;
+    let Some(next_hunk) = file.hunks.get(hunk_index + 1) else {
+        state.status = "This fold has no following hunk to expand toward".into();
+        return Ok(());
+    };
+    let current = &file.hunks[hunk_index];
+    let old_start = current.old_start + current.old_count;
+    let new_start = current.new_start + current.new_count;
+    let hidden = next_hunk
+        .old_start
+        .saturating_sub(old_start)
+        .min(next_hunk.new_start.saturating_sub(new_start));
+    let count = if all { hidden } else { hidden.min(10) };
+    if count == 0 {
+        state.status = "No unchanged lines remain in this fold".into();
+        return Ok(());
+    }
+
+    let repo_path = repo.record.path.clone();
+    let working_root = repo
+        .version
+        .worktree_path
+        .clone()
+        .unwrap_or_else(|| repo_path.clone());
+    let file_path = file.display_path.clone();
+    let working = std::fs::read_to_string(working_root.join(&file_path)).or_else(|_| {
+        Git::default().file_at_revision(&repo_path, &repo.version.head_sha, &file_path)
+    })?;
+    let working_lines = working.lines().collect::<Vec<_>>();
+    let hunk = &mut state.workspace.repos[repo_index].diff.files[file_index].hunks[hunk_index];
+    hunk.lines.retain(|line| !is_expandable_fold(line));
+    for index in 0..count {
+        hunk.lines.push(DiffLine {
+            kind: LineKind::Context,
+            old_line: Some(old_start + index),
+            new_line: Some(new_start + index),
+            content: working_lines
+                .get(new_start + index - 1)
+                .copied()
+                .unwrap_or_default()
+                .to_owned(),
+        });
+    }
+    hunk.old_count += count;
+    hunk.new_count += count;
+    merge_touching_hunks(&mut state.workspace.repos[repo_index].diff.files[file_index].hunks);
+    state.invalidate_rows();
+    state.status = if all {
+        format!("Expanded all {count} unchanged lines in this fold")
+    } else {
+        format!("Expanded {count} unchanged lines · press o again or O for all")
+    };
     Ok(())
 }
 
@@ -2340,7 +2439,7 @@ fn expand_hunk_edge(state: &mut RevState, above: bool) -> Result<()> {
 
 fn merge_touching_hunks(hunks: &mut Vec<Hunk>) {
     for hunk in hunks.iter_mut() {
-        hunk.lines.retain(|line| line.kind != LineKind::Meta);
+        hunk.lines.retain(|line| !is_expandable_fold(line));
     }
     let mut merged: Vec<Hunk> = Vec::with_capacity(hunks.len());
     for mut next in std::mem::take(hunks) {
@@ -2380,9 +2479,7 @@ fn merge_touching_hunks(hunks: &mut Vec<Hunk>) {
                 kind: LineKind::Meta,
                 old_line: None,
                 new_line: None,
-                content: format!(
-                    "··· {gap} unchanged lines ··· (Shift+↑/↓ reveals 5 at the active hunk edge)"
-                ),
+                content: format!("··· {gap} unchanged lines ··· (o expand 10 · O expand all)"),
             });
         }
     }
@@ -4163,10 +4260,8 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
             };
             let title = match annotation.kind {
                 AnnotationKind::Comment => format!(
-                    "Feedback · lines {}-{} · {}",
-                    placement.line_start,
-                    placement.line_end,
-                    annotation.text.as_deref().unwrap_or_default()
+                    "Feedback · lines {}-{}",
+                    placement.line_start, placement.line_end
                 ),
                 AnnotationKind::Ask => format!(
                     "Question · lines {}-{} · isolated session",
@@ -4258,6 +4353,30 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
                     item_text: annotation_item_text.clone(),
                 });
             } else {
+                let feedback = annotation.text.as_deref().unwrap_or_default();
+                for mapped in
+                    render_markdown_mapped(feedback, width.saturating_sub(4).max(1), highlighter)
+                        .rows
+                {
+                    let mut line = Line::from(vec![Span::raw("│ ")]);
+                    line.spans.extend(mapped.line.spans);
+                    let yank_text = line
+                        .spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                        .trim_start_matches("│ ")
+                        .to_owned();
+                    rows.push(RevRow {
+                        kind: RevRowKind::Annotation {
+                            annotation_id: annotation.id.clone(),
+                            anchor_visible_index: visible_index,
+                        },
+                        line: Some(line),
+                        yank_text,
+                        item_text: annotation_item_text.clone(),
+                    });
+                }
                 rows.push(RevRow {
                     kind: RevRowKind::Annotation {
                         annotation_id: annotation.id.clone(),
@@ -4661,7 +4780,7 @@ fn close_markdown_preview(state: &mut RevState) {
         state.cmux_close = Some(spawn_cmux_close(surface));
     }
     if state.cmux_open.is_none() {
-        remove_cmux_preview_file(state);
+        state.markdown_server = None;
     }
     state.status = "Rendered Markdown preview closed · cmux cleanup running in background".into();
 }
@@ -4673,12 +4792,6 @@ fn spawn_cmux_close(surface: MarkdownSurface) -> Receiver<()> {
         sender.send(()).ok();
     });
     receiver
-}
-
-fn remove_cmux_preview_file(state: &mut RevState) {
-    if let Some(path) = state.cmux_preview_path.take() {
-        std::fs::remove_file(path).ok();
-    }
 }
 
 fn drain_cmux_preview(state: &mut RevState) {
@@ -4714,26 +4827,27 @@ fn drain_cmux_preview(state: &mut RevState) {
         Ok(Some(surface)) if state.markdown_preview => {
             state.cmux_markdown = Some(surface);
             state.status =
-                "MARKDOWN DIFF · one native cmux pane ready · terminal pane owns cursor synchronization"
-                    .into();
+                "MARKDOWN DIFF · cmux pane opened · waiting for renderer heartbeat".into();
         }
         Ok(Some(surface)) => {
             state.cmux_close = Some(spawn_cmux_close(surface));
-            remove_cmux_preview_file(state);
+            state.markdown_server = None;
         }
         Ok(None) if state.markdown_preview => {
+            state.markdown_server = None;
             state.status =
                 "MARKDOWN DIFF · terminal preview active · cmux context not detected".into();
         }
         Ok(None) => {}
         Err(error) if state.markdown_preview => {
+            state.markdown_server = None;
             state.status =
                 format!("Terminal Markdown preview active · cmux pane unavailable: {error:#}");
         }
         Err(_) => {}
     }
     if !state.markdown_preview && state.cmux_open.is_none() {
-        remove_cmux_preview_file(state);
+        state.markdown_server = None;
     }
 }
 
@@ -4756,7 +4870,7 @@ fn focused_diff_line(state: &RevState) -> Option<&DiffLine> {
     }
 }
 
-fn sync_markdown_preview(state: &mut RevState, paths: &AppPaths) -> Result<()> {
+fn sync_markdown_preview(state: &mut RevState, _paths: &AppPaths) -> Result<()> {
     if !state.markdown_preview {
         return Ok(());
     }
@@ -4771,7 +4885,7 @@ fn sync_markdown_preview(state: &mut RevState, paths: &AppPaths) -> Result<()> {
             state.cmux_close = Some(spawn_cmux_close(surface));
         }
         if state.cmux_open.is_none() {
-            remove_cmux_preview_file(state);
+            state.markdown_server = None;
         }
         state.status = "Markdown preview closed · refreshed revision has no changed files".into();
         return Ok(());
@@ -4786,26 +4900,34 @@ fn sync_markdown_preview(state: &mut RevState, paths: &AppPaths) -> Result<()> {
             state.cmux_close = Some(spawn_cmux_close(surface));
         }
         if state.cmux_open.is_none() {
-            remove_cmux_preview_file(state);
+            state.markdown_server = None;
         }
         state.status =
             "Rendered Markdown preview closed because the selected file is not Markdown".into();
         return Ok(());
     }
-    let focus = focused_diff_line(state)
-        .and_then(|line| line.new_line.or(line.old_line))
-        .unwrap_or(1);
+    let (focus_side, focus) = focused_diff_line(state)
+        .map(|line| {
+            if line.kind == LineKind::Deletion {
+                ("old", line.old_line.unwrap_or(1))
+            } else {
+                ("new", line.new_line.or(line.old_line).unwrap_or(1))
+            }
+        })
+        .unwrap_or(("new", 1));
     let content_key = markdown_content_identity(state, &path);
-    if state.markdown_content_key.as_deref() != Some(&content_key) {
+    let content_changed = state.markdown_content_key.as_deref() != Some(&content_key);
+    if content_changed {
         state.markdown_sides_cache = Some(markdown_sides(state)?);
         state.markdown_content_key = Some(content_key.clone());
         state.markdown_render_cache = None;
     }
+    update_markdown_connection_status(state);
     if state.cmux_markdown_requested && state.cmux_close.is_some() {
         state.status = "MARKDOWN DIFF · waiting for the previous cmux pane to close…".into();
         return Ok(());
     }
-    let key = format!("{content_key}\0{focus}");
+    let key = format!("{content_key}\0{focus_side}\0{focus}");
     if state.markdown_sync_key.as_deref() == Some(&key) {
         return Ok(());
     }
@@ -4820,24 +4942,28 @@ fn sync_markdown_preview(state: &mut RevState, paths: &AppPaths) -> Result<()> {
         .markdown_sides_cache
         .as_ref()
         .context("Markdown content cache was not initialized")?;
-    let document = cmux_markdown_document(state, sides, focus);
-    let directory = paths.cache.join("previews");
-    std::fs::create_dir_all(&directory)?;
-    let preview_path = directory.join(format!(
-        "{}-{}-review.md",
-        state.workspace.item.id,
-        std::process::id()
-    ));
-    let temporary = preview_path.with_extension(format!("md.next-{}", Uuid::new_v4()));
-    std::fs::write(&temporary, document)?;
-    std::fs::rename(&temporary, &preview_path)?;
-    state.cmux_preview_path = Some(preview_path.clone());
+    let focus_state = browser_markdown_focus(&content_key, focus_side, focus)?;
+    if let Some(server) = &state.markdown_server {
+        if content_changed {
+            server.update_document(browser_markdown_state(state, sides, &content_key)?);
+        }
+        server.update_focus(focus_state);
+    } else {
+        state.markdown_server = Some(MarkdownPreviewServer::start(
+            browser_markdown_state(state, sides, &content_key)?,
+            focus_state,
+        )?);
+    }
     if state.cmux_markdown.is_none() && state.cmux_open.is_none() {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let worker_path = preview_path.clone();
+        let url = state
+            .markdown_server
+            .as_ref()
+            .context("Markdown browser server did not start")?
+            .url();
         std::thread::spawn(move || {
             if let Err(std::sync::mpsc::SendError(Ok(Some(surface)))) =
-                sender.send(MarkdownSurface::open(&worker_path))
+                sender.send(MarkdownSurface::open(&url))
             {
                 surface.close_detached().ok();
             }
@@ -4845,6 +4971,40 @@ fn sync_markdown_preview(state: &mut RevState, paths: &AppPaths) -> Result<()> {
         state.cmux_open = Some(receiver);
     }
     Ok(())
+}
+
+fn update_markdown_connection_status(state: &mut RevState) {
+    if state.cmux_markdown.is_none() {
+        return;
+    }
+    let age = state
+        .markdown_server
+        .as_ref()
+        .and_then(MarkdownPreviewServer::client_age);
+    let waiting = state
+        .markdown_server
+        .as_ref()
+        .map(MarkdownPreviewServer::waiting_for)
+        .unwrap_or_default();
+    if age.is_some_and(|age| age <= Duration::from_secs(2))
+        && (state.status.contains("renderer heartbeat")
+            || state.status.contains("browser preview disconnected")
+            || state.status.contains("renderer has not connected"))
+    {
+        state.status =
+            "MARKDOWN DIFF · cmux browser connected · following the active source line".into();
+    } else if age.is_some_and(|age| age > Duration::from_secs(5))
+        && state.status.starts_with("MARKDOWN DIFF · cmux browser")
+    {
+        state.status =
+            "MARKDOWN DIFF · browser preview disconnected · :render markdown cmux retries".into();
+    } else if age.is_none()
+        && waiting > Duration::from_secs(5)
+        && state.status.contains("renderer heartbeat")
+    {
+        state.status =
+            "MARKDOWN DIFF · renderer has not connected · inspect the cmux browser pane".into();
+    }
 }
 
 fn markdown_content_identity(state: &RevState, path: &Path) -> String {
@@ -4871,65 +5031,73 @@ fn markdown_content_identity(state: &RevState, path: &Path) -> String {
     )
 }
 
-fn cmux_markdown_document(state: &RevState, sides: &MarkdownSides, focus: usize) -> String {
+fn browser_markdown_state(
+    state: &RevState,
+    sides: &MarkdownSides,
+    revision: &str,
+) -> Result<String> {
     let path = state
         .current_file()
         .map(|file| file.path().display().to_string())
         .unwrap_or_else(|| "Markdown".into());
-    let mut output = format!(
-        "# Rendered review: `{path}`\n\n> Review focus: source line **{focus}**. \
-         This optional cmux pane live-reloads; the in-terminal preview owns cursor synchronization.\n\n\
-         ## Source diff\n\n```diff\n"
-    );
+    let mut additions = Vec::new();
+    let mut deletions = Vec::new();
     if let Some(file) = state.current_file() {
         for line in file.visible_lines() {
-            let marker = match line.kind {
-                LineKind::Addition => "+",
-                LineKind::Deletion => "-",
-                LineKind::Context => " ",
-                LineKind::Meta => "@",
-            };
-            output.push_str(marker);
-            output.push_str(&line.content);
-            output.push('\n');
-        }
-    }
-    output.push_str(&format!(
-        "```\n\n## Review notes\n\n{}\n\n## Current rendered revision\n\n{}\n\n\
-         ## Previous rendered revision\n\n{}\n",
-        markdown_review_notes(state),
-        sides.new,
-        sides.old
-    ));
-    output
-}
-
-fn markdown_review_notes(state: &RevState) -> String {
-    let mut output = String::new();
-    let mut count = 0;
-    if let Some(repo) = state.current_repo() {
-        if let Some(file) = state.current_file() {
-            for (annotation, placement) in &state.annotations {
-                if annotation.repo_id != repo.record.id || annotation.file_path != file.display_path
-                {
-                    continue;
-                }
-                count += 1;
-                let text = annotation.text.as_deref().unwrap_or("Question thread");
-                output.push_str(&format!(
-                    "- **{} lines {}–{}:** {}\n",
-                    annotation.kind.as_str(),
-                    placement.line_start,
-                    placement.line_end,
-                    text
-                ));
+            match line.kind {
+                LineKind::Addition => additions.extend(line.new_line),
+                LineKind::Deletion => deletions.extend(line.old_line),
+                LineKind::Context | LineKind::Meta => {}
             }
         }
     }
-    if count == 0 {
-        output.push_str("- No comments or questions on this file yet.\n");
+    let mut notes = Vec::new();
+    if let Some(repo) = state.current_repo() {
+        if let Some(file) = state.current_file() {
+            for (annotation, placement) in &state.annotations {
+                if annotation.repo_id != repo.record.id
+                    || annotation.file_path != file.display_path
+                    || annotation.status != AnnotationStatus::Active
+                {
+                    continue;
+                }
+                let text = annotation.text.clone().or_else(|| {
+                    state
+                        .threads
+                        .get(&annotation.id)
+                        .and_then(|messages| messages.iter().find(|message| message.role == "user"))
+                        .map(|message| message.text.clone())
+                });
+                notes.push(serde_json::json!({
+                    "kind": annotation.kind.as_str(),
+                    "side": match placement.side {
+                        AnchorSide::Old => "old",
+                        AnchorSide::New => "new",
+                    },
+                    "line_start": placement.line_start,
+                    "line_end": placement.line_end,
+                    "text": text.unwrap_or_else(|| "Question thread".into()),
+                }));
+            }
+        }
     }
-    output
+    Ok(serde_json::to_string(&serde_json::json!({
+        "revision": revision,
+        "path": path,
+        "current": sides.new,
+        "previous": sides.old,
+        "additions": additions,
+        "deletions": deletions,
+        "notes": notes,
+    }))?)
+}
+
+fn browser_markdown_focus(revision: &str, focus_side: &str, focus: usize) -> Result<String> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "revision": revision,
+        "focus_side": focus_side,
+        "focus_line": focus,
+    }))?)
 }
 
 fn render_markdown_diff_preview(
@@ -5317,6 +5485,8 @@ fn help_lines() -> Vec<Line<'static>> {
             "Shift+↓",
             "reveal five unchanged lines below the active hunk",
         ),
+        key("o", "reveal ten lines at the unchanged-lines fold"),
+        key("O", "reveal every remaining line at the unchanged-lines fold"),
         Line::raw(""),
         section("File tree"),
         key(
@@ -5446,7 +5616,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ),
         key(
             ":render markdown cmux",
-            "optionally open one live-reloading native cmux/Mermaid pane",
+            "open one live-rendered cmux browser pane with Mermaid and source sync",
         ),
         key(
             ":render markdown close",
@@ -6586,6 +6756,18 @@ pub(crate) fn render_snapshot(width: u16, height: u16, snapshot: &str) -> Result
                 "EDIT FEEDBACK · original selection restored · Enter saves · Esc keeps selection"
                     .into();
         }
+        "long-feedback" => {
+            seed_snapshot_feedback(&mut state);
+            state.annotations[0].0.text = Some(
+                "This feedback is intentionally long enough to wrap across multiple terminal rows. \
+                 Keep the complete explanation visible, including this final verification marker: \
+                 FEEDBACK_TAIL."
+                    .into(),
+            );
+            state.row_cursor = 1;
+            state.status = "Saved feedback wraps without clipping".into();
+            state.invalidate_rows();
+        }
         "question-models" | "model-search" => {
             state.mode = RevMode::Model;
             state.status = "MODEL 1/3 · choose a model for this question".into();
@@ -6904,15 +7086,16 @@ mod tests {
     use ratatui::Terminal;
 
     use super::{
-        build_rows, close_file_picker, close_questions, current_item_yank_text, execute_command,
-        finish_active_question, handle_agent_event, handle_compose_key, handle_file_picker_key,
-        handle_help_key, handle_history_key, handle_key, handle_markdown_preview_key,
-        handle_question_key, handle_review_key, help_lines, merge_touching_hunks, open_file_picker,
-        open_questions, page_move, question_ids, queue_question_launch, render, render_snapshot,
-        rendered_markdown_diff, row_count, seed_snapshot_feedback, seed_snapshot_questions,
-        snapshot_workspace, split_highlight_side, split_source_lines, style_split_side,
-        visual_selection_yank_text, ComposeTarget, ModelPicker, PendingSend, PickerScope,
-        PickerStage, QuestionLaunch, RevAgentSlot, RevDiffLayout, RevMode, RevState,
+        browser_markdown_focus, browser_markdown_state, build_rows, close_file_picker,
+        close_questions, current_item_yank_text, execute_command, finish_active_question,
+        handle_agent_event, handle_compose_key, handle_file_picker_key, handle_help_key,
+        handle_history_key, handle_key, handle_markdown_preview_key, handle_question_key,
+        handle_review_key, help_lines, is_expandable_fold, markdown_sides, merge_touching_hunks,
+        open_file_picker, open_questions, page_move, question_ids, queue_question_launch, render,
+        render_snapshot, rendered_markdown_diff, row_count, seed_snapshot_feedback,
+        seed_snapshot_questions, snapshot_workspace, split_highlight_side, split_source_lines,
+        style_split_side, visual_selection_yank_text, ComposeTarget, ModelPicker, PendingSend,
+        PickerScope, PickerStage, QuestionLaunch, RevAgentSlot, RevDiffLayout, RevMode, RevState,
     };
     use crate::config::AppPaths;
     use crate::copilot::{
@@ -7069,6 +7252,40 @@ mod tests {
     }
 
     #[test]
+    fn browser_markdown_state_keeps_diff_sides_source_lines_and_review_notes() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        state.file_index = 1;
+        seed_snapshot_questions(&mut state);
+        let sides = markdown_sides(&state).unwrap();
+        let payload = serde_json::from_str::<serde_json::Value>(
+            &browser_markdown_state(&state, &sides, "revision-7").unwrap(),
+        )
+        .unwrap();
+        let focus = serde_json::from_str::<serde_json::Value>(
+            &browser_markdown_focus("revision-7", "new", 2).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(payload["revision"], "revision-7");
+        assert_eq!(payload["path"], "README.md");
+        assert_eq!(focus["focus_side"], "new");
+        assert_eq!(focus["focus_line"], 2);
+        assert_eq!(payload["additions"], serde_json::json!([2]));
+        assert_eq!(payload["deletions"], serde_json::json!([]));
+        assert_eq!(payload["notes"][0]["side"], "new");
+        assert!(payload["current"]
+            .as_str()
+            .unwrap()
+            .contains("Use the file tree."));
+        assert!(payload["notes"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("file-tree shortcut"));
+    }
+
+    #[test]
     fn markdown_snapshot_is_agent_inspectable() {
         let frame = render_snapshot(120, 30, "markdown").unwrap();
         assert!(frame.contains("Markdown diff"));
@@ -7182,6 +7399,11 @@ mod tests {
         assert!(editing.contains("Keep isolated question sessions"));
         assert!(editing.contains("EDIT FEEDBACK"));
 
+        let long_feedback = render_snapshot(58, 20, "long-feedback").unwrap();
+        assert!(long_feedback.contains("Feedback · lines 10-11"));
+        assert!(long_feedback.contains("intentionally long enough to wrap"));
+        assert!(long_feedback.contains("FEEDBACK_TAIL"));
+
         let models = render_snapshot(100, 28, "question-models").unwrap();
         assert!(models.contains("model 1/3"));
         assert!(models.contains("GPT-5.2 · 128000 ctx · current"));
@@ -7237,6 +7459,8 @@ mod tests {
         );
         assert!(complete_help.contains("Ctrl-C"));
         assert!(complete_help.contains(":diff split"));
+        assert!(complete_help.contains("reveal ten lines"));
+        assert!(complete_help.contains("reveal every remaining line"));
         assert!(complete_help.contains("rev delete PATH"));
     }
 
@@ -8906,6 +9130,141 @@ mod tests {
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].lines.len(), 10);
         assert_eq!(hunks[0].new_count, 10);
+    }
+
+    #[test]
+    fn only_unchanged_line_separators_are_expandable_folds() {
+        assert!(is_expandable_fold(&DiffLine {
+            kind: LineKind::Meta,
+            old_line: None,
+            new_line: None,
+            content: "··· 90 unchanged lines ··· (o expand 10 · O expand all)".into(),
+        }));
+        assert!(!is_expandable_fold(&DiffLine {
+            kind: LineKind::Meta,
+            old_line: None,
+            new_line: None,
+            content: "\\ No newline at end of file".into(),
+        }));
+    }
+
+    #[test]
+    fn o_and_shift_o_expand_the_fold_under_the_cursor() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        let test_root = std::env::temp_dir().join(format!(
+            "rev-fold-expand-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(test_root.join("src")).unwrap();
+        std::fs::write(
+            test_root.join("src/lib.rs"),
+            (1..=30)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        state.workspace.repos[0].record.path = test_root.clone();
+        state.workspace.repos[0].version.worktree_path = Some(test_root.clone());
+        state.workspace.repos[0].diff = parse_unified(
+            "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -2 +2 @@
+-old 2
++line 2
+@@ -25 +25 @@
+-old 25
++line 25
+",
+        )
+        .unwrap();
+        state.invalidate_rows();
+
+        let paths = AppPaths {
+            data: test_root.join("data"),
+            cache: test_root.join("cache"),
+            database: test_root.join("rev.db"),
+            roots: test_root.join("roots"),
+            prs: test_root.join("prs"),
+            exports: test_root.join("exports"),
+            skills: test_root.join("skills"),
+            plugins: test_root.join("plugins"),
+        };
+        let mut highlighter = PlainHighlighter;
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    &row.kind,
+                    super::RevRowKind::Source { line, .. } if line.kind == LineKind::Meta
+                )
+            })
+            .unwrap();
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.workspace.repos[0].diff.files[0].hunks.len(), 2);
+        assert_eq!(
+            state.workspace.repos[0].diff.files[0].hunks[0]
+                .lines
+                .iter()
+                .filter(|line| line.kind == LineKind::Context)
+                .count(),
+            10
+        );
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    &row.kind,
+                    super::RevRowKind::Source { line, .. } if line.kind == LineKind::Meta
+                )
+            })
+            .unwrap();
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        assert_eq!(state.workspace.repos[0].diff.files[0].hunks.len(), 1);
+        assert!(!state.workspace.repos[0].diff.files[0].hunks[0]
+            .lines
+            .iter()
+            .any(|line| line.kind == LineKind::Meta));
+
+        std::fs::remove_dir_all(test_root).unwrap();
     }
 
     #[test]

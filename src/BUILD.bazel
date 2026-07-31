@@ -35,6 +35,7 @@ LIB_SRCS = glob(["**/*.rs"], exclude = ["main.rs", "rev_main.rs"])
 rust_library(
     name = "rq_tui_lib",
     srcs = LIB_SRCS,
+    compile_data = ["//vendor/markdown-preview.nvim:assets"],
     crate_name = "rq_tui",
     crate_root = "lib.rs",
     edition = "2021",
@@ -70,6 +71,7 @@ rust_binary(
 rust_test(
     name = "rq_tui_tests",
     srcs = LIB_SRCS,
+    compile_data = ["//vendor/markdown-preview.nvim:assets"],
     crate_root = "lib.rs",
     edition = "2021",
     deps = RUNTIME_DEPS + [

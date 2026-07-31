@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
 use anyhow::{bail, Context, Result};
@@ -21,7 +21,7 @@ impl MarkdownSurface {
         CmuxContext::discover().is_some()
     }
 
-    pub(crate) fn open(path: &Path) -> Result<Option<Self>> {
+    pub(crate) fn open(url: &str) -> Result<Option<Self>> {
         let Some(context) = CmuxContext::discover() else {
             return Ok(None);
         };
@@ -30,9 +30,9 @@ impl MarkdownSurface {
                 &context.socket,
                 &context.workspace_id,
                 &context.surface_id,
-                path,
+                url,
             )),
-            "cmux markdown open",
+            "cmux browser preview open",
         )?;
         let payload = serde_json::from_slice::<Value>(&output.stdout).ok();
         if !output.status.success() {
@@ -49,7 +49,7 @@ impl MarkdownSurface {
                 .close_detached()
                 .ok();
             }
-            ensure_success("cmux markdown open", &output)?;
+            ensure_success("cmux browser preview open", &output)?;
         }
         let payload = payload.context("cmux returned invalid JSON")?;
         let workspace_id =
@@ -134,21 +134,19 @@ fn open_args<'a>(
     socket: &'a str,
     workspace_id: &'a str,
     surface_id: &'a str,
-    path: &'a Path,
+    url: &'a str,
 ) -> Vec<&'a std::ffi::OsStr> {
     [
         std::ffi::OsStr::new("--socket"),
         std::ffi::OsStr::new(socket),
         std::ffi::OsStr::new("--json"),
-        std::ffi::OsStr::new("markdown"),
-        std::ffi::OsStr::new("open"),
-        path.as_os_str(),
+        std::ffi::OsStr::new("browser"),
+        std::ffi::OsStr::new("open-split"),
+        std::ffi::OsStr::new(url),
         std::ffi::OsStr::new("--workspace"),
         std::ffi::OsStr::new(workspace_id),
         std::ffi::OsStr::new("--surface"),
         std::ffi::OsStr::new(surface_id),
-        std::ffi::OsStr::new("--direction"),
-        std::ffi::OsStr::new("right"),
         std::ffi::OsStr::new("--focus"),
         std::ffi::OsStr::new("false"),
     ]
@@ -181,18 +179,16 @@ fn ensure_success(operation: &str, output: &Output) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
-    use std::path::Path;
-
     use super::{open_args, result_string};
+    use std::ffi::OsStr;
 
     #[test]
-    fn markdown_open_is_routed_to_the_calling_surface_without_focus() {
+    fn browser_preview_is_opened_once_to_the_right_without_focus() {
         let args = open_args(
             "/tmp/cmux.sock",
             "workspace:7",
             "surface:3",
-            Path::new("/tmp/review.md"),
+            "http://127.0.0.1:8765/review/token",
         );
         let args = args
             .into_iter()
@@ -204,15 +200,13 @@ mod tests {
                 "--socket",
                 "/tmp/cmux.sock",
                 "--json",
-                "markdown",
-                "open",
-                "/tmp/review.md",
+                "browser",
+                "open-split",
+                "http://127.0.0.1:8765/review/token",
                 "--workspace",
                 "workspace:7",
                 "--surface",
                 "surface:3",
-                "--direction",
-                "right",
                 "--focus",
                 "false",
             ]
