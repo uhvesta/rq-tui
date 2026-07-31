@@ -5576,6 +5576,10 @@ fn help_lines() -> Vec<Line<'static>> {
         ),
         key("o", "reveal ten lines at the unchanged-lines fold"),
         key("O", "reveal every remaining line at the unchanged-lines fold"),
+        key(
+            "visual r",
+            "retract selected gray expanded context; changed lines are retained",
+        ),
         Line::raw(""),
         section("File tree"),
         key(
@@ -5709,6 +5713,17 @@ fn help_lines() -> Vec<Line<'static>> {
         ),
         key(":expand above", "reveal five lines above the active hunk"),
         key(":expand below", "reveal five lines below the active hunk"),
+        key(":retract all", "retract expanded context in every file"),
+        key(
+            ":hide comments",
+            "hide local feedback from the diff without deleting it",
+        ),
+        key(
+            ":hide questions",
+            "hide local question threads from the diff without deleting them",
+        ),
+        key(":show comments", "show hidden local feedback again"),
+        key(":show questions", "show hidden local question threads again"),
         key(
             ":base <ref>",
             "rebuild the review relative to an autocompleted ref",

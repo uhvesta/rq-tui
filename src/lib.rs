@@ -14,6 +14,7 @@ pub(crate) mod diff;
 pub(crate) mod domain;
 pub(crate) mod export;
 pub(crate) mod git;
+pub(crate) mod github_review;
 pub(crate) use rq_tui_text::highlight;
 pub(crate) use rq_tui_text::markdown;
 pub(crate) mod markdown_preview;
