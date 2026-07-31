@@ -30,7 +30,14 @@ RUNTIME_DEPS = crate_deps([
 
 PROC_MACRO_DEPS = crate_deps(["async-trait"], package_name = "")
 
-LIB_SRCS = glob(["**/*.rs"], exclude = ["main.rs", "rev_main.rs"])
+LIB_SRCS = glob(
+    ["**/*.rs"],
+    exclude = [
+        "main.rs",
+        "markdown_preview_fixture.rs",
+        "rev_main.rs",
+    ],
+)
 
 rust_library(
     name = "rq_tui_lib",
@@ -66,6 +73,23 @@ rust_binary(
     edition = "2021",
     deps = [":rq_tui_lib"],
     visibility = ["//:__pkg__"],
+)
+
+rust_binary(
+    name = "markdown_preview_fixture",
+    srcs = [
+        "markdown_preview.rs",
+        "markdown_preview_fixture.rs",
+    ],
+    compile_data = ["//vendor/markdown-preview.nvim:assets"],
+    crate_root = "markdown_preview_fixture.rs",
+    edition = "2021",
+    testonly = True,
+    deps = crate_deps([
+        "anyhow",
+        "serde_json",
+        "uuid",
+    ], package_name = ""),
 )
 
 rust_test(

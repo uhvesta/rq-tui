@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from pty_smoke import Child, git, make_fixture, terminal_text
@@ -26,7 +27,19 @@ def main() -> int:
         )
         (repo / "README.md").write_text("baseline\nchanged\n", encoding="utf-8")
 
-        child = Child(binary, repo, root / "app")
+        opener_log = root / "browser-open.log"
+        opener = root / "browser-open"
+        opener.write_text(
+            f"#!/bin/sh\nprintf '%s\\n' \"$1\" > {opener_log!s}\n",
+            encoding="utf-8",
+        )
+        opener.chmod(0o755)
+        child = Child(
+            binary,
+            repo,
+            root / "app",
+            extra_env={"REV_BROWSER_OPENER": str(opener)},
+        )
         try:
             child.resize(120, 24)
             child.wait_for_screen("rev · rev-fixture", timeout=8)
@@ -72,14 +85,28 @@ def main() -> int:
             child.wait_for_screen("README.md", timeout=4)
             child.send(b"M")
             child.wait_for_screen_state(
-                required=("Markdown diff", "baseline", "changed", "Mermaid"),
-                forbidden=(),
+                required=("MARKDOWN RICH DIFF", "baseline", "changed"),
+                forbidden=("Markdown diff", "Mermaid"),
                 timeout=4,
             )
+            for _ in range(40):
+                if opener_log.exists():
+                    break
+                time.sleep(0.05)
+            if not opener_log.exists():
+                raise AssertionError(child.failure("rich-diff browser opener was not invoked"))
+            opened_url = opener_log.read_text(encoding="utf-8").strip()
+            if not (
+                opened_url.startswith("http://127.0.0.1:")
+                and "/review/" in opened_url
+            ):
+                raise AssertionError(
+                    child.failure(f"unexpected rich-diff URL: {opened_url!r}")
+                )
             child.send(b"M")
             child.wait_for_screen_state(
                 required=("README.md", "NORMAL"),
-                forbidden=("Markdown diff",),
+                forbidden=("MARKDOWN RICH DIFF", "Markdown diff"),
                 timeout=4,
             )
 
@@ -99,7 +126,7 @@ def main() -> int:
 
     print(
         "REV_PTY_SMOKE_OK: tree-live-preview enter-and-t-return "
-        "q-questions markdown-diff command-only-quit"
+        "q-questions browser-rich-diff command-only-quit"
     )
     return 0
 

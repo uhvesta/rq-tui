@@ -4,25 +4,15 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>rev · Markdown diff</title>
-    <link rel="stylesheet" href="/vendor/page.css">
-    <link rel="stylesheet" href="/vendor/markdown.css">
-    <link rel="stylesheet" href="/vendor/highlight.css">
-    <link rel="stylesheet" href="/rev-preview.css">
+    <!-- rev-inline-styles -->
   </head>
   <body>
     <header id="review-toolbar">
       <div id="review-title">Opening Markdown review…</div>
       <div id="review-status">connecting</div>
     </header>
-    <main id="review-grid">
-      <section class="revision">
-        <h2 class="revision-label">Current · additions</h2>
-        <article id="current-markdown" class="markdown-body"></article>
-      </section>
-      <section class="revision">
-        <h2 class="revision-label">Previous · removals</h2>
-        <article id="previous-markdown" class="markdown-body"></article>
-      </section>
+    <main id="review-document">
+      <article id="rich-diff" class="markdown-body" aria-label="Rendered Markdown diff"></article>
     </main>
     <script src="/vendor/markdown-it.min.js"></script>
     <script src="/vendor/highlight.min.js"></script>

@@ -9,7 +9,7 @@ process serves one local-only browser page and publishes review state as JSON.
 The fork keeps the upstream Markdown presentation, Mermaid renderer, source-line
 metadata, and cursor-to-rendered-document scroll model, then adds:
 
-- current/previous rendered revisions with added and removed block treatment;
+- one merged rich-diff document with green added and red removed block gutters;
 - review-comment markers;
 - immediate, non-animated movement to the active diff line;
 - one stable cmux browser surface instead of reopening Markdown files.

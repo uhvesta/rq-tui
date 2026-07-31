@@ -128,6 +128,9 @@ fn serve(
     stream
         .set_read_timeout(Some(Duration::from_millis(250)))
         .ok();
+    stream
+        .set_write_timeout(Some(Duration::from_millis(500)))
+        .ok();
     let mut request = [0u8; 8_192];
     let Ok(read) = stream.read(&mut request) else {
         return;
@@ -143,11 +146,19 @@ fn serve(
     let review_path = format!("/review/{token}");
     let (status, content_type, cache, body): (&str, &str, &str, Vec<u8>) =
         if target == review_path || target == format!("{review_path}/") {
-            let index = INDEX.replacen(
-                "<body>",
-                &format!("<body data-preview-token=\"{token}\">"),
-                1,
-            );
+            let index = INDEX
+                .replacen(
+                    "<body>",
+                    &format!("<body data-preview-token=\"{token}\">"),
+                    1,
+                )
+                .replacen(
+                    "<!-- rev-inline-styles -->",
+                    &format!(
+                        "<style>{PAGE_CSS}\n{MARKDOWN_CSS}\n{HIGHLIGHT_CSS}\n{PREVIEW_CSS}</style>"
+                    ),
+                    1,
+                );
             (
                 "200 OK",
                 "text/html; charset=utf-8",
@@ -175,12 +186,7 @@ fn serve(
                 b"{\"ready\":true}".to_vec(),
             )
         } else if let Some(asset) = asset(target) {
-            (
-                "200 OK",
-                asset.0,
-                "public, max-age=31536000, immutable",
-                asset.1.to_vec(),
-            )
+            ("200 OK", asset.0, "no-store", asset.1.to_vec())
         } else {
             (
                 "404 Not Found",
@@ -275,6 +281,20 @@ mod tests {
             get_matching(&server.url(), "/rev-preview.js", "HTTP/1.1 200 OK")
                 .contains("window.markdownit")
         );
+        assert!(index.contains(r#"id="rich-diff""#));
+        assert!(index.contains("<style>"));
+        assert!(index.contains(".source-added { border-left-color:"));
+        assert!(!index.contains(r#"id="current-markdown""#));
+        assert!(!index.contains(r#"id="previous-markdown""#));
+        let renderer = get_matching(&server.url(), "/rev-preview.js", "HTTP/1.1 200 OK");
+        assert!(renderer.contains("renderRichDiff(review)"));
+        assert!(renderer.contains("diffBlocks(previous, current)"));
+        assert!(renderer.contains("largeDiffBlocks(previous, current)"));
+        assert!(renderer.contains("window.__revPreviewInspect"));
+        let stylesheet = get_matching(&server.url(), "/rev-preview.css", "HTTP/1.1 200 OK");
+        assert!(stylesheet.contains(".source-added { border-left-color:"));
+        assert!(stylesheet.contains(".source-removed { border-left-color:"));
+        assert!(!stylesheet.contains("grid-template-columns"));
         assert!(
             get_matching(&server.url(), "/focus.json?token=wrong", "HTTP/1.1 404")
                 .starts_with("HTTP/1.1 404")

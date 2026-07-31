@@ -20,11 +20,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
-use similar::{ChangeTag, TextDiff};
 use uuid::Uuid;
 
 use crate::annotations::{anchor_from_diff, create_local_annotation, AnnotationRequest};
-use crate::chat_render::{render_markdown_mapped, CellSource, MappedRow};
+use crate::chat_render::render_markdown_mapped;
 use crate::cmux::MarkdownSurface;
 use crate::config::AppPaths;
 use crate::copilot::{
@@ -309,10 +308,6 @@ struct RevState {
     refresh: Option<Receiver<Result<ResolvedWorkItem>>>,
     refresh_started: Option<Instant>,
     markdown_preview: bool,
-    markdown_scroll: usize,
-    markdown_viewport_height: usize,
-    markdown_preview_focused: bool,
-    markdown_follow_source: bool,
     cmux_markdown_requested: bool,
     cmux_markdown: Option<MarkdownSurface>,
     cmux_open: Option<Receiver<Result<Option<MarkdownSurface>>>>,
@@ -321,7 +316,6 @@ struct RevState {
     markdown_sync_key: Option<String>,
     markdown_content_key: Option<String>,
     markdown_sides_cache: Option<MarkdownSides>,
-    markdown_render_cache: Option<MarkdownRenderCache>,
 }
 
 impl RevState {
@@ -418,10 +412,6 @@ impl RevState {
             refresh: None,
             refresh_started: None,
             markdown_preview: false,
-            markdown_scroll: 0,
-            markdown_viewport_height: 1,
-            markdown_preview_focused: false,
-            markdown_follow_source: true,
             cmux_markdown_requested: false,
             cmux_markdown: None,
             cmux_open: None,
@@ -430,7 +420,6 @@ impl RevState {
             markdown_sync_key: None,
             markdown_content_key: None,
             markdown_sides_cache: None,
-            markdown_render_cache: None,
         })
     }
 
@@ -637,8 +626,7 @@ fn run_loop<B: Backend>(
         drain_model_catalog(state)?;
         drain_cmux_preview(state);
         if let Err(error) = sync_markdown_preview(state, paths) {
-            state.status =
-                format!("Terminal Markdown preview active · cmux sync failed: {error:#}");
+            state.status = format!("Markdown rich diff sync failed: {error:#}");
         }
         terminal.draw(|frame| render(frame, state, highlighter))?;
         if state.status == "quit" {
@@ -663,10 +651,6 @@ fn run_loop<B: Backend>(
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollDown => match state.mode {
-                        RevMode::Normal | RevMode::Visual if state.markdown_preview_focused => {
-                            state.markdown_follow_source = false;
-                            state.markdown_scroll = state.markdown_scroll.saturating_add(3);
-                        }
                         RevMode::Normal | RevMode::Visual => move_row(state, highlighter, 3),
                         RevMode::Compose => {
                             state.compose_scroll = state.compose_scroll.saturating_add(3)
@@ -687,10 +671,6 @@ fn run_loop<B: Backend>(
                         RevMode::ConfirmClear | RevMode::ConfirmResolve => {}
                     },
                     MouseEventKind::ScrollUp => match state.mode {
-                        RevMode::Normal | RevMode::Visual if state.markdown_preview_focused => {
-                            state.markdown_follow_source = false;
-                            state.markdown_scroll = state.markdown_scroll.saturating_sub(3);
-                        }
                         RevMode::Normal | RevMode::Visual => move_row(state, highlighter, -3),
                         RevMode::Compose => {
                             state.compose_scroll = state.compose_scroll.saturating_sub(3)
@@ -738,20 +718,6 @@ fn handle_key(
         state.status =
             "Cancelling the active question · the UI remains responsive until it settles".into();
         return Ok(());
-    }
-    if state.markdown_preview {
-        if state.markdown_preview_focused {
-            if handle_markdown_preview_key(state, key) {
-                return Ok(());
-            }
-        } else if key.code == KeyCode::Tab {
-            state.markdown_preview_focused = true;
-            state.markdown_follow_source = false;
-            state.status =
-                "MARKDOWN PREVIEW FOCUS · j/k or Ctrl-D/U scroll · Tab/Esc follows source again"
-                    .into();
-            return Ok(());
-        }
     }
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('u'))
@@ -856,66 +822,6 @@ fn handle_key(
         }
         RevMode::Normal | RevMode::Visual => {
             handle_review_key(state, storage, paths, highlighter, key)
-        }
-    }
-}
-
-fn handle_markdown_preview_key(state: &mut RevState, key: KeyEvent) -> bool {
-    let half_page = state.markdown_viewport_height.saturating_div(2).max(1);
-    let movement = match key.code {
-        KeyCode::Char('j') | KeyCode::Down => Some(1isize),
-        KeyCode::Char('k') | KeyCode::Up => Some(-1),
-        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Some(half_page as isize)
-        }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Some(-(half_page as isize))
-        }
-        KeyCode::PageDown => Some(state.markdown_viewport_height.max(1) as isize),
-        KeyCode::PageUp => Some(-(state.markdown_viewport_height.max(1) as isize)),
-        _ => None,
-    };
-    if let Some(movement) = movement {
-        state.markdown_follow_source = false;
-        if movement >= 0 {
-            state.markdown_scroll = state
-                .markdown_scroll
-                .saturating_add(movement.unsigned_abs());
-        } else {
-            state.markdown_scroll = state
-                .markdown_scroll
-                .saturating_sub(movement.unsigned_abs());
-        }
-        state.status =
-            "MARKDOWN PREVIEW FOCUS · independent scroll · Tab/Esc resumes source following".into();
-        return true;
-    }
-    match key.code {
-        KeyCode::Tab | KeyCode::Esc => {
-            state.markdown_preview_focused = false;
-            state.markdown_follow_source = true;
-            state.status =
-                "MARKDOWN DIFF · source focus restored · preview follows code navigation".into();
-            true
-        }
-        KeyCode::Char('g') | KeyCode::Home => {
-            state.markdown_follow_source = false;
-            state.markdown_scroll = 0;
-            true
-        }
-        KeyCode::Char('G') | KeyCode::End => {
-            state.markdown_follow_source = false;
-            state.markdown_scroll = usize::MAX;
-            true
-        }
-        KeyCode::Char('M') => {
-            close_markdown_preview(state);
-            true
-        }
-        _ => {
-            state.status =
-                "MARKDOWN PREVIEW FOCUS · j/k, Ctrl-D/U, g/G scroll · Tab/Esc returns".into();
-            true
         }
     }
 }
@@ -1907,7 +1813,6 @@ fn command_candidates(state: &RevState) -> Vec<String> {
         "questions".to_owned(),
         "refresh".to_owned(),
         "render markdown".to_owned(),
-        "render markdown cmux".to_owned(),
         "render markdown close".to_owned(),
         "clear".to_owned(),
         "q".to_owned(),
@@ -2008,7 +1913,7 @@ fn execute_command(
                 toggle_markdown_preview(state, paths)?;
             } else {
                 state.status =
-                    "Rendered Markdown diff is already open · navigation is synchronized · M closes"
+                    "Markdown rich diff is already open · navigation is synchronized · M closes"
                         .into();
             }
         }
@@ -2016,15 +1921,11 @@ fn execute_command(
             state.mode = RevMode::Normal;
             if !state.markdown_preview {
                 toggle_markdown_preview(state, paths)?;
-            }
-            state.cmux_markdown_requested = true;
-            state.markdown_sync_key = None;
-            sync_markdown_preview(state, paths)?;
-            state.status = if state.cmux_open.is_some() || state.cmux_markdown.is_some() {
-                "MARKDOWN DIFF · one cmux browser pane opening · source-line sync stays live".into()
             } else {
-                "MARKDOWN DIFF · terminal preview active · cmux is unavailable".into()
-            };
+                state.status =
+                    "Markdown rich diff is already open · navigation is synchronized · M closes"
+                        .into();
+            }
         }
         "render markdown close" | "render-markdown close" => {
             state.mode = RevMode::Normal;
@@ -2176,8 +2077,6 @@ fn drain_refresh(state: &mut RevState, storage: &Storage) -> Result<()> {
             let selected = state.current_file().map(|file| file.path().to_path_buf());
             let layout = state.diff_layout;
             let markdown_preview = state.markdown_preview;
-            let markdown_preview_focused = state.markdown_preview_focused;
-            let markdown_follow_source = state.markdown_follow_source;
             let cmux_markdown_requested = state.cmux_markdown_requested;
             let cmux_markdown = state.cmux_markdown.take();
             let cmux_open = state.cmux_open.take();
@@ -2186,8 +2085,6 @@ fn drain_refresh(state: &mut RevState, storage: &Storage) -> Result<()> {
             let mut replacement = RevState::load(workspace, storage)?;
             replacement.diff_layout = layout;
             replacement.markdown_preview = markdown_preview;
-            replacement.markdown_preview_focused = markdown_preview_focused;
-            replacement.markdown_follow_source = markdown_follow_source;
             replacement.cmux_markdown_requested = cmux_markdown_requested;
             replacement.cmux_markdown = cmux_markdown;
             replacement.cmux_open = cmux_open;
@@ -4464,23 +4361,7 @@ fn render_workspace_panes(
 ) {
     let tree = state.file_tree_open;
     let questions = state.questions_open;
-    if state.markdown_preview && !tree && !questions {
-        if area.width >= 80 {
-            let panes = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .split(area);
-            render_review(frame, state, panes[0], highlighter);
-            render_markdown_diff_preview(frame, state, panes[1], highlighter);
-        } else {
-            let panes = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(area);
-            render_review(frame, state, panes[0], highlighter);
-            render_markdown_diff_preview(frame, state, panes[1], highlighter);
-        }
-    } else if tree && questions && area.width >= 108 {
+    if tree && questions && area.width >= 108 {
         let panes = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -4674,11 +4555,13 @@ struct MarkdownSides {
     new: String,
 }
 
+#[cfg(any())]
 struct MarkdownRenderCache {
     key: String,
     rows: Vec<RenderedMarkdownRow>,
 }
 
+#[cfg(any())]
 #[derive(Clone)]
 struct RenderedMarkdownRow {
     line: Line<'static>,
@@ -4755,27 +4638,20 @@ fn toggle_markdown_preview(state: &mut RevState, paths: &AppPaths) -> Result<()>
     }
     markdown_sides(state)?;
     state.markdown_preview = true;
-    state.markdown_scroll = 0;
-    state.markdown_preview_focused = false;
-    state.markdown_follow_source = true;
-    state.cmux_markdown_requested = false;
+    state.cmux_markdown_requested = true;
     state.markdown_sync_key = None;
     sync_markdown_preview(state, paths)?;
     state.status =
-        "MARKDOWN DIFF · synchronized terminal preview · M closes · :render markdown cmux is optional"
-            .into();
+        "MARKDOWN RICH DIFF · opening browser preview · source-line sync stays live".into();
     Ok(())
 }
 
 fn close_markdown_preview(state: &mut RevState) {
     state.markdown_preview = false;
-    state.markdown_preview_focused = false;
-    state.markdown_follow_source = true;
     state.cmux_markdown_requested = false;
     state.markdown_sync_key = None;
     state.markdown_content_key = None;
     state.markdown_sides_cache = None;
-    state.markdown_render_cache = None;
     if let Some(surface) = state.cmux_markdown.take() {
         state.cmux_close = Some(spawn_cmux_close(surface));
     }
@@ -4827,7 +4703,7 @@ fn drain_cmux_preview(state: &mut RevState) {
         Ok(Some(surface)) if state.markdown_preview => {
             state.cmux_markdown = Some(surface);
             state.status =
-                "MARKDOWN DIFF · cmux pane opened · waiting for renderer heartbeat".into();
+                "MARKDOWN RICH DIFF · browser opened · waiting for renderer heartbeat".into();
         }
         Ok(Some(surface)) => {
             state.cmux_close = Some(spawn_cmux_close(surface));
@@ -4835,14 +4711,12 @@ fn drain_cmux_preview(state: &mut RevState) {
         }
         Ok(None) if state.markdown_preview => {
             state.markdown_server = None;
-            state.status =
-                "MARKDOWN DIFF · terminal preview active · cmux context not detected".into();
+            state.status = "MARKDOWN RICH DIFF · browser opener unavailable".into();
         }
         Ok(None) => {}
         Err(error) if state.markdown_preview => {
             state.markdown_server = None;
-            state.status =
-                format!("Terminal Markdown preview active · cmux pane unavailable: {error:#}");
+            state.status = format!("Markdown rich diff unavailable: {error:#}");
         }
         Err(_) => {}
     }
@@ -4880,7 +4754,6 @@ fn sync_markdown_preview(state: &mut RevState, _paths: &AppPaths) -> Result<()> 
         state.markdown_sync_key = None;
         state.markdown_content_key = None;
         state.markdown_sides_cache = None;
-        state.markdown_render_cache = None;
         if let Some(surface) = state.cmux_markdown.take() {
             state.cmux_close = Some(spawn_cmux_close(surface));
         }
@@ -4895,7 +4768,6 @@ fn sync_markdown_preview(state: &mut RevState, _paths: &AppPaths) -> Result<()> 
         state.cmux_markdown_requested = false;
         state.markdown_content_key = None;
         state.markdown_sides_cache = None;
-        state.markdown_render_cache = None;
         if let Some(surface) = state.cmux_markdown.take() {
             state.cmux_close = Some(spawn_cmux_close(surface));
         }
@@ -4920,7 +4792,6 @@ fn sync_markdown_preview(state: &mut RevState, _paths: &AppPaths) -> Result<()> 
     if content_changed {
         state.markdown_sides_cache = Some(markdown_sides(state)?);
         state.markdown_content_key = Some(content_key.clone());
-        state.markdown_render_cache = None;
     }
     update_markdown_connection_status(state);
     if state.cmux_markdown_requested && state.cmux_close.is_some() {
@@ -4953,6 +4824,9 @@ fn sync_markdown_preview(state: &mut RevState, _paths: &AppPaths) -> Result<()> 
             browser_markdown_state(state, sides, &content_key)?,
             focus_state,
         )?);
+    }
+    if cfg!(test) {
+        return Ok(());
     }
     if state.cmux_markdown.is_none() && state.cmux_open.is_none() {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -4992,18 +4866,18 @@ fn update_markdown_connection_status(state: &mut RevState) {
             || state.status.contains("renderer has not connected"))
     {
         state.status =
-            "MARKDOWN DIFF · cmux browser connected · following the active source line".into();
+            "MARKDOWN RICH DIFF · browser connected · following the active source line".into();
     } else if age.is_some_and(|age| age > Duration::from_secs(5))
-        && state.status.starts_with("MARKDOWN DIFF · cmux browser")
+        && state.status.starts_with("MARKDOWN RICH DIFF · browser")
     {
         state.status =
-            "MARKDOWN DIFF · browser preview disconnected · :render markdown cmux retries".into();
+            "MARKDOWN RICH DIFF · browser disconnected · M closes; M again reopens".into();
     } else if age.is_none()
         && waiting > Duration::from_secs(5)
         && state.status.contains("renderer heartbeat")
     {
         state.status =
-            "MARKDOWN DIFF · renderer has not connected · inspect the cmux browser pane".into();
+            "MARKDOWN RICH DIFF · renderer has not connected · inspect the browser pane".into();
     }
 }
 
@@ -5100,6 +4974,7 @@ fn browser_markdown_focus(revision: &str, focus_side: &str, focus: usize) -> Res
     }))?)
 }
 
+#[cfg(any())]
 fn render_markdown_diff_preview(
     frame: &mut Frame,
     state: &mut RevState,
@@ -5185,6 +5060,7 @@ fn render_markdown_diff_preview(
     frame.render_widget(Paragraph::new(visible), inner);
 }
 
+#[cfg(any())]
 fn decorate_markdown_annotations(
     state: &RevState,
     rows: Vec<RenderedMarkdownRow>,
@@ -5267,6 +5143,7 @@ fn decorate_markdown_annotations(
     rendered
 }
 
+#[cfg(any())]
 fn rendered_markdown_diff(
     old_source: &str,
     new_source: &str,
@@ -5374,12 +5251,14 @@ fn rendered_markdown_diff(
     rows
 }
 
+#[cfg(any())]
 fn prefixed_line(prefix: &'static str, line: Line<'static>, color: Color) -> Line<'static> {
     let mut spans = vec![Span::styled(prefix, Style::default().fg(color))];
     spans.extend(line.spans);
     Line::from(spans)
 }
 
+#[cfg(any())]
 fn mapped_row_text(row: &MappedRow) -> String {
     row.line
         .spans
@@ -5388,6 +5267,7 @@ fn mapped_row_text(row: &MappedRow) -> String {
         .collect()
 }
 
+#[cfg(any())]
 fn mapped_row_source_line(row: &MappedRow, source: &str) -> Option<usize> {
     let offset = row.cells.iter().find_map(|cell| match &cell.source {
         CellSource::Text(range) | CellSource::Decoration(range) => Some(range.start),
@@ -5525,7 +5405,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ),
         key(
             "M",
-            "toggle a synchronized rendered Markdown diff; cmux opens a native right pane",
+            "toggle the synchronized browser rich diff with red/green gutters",
         ),
         key("y / n", "confirm or cancel clearing saved review history"),
         key(":", "open the command palette"),
@@ -5612,11 +5492,7 @@ fn help_lines() -> Vec<Line<'static>> {
         key(":diff split", "render old and new sides in two columns"),
         key(
             ":render markdown",
-            "open the synchronized in-terminal rendered Markdown diff",
-        ),
-        key(
-            ":render markdown cmux",
-            "open one live-rendered cmux browser pane with Mermaid and source sync",
+            "open one rich-diff browser view; cmux uses a native right pane",
         ),
         key(
             ":render markdown close",
@@ -6692,7 +6568,7 @@ pub(crate) fn render_snapshot(width: u16, height: u16, snapshot: &str) -> Result
             state.file_index = 1;
             state.markdown_preview = true;
             state.status =
-                "MARKDOWN DIFF · synchronized terminal preview · cmux supports Mermaid".into();
+                "MARKDOWN RICH DIFF · one browser document · red/green change gutters".into();
         }
         "expanded" => {
             let hunk = &mut state.workspace.repos[0].diff.files[0].hunks[0];
@@ -7089,13 +6965,13 @@ mod tests {
         browser_markdown_focus, browser_markdown_state, build_rows, close_file_picker,
         close_questions, current_item_yank_text, execute_command, finish_active_question,
         handle_agent_event, handle_compose_key, handle_file_picker_key, handle_help_key,
-        handle_history_key, handle_key, handle_markdown_preview_key, handle_question_key,
-        handle_review_key, help_lines, is_expandable_fold, markdown_sides, merge_touching_hunks,
-        open_file_picker, open_questions, page_move, question_ids, queue_question_launch, render,
-        render_snapshot, rendered_markdown_diff, row_count, seed_snapshot_feedback,
-        seed_snapshot_questions, snapshot_workspace, split_highlight_side, split_source_lines,
-        style_split_side, visual_selection_yank_text, ComposeTarget, ModelPicker, PendingSend,
-        PickerScope, PickerStage, QuestionLaunch, RevAgentSlot, RevDiffLayout, RevMode, RevState,
+        handle_history_key, handle_key, handle_question_key, handle_review_key, help_lines,
+        is_expandable_fold, markdown_sides, merge_touching_hunks, open_file_picker, open_questions,
+        page_move, question_ids, queue_question_launch, render, render_snapshot, row_count,
+        seed_snapshot_feedback, seed_snapshot_questions, snapshot_workspace, split_highlight_side,
+        split_source_lines, style_split_side, visual_selection_yank_text, ComposeTarget,
+        ModelPicker, PendingSend, PickerScope, PickerStage, QuestionLaunch, RevAgentSlot,
+        RevDiffLayout, RevMode, RevState,
     };
     use crate::config::AppPaths;
     use crate::copilot::{
@@ -7118,40 +6994,6 @@ mod tests {
         fn try_recv(&self) -> Option<AgentEvent> {
             None
         }
-    }
-
-    #[test]
-    fn rendered_markdown_diff_preserves_semantics_and_source_lines() {
-        let mut highlighter = PlainHighlighter;
-        let rows = rendered_markdown_diff(
-            "# Guide\n\n- old\n",
-            "# Guide\n\n- new\n\n```mermaid\ngraph TD\n  A --> B\n```\n",
-            60,
-            &mut highlighter,
-        );
-        let text = rows
-            .iter()
-            .map(|row| {
-                row.line
-                    .spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("Guide"));
-        assert!(text.contains("- • old"));
-        assert!(text.contains("+ • new"));
-        assert!(text.contains("• old"));
-        assert!(text.contains("• new"));
-        assert!(text.contains("graph TD"));
-        assert!(rows
-            .iter()
-            .any(|row| row.side == Some(AnchorSide::Old) && row.source_line == Some(3)));
-        assert!(rows
-            .iter()
-            .any(|row| row.side == Some(AnchorSide::New) && row.source_line == Some(3)));
     }
 
     #[test]
@@ -7229,29 +7071,6 @@ mod tests {
     }
 
     #[test]
-    fn markdown_preview_can_scroll_independently_then_resume_source_following() {
-        let storage = Storage::in_memory().unwrap();
-        let workspace = snapshot_workspace(&storage).unwrap();
-        let mut state = RevState::load(workspace, &storage).unwrap();
-        state.markdown_preview = true;
-        state.markdown_preview_focused = true;
-        state.markdown_follow_source = false;
-        state.markdown_scroll = 10;
-        state.markdown_viewport_height = 8;
-        assert!(handle_markdown_preview_key(
-            &mut state,
-            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
-        ));
-        assert_eq!(state.markdown_scroll, 14);
-        assert!(handle_markdown_preview_key(
-            &mut state,
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-        ));
-        assert!(!state.markdown_preview_focused);
-        assert!(state.markdown_follow_source);
-    }
-
-    #[test]
     fn browser_markdown_state_keeps_diff_sides_source_lines_and_review_notes() {
         let storage = Storage::in_memory().unwrap();
         let workspace = snapshot_workspace(&storage).unwrap();
@@ -7288,13 +7107,12 @@ mod tests {
     #[test]
     fn markdown_snapshot_is_agent_inspectable() {
         let frame = render_snapshot(120, 30, "markdown").unwrap();
-        assert!(frame.contains("Markdown diff"));
+        assert!(frame.contains("MARKDOWN RICH DIFF"));
         assert!(frame.contains("Demo"));
         assert!(frame.contains("Use the file tree."));
-        assert!(frame.contains("Mermaid"));
 
         let narrow = render_snapshot(60, 20, "markdown").unwrap();
-        assert!(narrow.contains("Markdown diff"));
+        assert!(narrow.contains("MARKDOWN RICH DIFF"));
         assert!(narrow.contains("Use the file tree."));
         assert!(narrow.contains("review · unified"));
     }
@@ -7314,7 +7132,7 @@ mod tests {
     }
 
     #[test]
-    fn render_markdown_defaults_to_one_in_terminal_preview() {
+    fn render_markdown_opens_only_the_browser_rich_diff() {
         let storage = Storage::in_memory().unwrap();
         let workspace = snapshot_workspace(&storage).unwrap();
         let mut state = RevState::load(workspace, &storage).unwrap();
@@ -7322,12 +7140,13 @@ mod tests {
         execute_command(
             &mut state,
             &storage,
-            &test_paths("rev-markdown-terminal-only"),
+            &test_paths("rev-markdown-rich-diff"),
             "render markdown",
         )
         .unwrap();
         assert!(state.markdown_preview);
-        assert!(!state.cmux_markdown_requested);
+        assert!(state.cmux_markdown_requested);
+        assert!(state.markdown_server.is_some());
         assert!(state.cmux_open.is_none());
         assert!(state.cmux_markdown.is_none());
     }
