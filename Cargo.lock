@@ -1665,6 +1665,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "rq-tui-domain",
+ "rq-tui-github-review",
  "rusqlite",
  "tempfile",
 ]

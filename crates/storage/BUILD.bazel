@@ -13,7 +13,10 @@ rust_library(
     crate_name = "rq_tui_storage",
     crate_root = "src/lib.rs",
     edition = "2021",
-    deps = STORAGE_DEPS + ["//crates/domain:domain_lib"],
+    deps = STORAGE_DEPS + [
+        "//crates/domain:domain_lib",
+        "//crates/github_review:github_review_lib",
+    ],
     visibility = ["//src:__pkg__"],
 )
 
@@ -25,6 +28,7 @@ rust_test(
     edition = "2021",
     deps = STORAGE_DEPS + [
         "//crates/domain:domain_lib",
+        "//crates/github_review:github_review_lib",
     ] + crate_deps(["tempfile"], package_name = "crates/storage"),
     visibility = ["//visibility:private"],
 )

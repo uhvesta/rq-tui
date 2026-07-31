@@ -11,6 +11,7 @@ path = "src/lib.rs"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 rq-tui-domain = { path = "../domain" }
+rq-tui-github-review = { path = "../github_review" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 
 [dev-dependencies]

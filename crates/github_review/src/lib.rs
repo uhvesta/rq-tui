@@ -117,6 +117,69 @@ pub trait GitHubTransport {
     fn execute(&self, request: ApiRequest) -> Result<Value>;
 }
 
+const PULL_REQUEST_QUERY: &str = r#"
+query RevPullRequest($owner: String!, $repository: String!, $number: Int!, $threadsCursor: String) {
+  repository(owner: $owner, name: $repository) {
+    pullRequest(number: $number) {
+      id
+      title
+      body
+      url
+      updatedAt
+      author { login }
+      headRefOid
+      baseRefOid
+      reviewThreads(first: 100, after: $threadsCursor) {
+        nodes {
+          id
+          path
+          line
+          originalLine
+          diffSide
+          isOutdated
+          isResolved
+          viewerCanReply
+          comments(first: 100) {
+            nodes {
+              id
+              databaseId
+              author { login }
+              body
+              createdAt
+              url
+              replyTo { id }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"#;
+
+const THREAD_COMMENTS_QUERY: &str = r#"
+query RevThreadComments($threadId: ID!, $commentsCursor: String) {
+  node(id: $threadId) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $commentsCursor) {
+        nodes {
+          id
+          databaseId
+          author { login }
+          body
+          createdAt
+          url
+          replyTo { id }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"#;
+
 pub struct GitHubReviewClient<T> {
     transport: T,
 }
@@ -128,6 +191,115 @@ impl<T> GitHubReviewClient<T> {
 }
 
 impl<T: GitHubTransport> GitHubReviewClient<T> {
+    /// Loads a complete pull-request snapshot through the GraphQL API.
+    ///
+    /// GitHub paginates review threads and each thread paginates its comments
+    /// independently. The transport deliberately receives every request so a
+    /// caller can provide authentication, retries, logging, or a deterministic
+    /// fake without coupling this crate to `gh` or an HTTP implementation.
+    pub fn load_snapshot(&self, reference: &PullRequestRef) -> Result<PullRequestSnapshot> {
+        let mut thread_cursor = None;
+        let mut snapshot = None;
+        let mut threads = Vec::new();
+
+        loop {
+            let response = self.transport.execute(ApiRequest {
+                method: "POST",
+                path: "/graphql".into(),
+                body: json!({
+                    "query": PULL_REQUEST_QUERY,
+                    "operationName": "RevPullRequest",
+                    "variables": {
+                        "owner": reference.owner,
+                        "repository": reference.repository,
+                        "number": reference.number,
+                        "threadsCursor": thread_cursor,
+                    },
+                }),
+            })?;
+            let data = graphql_data(&response)?;
+            let pull_request = data
+                .get("repository")
+                .and_then(|repository| repository.get("pullRequest"))
+                .context("GitHub GraphQL response did not contain the pull request")?;
+            if pull_request.is_null() {
+                bail!(
+                    "GitHub GraphQL response did not contain pull request #{}",
+                    reference.number
+                );
+            }
+
+            if snapshot.is_none() {
+                snapshot = Some(parse_snapshot_metadata(pull_request)?);
+            }
+
+            let review_threads = pull_request
+                .get("reviewThreads")
+                .context("GitHub GraphQL response did not contain reviewThreads")?;
+            let nodes = review_threads
+                .get("nodes")
+                .and_then(Value::as_array)
+                .context("GitHub GraphQL reviewThreads.nodes was not an array")?;
+            for node in nodes {
+                let (thread, comments_page) = parse_thread(node)?;
+                let thread_id = thread.node_id.clone();
+                let mut thread = thread;
+                let mut comments_cursor = comments_page.end_cursor;
+                let mut has_more_comments = comments_page.has_next_page;
+                while has_more_comments {
+                    let cursor = comments_cursor
+                        .clone()
+                        .context("GitHub returned hasNextPage without endCursor for comments")?;
+                    let response = self.transport.execute(ApiRequest {
+                        method: "POST",
+                        path: "/graphql".into(),
+                        body: json!({
+                            "query": THREAD_COMMENTS_QUERY,
+                            "operationName": "RevThreadComments",
+                            "variables": {
+                                "threadId": thread_id,
+                                "commentsCursor": cursor,
+                            },
+                        }),
+                    })?;
+                    let data = graphql_data(&response)?;
+                    let comments = data
+                        .get("node")
+                        .and_then(|node| node.get("comments"))
+                        .context("GitHub GraphQL response did not contain thread comments")?;
+                    let comment_nodes = comments
+                        .get("nodes")
+                        .and_then(Value::as_array)
+                        .context("GitHub GraphQL comments.nodes was not an array")?;
+                    thread.comments.extend(
+                        comment_nodes
+                            .iter()
+                            .map(parse_comment)
+                            .collect::<Result<Vec<_>>>()?,
+                    );
+                    let page_info = parse_page_info(comments)?;
+                    has_more_comments = page_info.has_next_page;
+                    comments_cursor = page_info.end_cursor;
+                }
+                threads.push(thread);
+            }
+
+            let page_info = parse_page_info(review_threads)?;
+            if !page_info.has_next_page {
+                break;
+            }
+            thread_cursor = Some(
+                page_info
+                    .end_cursor
+                    .context("GitHub returned hasNextPage without endCursor for reviewThreads")?,
+            );
+        }
+
+        let mut snapshot = snapshot.context("GitHub returned no pull-request snapshot")?;
+        snapshot.threads = threads;
+        Ok(snapshot)
+    }
+
     pub fn submit_review(
         &self,
         reference: &PullRequestRef,
@@ -188,21 +360,170 @@ impl<T: GitHubTransport> GitHubReviewClient<T> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+fn graphql_data(response: &Value) -> Result<&Value> {
+    if let Some(errors) = response.get("errors").and_then(Value::as_array) {
+        if !errors.is_empty() {
+            let messages = errors
+                .iter()
+                .filter_map(|error| error.get("message").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            bail!(
+                "GitHub GraphQL request failed: {}",
+                if messages.is_empty() {
+                    "unknown GraphQL error".into()
+                } else {
+                    messages.join("; ")
+                }
+            );
+        }
+    }
+    response
+        .get("data")
+        .context("GitHub GraphQL response did not contain data")
+}
+
+fn parse_snapshot_metadata(value: &Value) -> Result<PullRequestSnapshot> {
+    Ok(PullRequestSnapshot {
+        node_id: required_string(value, "id")?,
+        title: required_string(value, "title")?,
+        body: value
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        url: required_string(value, "url")?,
+        author: value
+            .get("author")
+            .and_then(|author| author.get("login"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        head_sha: required_string(value, "headRefOid")?,
+        base_sha: required_string(value, "baseRefOid")?,
+        updated_at: required_string(value, "updatedAt")?,
+        threads: Vec::new(),
+    })
+}
+
+fn parse_thread(value: &Value) -> Result<(ReviewThread, PageInfo)> {
+    let comments = value
+        .get("comments")
+        .context("GitHub GraphQL review thread did not contain comments")?;
+    let nodes = comments
+        .get("nodes")
+        .and_then(Value::as_array)
+        .context("GitHub GraphQL thread comments.nodes was not an array")?;
+    let thread = ReviewThread {
+        node_id: required_string(value, "id")?,
+        path: required_string(value, "path")?,
+        line: optional_u64(value, "line")?,
+        original_line: optional_u64(value, "originalLine")?,
+        side: parse_side(value.get("diffSide"))?,
+        is_outdated: required_bool(value, "isOutdated")?,
+        is_resolved: required_bool(value, "isResolved")?,
+        viewer_can_reply: required_bool(value, "viewerCanReply")?,
+        comments: nodes.iter().map(parse_comment).collect::<Result<Vec<_>>>()?,
+    };
+    Ok((thread, parse_page_info(comments)?))
+}
+
+fn parse_comment(value: &Value) -> Result<ReviewComment> {
+    Ok(ReviewComment {
+        node_id: required_string(value, "id")?,
+        database_id: value.get("databaseId").and_then(Value::as_u64),
+        author: value
+            .get("author")
+            .and_then(|author| author.get("login"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        body: required_string(value, "body")?,
+        created_at: required_string(value, "createdAt")?,
+        url: required_string(value, "url")?,
+        reply_to: value
+            .get("replyTo")
+            .and_then(|reply_to| reply_to.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn parse_page_info(value: &Value) -> Result<PageInfo> {
+    let page_info = value
+        .get("pageInfo")
+        .context("GitHub GraphQL connection did not contain pageInfo")?;
+    Ok(PageInfo {
+        has_next_page: required_bool(page_info, "hasNextPage")?,
+        end_cursor: page_info
+            .get("endCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn required_string(value: &Value, field: &str) -> Result<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("GitHub GraphQL field {field} was missing or not a string"))
+}
+
+fn required_bool(value: &Value, field: &str) -> Result<bool> {
+    value
+        .get(field)
+        .and_then(Value::as_bool)
+        .with_context(|| format!("GitHub GraphQL field {field} was missing or not a boolean"))
+}
+
+fn optional_u64(value: &Value, field: &str) -> Result<Option<u64>> {
+    let value = value.get(field).unwrap_or(&Value::Null);
+    if value.is_null() {
+        Ok(None)
+    } else {
+        value
+            .as_u64()
+            .map(Some)
+            .with_context(|| format!("GitHub GraphQL field {field} was not an integer"))
+    }
+}
+
+fn parse_side(value: Option<&Value>) -> Result<DiffSide> {
+    match value.and_then(Value::as_str) {
+        Some("LEFT") => Ok(DiffSide::Left),
+        Some("RIGHT") => Ok(DiffSide::Right),
+        Some(side) => bail!("unsupported GitHub GraphQL diff side {side}"),
+        None => bail!("GitHub GraphQL thread did not contain diffSide"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::VecDeque;
 
     use super::*;
 
     #[derive(Default)]
     struct FakeTransport {
         requests: RefCell<Vec<ApiRequest>>,
+        responses: RefCell<VecDeque<Value>>,
     }
 
     impl GitHubTransport for FakeTransport {
         fn execute(&self, request: ApiRequest) -> Result<Value> {
             self.requests.borrow_mut().push(request);
-            Ok(json!({ "id": 42 }))
+            Ok(self
+                .responses
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| json!({ "id": 42 })))
         }
     }
 
@@ -308,5 +629,211 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("require an overall body"));
         assert!(client.transport.requests.borrow().is_empty());
+    }
+
+    fn thread(
+        id: &str,
+        comment_nodes: Value,
+        comments_has_next: bool,
+        comments_cursor: Option<&str>,
+        side: &str,
+        outdated: bool,
+        resolved: bool,
+        can_reply: bool,
+    ) -> Value {
+        json!({
+            "id": id,
+            "path": "src/lib.rs",
+            "line": 24,
+            "originalLine": 20,
+            "diffSide": side,
+            "isOutdated": outdated,
+            "isResolved": resolved,
+            "viewerCanReply": can_reply,
+            "comments": {
+                "nodes": comment_nodes,
+                "pageInfo": {
+                    "hasNextPage": comments_has_next,
+                    "endCursor": comments_cursor,
+                }
+            }
+        })
+    }
+
+    fn comment(id: &str, author: &str, body: &str, reply_to: Option<&str>) -> Value {
+        json!({
+            "id": id,
+            "databaseId": 700,
+            "author": { "login": author },
+            "body": body,
+            "createdAt": "2026-07-31T01:02:03Z",
+            "url": format!("https://github.com/acme/api/pull/17#discussion_r{id}"),
+            "replyTo": reply_to.map(|id| json!({ "id": id })),
+        })
+    }
+
+    fn pull_request_page(
+        threads: Value,
+        has_next: bool,
+        end_cursor: Option<&str>,
+    ) -> Value {
+        json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "id": "PR_node_17",
+                        "title": "Improve review UX",
+                        "body": "## Description\nA paginated review.",
+                        "url": "https://github.com/acme/api/pull/17",
+                        "updatedAt": "2026-07-31T01:00:00Z",
+                        "author": { "login": "octocat" },
+                        "headRefOid": "head-sha-2",
+                        "baseRefOid": "base-sha-1",
+                        "reviewThreads": {
+                            "nodes": threads,
+                            "pageInfo": {
+                                "hasNextPage": has_next,
+                                "endCursor": end_cursor,
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn comments_page(thread_id: &str, comments: Value, has_next: bool, cursor: Option<&str>) -> Value {
+        json!({
+            "data": {
+                "node": {
+                    "id": thread_id,
+                    "comments": {
+                        "nodes": comments,
+                        "pageInfo": {
+                            "hasNextPage": has_next,
+                            "endCursor": cursor,
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn loads_two_thread_pages_and_paginates_thread_comments() {
+        let transport = FakeTransport {
+            requests: RefCell::new(Vec::new()),
+            responses: RefCell::new(VecDeque::from([
+                pull_request_page(
+                    json!([thread(
+                        "thread-1",
+                        json!([comment("comment-1", "reviewer-one", "Please simplify this.", None)]),
+                        true,
+                        Some("comments-cursor-1"),
+                        "RIGHT",
+                        true,
+                        false,
+                        true,
+                    )]),
+                    true,
+                    Some("threads-cursor-1"),
+                ),
+                comments_page(
+                    "thread-1",
+                    json!([comment(
+                        "comment-1-reply",
+                        "octocat",
+                        "Thanks, updated.",
+                        Some("comment-1")
+                    )]),
+                    false,
+                    None,
+                ),
+                pull_request_page(
+                    json!([thread(
+                        "thread-2",
+                        json!([comment("comment-2", "reviewer-two", "This is resolved.", Some("comment-root"))]),
+                        false,
+                        None,
+                        "LEFT",
+                        false,
+                        true,
+                        false,
+                    )]),
+                    false,
+                    None,
+                ),
+            ])),
+        };
+        let client = GitHubReviewClient::new(transport);
+        let snapshot = client.load_snapshot(&reference()).unwrap();
+
+        assert_eq!(snapshot.node_id, "PR_node_17");
+        assert_eq!(snapshot.author, "octocat");
+        assert_eq!(snapshot.body, "## Description\nA paginated review.");
+        assert_eq!(snapshot.head_sha, "head-sha-2");
+        assert_eq!(snapshot.base_sha, "base-sha-1");
+        assert_eq!(snapshot.threads.len(), 2);
+        assert!(snapshot.threads[0].is_outdated);
+        assert!(!snapshot.threads[0].is_resolved);
+        assert!(snapshot.threads[0].viewer_can_reply);
+        assert_eq!(snapshot.threads[0].comments.len(), 2);
+        assert_eq!(snapshot.threads[0].comments[1].author, "octocat");
+        assert_eq!(snapshot.threads[0].comments[1].reply_to.as_deref(), Some("comment-1"));
+        assert!(!snapshot.threads[1].viewer_can_reply);
+        assert!(snapshot.threads[1].is_resolved);
+        assert_eq!(snapshot.threads[1].side, DiffSide::Left);
+
+        let requests = client.transport.requests.borrow();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].path, "/graphql");
+        assert_eq!(requests[0].body["operationName"], "RevPullRequest");
+        let query = requests[0].body["query"].as_str().unwrap();
+        for field in [
+            "body",
+            "author { login }",
+            "headRefOid",
+            "baseRefOid",
+            "reviewThreads",
+            "isOutdated",
+            "isResolved",
+            "viewerCanReply",
+            "replyTo { id }",
+        ] {
+            assert!(query.contains(field), "query is missing {field}");
+        }
+        assert_eq!(requests[0].body["variables"]["threadsCursor"], Value::Null);
+        assert_eq!(requests[1].body["operationName"], "RevThreadComments");
+        assert_eq!(requests[1].body["variables"]["threadId"], "thread-1");
+        assert_eq!(requests[1].body["variables"]["commentsCursor"], "comments-cursor-1");
+        assert_eq!(requests[2].body["variables"]["threadsCursor"], "threads-cursor-1");
+    }
+
+    #[test]
+    fn graphql_errors_are_returned_instead_of_being_treated_as_an_empty_snapshot() {
+        let transport = FakeTransport {
+            requests: RefCell::new(Vec::new()),
+            responses: RefCell::new(VecDeque::from([json!({
+                "errors": [{ "message": "Bad credentials" }]
+            })])),
+        };
+        let client = GitHubReviewClient::new(transport);
+        let error = client.load_snapshot(&reference()).unwrap_err();
+        assert!(error.to_string().contains("Bad credentials"));
+    }
+
+    #[test]
+    fn missing_pagination_cursor_is_a_hard_error() {
+        let transport = FakeTransport {
+            requests: RefCell::new(Vec::new()),
+            responses: RefCell::new(VecDeque::from([pull_request_page(
+                json!([]),
+                true,
+                None,
+            )])),
+        };
+        let client = GitHubReviewClient::new(transport);
+        let error = client.load_snapshot(&reference()).unwrap_err();
+        assert!(error.to_string().contains("hasNextPage without endCursor"));
     }
 }

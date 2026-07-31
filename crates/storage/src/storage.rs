@@ -10,6 +10,7 @@ use rq_tui_domain::{
     DeliveryState, EphemeralSessionRecord, PendingChat, Placement, Repo, ReviewContext,
     SessionRecord, Version, VersionKind, WorkItem,
 };
+use rq_tui_github_review::{DiffSide, PullRequestSnapshot, ReviewComment, ReviewThread};
 
 pub const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
 pub const MIGRATION_2: &str = include_str!("../migrations/0002_placement_side.sql");
@@ -20,6 +21,7 @@ pub const MIGRATION_6: &str = include_str!("../migrations/0006_outbox_metadata.s
 pub const MIGRATION_7: &str = include_str!("../migrations/0007_session_ephemeral.sql");
 pub const MIGRATION_8: &str = include_str!("../migrations/0008_rev_question_sessions.sql");
 pub const MIGRATION_9: &str = include_str!("../migrations/0009_annotation_status.sql");
+pub const MIGRATION_10: &str = include_str!("../migrations/0010_github_pull_request_snapshots.sql");
 
 pub struct Storage {
     connection: Connection,
@@ -173,6 +175,7 @@ impl Storage {
             (7, MIGRATION_7),
             (8, MIGRATION_8),
             (9, MIGRATION_9),
+            (10, MIGRATION_10),
         ] {
             let applied = tx
                 .query_row(
@@ -738,6 +741,228 @@ impl Storage {
             },
         )
         .transpose()
+    }
+
+    /// Persist one complete GitHub pull-request view for an immutable local
+    /// review version. Re-upserting the same version replaces only that
+    /// version's remote threads/comments; snapshots for older versions remain
+    /// untouched for history and outdated-thread rendering.
+    pub fn upsert_pull_request_snapshot(
+        &self,
+        version_id: &str,
+        snapshot: &PullRequestSnapshot,
+    ) -> Result<()> {
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO pull_request_snapshots(
+                version_id, node_id, title, body, url, author, head_sha,
+                base_sha, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(version_id) DO UPDATE SET
+                node_id = excluded.node_id,
+                title = excluded.title,
+                body = excluded.body,
+                url = excluded.url,
+                author = excluded.author,
+                head_sha = excluded.head_sha,
+                base_sha = excluded.base_sha,
+                updated_at = excluded.updated_at",
+            params![
+                version_id,
+                snapshot.node_id,
+                snapshot.title,
+                snapshot.body,
+                snapshot.url,
+                snapshot.author,
+                snapshot.head_sha,
+                snapshot.base_sha,
+                snapshot.updated_at,
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM pull_request_review_comments WHERE version_id = ?1",
+            [version_id],
+        )?;
+        tx.execute(
+            "DELETE FROM pull_request_review_threads WHERE version_id = ?1",
+            [version_id],
+        )?;
+
+        for (thread_ordinal, thread) in snapshot.threads.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO pull_request_review_threads(
+                    version_id, node_id, ordinal, path, line, original_line,
+                    side, is_outdated, is_resolved, viewer_can_reply
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    version_id,
+                    thread.node_id,
+                    sql_ordinal(thread_ordinal)?,
+                    thread.path,
+                    sql_optional_u64(thread.line, "review-thread line")?,
+                    sql_optional_u64(thread.original_line, "review-thread original line")?,
+                    diff_side_name(thread.side),
+                    sql_bool(thread.is_outdated),
+                    sql_bool(thread.is_resolved),
+                    sql_bool(thread.viewer_can_reply),
+                ],
+            )?;
+            for (comment_ordinal, comment) in thread.comments.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO pull_request_review_comments(
+                        version_id, node_id, thread_node_id, ordinal, database_id,
+                        author, body, created_at, url, reply_to
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        version_id,
+                        comment.node_id,
+                        thread.node_id,
+                        sql_ordinal(comment_ordinal)?,
+                        sql_optional_u64(comment.database_id, "review-comment database ID")?,
+                        comment.author,
+                        comment.body,
+                        comment.created_at,
+                        comment.url,
+                        comment.reply_to,
+                    ],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load the complete GitHub pull-request state captured for `version_id`.
+    /// A missing row means that version was local-only or has not yet been
+    /// refreshed from GitHub.
+    pub fn pull_request_snapshot(&self, version_id: &str) -> Result<Option<PullRequestSnapshot>> {
+        let snapshot = self
+            .connection
+            .query_row(
+                "SELECT node_id, title, body, url, author, head_sha, base_sha, updated_at
+                 FROM pull_request_snapshots WHERE version_id = ?1",
+                [version_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((node_id, title, body, url, author, head_sha, base_sha, updated_at)) = snapshot
+        else {
+            return Ok(None);
+        };
+
+        let threads = {
+            let mut statement = self.connection.prepare(
+                "SELECT node_id, path, line, original_line, side, is_outdated,
+                        is_resolved, viewer_can_reply
+                 FROM pull_request_review_threads
+                 WHERE version_id = ?1
+                 ORDER BY ordinal",
+            )?;
+            let rows = statement
+                .query_map([version_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)? != 0,
+                        row.get::<_, i64>(6)? != 0,
+                        row.get::<_, i64>(7)? != 0,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+
+        let mut review_threads = Vec::with_capacity(threads.len());
+        for (
+            thread_node_id,
+            path,
+            line,
+            original_line,
+            side,
+            is_outdated,
+            is_resolved,
+            viewer_can_reply,
+        ) in threads
+        {
+            let stored_comments = {
+                let mut statement = self.connection.prepare(
+                    "SELECT node_id, database_id, author, body, created_at, url, reply_to
+                     FROM pull_request_review_comments
+                     WHERE version_id = ?1 AND thread_node_id = ?2
+                     ORDER BY ordinal",
+                )?;
+                let rows = statement
+                    .query_map(params![version_id, thread_node_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            let comments = stored_comments
+                .into_iter()
+                .map(
+                    |(node_id, database_id, author, body, created_at, url, reply_to)| {
+                        Ok(ReviewComment {
+                            node_id,
+                            database_id: sql_to_optional_u64(
+                                database_id,
+                                "review-comment database ID",
+                            )?,
+                            author,
+                            body,
+                            created_at,
+                            url,
+                            reply_to,
+                        })
+                    },
+                )
+                .collect::<Result<Vec<_>>>()?;
+            review_threads.push(ReviewThread {
+                node_id: thread_node_id,
+                path,
+                line: sql_to_optional_u64(line, "review-thread line")?,
+                original_line: sql_to_optional_u64(original_line, "review-thread original line")?,
+                side: diff_side_from_name(&side)?,
+                is_outdated,
+                is_resolved,
+                viewer_can_reply,
+                comments,
+            });
+        }
+
+        Ok(Some(PullRequestSnapshot {
+            node_id,
+            title,
+            body,
+            url,
+            author,
+            head_sha,
+            base_sha,
+            updated_at,
+            threads: review_threads,
+        }))
     }
 
     pub fn mark_version_opened(&self, version_id: &str) -> Result<()> {
@@ -2616,6 +2841,43 @@ impl Storage {
     }
 }
 
+fn diff_side_name(side: DiffSide) -> &'static str {
+    match side {
+        DiffSide::Left => "LEFT",
+        DiffSide::Right => "RIGHT",
+    }
+}
+
+fn diff_side_from_name(value: &str) -> Result<DiffSide> {
+    match value {
+        "LEFT" => Ok(DiffSide::Left),
+        "RIGHT" => Ok(DiffSide::Right),
+        other => anyhow::bail!("invalid GitHub review diff side: {other}"),
+    }
+}
+
+fn sql_bool(value: bool) -> i64 {
+    i64::from(value)
+}
+
+fn sql_ordinal(value: usize) -> Result<i64> {
+    i64::try_from(value).context("GitHub review item ordinal exceeds SQLite integer range")
+}
+
+fn sql_optional_u64(value: Option<u64>, field: &str) -> Result<Option<i64>> {
+    value
+        .map(|value| {
+            i64::try_from(value).with_context(|| format!("{field} exceeds SQLite integer range"))
+        })
+        .transpose()
+}
+
+fn sql_to_optional_u64(value: Option<i64>, field: &str) -> Result<Option<u64>> {
+    value
+        .map(|value| u64::try_from(value).with_context(|| format!("stored {field} is negative")))
+        .transpose()
+}
+
 pub fn now() -> String {
     Utc::now().to_rfc3339()
 }
@@ -2635,6 +2897,7 @@ mod tests {
         DeliveryState, EphemeralSessionRecord, PendingChat, Placement, Repo, SessionRecord,
         Version, VersionKind, WorkItem,
     };
+    use rq_tui_github_review::{DiffSide, PullRequestSnapshot, ReviewComment, ReviewThread};
 
     fn seed_status_annotation(storage: &Storage) {
         storage
@@ -2702,6 +2965,49 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    fn snapshot(suffix: &str) -> PullRequestSnapshot {
+        PullRequestSnapshot {
+            node_id: format!("PR_{suffix}"),
+            title: format!("Review {suffix}"),
+            body: format!("## Summary\nSnapshot {suffix}"),
+            url: format!("https://github.com/acme/rev/pull/{suffix}"),
+            author: "octocat".into(),
+            head_sha: format!("head-{suffix}"),
+            base_sha: format!("base-{suffix}"),
+            updated_at: format!("2026-07-{suffix}T00:00:00Z"),
+            threads: vec![ReviewThread {
+                node_id: format!("thread-{suffix}"),
+                path: "src/lib.rs".into(),
+                line: Some(42),
+                original_line: Some(40),
+                side: DiffSide::Right,
+                is_outdated: suffix == "old",
+                is_resolved: false,
+                viewer_can_reply: true,
+                comments: vec![
+                    ReviewComment {
+                        node_id: format!("comment-{suffix}-1"),
+                        database_id: Some(99),
+                        author: "reviewer".into(),
+                        body: "Could this keep the old behavior?".into(),
+                        created_at: "2026-07-30T00:00:00Z".into(),
+                        url: "https://github.com/acme/rev/pull/1#discussion_r99".into(),
+                        reply_to: None,
+                    },
+                    ReviewComment {
+                        node_id: format!("comment-{suffix}-2"),
+                        database_id: None,
+                        author: "author".into(),
+                        body: "Yes; I added a compatibility test.".into(),
+                        created_at: "2026-07-30T01:00:00Z".into(),
+                        url: "https://github.com/acme/rev/pull/1#discussion_r100".into(),
+                        reply_to: Some(format!("comment-{suffix}-1")),
+                    },
+                ],
+            }],
+        }
     }
 
     #[test]
@@ -2827,13 +3133,19 @@ mod tests {
                      'prune_operations_one_unfinished_per_work_item',
                      'prune_targets_operation_state',
                      'rev_question_sessions',
-                     'rev_question_sessions_state'
+                     'rev_question_sessions_state',
+                     'pull_request_snapshots',
+                     'pull_request_review_threads',
+                     'pull_request_review_comments',
+                     'pull_request_snapshots_node',
+                     'pull_request_review_threads_location',
+                     'pull_request_review_comments_thread'
                    )",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 26);
+        assert_eq!(count, 32);
         let ephemeral_column: i64 = storage
             .connection
             .query_row(
@@ -2844,6 +3156,82 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ephemeral_column, 1);
+    }
+
+    #[test]
+    fn pull_request_snapshot_round_trips_threads_comments_and_outdated_state() {
+        let storage = Storage::in_memory().unwrap();
+        seed_status_annotation(&storage);
+        let expected = snapshot("old");
+
+        assert!(storage
+            .pull_request_snapshot("status-version")
+            .unwrap()
+            .is_none());
+        storage
+            .upsert_pull_request_snapshot("status-version", &expected)
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .pull_request_snapshot("status-version")
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn pull_request_snapshots_are_replaced_per_version_and_retained_in_history() {
+        let storage = Storage::in_memory().unwrap();
+        seed_status_annotation(&storage);
+        storage
+            .upsert_version(&Version {
+                id: "status-version-2".into(),
+                repo_id: "status-repo".into(),
+                version_num: 1,
+                kind: VersionKind::Remote,
+                created_at: "later".into(),
+                head_sha: "head-new".into(),
+                worktree_path: None,
+                last_opened_at: None,
+            })
+            .unwrap();
+        let original = snapshot("old");
+        let newer = snapshot("new");
+        storage
+            .upsert_pull_request_snapshot("status-version", &original)
+            .unwrap();
+        storage
+            .upsert_pull_request_snapshot("status-version-2", &newer)
+            .unwrap();
+
+        let mut replacement = snapshot("replacement");
+        replacement.threads.clear();
+        storage
+            .upsert_pull_request_snapshot("status-version", &replacement)
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .pull_request_snapshot("status-version")
+                .unwrap()
+                .unwrap(),
+            replacement
+        );
+        assert_eq!(
+            storage
+                .pull_request_snapshot("status-version-2")
+                .unwrap()
+                .unwrap(),
+            newer
+        );
+
+        storage.delete_version("status-version-2").unwrap();
+        assert!(storage
+            .pull_request_snapshot("status-version-2")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
