@@ -18,6 +18,8 @@ pub(crate) use rq_tui_text::markdown;
 pub(crate) mod process_control;
 pub(crate) mod prune;
 pub(crate) mod remote;
+pub(crate) mod rev;
+pub(crate) mod rev_ui;
 pub(crate) mod review_stream;
 pub(crate) mod storage;
 pub(crate) use rq_tui_text::terminal_text;
@@ -66,4 +68,8 @@ pub fn run() -> Result<()> {
             Ok(())
         }
     }
+}
+
+pub fn run_rev() -> Result<()> {
+    crate::rev::run()
 }

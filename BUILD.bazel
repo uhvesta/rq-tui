@@ -12,6 +12,12 @@ alias(
     visibility = ["//visibility:private"],
 )
 
+alias(
+    name = "rev",
+    actual = "//src:rev",
+    visibility = ["//visibility:private"],
+)
+
 sh_test(
     name = "bootstrap_bazelisk_test",
     srcs = ["tests/bootstrap_bazelisk_test.sh"],

@@ -7,5 +7,6 @@
 mod storage;
 
 pub use storage::{
-    now, PruneOperation, PruneTarget, ReviewHistoryItem, SideSessionRecord, Storage,
+    now, PruneOperation, PruneTarget, RevQuestionSession, ReviewHistoryItem, SideSessionRecord,
+    Storage,
 };

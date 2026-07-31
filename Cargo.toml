@@ -3,6 +3,14 @@ name = "rq-tui"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "rq-tui"
+path = "src/main.rs"
+
+[[bin]]
+name = "rev"
+path = "src/rev_main.rs"
+
 [workspace]
 resolver = "2"
 members = ["crates/app", "crates/domain", "crates/storage", "crates/tui_text"]

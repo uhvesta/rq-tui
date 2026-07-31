@@ -112,6 +112,44 @@ impl CommentExport {
         message
     }
 
+    /// A paste-ready request for an agentic coding session. Unlike the compact
+    /// SDK delivery summary, this retains the selected source context so the
+    /// receiving agent can verify every requested change.
+    pub(crate) fn structured_agent_prompt(&self) -> String {
+        let mut prompt = format!(
+            "Address the following code-review feedback for workspace \"{}\".\n\
+             Preserve unrelated behavior, inspect the referenced code before editing, and \
+             report how each item was resolved.\n",
+            self.work_item_name
+        );
+        for (index, comment) in self.comments.iter().enumerate() {
+            let marker = if comment.outdated {
+                " [outdated anchor; re-verify]"
+            } else if comment.ambiguous {
+                " [re-anchored; verify location]"
+            } else {
+                ""
+            };
+            let _ = write!(
+                prompt,
+                "\n{}. Repository: {}\n\
+                 File: {}\n\
+                 Lines: {}-{}{}\n\
+                 Feedback: {}\n\
+                 Selected code:\n```text\n{}\n```\n",
+                index + 1,
+                comment.repo,
+                comment.file.display(),
+                comment.line_start,
+                comment.line_end,
+                marker,
+                comment.text,
+                comment.anchor_snippet,
+            );
+        }
+        prompt
+    }
+
     pub(crate) fn render(&self, format: ExportFormat) -> Result<String> {
         match format {
             ExportFormat::Json => Ok(serde_json::to_string_pretty(self)?),
@@ -127,7 +165,7 @@ impl CommentExport {
             .with_context(|| format!("cannot write {}", path.display()))
     }
 
-    fn markdown(&self) -> String {
+    pub(crate) fn markdown(&self) -> String {
         let mut output = format!(
             "# Code review: {}\n\nGenerated: {}\n",
             self.work_item_name, self.generated_at
@@ -224,7 +262,7 @@ impl ReviewArchive {
             .with_context(|| format!("cannot write {}", path.display()))
     }
 
-    fn markdown(&self) -> String {
+    pub(crate) fn markdown(&self) -> String {
         let mut output = format!(
             "# Review archive: {}\n\nGenerated: {}\n",
             self.work_item_name, self.generated_at

@@ -18,6 +18,7 @@ pub const MIGRATION_4: &str = include_str!("../migrations/0004_ephemeral_session
 pub const MIGRATION_5: &str = include_str!("../migrations/0005_prune_journal.sql");
 pub const MIGRATION_6: &str = include_str!("../migrations/0006_outbox_metadata.sql");
 pub const MIGRATION_7: &str = include_str!("../migrations/0007_session_ephemeral.sql");
+pub const MIGRATION_8: &str = include_str!("../migrations/0008_rev_question_sessions.sql");
 
 pub struct Storage {
     connection: Connection,
@@ -31,6 +32,18 @@ pub struct ReviewHistoryItem {
     pub last_opened_at: String,
     pub versions: usize,
     pub annotations: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevQuestionSession {
+    pub annotation_id: String,
+    pub session_id: String,
+    pub model_id: String,
+    pub reasoning_effort: Option<String>,
+    pub context_tier: Option<String>,
+    pub state: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,6 +170,7 @@ impl Storage {
             (5, MIGRATION_5),
             (6, MIGRATION_6),
             (7, MIGRATION_7),
+            (8, MIGRATION_8),
         ] {
             let applied = tx
                 .query_row(
@@ -252,6 +266,78 @@ impl Storage {
         self.connection
             .execute("DELETE FROM work_items WHERE id = ?1", [work_item_id])?;
         Ok(())
+    }
+
+    /// Remove review artifacts while retaining the workspace and repository
+    /// metadata needed to open it again immediately.
+    pub fn clear_review_history(&self, work_item_id: &str) -> Result<()> {
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM annotations
+             WHERE repo_id IN (SELECT id FROM repos WHERE work_item_id = ?1)",
+            [work_item_id],
+        )?;
+        tx.execute(
+            "DELETE FROM chat_outbox WHERE work_item_id = ?1",
+            [work_item_id],
+        )?;
+        tx.execute(
+            "DELETE FROM contexts WHERE work_item_id = ?1",
+            [work_item_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn upsert_rev_question_session(&self, session: &RevQuestionSession) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO rev_question_sessions(
+                annotation_id, session_id, model_id, reasoning_effort,
+                context_tier, state, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(annotation_id) DO UPDATE SET
+                session_id = excluded.session_id,
+                model_id = excluded.model_id,
+                reasoning_effort = excluded.reasoning_effort,
+                context_tier = excluded.context_tier,
+                state = excluded.state,
+                updated_at = excluded.updated_at",
+            params![
+                session.annotation_id,
+                session.session_id,
+                session.model_id,
+                session.reasoning_effort,
+                session.context_tier,
+                session.state,
+                session.created_at,
+                session.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn rev_question_session(&self, annotation_id: &str) -> Result<Option<RevQuestionSession>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT annotation_id, session_id, model_id, reasoning_effort,
+                        context_tier, state, created_at, updated_at
+                 FROM rev_question_sessions WHERE annotation_id = ?1",
+                [annotation_id],
+                |row| {
+                    Ok(RevQuestionSession {
+                        annotation_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        model_id: row.get(2)?,
+                        reasoning_effort: row.get(3)?,
+                        context_tier: row.get(4)?,
+                        state: row.get(5)?,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     pub fn work_item_by_root(&self, root: &Path) -> Result<Option<WorkItem>> {
@@ -2197,8 +2283,8 @@ mod tests {
     use std::thread;
 
     use super::{
-        SideSessionRecord, Storage, MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4,
-        MIGRATION_5, MIGRATION_6,
+        RevQuestionSession, SideSessionRecord, Storage, MIGRATION_1, MIGRATION_2, MIGRATION_3,
+        MIGRATION_4, MIGRATION_5, MIGRATION_6,
     };
     use rq_tui_domain::{
         AnchorSide, Annotation, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState,
@@ -2226,13 +2312,15 @@ mod tests {
                      'ephemeral_sessions_work_item_created',
                      'sessions_work_item_ephemeral',
                      'prune_operations_one_unfinished_per_work_item',
-                     'prune_targets_operation_state'
+                     'prune_targets_operation_state',
+                     'rev_question_sessions',
+                     'rev_question_sessions_state'
                    )",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 24);
+        assert_eq!(count, 26);
         let ephemeral_column: i64 = storage
             .connection
             .query_row(
@@ -2731,12 +2819,12 @@ mod tests {
         let count: i64 = storage
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7)",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6, 7, 8)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 7);
+        assert_eq!(count, 8);
     }
 
     #[test]
@@ -2772,7 +2860,7 @@ mod tests {
         let migrations_applied: i64 = storage
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (5, 6, 7)",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (5, 6, 7, 8)",
                 [],
                 |row| row.get(0),
             )
@@ -2787,7 +2875,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migrations_applied, 3);
+        assert_eq!(migrations_applied, 4);
         assert_eq!(tables, 2);
     }
 
@@ -3323,5 +3411,34 @@ mod tests {
         );
         assert!(storage.append_ask_message_delta("missing", "lost").is_err());
         assert!(storage.update_ask_message_text("missing", "lost").is_err());
+
+        let question_session = RevQuestionSession {
+            annotation_id: "annotation".into(),
+            session_id: "copilot-question-1".into(),
+            model_id: "gpt-5".into(),
+            reasoning_effort: Some("high".into()),
+            context_tier: Some("large".into()),
+            state: "ready".into(),
+            created_at: "now".into(),
+            updated_at: "later".into(),
+        };
+        storage
+            .upsert_rev_question_session(&question_session)
+            .unwrap();
+        assert_eq!(
+            storage.rev_question_session("annotation").unwrap(),
+            Some(question_session)
+        );
+
+        storage.clear_review_history("work").unwrap();
+        assert!(storage
+            .annotation_by_id("annotation")
+            .unwrap()
+            .is_none());
+        assert!(storage
+            .rev_question_session("annotation")
+            .unwrap()
+            .is_none());
+        assert!(storage.work_item_by_id("work").unwrap().is_some());
     }
 }

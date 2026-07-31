@@ -30,7 +30,7 @@ RUNTIME_DEPS = crate_deps([
 
 PROC_MACRO_DEPS = crate_deps(["async-trait"], package_name = "")
 
-LIB_SRCS = glob(["**/*.rs"], exclude = ["main.rs"])
+LIB_SRCS = glob(["**/*.rs"], exclude = ["main.rs", "rev_main.rs"])
 
 rust_library(
     name = "rq_tui_lib",
@@ -59,6 +59,14 @@ rust_binary(
     visibility = ["//:__pkg__"],
 )
 
+rust_binary(
+    name = "rev",
+    srcs = ["rev_main.rs"],
+    edition = "2021",
+    deps = [":rq_tui_lib"],
+    visibility = ["//:__pkg__"],
+)
+
 rust_test(
     name = "rq_tui_tests",
     srcs = LIB_SRCS,
@@ -78,6 +86,7 @@ rust_clippy_test(
     name = "clippy_test",
     targets = [
         ":rq-tui",
+        ":rev",
         ":rq_tui_lib",
         ":rq_tui_tests",
     ],
@@ -88,6 +97,7 @@ rustfmt_test(
     name = "rustfmt_test",
     targets = [
         ":rq-tui",
+        ":rev",
         ":rq_tui_lib",
         ":rq_tui_tests",
     ],
