@@ -97,10 +97,6 @@ impl PrReference {
         )
     }
 
-    pub(crate) fn gh_selector(&self) -> String {
-        format!("{}/{}#{}", self.owner, self.repo, self.number)
-    }
-
     pub(crate) fn cache_relative_path(&self) -> PathBuf {
         PathBuf::from(&self.owner)
             .join(&self.repo)
@@ -119,7 +115,7 @@ pub(crate) struct PrMetadata {
     pub(crate) merged_at: Option<String>,
     pub(crate) updated_at: String,
     pub(crate) base_ref_name: String,
-    pub(crate) head_ref_oid: String,
+    pub(crate) head_ref_name: String,
 }
 
 pub(crate) trait ProcessRunner {
@@ -157,13 +153,16 @@ impl Default for RemoteResolver<SystemProcessRunner> {
 
 impl<R: ProcessRunner> RemoteResolver<R> {
     pub(crate) fn metadata(&self, reference: &PrReference) -> Result<PrMetadata> {
-        let output = self.runner.output(Command::new("gh").args([
-            "pr",
-            "view",
-            &reference.gh_selector(),
-            "--json",
-            "number,title,body,url,state,mergedAt,updatedAt,baseRefName,headRefOid",
-        ]))?;
+        let output = self.runner.output(
+            Command::new("gh")
+                .args(["pr", "view"])
+                .arg(reference.number.to_string())
+                .args(["--repo", &format!("{}/{}", reference.owner, reference.repo)])
+                .args([
+                    "--json",
+                    "number,title,body,url,state,mergedAt,updatedAt,baseRefName,headRefName",
+                ]),
+        )?;
         ensure_success("gh pr view", &output)?;
         serde_json::from_slice(&output.stdout).context("invalid PR metadata from gh")
     }
@@ -556,7 +555,7 @@ fn write_remote_metadata(root: &Path, metadata: &[PrMetadata]) -> Result<()> {
                 entry.url,
                 entry.state,
                 entry.base_ref_name,
-                entry.head_ref_oid,
+                entry.head_ref_name,
             ),
         )?;
     }
@@ -656,7 +655,7 @@ mod tests {
                 "mergedAt": null,
                 "updatedAt": "2026-07-29T10:11:12Z",
                 "baseRefName": "main",
-                "headRefOid": "abc123"
+                "headRefName": "fix-ordering"
             }"#,
         )
         .unwrap();
