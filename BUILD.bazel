@@ -54,6 +54,20 @@ sh_test(
     visibility = ["//visibility:private"],
 )
 
+sh_test(
+    name = "rev_pty_smoke_test",
+    srcs = ["tests/rev_pty_smoke_test.sh"],
+    data = [
+        ":rev",
+        "tests/pty_smoke.py",
+        "tests/rev_pty_smoke.py",
+    ],
+    deps = ["@rules_shell//shell/runfiles"],
+    tags = ["local", "pty"],
+    timeout = "short",
+    visibility = ["//visibility:private"],
+)
+
 test_suite(
     name = "rq_tui_tests",
     tests = [
@@ -63,6 +77,7 @@ test_suite(
         ":bootstrap_bazelisk_test",
         ":non_tty_cli_test",
         ":rev_non_tty_cli_test",
+        ":rev_pty_smoke_test",
         ":pty_smoke_test",
         "//src:clippy_test",
         "//src:rq_tui_tests",
