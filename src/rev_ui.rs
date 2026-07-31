@@ -263,9 +263,11 @@ struct RevState {
     files: Vec<(usize, usize)>,
     file_index: usize,
     row_cursor: usize,
+    review_scroll: usize,
     review_viewport_height: usize,
     terminal_height: usize,
     file_row_cursors: HashMap<usize, usize>,
+    file_review_scrolls: HashMap<usize, usize>,
     visual_anchor: Option<usize>,
     visual_row_anchor: Option<usize>,
     pending_yank: bool,
@@ -274,6 +276,9 @@ struct RevState {
     command: CommandPalette,
     branch_candidates: Vec<String>,
     original_context: HashSet<String>,
+    original_files: HashMap<String, DiffFile>,
+    show_comments: bool,
+    show_questions: bool,
     compose_target: Option<ComposeTarget>,
     compose: String,
     compose_cursor: usize,
@@ -358,14 +363,28 @@ impl RevState {
             .into_iter()
             .collect::<Vec<_>>();
         let original_context = context_keys(&workspace);
+        let original_files = workspace
+            .repos
+            .iter()
+            .flat_map(|repo| {
+                repo.diff.files.iter().map(move |file| {
+                    (
+                        review_file_key(&repo.record.id, file.path()),
+                        file.clone(),
+                    )
+                })
+            })
+            .collect();
         Ok(Self {
             workspace,
             files,
             file_index: 0,
             row_cursor: 0,
+            review_scroll: 0,
             review_viewport_height: 1,
             terminal_height: 9,
             file_row_cursors: HashMap::new(),
+            file_review_scrolls: HashMap::new(),
             visual_anchor: None,
             visual_row_anchor: None,
             pending_yank: false,
@@ -374,6 +393,9 @@ impl RevState {
             command: CommandPalette::default(),
             branch_candidates,
             original_context,
+            original_files,
+            show_comments: true,
+            show_questions: true,
             compose_target: None,
             compose: String::new(),
             compose_cursor: 0,
@@ -455,8 +477,15 @@ impl RevState {
         }
         self.file_row_cursors
             .insert(self.file_index, self.row_cursor);
+        self.file_review_scrolls
+            .insert(self.file_index, self.review_scroll);
         self.file_index = target;
         self.row_cursor = self.file_row_cursors.get(&target).copied().unwrap_or(0);
+        self.review_scroll = self
+            .file_review_scrolls
+            .get(&target)
+            .copied()
+            .unwrap_or(0);
         self.visual_anchor = None;
         self.visual_row_anchor = None;
         self.pending_yank = false;
@@ -839,7 +868,21 @@ fn page_move(state: &mut RevState, highlighter: &mut dyn Highlighter, direction:
     };
     let signed = direction.saturating_mul(review_step as isize);
     match state.mode {
-        RevMode::Normal | RevMode::Visual => move_row(state, highlighter, signed),
+        RevMode::Normal | RevMode::Visual => {
+            let old_cursor = state.row_cursor;
+            let old_scroll = state.review_scroll;
+            move_row(state, highlighter, signed);
+            let moved = state.row_cursor.abs_diff(old_cursor);
+            if direction > 0 {
+                let count = row_count(state, highlighter);
+                let max_scroll = count.saturating_sub(state.review_viewport_height);
+                state.review_scroll = old_scroll.saturating_add(moved).min(max_scroll);
+            } else {
+                state.review_scroll = old_scroll.saturating_sub(moved);
+            }
+            state.status =
+                "Moved cursor and viewport by half a page · Ctrl-D/Ctrl-U move down/up".into();
+        }
         RevMode::Compose => {
             let step = review_step.min(u16::MAX as usize) as u16;
             if direction > 0 {
@@ -1038,7 +1081,9 @@ fn handle_review_key(
             }
         }
         KeyCode::Char('r') => {
-            if let Some(id) = current_annotation_id(state, highlighter) {
+            if state.mode == RevMode::Visual && state.visual_anchor.is_some() {
+                retract_selected_context(state, highlighter)?;
+            } else if let Some(id) = current_annotation_id(state, highlighter) {
                 begin_resolve(state, id);
             } else {
                 state.mode = RevMode::History;
@@ -1746,11 +1791,13 @@ fn handle_command_key(
             }
         }
         KeyCode::Enter => {
+            let typed = state.command.input.trim();
             let command = candidates
-                .get(state.command.selected)
-                .filter(|_| !candidates.is_empty())
+                .iter()
+                .find(|candidate| candidate.as_str() == typed)
                 .cloned()
-                .unwrap_or_else(|| state.command.input.trim().to_owned());
+                .or_else(|| candidates.get(state.command.selected).cloned())
+                .unwrap_or_else(|| typed.to_owned());
             execute_command(state, storage, paths, &command)?;
         }
         KeyCode::Backspace => {
@@ -1807,14 +1854,19 @@ fn command_candidates(state: &RevState) -> Vec<String> {
         "expand below".to_owned(),
         "export feedback".to_owned(),
         "help".to_owned(),
+        "hide comments".to_owned(),
+        "hide questions".to_owned(),
         "history".to_owned(),
         "model".to_owned(),
         "model reset".to_owned(),
         "questions".to_owned(),
         "refresh".to_owned(),
+        "retract all".to_owned(),
         "render markdown".to_owned(),
         "render markdown close".to_owned(),
         "clear".to_owned(),
+        "show comments".to_owned(),
+        "show questions".to_owned(),
         "q".to_owned(),
         "quit".to_owned(),
     ];
@@ -1893,6 +1945,38 @@ fn execute_command(
             state.mode = RevMode::Normal;
             expand_hunk_edge(state, false)?;
         }
+        "hide comments" => {
+            state.show_comments = false;
+            state.invalidate_rows();
+            state.mode = RevMode::Normal;
+            state.status =
+                "Comments hidden from the diff · they remain saved · :show comments restores them"
+                    .into();
+        }
+        "show comments" => {
+            state.show_comments = true;
+            state.invalidate_rows();
+            state.mode = RevMode::Normal;
+            state.status = "Comments are visible in the diff".into();
+        }
+        "hide questions" => {
+            state.show_questions = false;
+            state.invalidate_rows();
+            state.mode = RevMode::Normal;
+            state.status =
+                "Questions hidden from the diff · threads remain saved · :show questions restores them"
+                    .into();
+        }
+        "show questions" => {
+            state.show_questions = true;
+            state.invalidate_rows();
+            state.mode = RevMode::Normal;
+            state.status = "Questions are visible in the diff".into();
+        }
+        "retract all" => {
+            state.mode = RevMode::Normal;
+            retract_all_context(state)?;
+        }
         "export feedback" | "feedback" | "export" => {
             state.mode = RevMode::Normal;
             copy_feedback_prompt(state, storage)?;
@@ -1969,6 +2053,8 @@ fn execute_command(
             }
             let workspace_root = state.workspace.item.workspace_root.clone();
             let layout = state.diff_layout;
+            let show_comments = state.show_comments;
+            let show_questions = state.show_questions;
             let mut selected_repo = state
                 .current_repo()
                 .map(|repo| repo.record.clone())
@@ -1986,6 +2072,8 @@ fn execute_command(
             };
             let mut replacement = RevState::load(workspace, storage)?;
             replacement.diff_layout = layout;
+            replacement.show_comments = show_comments;
+            replacement.show_questions = show_questions;
             replacement.status =
                 format!("Diff base for {} changed to {branch}", selected_repo.name);
             *state = replacement;
@@ -2414,6 +2502,112 @@ fn context_key(repo_id: &str, path: &Path, line: &DiffLine) -> String {
         line.old_line,
         line.new_line
     )
+}
+
+fn review_file_key(repo_id: &str, path: &Path) -> String {
+    format!("{repo_id}\0{}", path.display())
+}
+
+fn retract_selected_context(
+    state: &mut RevState,
+    highlighter: &mut dyn Highlighter,
+) -> Result<()> {
+    let (start, end) = selected_source_range(state, highlighter)
+        .context("select source lines before retracting expanded context")?;
+    let (repo_index, file_index) = state.current_indices().context("no current file")?;
+    let repo = &state.workspace.repos[repo_index];
+    let file = &repo.diff.files[file_index];
+    let selected = file
+        .visible_lines()
+        .enumerate()
+        .filter(|(index, line)| {
+            (start..=end).contains(index) && is_expanded_context(state, line)
+        })
+        .map(|(_, line)| diff_line_identity(line))
+        .collect::<HashSet<_>>();
+    if selected.is_empty() {
+        state.status =
+            "The selection contains no gray expanded context · changed diff lines were retained"
+                .into();
+        return Ok(());
+    }
+    rebuild_file_without_expanded_lines(state, repo_index, file_index, &selected)?;
+    state.visual_anchor = None;
+    state.visual_row_anchor = None;
+    state.mode = RevMode::Normal;
+    state.invalidate_rows();
+    state.status = format!(
+        "Retracted {} expanded context line(s) · changed and original diff lines were retained",
+        selected.len()
+    );
+    Ok(())
+}
+
+fn rebuild_file_without_expanded_lines(
+    state: &mut RevState,
+    repo_index: usize,
+    file_index: usize,
+    removed: &HashSet<(u8, Option<usize>, Option<usize>)>,
+) -> Result<()> {
+    let repo = &state.workspace.repos[repo_index];
+    let current = &repo.diff.files[file_index];
+    let file_key = review_file_key(&repo.record.id, current.path());
+    let mut rebuilt = state
+        .original_files
+        .get(&file_key)
+        .cloned()
+        .context("original diff snapshot is unavailable")?;
+    let retained = current
+        .visible_lines()
+        .filter(|line| is_expanded_context(state, line))
+        .filter(|line| !removed.contains(&diff_line_identity(line)))
+        .cloned()
+        .collect::<Vec<_>>();
+    for line in retained {
+        let old_start = line.old_line.unwrap_or(0);
+        let new_start = line.new_line.unwrap_or(0);
+        rebuilt.hunks.push(Hunk {
+            header: format!("@@ -{old_start},1 +{new_start},1 @@"),
+            old_start,
+            old_count: usize::from(line.old_line.is_some()),
+            new_start,
+            new_count: usize::from(line.new_line.is_some()),
+            lines: vec![line],
+        });
+    }
+    rebuilt.hunks.sort_by_key(|hunk| (hunk.new_start, hunk.old_start));
+    merge_touching_hunks(&mut rebuilt.hunks);
+    state.workspace.repos[repo_index].diff.files[file_index] = rebuilt;
+    Ok(())
+}
+
+fn retract_all_context(state: &mut RevState) -> Result<()> {
+    let mut restored = 0usize;
+    for repo in &mut state.workspace.repos {
+        for file in &mut repo.diff.files {
+            let key = review_file_key(&repo.record.id, file.path());
+            let Some(original) = state.original_files.get(&key) else {
+                continue;
+            };
+            if file != original {
+                *file = original.clone();
+                restored += 1;
+            }
+        }
+    }
+    state.visual_anchor = None;
+    state.visual_row_anchor = None;
+    state.row_cursor = 0;
+    state.review_scroll = 0;
+    state.file_row_cursors.clear();
+    state.file_review_scrolls.clear();
+    state.invalidate_rows();
+    state.status = if restored == 0 {
+        "No expanded context is currently visible".into()
+    } else {
+        format!("Retracted expanded context in {restored} file(s)")
+    };
+    Ok(())
 }
 
 fn handle_compose_key(
@@ -4112,6 +4306,10 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
         .iter()
         .filter(|(annotation, _)| {
             annotation.status == AnnotationStatus::Active
+                && match annotation.kind {
+                    AnnotationKind::Comment => state.show_comments,
+                    AnnotationKind::Ask => state.show_questions,
+                }
                 && annotation.repo_id == repo.record.id
                 && annotation.file_path.to_string_lossy() == file_path
         })
@@ -4453,11 +4651,18 @@ fn render_review(
     state.clamp_cursor(rows.len());
     let viewport = inner.height.max(1) as usize;
     state.review_viewport_height = viewport;
-    let start = state
-        .row_cursor
-        .saturating_add(1)
-        .saturating_sub(viewport)
-        .min(rows.len().saturating_sub(viewport));
+    let max_start = rows.len().saturating_sub(viewport);
+    state.review_scroll = state.review_scroll.min(max_start);
+    if state.row_cursor < state.review_scroll {
+        state.review_scroll = state.row_cursor;
+    } else if state.row_cursor >= state.review_scroll.saturating_add(viewport) {
+        state.review_scroll = state
+            .row_cursor
+            .saturating_add(1)
+            .saturating_sub(viewport)
+            .min(max_start);
+    }
+    let start = state.review_scroll;
     let source_selection = state
         .visual_anchor
         .zip(current_source_index_from_rows(&rows, state.row_cursor))
@@ -4493,9 +4698,16 @@ fn render_review(
             end.saturating_sub(start) + 1
         )
     } else {
+        let hidden = match (state.show_comments, state.show_questions) {
+            (true, true) => String::new(),
+            (false, true) => " · comments hidden".into(),
+            (true, false) => " · questions hidden".into(),
+            (false, false) => " · annotations hidden".into(),
+        };
         format!(
-            " review · {} · j/k bounded · Ctrl-D/U half-page · h/l files · t files · v select ",
-            state.diff_layout.label()
+            " review · {}{} · j/k bounded · Ctrl-D/U half-page · h/l files · t files · v select ",
+            state.diff_layout.label(),
+            hidden
         )
     };
     frame.render_widget(
@@ -4894,13 +5106,15 @@ fn markdown_content_identity(state: &RevState, path: &Path) -> String {
             .unwrap_or_default()
     });
     format!(
-        "{}\0{}\0{}\0{}\0{}",
+        "{}\0{}\0{}\0{}\0{}\0{}\0{}",
         state
             .current_repo()
             .map_or("", |repo| repo.version.id.as_str()),
         path.display(),
         state.annotations.len(),
         state.rows_revision,
+        state.show_comments,
+        state.show_questions,
         file_stamp
     )
 }
@@ -4932,6 +5146,10 @@ fn browser_markdown_state(
                 if annotation.repo_id != repo.record.id
                     || annotation.file_path != file.display_path
                     || annotation.status != AnnotationStatus::Active
+                    || match annotation.kind {
+                        AnnotationKind::Comment => !state.show_comments,
+                        AnnotationKind::Ask => !state.show_questions,
+                    }
                 {
                     continue;
                 }
@@ -6956,6 +7174,8 @@ fn seed_snapshot_feedback(state: &mut RevState) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
@@ -6966,12 +7186,13 @@ mod tests {
         close_questions, current_item_yank_text, execute_command, finish_active_question,
         handle_agent_event, handle_compose_key, handle_file_picker_key, handle_help_key,
         handle_history_key, handle_key, handle_question_key, handle_review_key, help_lines,
-        is_expandable_fold, markdown_sides, merge_touching_hunks, open_file_picker, open_questions,
-        page_move, question_ids, queue_question_launch, render, render_snapshot, row_count,
+        is_expandable_fold, markdown_sides, merge_touching_hunks, move_row, open_file_picker,
+        open_questions, page_move, question_ids, queue_question_launch,
+        rebuild_file_without_expanded_lines, render, render_snapshot, review_file_key, row_count,
         seed_snapshot_feedback, seed_snapshot_questions, snapshot_workspace, split_highlight_side,
         split_source_lines, style_split_side, visual_selection_yank_text, ComposeTarget,
         ModelPicker, PendingSend, PickerScope, PickerStage, QuestionLaunch, RevAgentSlot,
-        RevDiffLayout, RevMode, RevState,
+        RevDiffLayout, RevMode, RevRowKind, RevState,
     };
     use crate::config::AppPaths;
     use crate::copilot::{
@@ -8914,6 +9135,116 @@ mod tests {
         assert_eq!(
             terminal.backend().buffer()[(1, 3)].bg,
             Color::Rgb(38, 38, 38)
+        );
+    }
+
+    #[test]
+    fn hide_commands_filter_inline_items_without_deleting_history() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        seed_snapshot_feedback(&mut state);
+        seed_snapshot_questions(&mut state);
+        let total = state.annotations.len();
+        let paths = test_paths("rev-hide-inline");
+        let mut highlighter = PlainHighlighter;
+
+        execute_command(&mut state, &storage, &paths, "hide comments").unwrap();
+        let rows = build_rows(&state, 80, &mut highlighter);
+        assert!(!rows.iter().any(|row| {
+            matches!(
+                &row.kind,
+                RevRowKind::Annotation { annotation_id, .. }
+                    if annotation_id == "feedback-architecture"
+            )
+        }));
+        assert!(rows.iter().any(|row| {
+            matches!(
+                &row.kind,
+                RevRowKind::Annotation { annotation_id, .. }
+                    if annotation_id == "question-architecture"
+            )
+        }));
+
+        execute_command(&mut state, &storage, &paths, "hide questions").unwrap();
+        assert!(!build_rows(&state, 80, &mut highlighter)
+            .iter()
+            .any(|row| matches!(row.kind, RevRowKind::Annotation { .. })));
+        assert_eq!(state.annotations.len(), total);
+        assert_eq!(question_ids(&state).len(), 2);
+
+        execute_command(&mut state, &storage, &paths, "show comments").unwrap();
+        execute_command(&mut state, &storage, &paths, "show questions").unwrap();
+        assert!(build_rows(&state, 80, &mut highlighter)
+            .iter()
+            .any(|row| matches!(row.kind, RevRowKind::Annotation { .. })));
+    }
+
+    #[test]
+    fn review_viewport_moves_only_after_the_cursor_crosses_an_edge() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        let mut highlighter = PlainHighlighter;
+        let mut terminal = Terminal::new(TestBackend::new(80, 9)).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        assert_eq!(state.review_scroll, 0);
+        let viewport = state.review_viewport_height;
+        for _ in 1..viewport {
+            move_row(&mut state, &mut highlighter, 1);
+            terminal
+                .draw(|frame| render(frame, &mut state, &mut highlighter))
+                .unwrap();
+            assert_eq!(state.review_scroll, 0);
+        }
+        move_row(&mut state, &mut highlighter, 1);
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        assert_eq!(state.review_scroll, 1);
+        move_row(&mut state, &mut highlighter, -1);
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        assert_eq!(state.review_scroll, 1);
+    }
+
+    #[test]
+    fn retract_restores_original_diff_and_never_removes_changed_lines() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        let hunk = &mut state.workspace.repos[0].diff.files[0].hunks[0];
+        hunk.lines.insert(
+            0,
+            DiffLine {
+                kind: LineKind::Context,
+                old_line: Some(9),
+                new_line: Some(9),
+                content: "expanded".into(),
+            },
+        );
+        hunk.old_start = 9;
+        hunk.new_start = 9;
+        hunk.old_count += 1;
+        hunk.new_count += 1;
+        let removed = HashSet::from([(0, Some(9), Some(9))]);
+
+        rebuild_file_without_expanded_lines(&mut state, 0, 0, &removed).unwrap();
+        let file = &state.workspace.repos[0].diff.files[0];
+        assert!(!file.visible_lines().any(|line| line.content == "expanded"));
+        assert!(file
+            .visible_lines()
+            .any(|line| line.kind == LineKind::Addition));
+        assert_eq!(
+            file,
+            state
+                .original_files
+                .get(&review_file_key("rev-snapshot-repo", file.path()))
+                .unwrap()
         );
     }
 
