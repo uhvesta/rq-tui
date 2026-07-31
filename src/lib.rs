@@ -5,6 +5,7 @@ pub(crate) mod app;
 pub(crate) use rq_tui_text::chat_render;
 pub(crate) use rq_tui_text::chat_selection;
 pub(crate) mod cli;
+pub(crate) mod cmux;
 pub(crate) mod config;
 #[allow(dead_code)] // Bounded model slice; UI/storage integration follows separately.
 pub(crate) mod context_editor;

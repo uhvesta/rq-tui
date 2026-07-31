@@ -20,10 +20,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use similar::{ChangeTag, TextDiff};
 use uuid::Uuid;
 
 use crate::annotations::{anchor_from_diff, create_local_annotation, AnnotationRequest};
-use crate::chat_render::render_markdown_mapped;
+use crate::chat_render::{render_markdown_mapped, CellSource, MappedRow};
+use crate::cmux::MarkdownSurface;
 use crate::config::AppPaths;
 use crate::copilot::{
     start_agent, AgentCommand, AgentEvent, AgentRuntime, BridgeConfig, ModelOption, ModelSelection,
@@ -267,6 +269,15 @@ struct RevState {
     history_delete_armed: Option<String>,
     refresh: Option<Receiver<Result<ResolvedWorkItem>>>,
     refresh_started: Option<Instant>,
+    markdown_preview: bool,
+    markdown_scroll: usize,
+    cmux_markdown: Option<MarkdownSurface>,
+    cmux_open: Option<Receiver<Result<Option<MarkdownSurface>>>>,
+    cmux_preview_path: Option<PathBuf>,
+    markdown_sync_key: Option<String>,
+    markdown_content_key: Option<String>,
+    markdown_sides_cache: Option<MarkdownSides>,
+    markdown_render_cache: Option<MarkdownRenderCache>,
 }
 
 impl RevState {
@@ -352,6 +363,15 @@ impl RevState {
             history_delete_armed: None,
             refresh: None,
             refresh_started: None,
+            markdown_preview: false,
+            markdown_scroll: 0,
+            cmux_markdown: None,
+            cmux_open: None,
+            cmux_preview_path: None,
+            markdown_sync_key: None,
+            markdown_content_key: None,
+            markdown_sides_cache: None,
+            markdown_render_cache: None,
         })
     }
 
@@ -454,6 +474,16 @@ pub(crate) fn run(workspace: ResolvedWorkItem, storage: &Storage, paths: &AppPat
     )
     .ok();
     terminal.show_cursor().ok();
+    if let Some(receiver) = state.cmux_open.take() {
+        eprintln!("rev · waiting for pending cmux Markdown pane before cleanup");
+        if let Ok(Ok(Some(surface))) = receiver.recv_timeout(Duration::from_secs(4)) {
+            surface.close_detached().ok();
+        }
+    }
+    if let Some(surface) = state.cmux_markdown.take() {
+        surface.close_detached().ok();
+    }
+    remove_cmux_preview_file(&mut state);
     result
 }
 
@@ -547,6 +577,11 @@ fn run_loop<B: Backend>(
     loop {
         drain_refresh(state, storage)?;
         drain_agent_events(state, storage, paths)?;
+        drain_cmux_preview(state);
+        if let Err(error) = sync_markdown_preview(state, paths) {
+            state.status =
+                format!("Terminal Markdown preview active · cmux sync failed: {error:#}");
+        }
         terminal.draw(|frame| render(frame, state, highlighter))?;
         if state.status == "quit" {
             return Ok(());
@@ -767,6 +802,7 @@ fn handle_review_key(
         KeyCode::Char('k') | KeyCode::Up => move_row(state, highlighter, -1),
         KeyCode::Char('h') | KeyCode::Left => state.move_file(false),
         KeyCode::Char('l') | KeyCode::Right => state.move_file(true),
+        KeyCode::Char('M') => toggle_markdown_preview(state, paths)?,
         KeyCode::Char('g') | KeyCode::Home => state.row_cursor = 0,
         KeyCode::Char('G') | KeyCode::End => {
             let count = row_count(state, highlighter);
@@ -1542,6 +1578,8 @@ fn command_candidates(state: &RevState) -> Vec<String> {
         "model".to_owned(),
         "questions".to_owned(),
         "refresh".to_owned(),
+        "render markdown".to_owned(),
+        "render markdown close".to_owned(),
         "clear".to_owned(),
         "q".to_owned(),
         "quit".to_owned(),
@@ -1623,6 +1661,20 @@ fn execute_command(
         "refresh" => {
             state.mode = RevMode::Normal;
             start_refresh(state, paths)?;
+        }
+        "render markdown" | "render-markdown" | "markdown" => {
+            state.mode = RevMode::Normal;
+            if !state.markdown_preview {
+                toggle_markdown_preview(state, paths)?;
+            } else {
+                state.status =
+                    "Rendered Markdown preview is already open · M toggles · file changes sync"
+                        .into();
+            }
+        }
+        "render markdown close" | "render-markdown close" => {
+            state.mode = RevMode::Normal;
+            close_markdown_preview(state);
         }
         "clear" => {
             state.mode = RevMode::ConfirmClear;
@@ -1769,8 +1821,16 @@ fn drain_refresh(state: &mut RevState, storage: &Storage) -> Result<()> {
             }
             let selected = state.current_file().map(|file| file.path().to_path_buf());
             let layout = state.diff_layout;
+            let markdown_preview = state.markdown_preview;
+            let cmux_markdown = state.cmux_markdown.take();
+            let cmux_open = state.cmux_open.take();
+            let cmux_preview_path = state.cmux_preview_path.take();
             let mut replacement = RevState::load(workspace, storage)?;
             replacement.diff_layout = layout;
+            replacement.markdown_preview = markdown_preview;
+            replacement.cmux_markdown = cmux_markdown;
+            replacement.cmux_open = cmux_open;
+            replacement.cmux_preview_path = cmux_preview_path;
             if let Some(selected) = selected {
                 if let Some(index) = replacement.files.iter().position(|(repo, file)| {
                     replacement.workspace.repos[*repo].diff.files[*file].path() == selected
@@ -1822,14 +1882,26 @@ fn expand_hunk_edge(state: &mut RevState, above: bool) -> Result<()> {
         })
         .context("current row is not part of a hunk")?;
     let repo_path = repo.record.path.clone();
-    let revision = repo.version.head_sha.clone();
+    let working_root = repo
+        .version
+        .worktree_path
+        .clone()
+        .unwrap_or_else(|| repo_path.clone());
+    let old_revision = repo
+        .record
+        .remote_pr_url
+        .as_deref()
+        .and_then(|url| PrReference::parse(url).ok())
+        .map(|reference| format!("refs/rq-tui/pr/{}/base", reference.number))
+        .unwrap_or_else(|| repo.version.head_sha.clone());
     let file_path = file.display_path.clone();
-    let working = std::fs::read_to_string(repo_path.join(&file_path))
-        .or_else(|_| Git::default().file_at_revision(&repo_path, &revision, &file_path))?;
+    let working = std::fs::read_to_string(working_root.join(&file_path)).or_else(|_| {
+        Git::default().file_at_revision(&repo_path, &repo.version.head_sha, &file_path)
+    })?;
     let old = Git::default()
         .file_at_revision(
             &repo_path,
-            &revision,
+            &old_revision,
             file.old_path.as_deref().unwrap_or(&file_path),
         )
         .unwrap_or_else(|_| working.clone());
@@ -3557,7 +3629,23 @@ fn render_workspace_panes(
 ) {
     let tree = state.file_tree_open;
     let questions = state.questions_open;
-    if tree && questions && area.width >= 108 {
+    if state.markdown_preview && !tree && !questions {
+        if area.width >= 80 {
+            let panes = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .split(area);
+            render_review(frame, state, panes[0], highlighter);
+            render_markdown_diff_preview(frame, state, panes[1], highlighter);
+        } else {
+            let panes = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+            render_review(frame, state, panes[0], highlighter);
+            render_markdown_diff_preview(frame, state, panes[1], highlighter);
+        }
+    } else if tree && questions && area.width >= 108 {
         let panes = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -3737,6 +3825,609 @@ fn render_review(
     frame.render_widget(Paragraph::new(Text::from(visible)), inner);
 }
 
+#[derive(Clone)]
+struct MarkdownSides {
+    old: String,
+    new: String,
+}
+
+struct MarkdownRenderCache {
+    key: String,
+    rows: Vec<RenderedMarkdownRow>,
+}
+
+#[derive(Clone)]
+struct RenderedMarkdownRow {
+    line: Line<'static>,
+    side: Option<AnchorSide>,
+    source_line: Option<usize>,
+}
+
+fn is_markdown_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "md" | "markdown" | "mdx"
+            )
+        })
+}
+
+fn markdown_sides(state: &RevState) -> Result<MarkdownSides> {
+    let (repo_index, file_index) = state.current_indices().context("no current file")?;
+    let repo = &state.workspace.repos[repo_index];
+    let file = &repo.diff.files[file_index];
+    if !is_markdown_path(file.path()) {
+        anyhow::bail!("{} is not a Markdown file", file.path().display());
+    }
+    let new_root = repo
+        .version
+        .worktree_path
+        .as_deref()
+        .unwrap_or(&repo.record.path);
+    let mut new = if file.status == FileStatus::Deleted {
+        String::new()
+    } else {
+        std::fs::read_to_string(new_root.join(&file.display_path)).unwrap_or_default()
+    };
+    let old_revision = repo
+        .record
+        .remote_pr_url
+        .as_deref()
+        .and_then(|url| PrReference::parse(url).ok())
+        .map(|reference| format!("refs/rq-tui/pr/{}/base", reference.number))
+        .unwrap_or_else(|| repo.version.head_sha.clone());
+    let old_path = file.old_path.as_deref().unwrap_or(&file.display_path);
+    let mut old = if file.status == FileStatus::Added {
+        String::new()
+    } else {
+        Git::default()
+            .file_at_revision(&repo.record.path, &old_revision, old_path)
+            .unwrap_or_default()
+    };
+    if new.is_empty() && file.status != FileStatus::Deleted {
+        new = file
+            .visible_lines()
+            .filter(|line| !matches!(line.kind, LineKind::Deletion | LineKind::Meta))
+            .map(|line| line.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    if old.is_empty() && file.status != FileStatus::Added {
+        old = file
+            .visible_lines()
+            .filter(|line| !matches!(line.kind, LineKind::Addition | LineKind::Meta))
+            .map(|line| line.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    Ok(MarkdownSides { old, new })
+}
+
+fn toggle_markdown_preview(state: &mut RevState, paths: &AppPaths) -> Result<()> {
+    if state.markdown_preview {
+        close_markdown_preview(state);
+        return Ok(());
+    }
+    markdown_sides(state)?;
+    state.markdown_preview = true;
+    state.markdown_scroll = 0;
+    state.markdown_sync_key = None;
+    sync_markdown_preview(state, paths)?;
+    state.status = if state.cmux_markdown.is_some() {
+        "MARKDOWN DIFF · synchronized terminal pane + native cmux pane · M closes".into()
+    } else if state.cmux_open.is_some() {
+        "MARKDOWN DIFF · terminal pane ready · opening native cmux pane in background…".into()
+    } else {
+        "MARKDOWN DIFF · synchronized terminal pane · run inside cmux for native Mermaid preview"
+            .into()
+    };
+    Ok(())
+}
+
+fn close_markdown_preview(state: &mut RevState) {
+    state.markdown_preview = false;
+    state.markdown_sync_key = None;
+    state.markdown_content_key = None;
+    state.markdown_sides_cache = None;
+    state.markdown_render_cache = None;
+    if let Some(surface) = state.cmux_markdown.take() {
+        spawn_cmux_close(surface);
+    }
+    if state.cmux_open.is_none() {
+        remove_cmux_preview_file(state);
+    }
+    state.status = "Rendered Markdown preview closed · cmux cleanup running in background".into();
+}
+
+fn spawn_cmux_close(surface: MarkdownSurface) {
+    std::thread::spawn(move || {
+        surface.close().ok();
+    });
+}
+
+fn remove_cmux_preview_file(state: &mut RevState) {
+    if let Some(path) = state.cmux_preview_path.take() {
+        std::fs::remove_file(path).ok();
+    }
+}
+
+fn drain_cmux_preview(state: &mut RevState) {
+    let Some(receiver) = state.cmux_open.as_ref() else {
+        return;
+    };
+    let result = match receiver.try_recv() {
+        Ok(result) => result,
+        Err(TryRecvError::Empty) => return,
+        Err(TryRecvError::Disconnected) => {
+            state.cmux_open = None;
+            if state.markdown_preview {
+                state.status =
+                    "Terminal Markdown preview active · cmux opener stopped unexpectedly".into();
+            }
+            return;
+        }
+    };
+    state.cmux_open = None;
+    match result {
+        Ok(Some(surface)) if state.markdown_preview => {
+            state.cmux_markdown = Some(surface);
+            state.status =
+                "MARKDOWN DIFF · native cmux pane ready · navigation keeps it synchronized".into();
+        }
+        Ok(Some(surface)) => {
+            spawn_cmux_close(surface);
+            remove_cmux_preview_file(state);
+        }
+        Ok(None) if state.markdown_preview => {
+            state.status =
+                "MARKDOWN DIFF · terminal preview active · cmux context not detected".into();
+        }
+        Ok(None) => {}
+        Err(error) if state.markdown_preview => {
+            state.status =
+                format!("Terminal Markdown preview active · cmux pane unavailable: {error:#}");
+        }
+        Err(_) => {}
+    }
+    if !state.markdown_preview && state.cmux_open.is_none() {
+        remove_cmux_preview_file(state);
+    }
+}
+
+fn focused_diff_line(state: &RevState) -> Option<&DiffLine> {
+    match &state
+        .render_cache
+        .as_ref()?
+        .rows
+        .get(state.row_cursor)?
+        .kind
+    {
+        RevRowKind::Source { line, .. } => Some(line),
+        RevRowKind::Annotation {
+            anchor_visible_index,
+            ..
+        } => state
+            .current_file()?
+            .visible_lines()
+            .nth(*anchor_visible_index),
+    }
+}
+
+fn sync_markdown_preview(state: &mut RevState, paths: &AppPaths) -> Result<()> {
+    if !state.markdown_preview {
+        return Ok(());
+    }
+    let Some(path) = state.current_file().map(|file| file.path().to_path_buf()) else {
+        state.markdown_preview = false;
+        state.markdown_sync_key = None;
+        state.markdown_content_key = None;
+        state.markdown_sides_cache = None;
+        state.markdown_render_cache = None;
+        if let Some(surface) = state.cmux_markdown.take() {
+            spawn_cmux_close(surface);
+        }
+        if state.cmux_open.is_none() {
+            remove_cmux_preview_file(state);
+        }
+        state.status = "Markdown preview closed · refreshed revision has no changed files".into();
+        return Ok(());
+    };
+    if !is_markdown_path(&path) {
+        state.markdown_preview = false;
+        state.markdown_content_key = None;
+        state.markdown_sides_cache = None;
+        state.markdown_render_cache = None;
+        if let Some(surface) = state.cmux_markdown.take() {
+            spawn_cmux_close(surface);
+        }
+        if state.cmux_open.is_none() {
+            remove_cmux_preview_file(state);
+        }
+        state.status =
+            "Rendered Markdown preview closed because the selected file is not Markdown".into();
+        return Ok(());
+    }
+    let focus = focused_diff_line(state)
+        .and_then(|line| line.new_line.or(line.old_line))
+        .unwrap_or(1);
+    let content_key = markdown_content_identity(state, &path);
+    if state.markdown_content_key.as_deref() != Some(&content_key) {
+        state.markdown_sides_cache = Some(markdown_sides(state)?);
+        state.markdown_content_key = Some(content_key.clone());
+        state.markdown_render_cache = None;
+    }
+    let key = format!("{content_key}\0{focus}");
+    if state.markdown_sync_key.as_deref() == Some(&key) {
+        return Ok(());
+    }
+    state.markdown_sync_key = Some(key);
+    if !MarkdownSurface::available() {
+        return Ok(());
+    }
+    let sides = state
+        .markdown_sides_cache
+        .as_ref()
+        .context("Markdown content cache was not initialized")?;
+    let document = cmux_markdown_document(state, sides, focus);
+    let directory = paths.cache.join("previews");
+    std::fs::create_dir_all(&directory)?;
+    let preview_path = directory.join(format!(
+        "{}-{}-review.md",
+        state.workspace.item.id,
+        std::process::id()
+    ));
+    let temporary = preview_path.with_extension(format!("md.next-{}", Uuid::new_v4()));
+    std::fs::write(&temporary, document)?;
+    std::fs::rename(&temporary, &preview_path)?;
+    state.cmux_preview_path = Some(preview_path.clone());
+    if state.cmux_markdown.is_none() && state.cmux_open.is_none() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker_path = preview_path.clone();
+        std::thread::spawn(move || {
+            sender.send(MarkdownSurface::open(&worker_path)).ok();
+        });
+        state.cmux_open = Some(receiver);
+    }
+    Ok(())
+}
+
+fn markdown_content_identity(state: &RevState, path: &Path) -> String {
+    let file_stamp = state.current_repo().map_or_else(String::new, |repo| {
+        let root = repo
+            .version
+            .worktree_path
+            .as_deref()
+            .unwrap_or(&repo.record.path);
+        std::fs::metadata(root.join(path))
+            .ok()
+            .map(|metadata| format!("{}:{:?}", metadata.len(), metadata.modified().ok()))
+            .unwrap_or_default()
+    });
+    format!(
+        "{}\0{}\0{}\0{}\0{}",
+        state
+            .current_repo()
+            .map_or("", |repo| repo.version.id.as_str()),
+        path.display(),
+        state.annotations.len(),
+        state.rows_revision,
+        file_stamp
+    )
+}
+
+fn cmux_markdown_document(state: &RevState, sides: &MarkdownSides, focus: usize) -> String {
+    let path = state
+        .current_file()
+        .map(|file| file.path().display().to_string())
+        .unwrap_or_else(|| "Markdown".into());
+    let mut output = format!(
+        "# Rendered review: `{path}`\n\n> Synchronized review focus: source line **{focus}**. \
+         Green/red source changes and review notes follow the rendered revisions.\n\n\
+         ## Current rendered revision\n\n{}\n\n## Previous rendered revision\n\n{}\n\n\
+         ## Source diff\n\n```diff\n",
+        sides.new, sides.old
+    );
+    if let Some(file) = state.current_file() {
+        for line in file.visible_lines() {
+            let marker = match line.kind {
+                LineKind::Addition => "+",
+                LineKind::Deletion => "-",
+                LineKind::Context => " ",
+                LineKind::Meta => "@",
+            };
+            output.push_str(marker);
+            output.push_str(&line.content);
+            output.push('\n');
+        }
+    }
+    output.push_str("```\n\n## Review notes\n\n");
+    let mut count = 0;
+    if let Some(repo) = state.current_repo() {
+        if let Some(file) = state.current_file() {
+            for (annotation, placement) in &state.annotations {
+                if annotation.repo_id != repo.record.id || annotation.file_path != file.display_path
+                {
+                    continue;
+                }
+                count += 1;
+                let text = annotation.text.as_deref().unwrap_or("Question thread");
+                output.push_str(&format!(
+                    "- **{} lines {}–{}:** {}\n",
+                    annotation.kind.as_str(),
+                    placement.line_start,
+                    placement.line_end,
+                    text
+                ));
+            }
+        }
+    }
+    if count == 0 {
+        output.push_str("- No comments or questions on this file yet.\n");
+    }
+    output
+}
+
+fn render_markdown_diff_preview(
+    frame: &mut Frame,
+    state: &mut RevState,
+    area: Rect,
+    highlighter: &mut dyn Highlighter,
+) {
+    let block = Block::default()
+        .title(" Markdown diff · sync · M close · Mermaid ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if state.markdown_sides_cache.is_none() {
+        let Ok(sides) = markdown_sides(state) else {
+            frame.render_widget(Paragraph::new("Unable to load Markdown revisions"), inner);
+            return;
+        };
+        state.markdown_sides_cache = Some(sides);
+    }
+    let render_key = format!(
+        "{}:{}",
+        state.markdown_content_key.as_deref().unwrap_or("snapshot"),
+        inner.width
+    );
+    if state
+        .markdown_render_cache
+        .as_ref()
+        .is_none_or(|cache| cache.key != render_key)
+    {
+        let sides = state
+            .markdown_sides_cache
+            .as_ref()
+            .expect("Markdown sides were initialized");
+        let rows =
+            rendered_markdown_diff(&sides.old, &sides.new, inner.width as usize, highlighter);
+        let rows = decorate_markdown_annotations(state, rows, inner.width as usize);
+        state.markdown_render_cache = Some(MarkdownRenderCache {
+            key: render_key,
+            rows,
+        });
+    }
+    let focus = focused_diff_line(state).and_then(|line| {
+        line.new_line
+            .map(|line| (AnchorSide::New, line))
+            .or_else(|| line.old_line.map(|line| (AnchorSide::Old, line)))
+    });
+    let viewport = inner.height.max(1) as usize;
+    let rows = &state
+        .markdown_render_cache
+        .as_ref()
+        .expect("Markdown render cache was initialized")
+        .rows;
+    let focused_row = focus.and_then(|(side, line)| {
+        rows.iter()
+            .position(|row| row.side == Some(side) && row.source_line == Some(line))
+    });
+    let start = focused_row
+        .unwrap_or(state.markdown_scroll)
+        .saturating_sub(viewport / 3)
+        .min(rows.len().saturating_sub(viewport));
+    state.markdown_scroll = start;
+    let visible = rows
+        .iter()
+        .skip(start)
+        .take(viewport)
+        .map(|row| row.line.clone())
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+fn decorate_markdown_annotations(
+    state: &RevState,
+    rows: Vec<RenderedMarkdownRow>,
+    width: usize,
+) -> Vec<RenderedMarkdownRow> {
+    let mut rendered = Vec::with_capacity(rows.len() + 8);
+    let mut shown_annotations = HashSet::new();
+    let current_repo_id = state.current_repo().map(|repo| repo.record.id.as_str());
+    let current_path = state.current_file().map(|file| file.display_path.as_path());
+    for row in rows {
+        let side = row.side;
+        let source_line = row.source_line;
+        rendered.push(row);
+        let (Some(side), Some(source_line), Some(repo_id), Some(path)) =
+            (side, source_line, current_repo_id, current_path)
+        else {
+            continue;
+        };
+        for (annotation, placement) in &state.annotations {
+            if annotation.repo_id != repo_id
+                || annotation.file_path != path
+                || placement.side != side
+                || placement.line_end != source_line as i64
+                || !shown_annotations.insert(annotation.id.clone())
+            {
+                continue;
+            }
+            let text = annotation.text.as_deref().unwrap_or_else(|| {
+                state
+                    .threads
+                    .get(&annotation.id)
+                    .and_then(|thread| thread.iter().find(|message| message.role == "user"))
+                    .map_or("Question thread", |message| message.text.as_str())
+            });
+            rendered.push(RenderedMarkdownRow {
+                line: Line::styled(
+                    format!(
+                        "╰─ {} L{}–{} · {}",
+                        annotation.kind.as_str(),
+                        placement.line_start,
+                        placement.line_end,
+                        fit_text(text, width.saturating_sub(18))
+                    ),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                side: None,
+                source_line: None,
+            });
+        }
+    }
+    if let (Some(repo_id), Some(path)) = (current_repo_id, current_path) {
+        for (annotation, placement) in &state.annotations {
+            if annotation.repo_id != repo_id
+                || annotation.file_path != path
+                || !shown_annotations.insert(annotation.id.clone())
+            {
+                continue;
+            }
+            rendered.push(RenderedMarkdownRow {
+                line: Line::styled(
+                    format!(
+                        "╰─ {} L{}–{} · source-only anchor",
+                        annotation.kind.as_str(),
+                        placement.line_start,
+                        placement.line_end
+                    ),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                side: None,
+                source_line: None,
+            });
+        }
+    }
+    rendered
+}
+
+fn rendered_markdown_diff(
+    old_source: &str,
+    new_source: &str,
+    width: usize,
+    highlighter: &mut dyn Highlighter,
+) -> Vec<RenderedMarkdownRow> {
+    let old = render_markdown_mapped(old_source, width.max(1), highlighter);
+    let new = render_markdown_mapped(new_source, width.max(1), highlighter);
+    let old_text = old.rows.iter().map(mapped_row_text).collect::<Vec<_>>();
+    let new_text = new.rows.iter().map(mapped_row_text).collect::<Vec<_>>();
+    let old_refs = old_text.iter().map(String::as_str).collect::<Vec<_>>();
+    let new_refs = new_text.iter().map(String::as_str).collect::<Vec<_>>();
+    let diff = TextDiff::from_slices(&old_refs, &new_refs);
+    let mut rows = Vec::new();
+    for change in diff.iter_all_changes() {
+        let (line, side, source_line, style) = match change.tag() {
+            ChangeTag::Delete => {
+                let index = change.old_index().unwrap_or(0);
+                (
+                    old.rows[index].line.clone(),
+                    Some(AnchorSide::Old),
+                    mapped_row_source_line(&old.rows[index], old_source),
+                    Style::default().bg(Color::Rgb(63, 30, 34)),
+                )
+            }
+            ChangeTag::Insert => {
+                let index = change.new_index().unwrap_or(0);
+                (
+                    new.rows[index].line.clone(),
+                    Some(AnchorSide::New),
+                    mapped_row_source_line(&new.rows[index], new_source),
+                    Style::default().bg(Color::Rgb(20, 58, 42)),
+                )
+            }
+            ChangeTag::Equal => {
+                let index = change.new_index().unwrap_or(0);
+                (
+                    new.rows[index].line.clone(),
+                    Some(AnchorSide::New),
+                    mapped_row_source_line(&new.rows[index], new_source),
+                    Style::default(),
+                )
+            }
+        };
+        rows.push(RenderedMarkdownRow {
+            line: line.style(style),
+            side,
+            source_line,
+        });
+    }
+    if old_source != new_source {
+        rows.push(RenderedMarkdownRow {
+            line: Line::styled(
+                "── source/markup changes ──",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            side: None,
+            source_line: None,
+        });
+        for change in TextDiff::from_lines(old_source, new_source).iter_all_changes() {
+            let (marker, side, source_line, style) = match change.tag() {
+                ChangeTag::Delete => (
+                    "-",
+                    Some(AnchorSide::Old),
+                    change.old_index().map(|index| index + 1),
+                    Style::default().bg(Color::Rgb(63, 30, 34)),
+                ),
+                ChangeTag::Insert => (
+                    "+",
+                    Some(AnchorSide::New),
+                    change.new_index().map(|index| index + 1),
+                    Style::default().bg(Color::Rgb(20, 58, 42)),
+                ),
+                ChangeTag::Equal => continue,
+            };
+            rows.push(RenderedMarkdownRow {
+                line: Line::from(format!("{marker} {}", change.value().trim_end())).style(style),
+                side,
+                source_line,
+            });
+        }
+    }
+    rows
+}
+
+fn mapped_row_text(row: &MappedRow) -> String {
+    row.line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+fn mapped_row_source_line(row: &MappedRow, source: &str) -> Option<usize> {
+    let offset = row.cells.iter().find_map(|cell| match &cell.source {
+        CellSource::Text(range) | CellSource::Decoration(range) => Some(range.start),
+        CellSource::Synthetic => None,
+    })?;
+    Some(
+        source[..offset.min(source.len())]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1,
+    )
+}
+
 fn render_help(frame: &mut Frame, state: &mut RevState, area: Rect) {
     let block = Block::default()
         .title(" help · j/k/↑/↓ scroll · PgUp/PgDn · g/G · Esc close · q questions ")
@@ -3848,6 +4539,10 @@ fn help_lines() -> Vec<Line<'static>> {
             "e",
             "copy the structured feedback prompt using native clipboard or OSC 52",
         ),
+        key(
+            "M",
+            "toggle a synchronized rendered Markdown diff; cmux opens a native right pane",
+        ),
         key("y / n", "confirm or cancel clearing saved review history"),
         key(":", "open the command palette"),
         key(":q / :quit", "quit; plain q never exits"),
@@ -3920,6 +4615,14 @@ fn help_lines() -> Vec<Line<'static>> {
         key(":help", "open this shortcut and command reference"),
         key(":diff unified", "render one full-width diff stream"),
         key(":diff split", "render old and new sides in two columns"),
+        key(
+            ":render markdown",
+            "open the rendered Markdown diff and native cmux/Mermaid preview",
+        ),
+        key(
+            ":render markdown close",
+            "close the rendered preview and only the cmux surface rev owns",
+        ),
         key(":expand above", "reveal five lines above the active hunk"),
         key(":expand below", "reveal five lines below the active hunk"),
         key(
@@ -4776,6 +5479,12 @@ pub(crate) fn render_snapshot(width: u16, height: u16, snapshot: &str) -> Result
     match snapshot {
         "review" => {}
         "split" => state.diff_layout = RevDiffLayout::Split,
+        "markdown" => {
+            state.file_index = 1;
+            state.markdown_preview = true;
+            state.status =
+                "MARKDOWN DIFF · synchronized terminal preview · cmux supports Mermaid".into();
+        }
         "expanded" => {
             let hunk = &mut state.workspace.repos[0].diff.files[0].hunks[0];
             let mut context = (5..10)
@@ -5128,16 +5837,16 @@ mod tests {
         finish_active_question, handle_agent_event, handle_compose_key, handle_file_picker_key,
         handle_help_key, handle_history_key, handle_key, handle_question_key, handle_review_key,
         help_lines, merge_touching_hunks, open_file_picker, open_questions, queue_question_launch,
-        render, render_snapshot, row_count, seed_snapshot_feedback, seed_snapshot_questions,
-        snapshot_workspace, visual_selection_yank_text, ComposeTarget, ModelPicker, PendingSend,
-        QuestionLaunch, RevAgentSlot, RevMode, RevState,
+        render, render_snapshot, rendered_markdown_diff, row_count, seed_snapshot_feedback,
+        seed_snapshot_questions, snapshot_workspace, visual_selection_yank_text, ComposeTarget,
+        ModelPicker, PendingSend, QuestionLaunch, RevAgentSlot, RevMode, RevState,
     };
     use crate::config::AppPaths;
     use crate::copilot::{
         AgentCommand, AgentEvent, AgentRuntime, AgentSink, ModelOption, ModelSelection,
     };
     use crate::diff::{parse_unified, DiffLine, Hunk, LineKind};
-    use crate::domain::AnnotationKind;
+    use crate::domain::{AnchorSide, AnnotationKind};
     use crate::highlight::PlainHighlighter;
     use crate::storage::{RevQuestionSession, Storage};
 
@@ -5153,6 +5862,52 @@ mod tests {
         fn try_recv(&self) -> Option<AgentEvent> {
             None
         }
+    }
+
+    #[test]
+    fn rendered_markdown_diff_preserves_semantics_and_source_lines() {
+        let mut highlighter = PlainHighlighter;
+        let rows = rendered_markdown_diff(
+            "# Guide\n\n- old\n",
+            "# Guide\n\n- new\n\n```mermaid\ngraph TD\n  A --> B\n```\n",
+            60,
+            &mut highlighter,
+        );
+        let text = rows
+            .iter()
+            .map(|row| {
+                row.line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Guide"));
+        assert!(text.contains("• old"));
+        assert!(text.contains("• new"));
+        assert!(text.contains("graph TD"));
+        assert!(rows
+            .iter()
+            .any(|row| row.side == Some(AnchorSide::Old) && row.source_line == Some(3)));
+        assert!(rows
+            .iter()
+            .any(|row| row.side == Some(AnchorSide::New) && row.source_line == Some(3)));
+    }
+
+    #[test]
+    fn markdown_snapshot_is_agent_inspectable() {
+        let frame = render_snapshot(120, 30, "markdown").unwrap();
+        assert!(frame.contains("Markdown diff"));
+        assert!(frame.contains("Demo"));
+        assert!(frame.contains("Use the file tree."));
+        assert!(frame.contains("Mermaid"));
+
+        let narrow = render_snapshot(60, 20, "markdown").unwrap();
+        assert!(narrow.contains("Markdown diff"));
+        assert!(narrow.contains("Use the file tree."));
+        assert!(narrow.contains("review · unified"));
     }
 
     fn test_paths(name: &str) -> AppPaths {

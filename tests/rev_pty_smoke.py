@@ -68,6 +68,21 @@ def main() -> int:
                 timeout=4,
             )
 
+            child.send(b"h")
+            child.wait_for_screen("README.md", timeout=4)
+            child.send(b"M")
+            child.wait_for_screen_state(
+                required=("Markdown diff", "baseline", "changed", "Mermaid"),
+                forbidden=(),
+                timeout=4,
+            )
+            child.send(b"M")
+            child.wait_for_screen_state(
+                required=("README.md", "NORMAL"),
+                forbidden=("Markdown diff",),
+                timeout=4,
+            )
+
             child.send(b":q\r")
             status = child.wait_for_exit(timeout=8)
             if status != 0:
@@ -84,7 +99,7 @@ def main() -> int:
 
     print(
         "REV_PTY_SMOKE_OK: tree-live-preview enter-and-t-return "
-        "q-questions command-only-quit"
+        "q-questions markdown-diff command-only-quit"
     )
     return 0
 

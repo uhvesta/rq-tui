@@ -65,15 +65,21 @@ initializes the TUI.
 
 ## Focused `rev` CLI
 
-`rev` is the smaller local-review surface. Bare `rev` prints help; only
-`rev PATH` or `rev review PATH` opens a TUI. Every question owns an isolated
+`rev` is the smaller review surface. Bare `rev` prints help; only
+`rev PATH_OR_PR_URL` or `rev review PATH_OR_PR_URL` opens a TUI. A GitHub URL
+is fetched into an isolated `owner/repository/pr-N` cache with a complete
+worktree so context expansion works the same way as a local review. Every
+question owns an isolated
 Copilot session and later questions wait in a visible FIFO queue instead of
 blocking input or replacing a session that is still starting.
 
 ```sh
 bazel run //:rev -- .
 bazel run //:rev -- review . --base origin/main
+bazel run //:rev -- https://github.com/acme/api/pull/482
+bazel run //:rev -- refresh https://github.com/acme/api/pull/482
 bazel run //:rev -- history .
+bazel run //:rev -- history https://github.com/acme/api/pull/482
 bazel run //:rev -- feedback .
 bazel run //:rev -- export . --output feedback.md
 bazel run //:rev -- clear . --yes
@@ -102,11 +108,21 @@ explicit edit-feedback alias.
 `Shift+Down` reveals five below. Revealed context has a muted gray background,
 and overlapping expansions merge into one continuous region.
 
+On a Markdown diff, `M` or `:render markdown` opens a synchronized rendered
+Markdown diff beside the source. Rendered additions/deletions retain green/red
+diff styling, source-line comments and questions appear as inline callouts,
+and navigation keeps the rendered view aligned to the active source line.
+When `rev` is running inside cmux, it also opens cmux's native watched Markdown
+surface as a right split without stealing focus. That surface uses cmux's
+bundled syntax highlighter and Mermaid renderer; `M` or
+`:render markdown close` closes only the surface owned by `rev`. Outside cmux,
+the deterministic terminal pane remains the fallback.
+
 Press `:` for a scrollable palette. `:help` opens a scrollable reference for
 every mode, shortcut, and command. The palette also includes `diff unified`, `diff split`,
 `expand above`, `expand below`, `base <ref>` with local branch/ref
 autocomplete for the current repository, `export feedback`, `history`,
-`questions`, `model`, `clear`, and `quit`. In a question follow-up composer,
+`questions`, `model`, `refresh`, `render markdown`, `clear`, and `quit`. In a question follow-up composer,
 `/clear` erases only that thread and detaches its old Copilot context; the next
 `a` starts it fresh with the staged model picker. `a` asks, `c` records or
 edits feedback, `v` selects source rows,
@@ -124,6 +140,7 @@ Deterministic states can be inspected without a TTY or production data:
 ```sh
 bazel run //:rev -- ui-snapshot --state review --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state split --width 100 --height 28
+bazel run //:rev -- ui-snapshot --state markdown --width 120 --height 30
 bazel run //:rev -- ui-snapshot --state expanded --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state files --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state panes --width 140 --height 30
