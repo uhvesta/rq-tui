@@ -263,6 +263,8 @@ struct RevState {
     files: Vec<(usize, usize)>,
     file_index: usize,
     row_cursor: usize,
+    review_viewport_height: usize,
+    terminal_height: usize,
     file_row_cursors: HashMap<usize, usize>,
     visual_anchor: Option<usize>,
     visual_row_anchor: Option<usize>,
@@ -307,8 +309,13 @@ struct RevState {
     refresh_started: Option<Instant>,
     markdown_preview: bool,
     markdown_scroll: usize,
+    markdown_viewport_height: usize,
+    markdown_preview_focused: bool,
+    markdown_follow_source: bool,
+    cmux_markdown_requested: bool,
     cmux_markdown: Option<MarkdownSurface>,
     cmux_open: Option<Receiver<Result<Option<MarkdownSurface>>>>,
+    cmux_close: Option<Receiver<()>>,
     cmux_preview_path: Option<PathBuf>,
     markdown_sync_key: Option<String>,
     markdown_content_key: Option<String>,
@@ -361,6 +368,8 @@ impl RevState {
             files,
             file_index: 0,
             row_cursor: 0,
+            review_viewport_height: 1,
+            terminal_height: 9,
             file_row_cursors: HashMap::new(),
             visual_anchor: None,
             visual_row_anchor: None,
@@ -409,8 +418,13 @@ impl RevState {
             refresh_started: None,
             markdown_preview: false,
             markdown_scroll: 0,
+            markdown_viewport_height: 1,
+            markdown_preview_focused: false,
+            markdown_follow_source: true,
+            cmux_markdown_requested: false,
             cmux_markdown: None,
             cmux_open: None,
+            cmux_close: None,
             cmux_preview_path: None,
             markdown_sync_key: None,
             markdown_content_key: None,
@@ -648,6 +662,10 @@ fn run_loop<B: Backend>(
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollDown => match state.mode {
+                        RevMode::Normal | RevMode::Visual if state.markdown_preview_focused => {
+                            state.markdown_follow_source = false;
+                            state.markdown_scroll = state.markdown_scroll.saturating_add(3);
+                        }
                         RevMode::Normal | RevMode::Visual => move_row(state, highlighter, 3),
                         RevMode::Compose => {
                             state.compose_scroll = state.compose_scroll.saturating_add(3)
@@ -668,6 +686,10 @@ fn run_loop<B: Backend>(
                         RevMode::ConfirmClear | RevMode::ConfirmResolve => {}
                     },
                     MouseEventKind::ScrollUp => match state.mode {
+                        RevMode::Normal | RevMode::Visual if state.markdown_preview_focused => {
+                            state.markdown_follow_source = false;
+                            state.markdown_scroll = state.markdown_scroll.saturating_sub(3);
+                        }
                         RevMode::Normal | RevMode::Visual => move_row(state, highlighter, -3),
                         RevMode::Compose => {
                             state.compose_scroll = state.compose_scroll.saturating_sub(3)
@@ -714,6 +736,31 @@ fn handle_key(
         state.agent_last_event = Instant::now();
         state.status =
             "Cancelling the active question · the UI remains responsive until it settles".into();
+        return Ok(());
+    }
+    if state.markdown_preview {
+        if state.markdown_preview_focused {
+            if handle_markdown_preview_key(state, key) {
+                return Ok(());
+            }
+        } else if key.code == KeyCode::Tab {
+            state.markdown_preview_focused = true;
+            state.markdown_follow_source = false;
+            state.status =
+                "MARKDOWN PREVIEW FOCUS · j/k or Ctrl-D/U scroll · Tab/Esc follows source again"
+                    .into();
+            return Ok(());
+        }
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('u'))
+    {
+        let direction = if key.code == KeyCode::Char('d') {
+            1
+        } else {
+            -1
+        };
+        page_move(state, highlighter, direction);
         return Ok(());
     }
     if key.code == KeyCode::Char('q')
@@ -809,6 +856,124 @@ fn handle_key(
         RevMode::Normal | RevMode::Visual => {
             handle_review_key(state, storage, paths, highlighter, key)
         }
+    }
+}
+
+fn handle_markdown_preview_key(state: &mut RevState, key: KeyEvent) -> bool {
+    let half_page = state.markdown_viewport_height.saturating_div(2).max(1);
+    let movement = match key.code {
+        KeyCode::Char('j') | KeyCode::Down => Some(1isize),
+        KeyCode::Char('k') | KeyCode::Up => Some(-1),
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(half_page as isize)
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(-(half_page as isize))
+        }
+        KeyCode::PageDown => Some(state.markdown_viewport_height.max(1) as isize),
+        KeyCode::PageUp => Some(-(state.markdown_viewport_height.max(1) as isize)),
+        _ => None,
+    };
+    if let Some(movement) = movement {
+        state.markdown_follow_source = false;
+        if movement >= 0 {
+            state.markdown_scroll = state
+                .markdown_scroll
+                .saturating_add(movement.unsigned_abs());
+        } else {
+            state.markdown_scroll = state
+                .markdown_scroll
+                .saturating_sub(movement.unsigned_abs());
+        }
+        state.status =
+            "MARKDOWN PREVIEW FOCUS · independent scroll · Tab/Esc resumes source following".into();
+        return true;
+    }
+    match key.code {
+        KeyCode::Tab | KeyCode::Esc => {
+            state.markdown_preview_focused = false;
+            state.markdown_follow_source = true;
+            state.status =
+                "MARKDOWN DIFF · source focus restored · preview follows code navigation".into();
+            true
+        }
+        KeyCode::Char('g') | KeyCode::Home => {
+            state.markdown_follow_source = false;
+            state.markdown_scroll = 0;
+            true
+        }
+        KeyCode::Char('G') | KeyCode::End => {
+            state.markdown_follow_source = false;
+            state.markdown_scroll = usize::MAX;
+            true
+        }
+        KeyCode::Char('M') => {
+            close_markdown_preview(state);
+            true
+        }
+        _ => {
+            state.status =
+                "MARKDOWN PREVIEW FOCUS · j/k, Ctrl-D/U, g/G scroll · Tab/Esc returns".into();
+            true
+        }
+    }
+}
+
+fn page_move(state: &mut RevState, highlighter: &mut dyn Highlighter, direction: isize) {
+    let review_step = match state.mode {
+        RevMode::Normal | RevMode::Visual | RevMode::Compose => {
+            state.review_viewport_height.saturating_div(2).max(1)
+        }
+        _ => state
+            .terminal_height
+            .saturating_sub(5)
+            .saturating_div(2)
+            .max(1),
+    };
+    let signed = direction.saturating_mul(review_step as isize);
+    match state.mode {
+        RevMode::Normal | RevMode::Visual => move_row(state, highlighter, signed),
+        RevMode::Compose => {
+            let step = review_step.min(u16::MAX as usize) as u16;
+            if direction > 0 {
+                state.compose_scroll = state.compose_scroll.saturating_add(step);
+            } else {
+                state.compose_scroll = state.compose_scroll.saturating_sub(step);
+            }
+            state.status = "Composer scrolled by half a page · Ctrl-D/Ctrl-U move down/up".into();
+        }
+        RevMode::History => {
+            if direction > 0 {
+                state.history_cursor = (state.history_cursor + review_step)
+                    .min(state.annotations.len().saturating_sub(1));
+            } else {
+                state.history_cursor = state.history_cursor.saturating_sub(review_step);
+            }
+        }
+        RevMode::FilePicker => move_file_picker(state, signed),
+        RevMode::Questions => move_question_cursor(state, signed),
+        RevMode::Help => {
+            if direction > 0 {
+                state.help_scroll = state
+                    .help_scroll
+                    .saturating_add(review_step.min(u16::MAX as usize) as u16);
+            } else {
+                state.help_scroll = state
+                    .help_scroll
+                    .saturating_sub(review_step.min(u16::MAX as usize) as u16);
+            }
+        }
+        RevMode::Command => {
+            let count = command_candidates(state).len();
+            if direction > 0 {
+                state.command.selected =
+                    (state.command.selected + review_step).min(count.saturating_sub(1));
+            } else {
+                state.command.selected = state.command.selected.saturating_sub(review_step);
+            }
+        }
+        RevMode::Model => move_model_picker(state, signed),
+        RevMode::ConfirmClear | RevMode::ConfirmResolve => {}
     }
 }
 
@@ -1739,6 +1904,7 @@ fn command_candidates(state: &RevState) -> Vec<String> {
         "questions".to_owned(),
         "refresh".to_owned(),
         "render markdown".to_owned(),
+        "render markdown cmux".to_owned(),
         "render markdown close".to_owned(),
         "clear".to_owned(),
         "q".to_owned(),
@@ -1839,9 +2005,24 @@ fn execute_command(
                 toggle_markdown_preview(state, paths)?;
             } else {
                 state.status =
-                    "Rendered Markdown preview is already open · M toggles · file changes sync"
+                    "Rendered Markdown diff is already open · navigation is synchronized · M closes"
                         .into();
             }
+        }
+        "render markdown cmux" | "render-markdown cmux" => {
+            state.mode = RevMode::Normal;
+            if !state.markdown_preview {
+                toggle_markdown_preview(state, paths)?;
+            }
+            state.cmux_markdown_requested = true;
+            state.markdown_sync_key = None;
+            sync_markdown_preview(state, paths)?;
+            state.status = if state.cmux_open.is_some() || state.cmux_markdown.is_some() {
+                "MARKDOWN DIFF · terminal preview stays synchronized · one optional cmux pane opening"
+                    .into()
+            } else {
+                "MARKDOWN DIFF · terminal preview active · cmux is unavailable".into()
+            };
         }
         "render markdown close" | "render-markdown close" => {
             state.mode = RevMode::Normal;
@@ -1993,14 +2174,22 @@ fn drain_refresh(state: &mut RevState, storage: &Storage) -> Result<()> {
             let selected = state.current_file().map(|file| file.path().to_path_buf());
             let layout = state.diff_layout;
             let markdown_preview = state.markdown_preview;
+            let markdown_preview_focused = state.markdown_preview_focused;
+            let markdown_follow_source = state.markdown_follow_source;
+            let cmux_markdown_requested = state.cmux_markdown_requested;
             let cmux_markdown = state.cmux_markdown.take();
             let cmux_open = state.cmux_open.take();
+            let cmux_close = state.cmux_close.take();
             let cmux_preview_path = state.cmux_preview_path.take();
             let mut replacement = RevState::load(workspace, storage)?;
             replacement.diff_layout = layout;
             replacement.markdown_preview = markdown_preview;
+            replacement.markdown_preview_focused = markdown_preview_focused;
+            replacement.markdown_follow_source = markdown_follow_source;
+            replacement.cmux_markdown_requested = cmux_markdown_requested;
             replacement.cmux_markdown = cmux_markdown;
             replacement.cmux_open = cmux_open;
+            replacement.cmux_close = cmux_close;
             replacement.cmux_preview_path = cmux_preview_path;
             if let Some(selected) = selected {
                 if let Some(index) = replacement.files.iter().position(|(repo, file)| {
@@ -3787,10 +3976,11 @@ fn move_row(state: &mut RevState, highlighter: &mut dyn Highlighter, delta: isiz
     if rows.is_empty() {
         return;
     }
+    let direction = delta.signum();
+    let steps = delta.unsigned_abs().max(1);
     if state.mode == RevMode::Visual && state.visual_row_anchor.is_none() {
-        let direction = delta.signum();
         let mut cursor = state.row_cursor;
-        for _ in 0..delta.unsigned_abs().max(1) {
+        for _ in 0..steps {
             loop {
                 let next = if direction >= 0 {
                     (cursor + 1).min(rows.len() - 1)
@@ -3935,15 +4125,25 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
     annotations.sort_by_key(|(_, placement)| (placement.line_end, placement.line_start));
     let mut rows = Vec::new();
     for (visible_index, line) in file.visible_lines().enumerate() {
-        rows.push(RevRow {
-            kind: RevRowKind::Source {
-                visible_index,
-                line: line.clone(),
-            },
-            line: None,
-            yank_text: line.content.clone(),
-            item_text: line.content.clone(),
-        });
+        let rendered_lines = match state.diff_layout {
+            RevDiffLayout::Unified => {
+                source_lines(Some(file.path()), line, visible_index, width, highlighter)
+            }
+            RevDiffLayout::Split => {
+                split_source_lines(Some(file.path()), line, visible_index, width, highlighter)
+            }
+        };
+        for rendered_line in rendered_lines {
+            rows.push(RevRow {
+                kind: RevRowKind::Source {
+                    visible_index,
+                    line: line.clone(),
+                },
+                line: Some(rendered_line),
+                yank_text: line.content.clone(),
+                item_text: line.content.clone(),
+            });
+        }
         for (annotation, placement) in annotations.iter().filter(|(_, placement)| {
             let source_line = match placement.side {
                 AnchorSide::Old => line.old_line,
@@ -4078,6 +4278,7 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
 
 fn render(frame: &mut Frame, state: &mut RevState, highlighter: &mut dyn Highlighter) {
     let area = frame.area();
+    state.terminal_height = area.height as usize;
     if area.width < 36 || area.height < 9 {
         frame.render_widget(
             Paragraph::new("rev needs at least 36×9").block(Block::default().borders(Borders::ALL)),
@@ -4251,6 +4452,7 @@ fn render_review(
     let rows = ensure_rows(state, width, highlighter).to_vec();
     state.clamp_cursor(rows.len());
     let viewport = inner.height.max(1) as usize;
+    state.review_viewport_height = viewport;
     let start = state
         .row_cursor
         .saturating_add(1)
@@ -4260,9 +4462,21 @@ fn render_review(
         .visual_anchor
         .zip(current_source_index_from_rows(&rows, state.row_cursor))
         .map(|(a, b)| (a.min(b), a.max(b)));
+    let split_selection_side = source_selection.and_then(|range| {
+        state
+            .current_file()
+            .and_then(|file| split_range_side(file, range))
+    });
+    let cursor_anchor_side = match rows.get(state.row_cursor).map(|row| &row.kind) {
+        Some(RevRowKind::Annotation { annotation_id, .. }) => state
+            .annotation(annotation_id)
+            .map(|(_, placement)| placement.side),
+        _ => None,
+    };
     let row_selection = state
         .visual_row_anchor
         .map(|anchor| (anchor.min(state.row_cursor), anchor.max(state.row_cursor)));
+    let cursor_source = current_source_index_from_rows(&rows, state.row_cursor);
     let title = if let Some((start, end)) = source_selection.filter(|_| editing_feedback) {
         format!(
             " EDIT FEEDBACK · {} original line(s) selected · Enter saves · Esc cancels ",
@@ -4280,7 +4494,7 @@ fn render_review(
         )
     } else {
         format!(
-            " review · {} · j/k bounded · h/l files · t files · v select · Shift+↑/↓ expand ",
+            " review · {} · j/k bounded · Ctrl-D/U half-page · h/l files · t files · v select ",
             state.diff_layout.label()
         )
     };
@@ -4293,29 +4507,13 @@ fn render_review(
     );
     let mut visible = Vec::new();
     for (index, row) in rows.iter().enumerate().skip(start).take(viewport) {
-        let selected = index == state.row_cursor;
-        let mut line = match &row.kind {
-            RevRowKind::Source {
-                visible_index,
-                line,
-            } => match state.diff_layout {
-                RevDiffLayout::Unified => source_line(
-                    state.current_file().map(DiffFile::path),
-                    line,
-                    *visible_index,
-                    width,
-                    highlighter,
-                ),
-                RevDiffLayout::Split => split_source_line(
-                    state.current_file().map(DiffFile::path),
-                    line,
-                    *visible_index,
-                    width,
-                    highlighter,
-                ),
-            },
-            RevRowKind::Annotation { .. } => row.line.clone().unwrap_or_default(),
-        };
+        let selected = index == state.row_cursor
+            || matches!(
+                &row.kind,
+                RevRowKind::Source { visible_index, .. }
+                    if cursor_source == Some(*visible_index)
+            );
+        let mut line = row.line.clone().unwrap_or_default();
         let expanded_context = matches!(
             &row.kind,
             RevRowKind::Source { line, .. } if is_expanded_context(state, line)
@@ -4327,11 +4525,22 @@ fn render_review(
                 RevRowKind::Annotation { .. } => false,
             } || row_selection.is_some_and(|(start, end)| (start..=end).contains(&index));
         if selected || visually_selected {
-            line = line.style(Style::default().bg(if selection_mode {
+            let selection_color = if selection_mode {
                 Color::Rgb(52, 35, 63)
             } else {
                 Color::Rgb(35, 45, 58)
-            }));
+            };
+            if state.diff_layout == RevDiffLayout::Split {
+                if let RevRowKind::Source { line: source, .. } = &row.kind {
+                    let side =
+                        split_highlight_side(source, split_selection_side, cursor_anchor_side);
+                    line = style_split_side(line, width, side, selection_color);
+                } else {
+                    line = line.style(Style::default().bg(selection_color));
+                }
+            } else {
+                line = line.style(Style::default().bg(selection_color));
+            }
         } else if expanded_context {
             line = line.style(Style::default().bg(Color::Rgb(38, 38, 38)));
         }
@@ -4428,27 +4637,28 @@ fn toggle_markdown_preview(state: &mut RevState, paths: &AppPaths) -> Result<()>
     markdown_sides(state)?;
     state.markdown_preview = true;
     state.markdown_scroll = 0;
+    state.markdown_preview_focused = false;
+    state.markdown_follow_source = true;
+    state.cmux_markdown_requested = false;
     state.markdown_sync_key = None;
     sync_markdown_preview(state, paths)?;
-    state.status = if state.cmux_markdown.is_some() {
-        "MARKDOWN DIFF · synchronized terminal pane + native cmux pane · M closes".into()
-    } else if state.cmux_open.is_some() {
-        "MARKDOWN DIFF · terminal pane ready · opening native cmux pane in background…".into()
-    } else {
-        "MARKDOWN DIFF · synchronized terminal pane · run inside cmux for native Mermaid preview"
-            .into()
-    };
+    state.status =
+        "MARKDOWN DIFF · synchronized terminal preview · M closes · :render markdown cmux is optional"
+            .into();
     Ok(())
 }
 
 fn close_markdown_preview(state: &mut RevState) {
     state.markdown_preview = false;
+    state.markdown_preview_focused = false;
+    state.markdown_follow_source = true;
+    state.cmux_markdown_requested = false;
     state.markdown_sync_key = None;
     state.markdown_content_key = None;
     state.markdown_sides_cache = None;
     state.markdown_render_cache = None;
     if let Some(surface) = state.cmux_markdown.take() {
-        spawn_cmux_close(surface);
+        state.cmux_close = Some(spawn_cmux_close(surface));
     }
     if state.cmux_open.is_none() {
         remove_cmux_preview_file(state);
@@ -4456,10 +4666,13 @@ fn close_markdown_preview(state: &mut RevState) {
     state.status = "Rendered Markdown preview closed · cmux cleanup running in background".into();
 }
 
-fn spawn_cmux_close(surface: MarkdownSurface) {
+fn spawn_cmux_close(surface: MarkdownSurface) -> Receiver<()> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         surface.close().ok();
+        sender.send(()).ok();
     });
+    receiver
 }
 
 fn remove_cmux_preview_file(state: &mut RevState) {
@@ -4469,6 +4682,18 @@ fn remove_cmux_preview_file(state: &mut RevState) {
 }
 
 fn drain_cmux_preview(state: &mut RevState) {
+    if state
+        .cmux_close
+        .as_ref()
+        .is_some_and(|receiver| !matches!(receiver.try_recv(), Err(TryRecvError::Empty)))
+    {
+        state.cmux_close = None;
+        state.markdown_sync_key = None;
+        if state.markdown_preview && state.cmux_markdown_requested {
+            state.status =
+                "Previous cmux preview closed · opening the requested replacement pane…".into();
+        }
+    }
     let Some(receiver) = state.cmux_open.as_ref() else {
         return;
     };
@@ -4489,10 +4714,11 @@ fn drain_cmux_preview(state: &mut RevState) {
         Ok(Some(surface)) if state.markdown_preview => {
             state.cmux_markdown = Some(surface);
             state.status =
-                "MARKDOWN DIFF · native cmux pane ready · navigation keeps it synchronized".into();
+                "MARKDOWN DIFF · one native cmux pane ready · terminal pane owns cursor synchronization"
+                    .into();
         }
         Ok(Some(surface)) => {
-            spawn_cmux_close(surface);
+            state.cmux_close = Some(spawn_cmux_close(surface));
             remove_cmux_preview_file(state);
         }
         Ok(None) if state.markdown_preview => {
@@ -4536,12 +4762,13 @@ fn sync_markdown_preview(state: &mut RevState, paths: &AppPaths) -> Result<()> {
     }
     let Some(path) = state.current_file().map(|file| file.path().to_path_buf()) else {
         state.markdown_preview = false;
+        state.cmux_markdown_requested = false;
         state.markdown_sync_key = None;
         state.markdown_content_key = None;
         state.markdown_sides_cache = None;
         state.markdown_render_cache = None;
         if let Some(surface) = state.cmux_markdown.take() {
-            spawn_cmux_close(surface);
+            state.cmux_close = Some(spawn_cmux_close(surface));
         }
         if state.cmux_open.is_none() {
             remove_cmux_preview_file(state);
@@ -4551,11 +4778,12 @@ fn sync_markdown_preview(state: &mut RevState, paths: &AppPaths) -> Result<()> {
     };
     if !is_markdown_path(&path) {
         state.markdown_preview = false;
+        state.cmux_markdown_requested = false;
         state.markdown_content_key = None;
         state.markdown_sides_cache = None;
         state.markdown_render_cache = None;
         if let Some(surface) = state.cmux_markdown.take() {
-            spawn_cmux_close(surface);
+            state.cmux_close = Some(spawn_cmux_close(surface));
         }
         if state.cmux_open.is_none() {
             remove_cmux_preview_file(state);
@@ -4573,11 +4801,18 @@ fn sync_markdown_preview(state: &mut RevState, paths: &AppPaths) -> Result<()> {
         state.markdown_content_key = Some(content_key.clone());
         state.markdown_render_cache = None;
     }
+    if state.cmux_markdown_requested && state.cmux_close.is_some() {
+        state.status = "MARKDOWN DIFF · waiting for the previous cmux pane to close…".into();
+        return Ok(());
+    }
     let key = format!("{content_key}\0{focus}");
     if state.markdown_sync_key.as_deref() == Some(&key) {
         return Ok(());
     }
     state.markdown_sync_key = Some(key);
+    if !state.cmux_markdown_requested {
+        return Ok(());
+    }
     if !MarkdownSurface::available() {
         return Ok(());
     }
@@ -4601,7 +4836,11 @@ fn sync_markdown_preview(state: &mut RevState, paths: &AppPaths) -> Result<()> {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let worker_path = preview_path.clone();
         std::thread::spawn(move || {
-            sender.send(MarkdownSurface::open(&worker_path)).ok();
+            if let Err(std::sync::mpsc::SendError(Ok(Some(surface)))) =
+                sender.send(MarkdownSurface::open(&worker_path))
+            {
+                surface.close_detached().ok();
+            }
         });
         state.cmux_open = Some(receiver);
     }
@@ -4638,11 +4877,9 @@ fn cmux_markdown_document(state: &RevState, sides: &MarkdownSides, focus: usize)
         .map(|file| file.path().display().to_string())
         .unwrap_or_else(|| "Markdown".into());
     let mut output = format!(
-        "# Rendered review: `{path}`\n\n> Synchronized review focus: source line **{focus}**. \
-         Green/red source changes and review notes follow the rendered revisions.\n\n\
-         ## Current rendered revision\n\n{}\n\n## Previous rendered revision\n\n{}\n\n\
-         ## Source diff\n\n```diff\n",
-        sides.new, sides.old
+        "# Rendered review: `{path}`\n\n> Review focus: source line **{focus}**. \
+         This optional cmux pane live-reloads; the in-terminal preview owns cursor synchronization.\n\n\
+         ## Source diff\n\n```diff\n"
     );
     if let Some(file) = state.current_file() {
         for line in file.visible_lines() {
@@ -4657,7 +4894,18 @@ fn cmux_markdown_document(state: &RevState, sides: &MarkdownSides, focus: usize)
             output.push('\n');
         }
     }
-    output.push_str("```\n\n## Review notes\n\n");
+    output.push_str(&format!(
+        "```\n\n## Review notes\n\n{}\n\n## Current rendered revision\n\n{}\n\n\
+         ## Previous rendered revision\n\n{}\n",
+        markdown_review_notes(state),
+        sides.new,
+        sides.old
+    ));
+    output
+}
+
+fn markdown_review_notes(state: &RevState) -> String {
+    let mut output = String::new();
     let mut count = 0;
     if let Some(repo) = state.current_repo() {
         if let Some(file) = state.current_file() {
@@ -4690,10 +4938,19 @@ fn render_markdown_diff_preview(
     area: Rect,
     highlighter: &mut dyn Highlighter,
 ) {
+    let title = if state.markdown_preview_focused {
+        " Markdown focus · j/k · Ctrl-D/U · Tab source · -/+ diff "
+    } else {
+        " Markdown diff · Tab focus · Mermaid · - removed · + added "
+    };
     let block = Block::default()
-        .title(" Markdown diff · sync · M close · Mermaid ")
+        .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta));
+        .border_style(Style::default().fg(if state.markdown_preview_focused {
+            Color::Cyan
+        } else {
+            Color::Magenta
+        }));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if state.markdown_sides_cache.is_none() {
@@ -4731,6 +4988,7 @@ fn render_markdown_diff_preview(
             .or_else(|| line.old_line.map(|line| (AnchorSide::Old, line)))
     });
     let viewport = inner.height.max(1) as usize;
+    state.markdown_viewport_height = viewport;
     let rows = &state
         .markdown_render_cache
         .as_ref()
@@ -4740,10 +4998,15 @@ fn render_markdown_diff_preview(
         rows.iter()
             .position(|row| row.side == Some(side) && row.source_line == Some(line))
     });
-    let start = focused_row
-        .unwrap_or(state.markdown_scroll)
-        .saturating_sub(viewport / 3)
-        .min(rows.len().saturating_sub(viewport));
+    let maximum = rows.len().saturating_sub(viewport);
+    let start = if state.markdown_follow_source {
+        focused_row
+            .unwrap_or(state.markdown_scroll)
+            .saturating_sub(viewport / 3)
+            .min(maximum)
+    } else {
+        state.markdown_scroll.min(maximum)
+    };
     state.markdown_scroll = start;
     let visible = rows
         .iter()
@@ -4842,8 +5105,9 @@ fn rendered_markdown_diff(
     width: usize,
     highlighter: &mut dyn Highlighter,
 ) -> Vec<RenderedMarkdownRow> {
-    let old = render_markdown_mapped(old_source, width.max(1), highlighter);
-    let new = render_markdown_mapped(new_source, width.max(1), highlighter);
+    let content_width = width.saturating_sub(2).max(1);
+    let old = render_markdown_mapped(old_source, content_width, highlighter);
+    let new = render_markdown_mapped(new_source, content_width, highlighter);
     let old_text = old.rows.iter().map(mapped_row_text).collect::<Vec<_>>();
     let new_text = new.rows.iter().map(mapped_row_text).collect::<Vec<_>>();
     let old_refs = old_text.iter().map(String::as_str).collect::<Vec<_>>();
@@ -4855,7 +5119,7 @@ fn rendered_markdown_diff(
             ChangeTag::Delete => {
                 let index = change.old_index().unwrap_or(0);
                 (
-                    old.rows[index].line.clone(),
+                    prefixed_line("- ", old.rows[index].line.clone(), Color::Red),
                     Some(AnchorSide::Old),
                     mapped_row_source_line(&old.rows[index], old_source),
                     Style::default().bg(Color::Rgb(63, 30, 34)),
@@ -4864,7 +5128,7 @@ fn rendered_markdown_diff(
             ChangeTag::Insert => {
                 let index = change.new_index().unwrap_or(0);
                 (
-                    new.rows[index].line.clone(),
+                    prefixed_line("+ ", new.rows[index].line.clone(), Color::Green),
                     Some(AnchorSide::New),
                     mapped_row_source_line(&new.rows[index], new_source),
                     Style::default().bg(Color::Rgb(20, 58, 42)),
@@ -4873,7 +5137,7 @@ fn rendered_markdown_diff(
             ChangeTag::Equal => {
                 let index = change.new_index().unwrap_or(0);
                 (
-                    new.rows[index].line.clone(),
+                    prefixed_line("  ", new.rows[index].line.clone(), Color::DarkGray),
                     Some(AnchorSide::New),
                     mapped_row_source_line(&new.rows[index], new_source),
                     Style::default(),
@@ -4913,14 +5177,39 @@ fn rendered_markdown_diff(
                 ),
                 ChangeTag::Equal => continue,
             };
-            rows.push(RenderedMarkdownRow {
-                line: Line::from(format!("{marker} {}", change.value().trim_end())).style(style),
-                side,
-                source_line,
-            });
+            let content = vec![Span::raw(change.value().trim_end().to_owned())];
+            for (index, wrapped) in wrap_spans(&content, width.saturating_sub(2).max(1))
+                .into_iter()
+                .enumerate()
+            {
+                let mut spans = vec![Span::styled(
+                    if index == 0 {
+                        format!("{marker} ")
+                    } else {
+                        "  ".into()
+                    },
+                    Style::default().fg(if marker == "+" {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    }),
+                )];
+                spans.extend(wrapped);
+                rows.push(RenderedMarkdownRow {
+                    line: Line::from(spans).style(style),
+                    side,
+                    source_line,
+                });
+            }
         }
     }
     rows
+}
+
+fn prefixed_line(prefix: &'static str, line: Line<'static>, color: Color) -> Line<'static> {
+    let mut spans = vec![Span::styled(prefix, Style::default().fg(color))];
+    spans.extend(line.spans);
+    Line::from(spans)
 }
 
 fn mapped_row_text(row: &MappedRow) -> String {
@@ -4992,11 +5281,12 @@ fn help_lines() -> Vec<Line<'static>> {
     };
     vec![
         section("Review navigation"),
-        key("j / ↓", "next rendered row; stops at the end of this file"),
+        key("j / ↓", "next logical row; wrapped source remains one item"),
         key(
             "k / ↑",
             "previous rendered row; stops at the start of this file",
         ),
+        key("Ctrl-D / Ctrl-U", "move half a page down/up in the active pane"),
         key("h / ←", "previous file"),
         key("l / →", "next file"),
         key("g / Home", "first rendered row"),
@@ -5015,6 +5305,10 @@ fn help_lines() -> Vec<Line<'static>> {
             "copy the current source line or complete chat message",
         ),
         key("Esc", "clear the current selection"),
+        key(
+            "Tab (Markdown)",
+            "focus preview for independent scrolling; Tab/Esc resumes source following",
+        ),
         key(
             "Shift+↑",
             "reveal five unchanged lines above the active hunk",
@@ -5121,8 +5415,8 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::raw(""),
         section("History"),
         key(
-            "j/k / ↑/↓",
-            "move through saved comments and question threads",
+            "j/k / ↑/↓ · Ctrl-D/U",
+            "move one item or half a page down/up",
         ),
         key(
             "d, then d",
@@ -5148,7 +5442,11 @@ fn help_lines() -> Vec<Line<'static>> {
         key(":diff split", "render old and new sides in two columns"),
         key(
             ":render markdown",
-            "open the rendered Markdown diff and native cmux/Mermaid preview",
+            "open the synchronized in-terminal rendered Markdown diff",
+        ),
+        key(
+            ":render markdown cmux",
+            "optionally open one live-reloading native cmux/Mermaid pane",
         ),
         key(
             ":render markdown close",
@@ -5202,13 +5500,13 @@ fn is_expanded_context(state: &RevState, line: &DiffLine) -> bool {
         })
 }
 
-fn source_line(
+fn source_lines(
     path: Option<&Path>,
     line: &DiffLine,
     visible_index: usize,
     width: usize,
     highlighter: &mut dyn Highlighter,
-) -> Line<'static> {
+) -> Vec<Line<'static>> {
     let marker = match line.kind {
         LineKind::Addition => "+",
         LineKind::Deletion => "-",
@@ -5229,58 +5527,35 @@ fn source_line(
         gutter
     };
     let available = width.saturating_sub(cell_width(&rendered_gutter));
-    let segments = path
-        .and_then(|path| {
-            highlighter
-                .highlight_line(path, visible_index, &line.content)
-                .ok()
+    let content = highlighted_spans(path, line, visible_index, highlighter);
+    let wrapped = wrap_spans(&content, available.max(1));
+    let continuation = " ".repeat(cell_width(&rendered_gutter));
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(index, content)| {
+            let mut spans = vec![if index == 0 {
+                Span::styled(rendered_gutter.clone(), gutter_style)
+            } else {
+                Span::raw(continuation.clone())
+            }];
+            spans.extend(content);
+            Line::from(spans)
         })
-        .unwrap_or_else(|| {
-            vec![StyledSegment {
-                text: line.content.clone(),
-                foreground: (210, 210, 210),
-                bold: false,
-                italic: false,
-            }]
-        });
-    let mut spans = vec![Span::styled(rendered_gutter, gutter_style)];
-    let mut used = 0usize;
-    'segments: for segment in segments {
-        let mut style = Style::default().fg(Color::Rgb(
-            segment.foreground.0,
-            segment.foreground.1,
-            segment.foreground.2,
-        ));
-        if segment.bold {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        if segment.italic {
-            style = style.add_modifier(Modifier::ITALIC);
-        }
-        for (_, grapheme) in grapheme_indices(&segment.text) {
-            let grapheme_width = cell_width(grapheme);
-            if used.saturating_add(grapheme_width) > available {
-                spans.push(Span::styled("…", Style::default().fg(Color::Yellow)));
-                break 'segments;
-            }
-            spans.push(Span::styled(grapheme.to_owned(), style));
-            used += grapheme_width;
-        }
-    }
-    Line::from(spans)
+        .collect()
 }
 
-fn split_source_line(
+fn split_source_lines(
     path: Option<&Path>,
     line: &DiffLine,
     visible_index: usize,
     width: usize,
     highlighter: &mut dyn Highlighter,
-) -> Line<'static> {
+) -> Vec<Line<'static>> {
     let left_width = width.saturating_sub(1) / 2;
     let right_width = width.saturating_sub(left_width + 1);
     let left = match line.kind {
-        LineKind::Addition => blank_side(left_width),
+        LineKind::Addition => vec![blank_side(left_width)],
         _ => source_side(
             path,
             line,
@@ -5292,7 +5567,7 @@ fn split_source_line(
         ),
     };
     let right = match line.kind {
-        LineKind::Deletion => blank_side(right_width),
+        LineKind::Deletion => vec![blank_side(right_width)],
         _ => source_side(
             path,
             line,
@@ -5303,10 +5578,24 @@ fn split_source_line(
             highlighter,
         ),
     };
-    let mut spans = left;
-    spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-    spans.extend(right);
-    Line::from(spans)
+    let height = left.len().max(right.len()).max(1);
+    (0..height)
+        .map(|index| {
+            let mut spans = left
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| blank_side(left_width));
+            pad_spans(&mut spans, left_width);
+            spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+            let mut right = right
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| blank_side(right_width));
+            pad_spans(&mut right, right_width);
+            spans.extend(right);
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn blank_side(width: usize) -> Vec<Span<'static>> {
@@ -5321,9 +5610,9 @@ fn source_side(
     number: Option<usize>,
     changed: bool,
     highlighter: &mut dyn Highlighter,
-) -> Vec<Span<'static>> {
+) -> Vec<Vec<Span<'static>>> {
     if width == 0 {
-        return Vec::new();
+        return vec![Vec::new()];
     }
     let marker = if changed {
         match line.kind {
@@ -5347,23 +5636,46 @@ fn source_side(
         gutter
     };
     let available = width.saturating_sub(cell_width(&rendered_gutter));
-    let segments = path
-        .and_then(|path| {
-            highlighter
-                .highlight_line(path, visible_index, &line.content)
-                .ok()
+    let content = highlighted_spans(path, line, visible_index, highlighter);
+    let wrapped = wrap_spans(&content, available.max(1));
+    let continuation = " ".repeat(cell_width(&rendered_gutter));
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(index, content)| {
+            let mut spans = vec![if index == 0 {
+                Span::styled(rendered_gutter.clone(), gutter_style)
+            } else {
+                Span::raw(continuation.clone())
+            }];
+            spans.extend(content);
+            pad_spans(&mut spans, width);
+            spans
         })
-        .unwrap_or_else(|| {
-            vec![StyledSegment {
-                text: line.content.clone(),
-                foreground: (210, 210, 210),
-                bold: false,
-                italic: false,
-            }]
-        });
-    let mut spans = vec![Span::styled(rendered_gutter, gutter_style)];
-    let mut content_used = 0usize;
-    'segments: for segment in segments {
+        .collect()
+}
+
+fn highlighted_spans(
+    path: Option<&Path>,
+    line: &DiffLine,
+    visible_index: usize,
+    highlighter: &mut dyn Highlighter,
+) -> Vec<Span<'static>> {
+    path.and_then(|path| {
+        highlighter
+            .highlight_line(path, visible_index, &line.content)
+            .ok()
+    })
+    .unwrap_or_else(|| {
+        vec![StyledSegment {
+            text: line.content.clone(),
+            foreground: (210, 210, 210),
+            bold: false,
+            italic: false,
+        }]
+    })
+    .into_iter()
+    .map(|segment| {
         let mut style = Style::default().fg(Color::Rgb(
             segment.foreground.0,
             segment.foreground.1,
@@ -5375,18 +5687,41 @@ fn source_side(
         if segment.italic {
             style = style.add_modifier(Modifier::ITALIC);
         }
-        for (_, grapheme) in grapheme_indices(&segment.text) {
+        Span::styled(segment.text, style)
+    })
+    .collect()
+}
+
+fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    let mut rows = vec![Vec::new()];
+    let mut used = 0usize;
+    for span in spans {
+        let mut chunk = String::new();
+        for (_, grapheme) in grapheme_indices(span.content.as_ref()) {
             let grapheme_width = cell_width(grapheme);
-            if content_used.saturating_add(grapheme_width) > available {
-                if available > 0 {
-                    spans.push(Span::styled("…", Style::default().fg(Color::Yellow)));
+            if used > 0 && used.saturating_add(grapheme_width) > width {
+                if !chunk.is_empty() {
+                    rows.last_mut()
+                        .expect("wrapped rows are initialized")
+                        .push(Span::styled(std::mem::take(&mut chunk), span.style));
                 }
-                break 'segments;
+                rows.push(Vec::new());
+                used = 0;
             }
-            spans.push(Span::styled(grapheme.to_owned(), style));
-            content_used += grapheme_width;
+            chunk.push_str(grapheme);
+            used = used.saturating_add(grapheme_width);
+        }
+        if !chunk.is_empty() {
+            rows.last_mut()
+                .expect("wrapped rows are initialized")
+                .push(Span::styled(chunk, span.style));
         }
     }
+    rows
+}
+
+fn pad_spans(spans: &mut Vec<Span<'static>>, width: usize) {
     let current_width: usize = spans
         .iter()
         .map(|span| cell_width(span.content.as_ref()))
@@ -5394,7 +5729,87 @@ fn source_side(
     if current_width < width {
         spans.push(Span::raw(" ".repeat(width - current_width)));
     }
-    spans
+}
+
+fn split_line_side(line: &DiffLine) -> AnchorSide {
+    if line.kind == LineKind::Deletion {
+        AnchorSide::Old
+    } else {
+        AnchorSide::New
+    }
+}
+
+fn split_highlight_side(
+    line: &DiffLine,
+    selection_side: Option<AnchorSide>,
+    annotation_side: Option<AnchorSide>,
+) -> AnchorSide {
+    selection_side
+        .or(annotation_side)
+        .unwrap_or_else(|| split_line_side(line))
+}
+
+fn split_range_side(file: &DiffFile, range: (usize, usize)) -> Option<AnchorSide> {
+    let mut additions = false;
+    let mut deletions = false;
+    for line in file
+        .visible_lines()
+        .skip(range.0)
+        .take(range.1.saturating_sub(range.0) + 1)
+    {
+        additions |= line.kind == LineKind::Addition;
+        deletions |= line.kind == LineKind::Deletion;
+    }
+    if additions && deletions {
+        None
+    } else if deletions {
+        Some(AnchorSide::Old)
+    } else {
+        Some(AnchorSide::New)
+    }
+}
+
+fn style_split_side(
+    line: Line<'static>,
+    width: usize,
+    side: AnchorSide,
+    background: Color,
+) -> Line<'static> {
+    let left_width = width.saturating_sub(1) / 2;
+    let (start, end) = match side {
+        AnchorSide::Old => (0, left_width),
+        AnchorSide::New => (left_width.saturating_add(1), width),
+    };
+    let mut column = 0usize;
+    let mut spans = Vec::new();
+    for span in line.spans {
+        let mut chunk = String::new();
+        let mut chunk_selected = None;
+        for (_, grapheme) in grapheme_indices(span.content.as_ref()) {
+            let grapheme_width = cell_width(grapheme);
+            let selected = column < end && column.saturating_add(grapheme_width) > start;
+            if chunk_selected.is_some_and(|current| current != selected) {
+                let style = if chunk_selected == Some(true) {
+                    span.style.bg(background)
+                } else {
+                    span.style
+                };
+                spans.push(Span::styled(std::mem::take(&mut chunk), style));
+            }
+            chunk_selected = Some(selected);
+            chunk.push_str(grapheme);
+            column = column.saturating_add(grapheme_width);
+        }
+        if !chunk.is_empty() {
+            let style = if chunk_selected == Some(true) {
+                span.style.bg(background)
+            } else {
+                span.style
+            };
+            spans.push(Span::styled(chunk, style));
+        }
+    }
+    Line::from(spans)
 }
 
 fn render_composer(frame: &mut Frame, state: &mut RevState, area: Rect) {
@@ -6491,12 +6906,13 @@ mod tests {
     use super::{
         build_rows, close_file_picker, close_questions, current_item_yank_text, execute_command,
         finish_active_question, handle_agent_event, handle_compose_key, handle_file_picker_key,
-        handle_help_key, handle_history_key, handle_key, handle_question_key, handle_review_key,
-        help_lines, merge_touching_hunks, open_file_picker, open_questions, question_ids,
-        queue_question_launch, render, render_snapshot, rendered_markdown_diff, row_count,
-        seed_snapshot_feedback, seed_snapshot_questions, snapshot_workspace,
+        handle_help_key, handle_history_key, handle_key, handle_markdown_preview_key,
+        handle_question_key, handle_review_key, help_lines, merge_touching_hunks, open_file_picker,
+        open_questions, page_move, question_ids, queue_question_launch, render, render_snapshot,
+        rendered_markdown_diff, row_count, seed_snapshot_feedback, seed_snapshot_questions,
+        snapshot_workspace, split_highlight_side, split_source_lines, style_split_side,
         visual_selection_yank_text, ComposeTarget, ModelPicker, PendingSend, PickerScope,
-        PickerStage, QuestionLaunch, RevAgentSlot, RevMode, RevState,
+        PickerStage, QuestionLaunch, RevAgentSlot, RevDiffLayout, RevMode, RevState,
     };
     use crate::config::AppPaths;
     use crate::copilot::{
@@ -6542,6 +6958,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("Guide"));
+        assert!(text.contains("- • old"));
+        assert!(text.contains("+ • new"));
         assert!(text.contains("• old"));
         assert!(text.contains("• new"));
         assert!(text.contains("graph TD"));
@@ -6551,6 +6969,103 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row.side == Some(AnchorSide::New) && row.source_line == Some(3)));
+    }
+
+    #[test]
+    fn split_source_wraps_without_losing_the_tail_and_selection_owns_one_side() {
+        let mut highlighter = PlainHighlighter;
+        let line = DiffLine {
+            kind: LineKind::Addition,
+            old_line: None,
+            new_line: Some(6),
+            content: "AnchorSide, Annotation, AnnotationKind, AnnotationStatus, AskMessage, TAIL"
+                .into(),
+        };
+        let wrapped = split_source_lines(None, &line, 0, 41, &mut highlighter);
+        let rendered = wrapped
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(wrapped.len() > 1);
+        assert!(rendered.contains("TAIL"));
+        assert!(!rendered.contains('…'));
+
+        let selected = style_split_side(
+            ratatui::text::Line::from("LLLL│RRRR"),
+            9,
+            AnchorSide::New,
+            Color::Blue,
+        );
+        let cells = selected
+            .spans
+            .iter()
+            .flat_map(|span| {
+                span.content
+                    .chars()
+                    .map(move |character| (character, span.style.bg))
+            })
+            .collect::<Vec<_>>();
+        assert!(cells[..5]
+            .iter()
+            .all(|(_, background)| background.is_none()));
+        assert!(cells[5..]
+            .iter()
+            .all(|(_, background)| *background == Some(Color::Blue)));
+        let context = DiffLine {
+            kind: LineKind::Context,
+            old_line: Some(6),
+            new_line: Some(6),
+            content: "unchanged".into(),
+        };
+        assert_eq!(
+            split_highlight_side(&context, None, Some(AnchorSide::Old)),
+            AnchorSide::Old,
+            "an old-side context annotation keeps cursor ownership on the left"
+        );
+    }
+
+    #[test]
+    fn ctrl_d_and_ctrl_u_move_half_a_page_by_logical_rows() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        let mut highlighter = PlainHighlighter;
+        state.diff_layout = RevDiffLayout::Split;
+        state.review_viewport_height = 8;
+        page_move(&mut state, &mut highlighter, 1);
+        let moved = state.row_cursor;
+        assert!(moved > 0);
+        page_move(&mut state, &mut highlighter, -1);
+        assert_eq!(state.row_cursor, 0);
+    }
+
+    #[test]
+    fn markdown_preview_can_scroll_independently_then_resume_source_following() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        state.markdown_preview = true;
+        state.markdown_preview_focused = true;
+        state.markdown_follow_source = false;
+        state.markdown_scroll = 10;
+        state.markdown_viewport_height = 8;
+        assert!(handle_markdown_preview_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        ));
+        assert_eq!(state.markdown_scroll, 14);
+        assert!(handle_markdown_preview_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        ));
+        assert!(!state.markdown_preview_focused);
+        assert!(state.markdown_follow_source);
     }
 
     #[test]
@@ -6582,6 +7097,25 @@ mod tests {
     }
 
     #[test]
+    fn render_markdown_defaults_to_one_in_terminal_preview() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        state.file_index = 1;
+        execute_command(
+            &mut state,
+            &storage,
+            &test_paths("rev-markdown-terminal-only"),
+            "render markdown",
+        )
+        .unwrap();
+        assert!(state.markdown_preview);
+        assert!(!state.cmux_markdown_requested);
+        assert!(state.cmux_open.is_none());
+        assert!(state.cmux_markdown.is_none());
+    }
+
+    #[test]
     fn snapshot_exposes_the_small_rev_surface() {
         let snapshot = render_snapshot(100, 24, "review").unwrap();
         assert!(snapshot.contains("rev · workspace"));
@@ -6598,6 +7132,10 @@ mod tests {
         let split = render_snapshot(100, 28, "split").unwrap();
         assert!(split.contains("· split ·"));
         assert!(split.contains("│  11 +     let isolated_questions"));
+        let narrow_split = render_snapshot(72, 22, "split").unwrap();
+        assert!(narrow_split.contains("let isolated_questions ="));
+        assert!(narrow_split.contains("true;"));
+        assert!(!narrow_split.contains('…'));
 
         let command = render_snapshot(100, 28, "command").unwrap();
         assert!(command.contains("command palette"));

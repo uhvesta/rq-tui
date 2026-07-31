@@ -38,7 +38,7 @@ impl MarkdownSurface {
         if !output.status.success() {
             if let Some(surface_id) = payload
                 .as_ref()
-                .and_then(|value| find_string(value, "surface_id"))
+                .and_then(|value| result_string(value, "surface_id"))
             {
                 Self {
                     cli: context.cli.clone(),
@@ -53,9 +53,9 @@ impl MarkdownSurface {
         }
         let payload = payload.context("cmux returned invalid JSON")?;
         let workspace_id =
-            find_string(&payload, "workspace_id").unwrap_or_else(|| context.workspace_id.clone());
-        let surface_id = find_string(&payload, "surface_id")
-            .or_else(|| find_string(&payload, "panel_id"))
+            result_string(&payload, "workspace_id").unwrap_or_else(|| context.workspace_id.clone());
+        let surface_id = result_string(&payload, "surface_id")
+            .or_else(|| result_string(&payload, "panel_id"))
             .context("cmux did not return the created Markdown surface id")?;
         Ok(Some(Self {
             cli: context.cli,
@@ -155,16 +155,13 @@ fn open_args<'a>(
     .into()
 }
 
-fn find_string(value: &Value, key: &str) -> Option<String> {
-    match value {
-        Value::Object(values) => values
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| values.values().find_map(|value| find_string(value, key))),
-        Value::Array(values) => values.iter().find_map(|value| find_string(value, key)),
-        _ => None,
-    }
+fn result_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get("result")
+        .and_then(|result| result.get(key))
+        .and_then(Value::as_str)
+        .or_else(|| value.get(key).and_then(Value::as_str))
+        .map(str::to_owned)
 }
 
 fn run(command: &mut Command, label: &str) -> Result<Output> {
@@ -187,7 +184,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::Path;
 
-    use super::{find_string, open_args};
+    use super::{open_args, result_string};
 
     #[test]
     fn markdown_open_is_routed_to_the_calling_surface_without_focus() {
@@ -223,10 +220,14 @@ mod tests {
     }
 
     #[test]
-    fn ids_are_found_in_nested_cmux_envelopes() {
-        let payload = serde_json::json!({"ok": true, "result": {"surface_id": "surface:9"}});
+    fn created_ids_come_from_the_explicit_result_not_the_caller_envelope() {
+        let payload = serde_json::json!({
+            "ok": true,
+            "caller": {"surface_id": "surface:3"},
+            "result": {"surface_id": "surface:9"}
+        });
         assert_eq!(
-            find_string(&payload, "surface_id").as_deref(),
+            result_string(&payload, "surface_id").as_deref(),
             Some("surface:9")
         );
     }
