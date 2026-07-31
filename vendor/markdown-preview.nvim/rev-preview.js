@@ -321,10 +321,15 @@
 
   function scrollToFocus(payload) {
     document.querySelectorAll(".source-focus").forEach((node) => node.classList.remove("source-focus"));
-    const preferred = [...richDiff.querySelectorAll(`[data-diff-side="${payload.focus_side}"]`)];
-    const fallback = [...richDiff.querySelectorAll("[data-source-line]")];
-    const target = preferred.find((node) => containsLine(node, payload.focus_line)) ||
-      fallback.find((node) => containsLine(node, payload.focus_line)) ||
+    const mapped = [...richDiff.querySelectorAll("[data-source-line]")];
+    const containing = mapped
+      .filter((node) => containsLine(node, payload.focus_line))
+      .sort((left, right) =>
+        (Number(left.dataset.sourceEnd) - Number(left.dataset.sourceLine)) -
+        (Number(right.dataset.sourceEnd) - Number(right.dataset.sourceLine)));
+    const target = containing.find((node) =>
+      node.closest(`[data-diff-side="${payload.focus_side}"]`)) ||
+      containing[0] ||
       closestBlock(richDiff, payload.focus_line);
     if (!target) return;
     target.classList.add("source-focus");

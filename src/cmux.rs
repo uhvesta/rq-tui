@@ -34,7 +34,12 @@ impl MarkdownSurface {
             return Ok(Some(Self::SystemBrowser));
         };
         let output = run(
-            Command::new(&context.cli).args(open_args(&context.socket, &context.workspace_id, url)),
+            Command::new(&context.cli).args(open_args(
+                &context.socket,
+                &context.workspace_id,
+                &context.surface_id,
+                url,
+            )),
             "cmux browser preview open",
         )?;
         let payload = serde_json::from_slice::<Value>(&output.stdout).ok();
@@ -140,13 +145,14 @@ struct CmuxContext {
     cli: PathBuf,
     socket: String,
     workspace_id: String,
+    surface_id: String,
 }
 
 impl CmuxContext {
     fn discover() -> Option<Self> {
         let socket = nonempty_env("CMUX_SOCKET_PATH")?;
         let workspace_id = nonempty_env("CMUX_WORKSPACE_ID")?;
-        nonempty_env("CMUX_SURFACE_ID")?;
+        let surface_id = nonempty_env("CMUX_SURFACE_ID")?;
         let cli = nonempty_env("CMUX_BUNDLED_CLI_PATH")
             .map(PathBuf::from)
             .filter(|path| path.is_file())
@@ -155,6 +161,7 @@ impl CmuxContext {
             cli,
             socket,
             workspace_id,
+            surface_id,
         })
     }
 }
@@ -163,11 +170,18 @@ fn nonempty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-fn open_args<'a>(socket: &'a str, workspace_id: &'a str, url: &'a str) -> Vec<&'a std::ffi::OsStr> {
+fn open_args<'a>(
+    socket: &'a str,
+    workspace_id: &'a str,
+    surface_id: &'a str,
+    url: &'a str,
+) -> Vec<&'a std::ffi::OsStr> {
     [
         std::ffi::OsStr::new("--socket"),
         std::ffi::OsStr::new(socket),
         std::ffi::OsStr::new("--json"),
+        std::ffi::OsStr::new("--surface"),
+        std::ffi::OsStr::new(surface_id),
         std::ffi::OsStr::new("browser"),
         std::ffi::OsStr::new("open-split"),
         std::ffi::OsStr::new(url),
@@ -213,6 +227,7 @@ mod tests {
         let args = open_args(
             "/tmp/cmux.sock",
             "workspace:7",
+            "surface:3",
             "http://127.0.0.1:8765/review/token",
         );
         let args = args
@@ -225,6 +240,8 @@ mod tests {
                 "--socket",
                 "/tmp/cmux.sock",
                 "--json",
+                "--surface",
+                "surface:3",
                 "browser",
                 "open-split",
                 "http://127.0.0.1:8765/review/token",
