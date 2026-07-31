@@ -63,6 +63,54 @@ bazel run //:rq-tui -- review . --pr acme/api#482
 `rq-tui review` without a path or PR is rejected as a CLI error and never
 initializes the TUI.
 
+## Focused `rev` CLI
+
+`rev` is the smaller local-review surface. Bare `rev` prints help; only
+`rev PATH` or `rev review PATH` opens a TUI. Every question owns an isolated
+Copilot session and later questions wait in a visible FIFO queue instead of
+blocking input or replacing a session that is still starting.
+
+```sh
+bazel run //:rev -- .
+bazel run //:rev -- review . --base origin/main
+bazel run //:rev -- history .
+bazel run //:rev -- feedback .
+bazel run //:rev -- export . --output feedback.md
+bazel run //:rev -- clear . --yes
+bazel run //:rev -- delete . --export --yes
+```
+
+Inside `rev`, `j/k` stop at the first/last rendered row of the current file,
+including its inline questions and answers; only `h/l` changes files.
+`Shift+Up` reveals five unchanged lines above the active hunk and
+`Shift+Down` reveals five below. Revealed context has a muted gray background,
+and overlapping expansions merge into one continuous region.
+
+Press `:` for a scrollable palette. It includes `diff unified`, `diff split`,
+`expand above`, `expand below`, `base <ref>` with local branch/ref
+autocomplete for the current repository, `export feedback`, `history`,
+`clear`, and `quit`. `a` asks, `c` records feedback, `v` selects source rows,
+`r` opens persisted diff-related history, and `Ctrl-C` cancels an active
+question. The sticky composer grows up to the terminal’s available height,
+then scrolls with arrows, page keys, or the mouse.
+
+`rev delete` uses the durable Copilot prune journal: remote SDK sessions must
+be confirmed absent before local review data is removed. `rev clear` removes
+the local comments and Q&A while retaining workspace/session ownership so a
+later permanent delete can still clean remote sessions.
+
+Deterministic states can be inspected without a TTY or production data:
+
+```sh
+bazel run //:rev -- ui-snapshot --state review --width 100 --height 28
+bazel run //:rev -- ui-snapshot --state split --width 100 --height 28
+bazel run //:rev -- ui-snapshot --state expanded --width 100 --height 28
+bazel run //:rev -- ui-snapshot --state command --width 100 --height 28
+bazel run //:rev -- ui-snapshot --state composer --width 100 --height 28
+bazel run //:rev -- ui-snapshot --state history --width 100 --height 28
+bazel run //:rev -- ui-snapshot --state streaming --width 100 --height 28
+```
+
 ## Review and Chat
 
 Review mode is the diff workspace. `j/k`, `gg/G`, page and half-page movement

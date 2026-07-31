@@ -6,7 +6,6 @@ use clap::{Parser, Subcommand};
 
 use crate::config::AppPaths;
 use crate::export::{CommentExport, ReviewArchive};
-use crate::prune::prune_work_item;
 use crate::storage::Storage;
 use crate::work_item::resolve_local;
 
@@ -51,6 +50,13 @@ enum RevCommand {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Export the paste-ready feedback prompt, optionally to a file.
+    Export {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Clear comments and questions but retain the workspace entry.
     Clear {
         #[arg(default_value = ".")]
@@ -75,6 +81,9 @@ enum RevCommand {
         width: u16,
         #[arg(long, default_value_t = 28)]
         height: u16,
+        /// review, split, expanded, command, composer, history, or streaming
+        #[arg(long, default_value = "review")]
+        state: String,
     },
 }
 
@@ -86,10 +95,18 @@ pub(crate) fn run() -> Result<()> {
         (None, Some(RevCommand::Review { path })) => open(path, cli.base.as_deref(), paths),
         (None, Some(RevCommand::History { path, json })) => history(path, json, paths),
         (None, Some(RevCommand::Feedback { path })) => feedback(path, paths),
+        (None, Some(RevCommand::Export { path, output })) => export(path, output, paths),
         (None, Some(RevCommand::Clear { path, yes })) => clear(path, yes, paths),
         (None, Some(RevCommand::Delete { path, export, yes })) => delete(path, export, yes, paths),
-        (None, Some(RevCommand::UiSnapshot { width, height })) => {
-            print!("{}", crate::rev_ui::render_snapshot(width, height)?);
+        (
+            None,
+            Some(RevCommand::UiSnapshot {
+                width,
+                height,
+                state,
+            }),
+        ) => {
+            print!("{}", crate::rev_ui::render_snapshot(width, height, &state)?);
             Ok(())
         }
         (Some(_), Some(_)) => bail!("provide either a workspace path or a subcommand, not both"),
@@ -99,13 +116,44 @@ pub(crate) fn run() -> Result<()> {
 
 fn open(path: PathBuf, base: Option<&str>, paths: AppPaths) -> Result<()> {
     require_tty()?;
-    let storage = Storage::open(&paths.database)?;
     let workspace = invocation_path(&path);
     eprintln!(
-        "rev · inspecting workspace {} · Ctrl-C cancels",
+        "rev · inspecting workspace {} · Ctrl-C cancels · progress updates every second",
         workspace.display()
     );
-    let resolved = resolve_local(&workspace, base, &paths, &storage)?;
+    let worker_workspace = workspace.clone();
+    let worker_base = base.map(str::to_owned);
+    let worker_paths = paths.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = Storage::open(&worker_paths.database).and_then(|storage| {
+            resolve_local(
+                &worker_workspace,
+                worker_base.as_deref(),
+                &worker_paths,
+                &storage,
+            )
+        });
+        sender.send(result).ok();
+    });
+    let started = std::time::Instant::now();
+    let resolved = loop {
+        match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(result) => break result?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => eprintln!(
+                "rev · still inspecting local Git repositories · {}s elapsed · Ctrl-C cancels",
+                started.elapsed().as_secs()
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("workspace inspection worker stopped unexpectedly")
+            }
+        }
+    };
+    let storage = Storage::open(&paths.database)?;
+    eprintln!(
+        "rev · workspace ready in {}ms · opening terminal",
+        started.elapsed().as_millis()
+    );
     crate::rev_ui::run(resolved, &storage, &paths)
 }
 
@@ -129,12 +177,14 @@ fn history(path: Option<PathBuf>, json: bool, paths: AppPaths) -> Result<()> {
     } else {
         for item in items {
             let counts = ReviewArchive::load(&storage, &item)?.annotations.len();
-            println!(
-                "{}\t{} review item(s)\t{}",
-                item.last_opened_at.as_deref().unwrap_or("never"),
-                counts,
-                item.workspace_root.display()
-            );
+            if counts > 0 {
+                println!(
+                    "{}\t{} review item(s)\t{}",
+                    item.last_opened_at.as_deref().unwrap_or("never"),
+                    counts,
+                    item.workspace_root.display()
+                );
+            }
         }
     }
     Ok(())
@@ -148,6 +198,24 @@ fn feedback(path: PathBuf, paths: AppPaths) -> Result<()> {
         println!("No feedback has been recorded for this workspace.");
     } else {
         print!("{}", export.structured_agent_prompt());
+    }
+    Ok(())
+}
+
+fn export(path: PathBuf, output: Option<PathBuf>, paths: AppPaths) -> Result<()> {
+    let storage = Storage::open(&paths.database)?;
+    let item = current_item(&storage, &path)?;
+    let export = CommentExport::load(&storage, &item)?;
+    if export.comments.is_empty() {
+        println!("No feedback has been recorded for this workspace.");
+        return Ok(());
+    }
+    let prompt = export.structured_agent_prompt();
+    if let Some(output) = output {
+        std::fs::write(&output, prompt)?;
+        println!("Exported feedback prompt to {}.", output.display());
+    } else {
+        print!("{prompt}");
     }
     Ok(())
 }
@@ -172,9 +240,26 @@ fn delete(path: PathBuf, export: bool, confirmed: bool, paths: AppPaths) -> Resu
     }
     let storage = Storage::open(&paths.database)?;
     let item = current_item(&storage, &path)?;
-    prune_work_item(&storage, &paths, &item.id, export, None, None)?;
+    eprintln!(
+        "rev · deleting durable Copilot sessions before local history · Ctrl-C cancels safely"
+    );
+    let outcome = crate::copilot::prune_work_item_permanently(
+        &paths,
+        &item.id,
+        export,
+        |label, done, total| {
+            if total == 0 {
+                eprintln!("rev · {label}");
+            } else {
+                eprintln!("rev · [{done}/{total}] {label}");
+            }
+        },
+    )?;
+    if let Some(error) = outcome.error {
+        bail!("permanent deletion failed; local history was retained: {error}");
+    }
     println!(
-        "Deleted local review history and workspace metadata for {}.",
+        "Deleted Copilot sessions, local review history, and workspace metadata for {}.",
         item.workspace_root.display()
     );
     Ok(())
@@ -184,9 +269,15 @@ fn current_item(storage: &Storage, path: &Path) -> Result<crate::domain::WorkIte
     let workspace = invocation_path(path)
         .canonicalize()
         .with_context(|| format!("cannot resolve workspace {}", path.display()))?;
-    storage
-        .work_item_by_root(&workspace)?
-        .with_context(|| format!("no persisted review for {}", workspace.display()))
+    for candidate in workspace.ancestors() {
+        if let Some(item) = storage.work_item_by_root(candidate)? {
+            return Ok(item);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "no persisted review for {} or any parent workspace",
+        workspace.display()
+    ))
 }
 
 fn invocation_path(path: &Path) -> PathBuf {
@@ -233,6 +324,19 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(RevCommand::Delete { yes: true, .. })
+        ));
+    }
+
+    #[test]
+    fn export_is_a_normal_noninteractive_cli_command() {
+        let cli =
+            RevCli::try_parse_from(["rev", "export", ".", "--output", "feedback.md"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(RevCommand::Export {
+                output: Some(_),
+                ..
+            })
         ));
     }
 }

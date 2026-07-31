@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -29,8 +29,10 @@ use crate::copilot::{
     start_agent, AgentCommand, AgentEvent, AgentRuntime, BridgeConfig, ModelOption, ModelSelection,
     Outbound, OutboundKind,
 };
-use crate::diff::{DiffFile, DiffLine, LineKind};
-use crate::domain::{Annotation, AnnotationKind, AskMessage, DeliveryState, Placement};
+use crate::diff::{DiffFile, DiffLine, FileStatus, Hunk, LineKind};
+use crate::domain::{
+    Annotation, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState, Placement,
+};
 use crate::export::CommentExport;
 use crate::git::Git;
 use crate::highlight::{Highlighter, PlainHighlighter, StyledSegment, SyntectHighlighter};
@@ -39,7 +41,7 @@ use crate::terminal_text::{
     cell_width, floor_grapheme_boundary, grapheme_indices, next_grapheme_boundary,
     previous_grapheme_boundary,
 };
-use crate::work_item::{ResolvedWorkItem, ReviewRepo};
+use crate::work_item::{resolve_local, ResolvedWorkItem, ReviewRepo};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_EVENTS_PER_TICK: usize = 128;
@@ -49,9 +51,33 @@ enum RevMode {
     Normal,
     Visual,
     Compose,
+    Command,
     Model,
     History,
     ConfirmClear,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RevDiffLayout {
+    #[default]
+    Unified,
+    Split,
+}
+
+impl RevDiffLayout {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unified => "unified",
+            Self::Split => "split",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct CommandPalette {
+    input: String,
+    cursor: usize,
+    selected: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -175,9 +201,14 @@ struct RevState {
     row_cursor: usize,
     visual_anchor: Option<usize>,
     mode: RevMode,
+    diff_layout: RevDiffLayout,
+    command: CommandPalette,
+    branch_candidates: Vec<String>,
+    original_context: HashSet<String>,
     compose_target: Option<ComposeTarget>,
     compose: String,
     compose_cursor: usize,
+    compose_scroll: u16,
     status: String,
     annotations: Vec<(Annotation, Placement)>,
     threads: HashMap<String, Vec<AskMessage>>,
@@ -187,10 +218,10 @@ struct RevState {
     streaming: bool,
     agent_activity: String,
     agent_last_event: Instant,
-    quit_armed: bool,
     rows_revision: u64,
     render_cache: Option<RenderCache>,
     history_cursor: usize,
+    history_delete_armed: Option<String>,
 }
 
 impl RevState {
@@ -217,6 +248,18 @@ impl RevState {
                 annotations.push(pair);
             }
         }
+        let branch_candidates = workspace
+            .repos
+            .iter()
+            .flat_map(|repo| {
+                Git::default()
+                    .branch_candidates(&repo.record.path)
+                    .unwrap_or_default()
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let original_context = context_keys(&workspace);
         Ok(Self {
             workspace,
             files,
@@ -224,9 +267,14 @@ impl RevState {
             row_cursor: 0,
             visual_anchor: None,
             mode: RevMode::Normal,
+            diff_layout: RevDiffLayout::Unified,
+            command: CommandPalette::default(),
+            branch_candidates,
+            original_context,
             compose_target: None,
             compose: String::new(),
             compose_cursor: 0,
+            compose_scroll: 0,
             status: "j/k stay in this file · h/l change files".into(),
             annotations,
             threads,
@@ -236,10 +284,10 @@ impl RevState {
             streaming: false,
             agent_activity: "Copilot starts only when you ask a question".into(),
             agent_last_event: Instant::now(),
-            quit_armed: false,
             rows_revision: 1,
             render_cache: None,
             history_cursor: 0,
+            history_delete_armed: None,
         })
     }
 
@@ -303,6 +351,7 @@ impl RevState {
 
 pub(crate) fn run(workspace: ResolvedWorkItem, storage: &Storage, paths: &AppPaths) -> Result<()> {
     let mut state = RevState::load(workspace, storage)?;
+    recover_pending_questions(&mut state, storage, paths)?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -330,6 +379,74 @@ pub(crate) fn run(workspace: ResolvedWorkItem, storage: &Storage, paths: &AppPat
     .ok();
     terminal.show_cursor().ok();
     result
+}
+
+fn recover_pending_questions(
+    state: &mut RevState,
+    storage: &Storage,
+    paths: &AppPaths,
+) -> Result<()> {
+    let pending = storage.pending_ask_messages(&state.workspace.item.id)?;
+    for message in pending {
+        let Some((annotation, placement)) = state
+            .annotations
+            .iter()
+            .find(|(annotation, _)| annotation.id == message.annotation_id)
+        else {
+            continue;
+        };
+        let Some(repo) = state
+            .workspace
+            .repos
+            .iter()
+            .find(|repo| repo.record.id == annotation.repo_id)
+        else {
+            continue;
+        };
+        let Some(file) = repo
+            .diff
+            .files
+            .iter()
+            .find(|file| file.path() == annotation.file_path)
+        else {
+            continue;
+        };
+        let existing = storage.rev_question_session(&annotation.id)?;
+        let prompt = if message.seq == 0 {
+            question_prompt(
+                &repo.record.name,
+                file,
+                placement,
+                annotation,
+                &message.text,
+            )
+        } else {
+            message.text.clone()
+        };
+        queue_question_launch(
+            state,
+            paths,
+            QuestionLaunch {
+                annotation_id: annotation.id.clone(),
+                pending: PendingSend {
+                    annotation_id: annotation.id.clone(),
+                    user_message_id: message.id,
+                    assistant_message_id: Uuid::new_v4().to_string(),
+                    assistant_seq: message.seq + 1,
+                    prompt,
+                    needs_model_picker: existing.is_none(),
+                },
+                existing,
+            },
+        );
+    }
+    if !state.queued_questions.is_empty() {
+        state.status = format!(
+            "Resuming saved question work · {} waiting behind the active question",
+            state.queued_questions.len()
+        );
+    }
+    Ok(())
 }
 
 fn restore_terminal() {
@@ -364,15 +481,46 @@ fn run_loop<B: Backend>(
             let event = event::read()?;
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    handle_key(state, storage, paths, highlighter, key)?;
+                    if let Err(error) = handle_key(state, storage, paths, highlighter, key) {
+                        state.status = format!("Action failed: {error}");
+                        state.agent_activity = "UI action failed; review remains open".into();
+                    }
                 }
                 Event::Paste(text) if state.mode == RevMode::Compose => {
                     state.compose.insert_str(state.compose_cursor, &text);
                     state.compose_cursor += text.len();
+                    state.compose_scroll = u16::MAX;
                 }
                 Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollDown => move_row(state, highlighter, 3),
-                    MouseEventKind::ScrollUp => move_row(state, highlighter, -3),
+                    MouseEventKind::ScrollDown => match state.mode {
+                        RevMode::Normal | RevMode::Visual => move_row(state, highlighter, 3),
+                        RevMode::Compose => {
+                            state.compose_scroll = state.compose_scroll.saturating_add(3)
+                        }
+                        RevMode::History => {
+                            state.history_cursor = (state.history_cursor + 3)
+                                .min(state.annotations.len().saturating_sub(1))
+                        }
+                        RevMode::Command => {
+                            let count = command_candidates(state).len();
+                            state.command.selected =
+                                (state.command.selected + 1).min(count.saturating_sub(1));
+                        }
+                        RevMode::Model | RevMode::ConfirmClear => {}
+                    },
+                    MouseEventKind::ScrollUp => match state.mode {
+                        RevMode::Normal | RevMode::Visual => move_row(state, highlighter, -3),
+                        RevMode::Compose => {
+                            state.compose_scroll = state.compose_scroll.saturating_sub(3)
+                        }
+                        RevMode::History => {
+                            state.history_cursor = state.history_cursor.saturating_sub(3)
+                        }
+                        RevMode::Command => {
+                            state.command.selected = state.command.selected.saturating_sub(1)
+                        }
+                        RevMode::Model | RevMode::ConfirmClear => {}
+                    },
                     _ => {}
                 },
                 Event::Resize(_, _) => state.render_cache = None,
@@ -392,13 +540,33 @@ fn handle_key(
     highlighter: &mut dyn Highlighter,
     key: KeyEvent,
 ) -> Result<()> {
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('c')
+        && state.agent.is_some()
+    {
+        if let Some(agent) = state.agent.as_ref() {
+            agent.runtime.send(AgentCommand::Abort)?;
+        }
+        state.agent_activity = "Cancellation requested · waiting for Copilot to confirm…".into();
+        state.agent_last_event = Instant::now();
+        state.status =
+            "Cancelling the active question · the UI remains responsive until it settles".into();
+        return Ok(());
+    }
     match state.mode {
         RevMode::Compose => handle_compose_key(state, storage, paths, key),
-        RevMode::Model => handle_model_key(state, storage, key),
+        RevMode::Command => handle_command_key(state, storage, paths, key),
+        RevMode::Model => handle_model_key(state, storage, paths, key),
         RevMode::History => handle_history_key(state, storage, key),
         RevMode::ConfirmClear => {
             match key.code {
                 KeyCode::Char('y') => {
+                    if state.agent.is_some() || !state.queued_questions.is_empty() {
+                        state.mode = RevMode::Normal;
+                        state.status =
+                            "Cancel or finish active and queued questions before clearing".into();
+                        return Ok(());
+                    }
                     state.agent.take();
                     storage.clear_review_history(&state.workspace.item.id)?;
                     state.annotations.clear();
@@ -429,20 +597,18 @@ fn handle_review_key(
     key: KeyEvent,
 ) -> Result<()> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        if state.streaming {
-            if let Some(agent) = state.agent.as_ref() {
-                agent.runtime.send(AgentCommand::Abort)?;
-                state.agent_activity = "Cancelling the active question…".into();
-                state.agent_last_event = Instant::now();
-            }
-        } else {
-            state.visual_anchor = None;
-            state.mode = RevMode::Normal;
-            state.status = "Selection cleared".into();
-        }
+        state.visual_anchor = None;
+        state.mode = RevMode::Normal;
+        state.status = "Selection cleared".into();
         return Ok(());
     }
     match key.code {
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            expand_hunk_edge(state, true)?;
+        }
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            expand_hunk_edge(state, false)?;
+        }
         KeyCode::Char('j') | KeyCode::Down => move_row(state, highlighter, 1),
         KeyCode::Char('k') | KeyCode::Up => move_row(state, highlighter, -1),
         KeyCode::Char('h') | KeyCode::Left => state.move_file(false),
@@ -485,11 +651,16 @@ fn handle_review_key(
             state.mode = RevMode::ConfirmClear;
             state.status = "Clear every saved comment and question here? y/n".into();
         }
+        KeyCode::Char(':') => {
+            state.mode = RevMode::Command;
+            state.command = CommandPalette::default();
+            state.status = "COMMAND · type to filter · ↑/↓ select · Enter run · Esc return".into();
+        }
         KeyCode::Char('q') => {
-            if state.streaming && !state.quit_armed {
-                state.quit_armed = true;
+            if state.agent.is_some() || !state.queued_questions.is_empty() {
                 state.status =
-                    "A question is active · Ctrl-C cancels · press q again to quit anyway".into();
+                    "Questions are active or queued · Ctrl-C cancels the active one before quit"
+                        .into();
             } else {
                 state.status = "quit".into();
             }
@@ -506,17 +677,427 @@ fn handle_review_key(
 }
 
 fn begin_compose(state: &mut RevState, highlighter: &mut dyn Highlighter, target: ComposeTarget) {
-    if matches!(target, ComposeTarget::Feedback | ComposeTarget::NewQuestion)
-        && selected_source_range(state, highlighter).is_none()
-    {
-        state.status = "Move to a source row before adding feedback or a question".into();
-        return;
+    if matches!(target, ComposeTarget::Feedback | ComposeTarget::NewQuestion) {
+        let Some((start, end)) = selected_source_range(state, highlighter) else {
+            state.status = "Move to a source row before adding feedback or a question".into();
+            return;
+        };
+        if state.current_file().is_some_and(|file| {
+            file.visible_lines()
+                .enumerate()
+                .any(|(index, line)| (start..=end).contains(&index) && line.kind == LineKind::Meta)
+        }) {
+            state.status =
+                "Fold rows cannot be annotated · move onto source or reveal context first".into();
+            return;
+        }
     }
     state.mode = RevMode::Compose;
     state.compose_target = Some(target);
     state.compose.clear();
     state.compose_cursor = 0;
+    state.compose_scroll = 0;
     state.status = "INSERT · Enter submit · Shift-Enter newline · Esc cancel".into();
+}
+
+fn handle_command_key(
+    state: &mut RevState,
+    storage: &Storage,
+    paths: &AppPaths,
+    key: KeyEvent,
+) -> Result<()> {
+    let candidates = command_candidates(state);
+    match key.code {
+        KeyCode::Esc => {
+            state.mode = RevMode::Normal;
+            state.status = "Command cancelled".into();
+        }
+        KeyCode::Up => {
+            state.command.selected = state.command.selected.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            state.command.selected =
+                (state.command.selected + 1).min(candidates.len().saturating_sub(1));
+        }
+        KeyCode::Tab => {
+            if let Some(candidate) = candidates.get(state.command.selected) {
+                state.command.input.clone_from(candidate);
+                state.command.cursor = state.command.input.len();
+            }
+        }
+        KeyCode::Enter => {
+            let command = candidates
+                .get(state.command.selected)
+                .filter(|_| !candidates.is_empty())
+                .cloned()
+                .unwrap_or_else(|| state.command.input.trim().to_owned());
+            execute_command(state, storage, paths, &command)?;
+        }
+        KeyCode::Backspace => {
+            if state.command.cursor > 0 {
+                let previous =
+                    previous_grapheme_boundary(&state.command.input, state.command.cursor);
+                state
+                    .command
+                    .input
+                    .replace_range(previous..state.command.cursor, "");
+                state.command.cursor = previous;
+                state.command.selected = 0;
+            }
+        }
+        KeyCode::Delete => {
+            let next = next_grapheme_boundary(&state.command.input, state.command.cursor);
+            if next > state.command.cursor {
+                state
+                    .command
+                    .input
+                    .replace_range(state.command.cursor..next, "");
+            }
+        }
+        KeyCode::Left => {
+            state.command.cursor =
+                previous_grapheme_boundary(&state.command.input, state.command.cursor);
+        }
+        KeyCode::Right => {
+            state.command.cursor =
+                next_grapheme_boundary(&state.command.input, state.command.cursor);
+        }
+        KeyCode::Home => state.command.cursor = 0,
+        KeyCode::End => state.command.cursor = state.command.input.len(),
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            state.command.input.insert(state.command.cursor, character);
+            state.command.cursor += character.len_utf8();
+            state.command.selected = 0;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn command_candidates(state: &RevState) -> Vec<String> {
+    let input = state.command.input.trim().to_ascii_lowercase();
+    let mut commands = vec![
+        "diff unified".to_owned(),
+        "diff split".to_owned(),
+        "expand above".to_owned(),
+        "expand below".to_owned(),
+        "export feedback".to_owned(),
+        "history".to_owned(),
+        "clear".to_owned(),
+        "quit".to_owned(),
+    ];
+    commands.extend(
+        state
+            .branch_candidates
+            .iter()
+            .map(|branch| format!("base {branch}")),
+    );
+    commands.sort();
+    commands
+        .into_iter()
+        .filter(|candidate| {
+            input.is_empty()
+                || candidate.to_ascii_lowercase().contains(&input)
+                || (input.starts_with("base ")
+                    && candidate.starts_with("base ")
+                    && candidate
+                        .to_ascii_lowercase()
+                        .contains(input.trim_start_matches("base ").trim()))
+        })
+        .collect()
+}
+
+fn execute_command(
+    state: &mut RevState,
+    storage: &Storage,
+    paths: &AppPaths,
+    command: &str,
+) -> Result<()> {
+    let command = command.trim();
+    match command {
+        "diff unified" | "unified" => {
+            state.diff_layout = RevDiffLayout::Unified;
+            state.invalidate_rows();
+            state.mode = RevMode::Normal;
+            state.status = "Diff layout changed to unified".into();
+        }
+        "diff split" | "split" => {
+            state.diff_layout = RevDiffLayout::Split;
+            state.invalidate_rows();
+            state.mode = RevMode::Normal;
+            state.status = "Diff layout changed to split".into();
+        }
+        "expand above" => {
+            state.mode = RevMode::Normal;
+            expand_hunk_edge(state, true)?;
+        }
+        "expand below" => {
+            state.mode = RevMode::Normal;
+            expand_hunk_edge(state, false)?;
+        }
+        "export feedback" | "feedback" | "export" => {
+            state.mode = RevMode::Normal;
+            copy_feedback_prompt(state, storage)?;
+        }
+        "history" => {
+            state.mode = RevMode::History;
+            state.history_cursor = 0;
+            state.status = "HISTORY · j/k move · d delete item · Esc return".into();
+        }
+        "clear" => {
+            state.mode = RevMode::ConfirmClear;
+            state.status = "Clear every saved comment and question here? y/n".into();
+        }
+        "quit" | "q" => state.status = "quit".into(),
+        _ if command.starts_with("base ") => {
+            if state.streaming || state.agent.is_some() || !state.queued_questions.is_empty() {
+                state.mode = RevMode::Normal;
+                state.status =
+                    "Finish or cancel queued questions before changing the diff base".into();
+                return Ok(());
+            }
+            let branch = command.trim_start_matches("base ").trim();
+            if branch.is_empty() {
+                state.status = "Choose a base branch from the autocomplete list".into();
+                return Ok(());
+            }
+            let workspace_root = state.workspace.item.workspace_root.clone();
+            let layout = state.diff_layout;
+            let mut selected_repo = state
+                .current_repo()
+                .map(|repo| repo.record.clone())
+                .context("no current repository")?;
+            let previous_repo = selected_repo.clone();
+            selected_repo.base_branch = Some(branch.to_owned());
+            selected_repo.base_branch_source = BaseBranchSource::PerRepo;
+            storage.upsert_repo(&selected_repo)?;
+            let workspace = match resolve_local(&workspace_root, None, paths, storage) {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    storage.upsert_repo(&previous_repo)?;
+                    return Err(error);
+                }
+            };
+            let mut replacement = RevState::load(workspace, storage)?;
+            replacement.diff_layout = layout;
+            replacement.status =
+                format!("Diff base for {} changed to {branch}", selected_repo.name);
+            *state = replacement;
+        }
+        "" => {
+            state.mode = RevMode::Normal;
+            state.status = "No command entered".into();
+        }
+        _ => {
+            state.status = format!("Unknown command: {command}");
+        }
+    }
+    Ok(())
+}
+
+fn expand_hunk_edge(state: &mut RevState, above: bool) -> Result<()> {
+    const STEP: usize = 5;
+
+    let Some(visible_index) = state.render_cache.as_ref().and_then(|cache| {
+        cache.rows.get(state.row_cursor).map(|row| match row.kind {
+            RevRowKind::Source { visible_index, .. } => visible_index,
+            RevRowKind::Annotation {
+                anchor_visible_index,
+                ..
+            } => anchor_visible_index,
+        })
+    }) else {
+        state.status = "Render the current file before expanding its hunk".into();
+        return Ok(());
+    };
+    let (repo_index, file_index) = state.current_indices().context("no current file")?;
+    let repo = &state.workspace.repos[repo_index];
+    let file = &repo.diff.files[file_index];
+    if matches!(file.status, FileStatus::Added | FileStatus::Deleted) {
+        state.status = "Added and deleted files already show their complete changed side".into();
+        return Ok(());
+    }
+    let mut offset = 0;
+    let hunk_index = file
+        .hunks
+        .iter()
+        .position(|hunk| {
+            let contains = visible_index < offset + hunk.lines.len();
+            offset += hunk.lines.len();
+            contains
+        })
+        .context("current row is not part of a hunk")?;
+    let repo_path = repo.record.path.clone();
+    let revision = repo.version.head_sha.clone();
+    let file_path = file.display_path.clone();
+    let working = std::fs::read_to_string(repo_path.join(&file_path))
+        .or_else(|_| Git::default().file_at_revision(&repo_path, &revision, &file_path))?;
+    let old = Git::default()
+        .file_at_revision(
+            &repo_path,
+            &revision,
+            file.old_path.as_deref().unwrap_or(&file_path),
+        )
+        .unwrap_or_else(|_| working.clone());
+    let working_lines = working.lines().collect::<Vec<_>>();
+    let old_lines = old.lines().collect::<Vec<_>>();
+    let hunk = &mut state.workspace.repos[repo_index].diff.files[file_index].hunks[hunk_index];
+    let inserted = if above {
+        let count = STEP
+            .min(hunk.old_start.saturating_sub(1))
+            .min(hunk.new_start.saturating_sub(1));
+        if count == 0 {
+            0
+        } else {
+            let old_start = hunk.old_start - count;
+            let new_start = hunk.new_start - count;
+            let mut lines = (0..count)
+                .map(|index| DiffLine {
+                    kind: LineKind::Context,
+                    old_line: Some(old_start + index),
+                    new_line: Some(new_start + index),
+                    content: working_lines
+                        .get(new_start + index - 1)
+                        .copied()
+                        .unwrap_or_default()
+                        .to_owned(),
+                })
+                .collect::<Vec<_>>();
+            lines.append(&mut hunk.lines);
+            hunk.lines = lines;
+            hunk.old_start = old_start;
+            hunk.new_start = new_start;
+            hunk.old_count += count;
+            hunk.new_count += count;
+            count
+        }
+    } else {
+        let old_next = hunk.old_start + hunk.old_count;
+        let new_next = hunk.new_start + hunk.new_count;
+        let old_remaining = old_lines.len().saturating_sub(old_next.saturating_sub(1));
+        let new_remaining = working_lines
+            .len()
+            .saturating_sub(new_next.saturating_sub(1));
+        let count = STEP.min(old_remaining).min(new_remaining);
+        for index in 0..count {
+            hunk.lines.push(DiffLine {
+                kind: LineKind::Context,
+                old_line: Some(old_next + index),
+                new_line: Some(new_next + index),
+                content: working_lines
+                    .get(new_next + index - 1)
+                    .copied()
+                    .unwrap_or_default()
+                    .to_owned(),
+            });
+        }
+        hunk.old_count += count;
+        hunk.new_count += count;
+        count
+    };
+    merge_touching_hunks(&mut state.workspace.repos[repo_index].diff.files[file_index].hunks);
+    state.invalidate_rows();
+    state.status = if inserted == 0 {
+        if above {
+            "No more unchanged lines above this hunk".into()
+        } else {
+            "No more unchanged lines below this hunk".into()
+        }
+    } else {
+        format!(
+            "Revealed {inserted} unchanged lines {} this hunk · gray rows are outside the diff",
+            if above { "above" } else { "below" }
+        )
+    };
+    Ok(())
+}
+
+fn merge_touching_hunks(hunks: &mut Vec<Hunk>) {
+    for hunk in hunks.iter_mut() {
+        hunk.lines.retain(|line| line.kind != LineKind::Meta);
+    }
+    let mut merged: Vec<Hunk> = Vec::with_capacity(hunks.len());
+    for mut next in std::mem::take(hunks) {
+        if let Some(previous) = merged.last_mut() {
+            let old_touches = next.old_start <= previous.old_start + previous.old_count;
+            let new_touches = next.new_start <= previous.new_start + previous.new_count;
+            if old_touches && new_touches {
+                let mut seen = previous
+                    .lines
+                    .iter()
+                    .map(diff_line_identity)
+                    .collect::<HashSet<_>>();
+                next.lines
+                    .retain(|line| seen.insert(diff_line_identity(line)));
+                previous.lines.extend(next.lines);
+                let old_end =
+                    (previous.old_start + previous.old_count).max(next.old_start + next.old_count);
+                let new_end =
+                    (previous.new_start + previous.new_count).max(next.new_start + next.new_count);
+                previous.old_count = old_end.saturating_sub(previous.old_start);
+                previous.new_count = new_end.saturating_sub(previous.new_start);
+                previous.header = format!(
+                    "@@ -{},{} +{},{} @@",
+                    previous.old_start, previous.old_count, previous.new_start, previous.new_count
+                );
+                continue;
+            }
+        }
+        merged.push(next);
+    }
+    for index in 0..merged.len().saturating_sub(1) {
+        let next_start = merged[index + 1].new_start;
+        let current_end = merged[index].new_start + merged[index].new_count;
+        let gap = next_start.saturating_sub(current_end);
+        if gap > 0 {
+            merged[index].lines.push(DiffLine {
+                kind: LineKind::Meta,
+                old_line: None,
+                new_line: None,
+                content: format!(
+                    "··· {gap} unchanged lines ··· (Shift+↑/↓ reveals 5 at the active hunk edge)"
+                ),
+            });
+        }
+    }
+    *hunks = merged;
+}
+
+fn diff_line_identity(line: &DiffLine) -> (u8, Option<usize>, Option<usize>) {
+    let kind = match line.kind {
+        LineKind::Context => 0,
+        LineKind::Addition => 1,
+        LineKind::Deletion => 2,
+        LineKind::Meta => 3,
+    };
+    (kind, line.old_line, line.new_line)
+}
+
+fn context_keys(workspace: &ResolvedWorkItem) -> HashSet<String> {
+    workspace
+        .repos
+        .iter()
+        .flat_map(|repo| {
+            repo.diff.files.iter().flat_map(move |file| {
+                file.visible_lines()
+                    .filter(|line| line.kind == LineKind::Context)
+                    .map(move |line| context_key(&repo.record.id, file.path(), line))
+            })
+        })
+        .collect()
+}
+
+fn context_key(repo_id: &str, path: &Path, line: &DiffLine) -> String {
+    format!(
+        "{repo_id}\0{}\0{:?}\0{:?}",
+        path.display(),
+        line.old_line,
+        line.new_line
+    )
 }
 
 fn handle_compose_key(
@@ -535,6 +1116,7 @@ fn handle_compose_key(
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
             state.compose.insert(state.compose_cursor, '\n');
             state.compose_cursor += 1;
+            state.compose_scroll = u16::MAX;
             Ok(())
         }
         KeyCode::Enter => submit_compose(state, storage, paths),
@@ -545,6 +1127,7 @@ fn handle_compose_key(
                     .compose
                     .replace_range(previous..state.compose_cursor, "");
                 state.compose_cursor = previous;
+                state.compose_scroll = u16::MAX;
             }
             Ok(())
         }
@@ -552,6 +1135,7 @@ fn handle_compose_key(
             let next = next_grapheme_boundary(&state.compose, state.compose_cursor);
             if next > state.compose_cursor {
                 state.compose.replace_range(state.compose_cursor..next, "");
+                state.compose_scroll = u16::MAX;
             }
             Ok(())
         }
@@ -565,10 +1149,28 @@ fn handle_compose_key(
         }
         KeyCode::Home => {
             state.compose_cursor = 0;
+            state.compose_scroll = 0;
             Ok(())
         }
         KeyCode::End => {
             state.compose_cursor = state.compose.len();
+            state.compose_scroll = u16::MAX;
+            Ok(())
+        }
+        KeyCode::Up => {
+            state.compose_scroll = state.compose_scroll.saturating_sub(1);
+            Ok(())
+        }
+        KeyCode::Down => {
+            state.compose_scroll = state.compose_scroll.saturating_add(1);
+            Ok(())
+        }
+        KeyCode::PageUp => {
+            state.compose_scroll = state.compose_scroll.saturating_sub(5);
+            Ok(())
+        }
+        KeyCode::PageDown => {
+            state.compose_scroll = state.compose_scroll.saturating_add(5);
             Ok(())
         }
         KeyCode::Char(character)
@@ -578,6 +1180,7 @@ fn handle_compose_key(
         {
             state.compose.insert(state.compose_cursor, character);
             state.compose_cursor += character.len_utf8();
+            state.compose_scroll = u16::MAX;
             Ok(())
         }
         _ => Ok(()),
@@ -596,6 +1199,7 @@ fn submit_compose(state: &mut RevState, storage: &Storage, paths: &AppPaths) -> 
         .context("composer has no target")?;
     state.compose.clear();
     state.compose_cursor = 0;
+    state.compose_scroll = 0;
     state.mode = RevMode::Normal;
     match target {
         ComposeTarget::Feedback => create_feedback(state, storage, &text),
@@ -777,7 +1381,7 @@ fn question_prompt(
 }
 
 fn queue_question_launch(state: &mut RevState, paths: &AppPaths, launch: QuestionLaunch) {
-    if state.streaming {
+    if state.agent.is_some() {
         state.queued_questions.push_back(launch);
         state.status = format!(
             "Question saved in its own session queue · {} waiting",
@@ -789,7 +1393,7 @@ fn queue_question_launch(state: &mut RevState, paths: &AppPaths, launch: Questio
 }
 
 fn start_question_agent(state: &mut RevState, paths: &AppPaths, launch: QuestionLaunch) {
-    state.agent.take();
+    debug_assert!(state.agent.is_none());
     let selection = launch
         .existing
         .as_ref()
@@ -866,7 +1470,13 @@ fn drain_agent_events(state: &mut RevState, storage: &Storage, paths: &AppPaths)
             break;
         };
         state.agent_last_event = Instant::now();
-        handle_agent_event(state, storage, paths, event)?;
+        if let Err(error) = handle_agent_event(state, storage, paths, event) {
+            state.streaming = false;
+            state.status = format!("Copilot event failed: {error}");
+            state.agent_activity = "Copilot event failed; advancing the question queue".into();
+            finish_active_question(state, paths);
+            break;
+        }
     }
     Ok(())
 }
@@ -995,10 +1605,14 @@ fn handle_agent_event(
             state.invalidate_rows();
         }
         AgentEvent::ResponseDelta { outbound_id, delta } => {
-            append_response(state, &outbound_id, &delta, false);
+            if let Some((message_id, text)) = append_response(state, &outbound_id, &delta, false) {
+                storage.update_ask_message_text(&message_id, &text)?;
+            }
         }
         AgentEvent::ResponseSnapshot { outbound_id, text } => {
-            append_response(state, &outbound_id, &text, true);
+            if let Some((message_id, text)) = append_response(state, &outbound_id, &text, true) {
+                storage.update_ask_message_text(&message_id, &text)?;
+            }
         }
         AgentEvent::ResponseComplete {
             outbound_id,
@@ -1014,13 +1628,7 @@ fn handle_agent_event(
                 "Answer complete".into()
             };
             state.status = state.agent_activity.clone();
-            state.quit_armed = false;
-            if let Some(agent) = state.agent.as_mut() {
-                agent.outbound_id = None;
-            }
-            if let Some(next) = state.queued_questions.pop_front() {
-                start_question_agent(state, paths, next);
-            }
+            finish_active_question(state, paths);
         }
         AgentEvent::TurnFailed {
             outbound_id,
@@ -1033,6 +1641,7 @@ fn handle_agent_event(
             state.streaming = false;
             state.agent_activity = format!("Question failed: {message}");
             state.status = state.agent_activity.clone();
+            finish_active_question(state, paths);
         }
         AgentEvent::Activity { label, .. } => state.agent_activity = label,
         AgentEvent::Usage { model, .. } => {
@@ -1046,12 +1655,14 @@ fn handle_agent_event(
             state.streaming = false;
             state.agent_activity = format!("Copilot error: {message}");
             state.status = state.agent_activity.clone();
+            finish_active_question(state, paths);
         }
         AgentEvent::Stopped => {
             if state.streaming {
                 state.streaming = false;
                 state.status = "Copilot stopped before the answer completed".into();
             }
+            finish_active_question(state, paths);
         }
         AgentEvent::HistoryLoaded(_)
         | AgentEvent::Queued { .. }
@@ -1109,16 +1720,26 @@ fn pending_metadata(
         .context("active question lost its persistence metadata")
 }
 
-fn append_response(state: &mut RevState, outbound_id: &str, text: &str, snapshot: bool) {
-    let Some(agent) = state.agent.as_ref() else {
-        return;
-    };
-    if agent.outbound_id.as_deref() != Some(outbound_id) {
-        return;
+fn finish_active_question(state: &mut RevState, paths: &AppPaths) {
+    state.agent.take();
+    state.picker = None;
+    state.mode = RevMode::Normal;
+    if let Some(next) = state.queued_questions.pop_front() {
+        start_question_agent(state, paths, next);
     }
-    let Some(pending) = agent.pending.as_ref() else {
-        return;
-    };
+}
+
+fn append_response(
+    state: &mut RevState,
+    outbound_id: &str,
+    text: &str,
+    snapshot: bool,
+) -> Option<(String, String)> {
+    let agent = state.agent.as_ref()?;
+    if agent.outbound_id.as_deref() != Some(outbound_id) {
+        return None;
+    }
+    let pending = agent.pending.as_ref()?;
     if let Some(message) = state
         .threads
         .get_mut(&pending.annotation_id)
@@ -1129,12 +1750,16 @@ fn append_response(state: &mut RevState, outbound_id: &str, text: &str, snapshot
         })
     {
         if snapshot {
-            message.text.clone_from(&text.to_owned());
+            message.text.clear();
+            message.text.push_str(text);
         } else {
             message.text.push_str(text);
         }
+        let response = (message.id.clone(), message.text.clone());
         state.invalidate_rows();
+        return Some(response);
     }
+    None
 }
 
 fn active_response(state: &RevState, outbound_id: &str) -> Option<(String, String)> {
@@ -1151,13 +1776,30 @@ fn active_response(state: &RevState, outbound_id: &str) -> Option<(String, Strin
         .map(|message| (message.id.clone(), message.text.clone()))
 }
 
-fn handle_model_key(state: &mut RevState, storage: &Storage, key: KeyEvent) -> Result<()> {
+fn handle_model_key(
+    state: &mut RevState,
+    storage: &Storage,
+    paths: &AppPaths,
+    key: KeyEvent,
+) -> Result<()> {
     let picker = state.picker.as_mut().context("model mode has no picker")?;
     match key.code {
         KeyCode::Esc => {
+            if let Some(message_id) = state
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.pending.as_ref())
+                .map(|pending| pending.user_message_id.clone())
+            {
+                storage.discard_pending_ask(&message_id)?;
+            }
             state.mode = RevMode::Normal;
             state.agent.take();
+            state.picker = None;
             state.status = "Question kept as a draft; model selection cancelled".into();
+            if let Some(next) = state.queued_questions.pop_front() {
+                start_question_agent(state, paths, next);
+            }
         }
         KeyCode::Char('j') | KeyCode::Down => {
             picker.index = (picker.index + 1).min(picker.option_count().saturating_sub(1));
@@ -1202,20 +1844,35 @@ fn handle_history_key(state: &mut RevState, storage: &Storage, key: KeyEvent) ->
     match key.code {
         KeyCode::Esc | KeyCode::Char('r') => {
             state.mode = RevMode::Normal;
+            state.history_delete_armed = None;
             state.status = "Back to review".into();
         }
         KeyCode::Char('j') | KeyCode::Down => {
             state.history_cursor =
                 (state.history_cursor + 1).min(state.annotations.len().saturating_sub(1));
+            state.history_delete_armed = None;
         }
         KeyCode::Char('k') | KeyCode::Up => {
             state.history_cursor = state.history_cursor.saturating_sub(1);
+            state.history_delete_armed = None;
         }
         KeyCode::Char('d') => {
+            if state.agent.is_some() || !state.queued_questions.is_empty() {
+                state.status =
+                    "Finish or cancel active and queued questions before deleting history".into();
+                return Ok(());
+            }
             if let Some((annotation, _)) = state.annotations.get(state.history_cursor).cloned() {
+                if state.history_delete_armed.as_deref() != Some(&annotation.id) {
+                    state.history_delete_armed = Some(annotation.id);
+                    state.status =
+                        "Press d again to permanently delete this saved review item".into();
+                    return Ok(());
+                }
                 storage.delete_annotation(&annotation.id)?;
                 state.annotations.remove(state.history_cursor);
                 state.threads.remove(&annotation.id);
+                state.history_delete_armed = None;
                 state.history_cursor = state
                     .history_cursor
                     .min(state.annotations.len().saturating_sub(1));
@@ -1245,7 +1902,8 @@ fn copy_feedback_prompt(state: &mut RevState, storage: &Storage) -> Result<()> {
 }
 
 fn move_row(state: &mut RevState, highlighter: &mut dyn Highlighter, delta: isize) {
-    let rows = ensure_rows(state, 100, highlighter).to_vec();
+    let width = cached_row_width(state);
+    let rows = ensure_rows(state, width, highlighter).to_vec();
     if rows.is_empty() {
         return;
     }
@@ -1284,12 +1942,14 @@ fn move_row(state: &mut RevState, highlighter: &mut dyn Highlighter, delta: isiz
 }
 
 fn row_count(state: &mut RevState, highlighter: &mut dyn Highlighter) -> usize {
-    ensure_rows(state, 100, highlighter).len()
+    let width = cached_row_width(state);
+    ensure_rows(state, width, highlighter).len()
 }
 
 fn current_source_index(state: &mut RevState, highlighter: &mut dyn Highlighter) -> Option<usize> {
     let cursor = state.row_cursor;
-    match &ensure_rows(state, 100, highlighter).get(cursor)?.kind {
+    let width = cached_row_width(state);
+    match &ensure_rows(state, width, highlighter).get(cursor)?.kind {
         RevRowKind::Source { visible_index, .. } => Some(*visible_index),
         RevRowKind::Annotation {
             anchor_visible_index,
@@ -1303,10 +1963,15 @@ fn current_annotation_id(
     highlighter: &mut dyn Highlighter,
 ) -> Option<String> {
     let cursor = state.row_cursor;
-    match &ensure_rows(state, 100, highlighter).get(cursor)?.kind {
+    let width = cached_row_width(state);
+    match &ensure_rows(state, width, highlighter).get(cursor)?.kind {
         RevRowKind::Annotation { annotation_id, .. } => Some(annotation_id.clone()),
         RevRowKind::Source { .. } => None,
     }
+}
+
+fn cached_row_width(state: &RevState) -> usize {
+    state.render_cache.as_ref().map_or(100, |cache| cache.width)
 }
 
 fn selected_source_range(
@@ -1488,7 +2153,11 @@ fn render(frame: &mut Frame, state: &mut RevState, highlighter: &mut dyn Highlig
         return;
     }
     let compose_height = if state.mode == RevMode::Compose {
-        composer_height(&state.compose, area.width.saturating_sub(4) as usize)
+        composer_height(
+            &state.compose,
+            area.width.saturating_sub(4) as usize,
+            area.height.saturating_sub(8),
+        )
     } else {
         0
     };
@@ -1498,7 +2167,7 @@ fn render(frame: &mut Frame, state: &mut RevState, highlighter: &mut dyn Highlig
             Constraint::Length(2),
             Constraint::Min(3),
             Constraint::Length(compose_height),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(area);
     render_header(frame, state, vertical[0]);
@@ -1513,6 +2182,8 @@ fn render(frame: &mut Frame, state: &mut RevState, highlighter: &mut dyn Highlig
     render_footer(frame, state, vertical[3]);
     if state.mode == RevMode::Model {
         render_model_picker(frame, state, vertical[1]);
+    } else if state.mode == RevMode::Command {
+        render_command_palette(frame, state, vertical[1]);
     } else if state.mode == RevMode::ConfirmClear {
         render_confirmation(frame, vertical[1]);
     }
@@ -1527,10 +2198,15 @@ fn render_header(frame: &mut Frame, state: &RevState, area: Rect) {
         .map(|file| file.path().display().to_string())
         .unwrap_or_else(|| "no files".into());
     let title = format!(
-        " rev · {} · {} > {} · file {}/{} ",
+        " rev · {} · {} > {} · {} · base {} · file {}/{} ",
         state.workspace.item.name,
         repo,
         file,
+        state.diff_layout.label(),
+        state
+            .current_repo()
+            .and_then(|repo| repo.record.base_branch.as_deref())
+            .unwrap_or("auto"),
         state.file_index.saturating_add(1),
         state.files.len()
     );
@@ -1553,7 +2229,10 @@ fn render_review(
         Color::Cyan
     };
     let block = Block::default()
-        .title(" review · j/k bounded · h/l files ")
+        .title(format!(
+            " review · {} · j/k bounded · h/l files · Shift+↑/↓ expand ",
+            state.diff_layout.label()
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border));
     let inner = block.inner(area);
@@ -1578,15 +2257,28 @@ fn render_review(
             RevRowKind::Source {
                 visible_index,
                 line,
-            } => source_line(
-                state.current_file().map(DiffFile::path),
-                line,
-                *visible_index,
-                width,
-                highlighter,
-            ),
+            } => match state.diff_layout {
+                RevDiffLayout::Unified => source_line(
+                    state.current_file().map(DiffFile::path),
+                    line,
+                    *visible_index,
+                    width,
+                    highlighter,
+                ),
+                RevDiffLayout::Split => split_source_line(
+                    state.current_file().map(DiffFile::path),
+                    line,
+                    *visible_index,
+                    width,
+                    highlighter,
+                ),
+            },
             RevRowKind::Annotation { .. } => row.line.clone().unwrap_or_default(),
         };
+        let expanded_context = matches!(
+            &row.kind,
+            RevRowKind::Source { line, .. } if is_expanded_context(state, line)
+        );
         let visually_selected = match &row.kind {
             RevRowKind::Source { visible_index, .. } => {
                 selection.is_some_and(|(start, end)| (start..=end).contains(visible_index))
@@ -1599,10 +2291,23 @@ fn render_review(
             } else {
                 Color::Rgb(35, 45, 58)
             }));
+        } else if expanded_context {
+            line = line.style(Style::default().bg(Color::Rgb(38, 38, 38)));
         }
         visible.push(line);
     }
     frame.render_widget(Paragraph::new(Text::from(visible)), inner);
+}
+
+fn is_expanded_context(state: &RevState, line: &DiffLine) -> bool {
+    line.kind == LineKind::Context
+        && state.current_repo().is_some_and(|repo| {
+            state.current_file().is_some_and(|file| {
+                !state
+                    .original_context
+                    .contains(&context_key(&repo.record.id, file.path(), line))
+            })
+        })
 }
 
 fn source_line(
@@ -1626,7 +2331,12 @@ fn source_line(
         LineKind::Meta => Style::default().fg(Color::Blue),
     };
     let gutter = format!("{:>5} {marker} ", number);
-    let available = width.saturating_sub(cell_width(&gutter));
+    let rendered_gutter = if cell_width(&gutter) > width {
+        fit_text(&gutter, width)
+    } else {
+        gutter
+    };
+    let available = width.saturating_sub(cell_width(&rendered_gutter));
     let segments = path
         .and_then(|path| {
             highlighter
@@ -1641,7 +2351,7 @@ fn source_line(
                 italic: false,
             }]
         });
-    let mut spans = vec![Span::styled(gutter, gutter_style)];
+    let mut spans = vec![Span::styled(rendered_gutter, gutter_style)];
     let mut used = 0usize;
     'segments: for segment in segments {
         let mut style = Style::default().fg(Color::Rgb(
@@ -1668,26 +2378,167 @@ fn source_line(
     Line::from(spans)
 }
 
-fn render_composer(frame: &mut Frame, state: &RevState, area: Rect) {
+fn split_source_line(
+    path: Option<&Path>,
+    line: &DiffLine,
+    visible_index: usize,
+    width: usize,
+    highlighter: &mut dyn Highlighter,
+) -> Line<'static> {
+    let left_width = width.saturating_sub(1) / 2;
+    let right_width = width.saturating_sub(left_width + 1);
+    let left = match line.kind {
+        LineKind::Addition => blank_side(left_width),
+        _ => source_side(
+            path,
+            line,
+            visible_index,
+            left_width,
+            line.old_line,
+            line.kind == LineKind::Deletion,
+            highlighter,
+        ),
+    };
+    let right = match line.kind {
+        LineKind::Deletion => blank_side(right_width),
+        _ => source_side(
+            path,
+            line,
+            visible_index,
+            right_width,
+            line.new_line,
+            line.kind == LineKind::Addition,
+            highlighter,
+        ),
+    };
+    let mut spans = left;
+    spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+    spans.extend(right);
+    Line::from(spans)
+}
+
+fn blank_side(width: usize) -> Vec<Span<'static>> {
+    vec![Span::raw(" ".repeat(width))]
+}
+
+fn source_side(
+    path: Option<&Path>,
+    line: &DiffLine,
+    visible_index: usize,
+    width: usize,
+    number: Option<usize>,
+    changed: bool,
+    highlighter: &mut dyn Highlighter,
+) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let marker = if changed {
+        match line.kind {
+            LineKind::Addition => "+",
+            LineKind::Deletion => "-",
+            _ => " ",
+        }
+    } else {
+        " "
+    };
+    let gutter = format!("{:>4} {marker} ", number.unwrap_or(0));
+    let gutter_style = match line.kind {
+        LineKind::Addition if changed => Style::default().fg(Color::Green),
+        LineKind::Deletion if changed => Style::default().fg(Color::Red),
+        LineKind::Meta => Style::default().fg(Color::Blue),
+        _ => Style::default().fg(Color::DarkGray),
+    };
+    let rendered_gutter = if cell_width(&gutter) > width {
+        fit_text(&gutter, width)
+    } else {
+        gutter
+    };
+    let available = width.saturating_sub(cell_width(&rendered_gutter));
+    let segments = path
+        .and_then(|path| {
+            highlighter
+                .highlight_line(path, visible_index, &line.content)
+                .ok()
+        })
+        .unwrap_or_else(|| {
+            vec![StyledSegment {
+                text: line.content.clone(),
+                foreground: (210, 210, 210),
+                bold: false,
+                italic: false,
+            }]
+        });
+    let mut spans = vec![Span::styled(rendered_gutter, gutter_style)];
+    let mut content_used = 0usize;
+    'segments: for segment in segments {
+        let mut style = Style::default().fg(Color::Rgb(
+            segment.foreground.0,
+            segment.foreground.1,
+            segment.foreground.2,
+        ));
+        if segment.bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if segment.italic {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        for (_, grapheme) in grapheme_indices(&segment.text) {
+            let grapheme_width = cell_width(grapheme);
+            if content_used.saturating_add(grapheme_width) > available {
+                if available > 0 {
+                    spans.push(Span::styled("…", Style::default().fg(Color::Yellow)));
+                }
+                break 'segments;
+            }
+            spans.push(Span::styled(grapheme.to_owned(), style));
+            content_used += grapheme_width;
+        }
+    }
+    let current_width: usize = spans
+        .iter()
+        .map(|span| cell_width(span.content.as_ref()))
+        .sum();
+    if current_width < width {
+        spans.push(Span::raw(" ".repeat(width - current_width)));
+    }
+    spans
+}
+
+fn render_composer(frame: &mut Frame, state: &mut RevState, area: Rect) {
     if area.height == 0 {
         return;
     }
     let mut text = state.compose.clone();
     let cursor = floor_grapheme_boundary(&text, state.compose_cursor);
     text.insert(cursor, '▏');
-    let title = match state.compose_target {
+    let label = match state.compose_target {
         Some(ComposeTarget::Feedback) => " feedback ",
         Some(ComposeTarget::NewQuestion) => " question ",
         Some(ComposeTarget::FollowUp(_)) => " follow-up ",
         None => " input ",
     };
+    let content_width = area.width.saturating_sub(2).max(1) as usize;
+    let total_rows = wrapped_row_count(&text, content_width);
+    let visible_rows = area.height.saturating_sub(2).max(1) as usize;
+    let max_scroll = total_rows.saturating_sub(visible_rows) as u16;
+    state.compose_scroll = state.compose_scroll.min(max_scroll);
+    let title = format!(
+        "{label} · rows {}-{} of {} · ↑/↓ scroll ",
+        usize::from(state.compose_scroll) + 1,
+        (usize::from(state.compose_scroll) + visible_rows).min(total_rows),
+        total_rows
+    );
     frame.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
-        ),
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((state.compose_scroll, 0))
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Green)),
+            ),
         area,
     );
 }
@@ -1697,6 +2548,7 @@ fn render_footer(frame: &mut Frame, state: &RevState, area: Rect) {
         RevMode::Normal => "NORMAL",
         RevMode::Visual => "VISUAL",
         RevMode::Compose => "INSERT",
+        RevMode::Command => "COMMAND",
         RevMode::Model => "MODEL",
         RevMode::History => "HISTORY",
         RevMode::ConfirmClear => "CONFIRM",
@@ -1705,7 +2557,7 @@ fn render_footer(frame: &mut Frame, state: &RevState, area: Rect) {
         format!("{mode} · {}", state.status)
     } else {
         format!(
-            "{mode} · {} · a ask · c feedback · r history · e copy · q quit",
+            "{mode} · {} · : commands · a ask · c feedback · r history · e copy · q quit",
             state.status
         )
     };
@@ -1730,6 +2582,63 @@ fn render_footer(frame: &mut Frame, state: &RevState, area: Rect) {
         .block(Block::default().borders(Borders::TOP)),
         area,
     );
+}
+
+fn render_command_palette(frame: &mut Frame, state: &RevState, area: Rect) {
+    let width = area.width.saturating_sub(4).clamp(34, 84);
+    let candidates = command_candidates(state);
+    let visible_count = candidates.len().clamp(1, 8);
+    let height = (visible_count as u16 + 3).min(area.height);
+    let popup = centered_rect(area, width, height);
+    frame.render_widget(Clear, popup);
+    let inner = Block::default()
+        .title(" command palette · ↑/↓ scroll · Tab complete ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+    let body = inner.inner(popup);
+    frame.render_widget(inner, popup);
+    let mut input = state.command.input.clone();
+    input.insert(floor_grapheme_boundary(&input, state.command.cursor), '▏');
+    let start = state
+        .command
+        .selected
+        .saturating_add(1)
+        .saturating_sub(visible_count);
+    let mut lines = vec![Line::styled(
+        format!(
+            ":{}",
+            fit_text(&input, body.width.saturating_sub(1) as usize)
+        ),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )];
+    lines.extend(
+        candidates
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible_count)
+            .map(|(index, candidate)| {
+                Line::styled(
+                    format!(
+                        "{} {}",
+                        if index == state.command.selected {
+                            "❯"
+                        } else {
+                            " "
+                        },
+                        candidate
+                    ),
+                    if index == state.command.selected {
+                        Style::default().bg(Color::Rgb(48, 48, 60))
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    },
+                )
+            }),
+    );
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 fn render_model_picker(frame: &mut Frame, state: &RevState, area: Rect) {
@@ -1780,9 +2689,22 @@ fn render_model_picker(frame: &mut Frame, state: &RevState, area: Rect) {
             },
         ),
     };
+    let block = Block::default()
+        .title(format!("{title} · ↑/↓ scroll · Enter deeper "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    let viewport = inner.height.max(1) as usize;
+    let start = picker
+        .index
+        .saturating_add(1)
+        .saturating_sub(viewport)
+        .min(options.len().saturating_sub(viewport));
     let lines = options
         .iter()
         .enumerate()
+        .skip(start)
+        .take(viewport)
         .map(|(index, option)| {
             Line::styled(
                 format!(
@@ -1801,15 +2723,8 @@ fn render_model_picker(frame: &mut Frame, state: &RevState, area: Rect) {
             )
         })
         .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        ),
-        popup,
-    );
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_history(frame: &mut Frame, state: &RevState, area: Rect) {
@@ -1895,13 +2810,16 @@ fn current_source_index_from_rows(rows: &[RevRow], cursor: usize) -> Option<usiz
     }
 }
 
-fn composer_height(text: &str, width: usize) -> u16 {
+fn wrapped_row_count(text: &str, width: usize) -> usize {
     let width = width.max(1);
-    let cells = text
-        .split('\n')
+    text.split('\n')
         .map(|line| cell_width(line).max(1).div_ceil(width))
-        .sum::<usize>();
-    (cells + 2).clamp(3, 10) as u16
+        .sum::<usize>()
+}
+
+fn composer_height(text: &str, width: usize, maximum: u16) -> u16 {
+    let desired = wrapped_row_count(text, width).saturating_add(2) as u16;
+    desired.clamp(3, maximum.max(3))
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
@@ -1936,10 +2854,54 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-pub(crate) fn render_snapshot(width: u16, height: u16) -> Result<String> {
+pub(crate) fn render_snapshot(width: u16, height: u16, snapshot: &str) -> Result<String> {
     let storage = Storage::in_memory()?;
     let workspace = snapshot_workspace(&storage)?;
     let mut state = RevState::load(workspace, &storage)?;
+    match snapshot {
+        "review" => {}
+        "split" => state.diff_layout = RevDiffLayout::Split,
+        "expanded" => {
+            let hunk = &mut state.workspace.repos[0].diff.files[0].hunks[0];
+            let mut context = (5..10)
+                .map(|line| DiffLine {
+                    kind: LineKind::Context,
+                    old_line: Some(line),
+                    new_line: Some(line),
+                    content: format!("unchanged line {line}"),
+                })
+                .collect::<Vec<_>>();
+            context.append(&mut hunk.lines);
+            hunk.lines = context;
+            hunk.old_start = 5;
+            hunk.new_start = 5;
+            hunk.old_count += 5;
+            hunk.new_count += 5;
+            state.status = "Five gray unchanged lines revealed above the active hunk".into();
+        }
+        "command" => {
+            state.mode = RevMode::Command;
+            state.command.input = "diff".into();
+            state.command.cursor = state.command.input.len();
+        }
+        "composer" => {
+            state.mode = RevMode::Compose;
+            state.compose_target = Some(ComposeTarget::NewQuestion);
+            state.compose = (1..=30)
+                .map(|line| format!("Line {line}: a long question that exercises wrapping"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            state.compose_cursor = state.compose.len();
+            state.compose_scroll = u16::MAX;
+        }
+        "history" => state.mode = RevMode::History,
+        "streaming" => {
+            state.streaming = true;
+            state.agent_activity =
+                "tool · searching workspace · src/rev_ui.rs · event 12ms ago".into();
+        }
+        other => anyhow::bail!("unknown snapshot state: {other}"),
+    }
     let mut highlighter = PlainHighlighter;
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
     terminal.draw(|frame| render(frame, &mut state, &mut highlighter))?;
@@ -1947,12 +2909,14 @@ pub(crate) fn render_snapshot(width: u16, height: u16) -> Result<String> {
         .backend()
         .buffer()
         .content
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>()
-        .as_bytes()
         .chunks(width as usize)
-        .map(|row| String::from_utf8_lossy(row).trim_end().to_owned())
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
         .collect::<Vec<_>>()
         .join("\n")
         + "\n")
@@ -1998,7 +2962,7 @@ fn snapshot_workspace(storage: &Storage) -> Result<ResolvedWorkItem> {
         "diff --git a/src/lib.rs b/src/lib.rs\n",
         "--- a/src/lib.rs\n",
         "+++ b/src/lib.rs\n",
-        "@@ -1,3 +1,4 @@\n",
+        "@@ -10,3 +10,4 @@\n",
         " fn review() {\n",
         "+    let isolated_questions = true;\n",
         "     finish();\n",
@@ -2018,22 +2982,180 @@ fn snapshot_workspace(storage: &Storage) -> Result<ResolvedWorkItem> {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
+    use ratatui::Terminal;
 
     use super::{
-        handle_review_key, render_snapshot, row_count, snapshot_workspace, RevMode, RevState,
+        handle_review_key, merge_touching_hunks, queue_question_launch, render, render_snapshot,
+        row_count, snapshot_workspace, PendingSend, QuestionLaunch, RevAgentSlot, RevMode,
+        RevState,
     };
     use crate::config::AppPaths;
+    use crate::copilot::{AgentCommand, AgentEvent, AgentRuntime, AgentSink, ModelSelection};
+    use crate::diff::{DiffLine, Hunk, LineKind};
     use crate::highlight::PlainHighlighter;
     use crate::storage::Storage;
 
+    struct NoopAgent;
+
+    impl AgentSink for NoopAgent {
+        fn send(&self, _command: AgentCommand) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl AgentRuntime for NoopAgent {
+        fn try_recv(&self) -> Option<AgentEvent> {
+            None
+        }
+    }
+
     #[test]
     fn snapshot_exposes_the_small_rev_surface() {
-        let snapshot = render_snapshot(100, 24).unwrap();
+        let snapshot = render_snapshot(100, 24, "review").unwrap();
         assert!(snapshot.contains("rev · workspace"));
         assert!(snapshot.contains("j/k bounded"));
         assert!(snapshot.contains("h/l files"));
         assert!(snapshot.contains("a ask"));
         assert!(snapshot.contains("c feedback"));
+        assert!(!snapshot.contains('�'));
+        assert_eq!(snapshot.lines().count(), 24);
+    }
+
+    #[test]
+    fn snapshots_cover_split_palette_and_growing_composer_states() {
+        let split = render_snapshot(100, 28, "split").unwrap();
+        assert!(split.contains("· split ·"));
+        assert!(split.contains("│  11 +     let isolated_questions"));
+
+        let command = render_snapshot(100, 28, "command").unwrap();
+        assert!(command.contains("command palette"));
+        assert!(command.contains("❯ diff split"));
+
+        let composer = render_snapshot(100, 28, "composer").unwrap();
+        assert!(composer.contains("rows 13-30 of 30"));
+        assert!(composer.contains("↑/↓ scroll"));
+        assert!(composer.contains("COPILOT"));
+    }
+
+    #[test]
+    fn revealed_context_has_a_distinct_muted_background() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        let hunk = &mut state.workspace.repos[0].diff.files[0].hunks[0];
+        hunk.lines.insert(
+            0,
+            DiffLine {
+                kind: LineKind::Context,
+                old_line: Some(9),
+                new_line: Some(9),
+                content: "revealed".into(),
+            },
+        );
+        hunk.old_start = 9;
+        hunk.new_start = 9;
+        hunk.old_count += 1;
+        hunk.new_count += 1;
+        state.row_cursor = 1;
+        let mut highlighter = PlainHighlighter;
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+
+        assert_eq!(
+            terminal.backend().buffer()[(1, 3)].bg,
+            Color::Rgb(38, 38, 38)
+        );
+    }
+
+    #[test]
+    fn overlapping_hunk_expansions_become_one_continuous_region() {
+        let context = |line| DiffLine {
+            kind: LineKind::Context,
+            old_line: Some(line),
+            new_line: Some(line),
+            content: format!("line {line}"),
+        };
+        let mut hunks = vec![
+            Hunk {
+                header: "@@ -10,5 +10,5 @@".into(),
+                old_start: 10,
+                old_count: 5,
+                new_start: 10,
+                new_count: 5,
+                lines: (10..15).map(context).collect(),
+            },
+            Hunk {
+                header: "@@ -15,5 +15,5 @@".into(),
+                old_start: 15,
+                old_count: 5,
+                new_start: 15,
+                new_count: 5,
+                lines: (15..20).map(context).collect(),
+            },
+        ];
+
+        merge_touching_hunks(&mut hunks);
+
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].lines.len(), 10);
+        assert_eq!(hunks[0].new_count, 10);
+    }
+
+    #[test]
+    fn a_question_starting_up_is_not_replaced_by_the_next_question() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        state.agent = Some(RevAgentSlot {
+            question_id: "first".into(),
+            runtime: Box::new(NoopAgent),
+            pending: None,
+            outbound_id: None,
+            session_id: None,
+            selection: ModelSelection {
+                model_id: "test".into(),
+                reasoning_effort: None,
+                context_tier: None,
+            },
+            needs_model_picker: true,
+        });
+        let paths = AppPaths {
+            data: "/tmp/rev-queue/data".into(),
+            cache: "/tmp/rev-queue/cache".into(),
+            database: "/tmp/rev-queue/rev.db".into(),
+            roots: "/tmp/rev-queue/roots".into(),
+            prs: "/tmp/rev-queue/prs".into(),
+            exports: "/tmp/rev-queue/exports".into(),
+            skills: "/tmp/rev-queue/skills".into(),
+            plugins: "/tmp/rev-queue/plugins".into(),
+        };
+        queue_question_launch(
+            &mut state,
+            &paths,
+            QuestionLaunch {
+                annotation_id: "second".into(),
+                pending: PendingSend {
+                    annotation_id: "second".into(),
+                    user_message_id: "user".into(),
+                    assistant_message_id: "assistant".into(),
+                    assistant_seq: 1,
+                    prompt: "question".into(),
+                    needs_model_picker: true,
+                },
+                existing: None,
+            },
+        );
+
+        assert_eq!(
+            state.agent.as_ref().map(|agent| agent.question_id.as_str()),
+            Some("first")
+        );
+        assert_eq!(state.queued_questions.len(), 1);
+        assert!(state.status.contains("1 waiting"));
     }
 
     #[test]

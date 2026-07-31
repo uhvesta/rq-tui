@@ -135,6 +135,37 @@ impl<R: CommandRunner> Git<R> {
         )
     }
 
+    pub(crate) fn branch_candidates(&self, repo: &Path) -> Result<Vec<String>> {
+        let output = self.git_stdout(
+            repo,
+            [
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "refs/heads",
+                "refs/remotes",
+            ],
+        )?;
+        let mut branches = output
+            .lines()
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty() && !branch.ends_with("/HEAD"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        branches.sort();
+        branches.dedup();
+        Ok(branches)
+    }
+
+    pub(crate) fn file_at_revision(
+        &self,
+        repo: &Path,
+        revision: &str,
+        path: &Path,
+    ) -> Result<String> {
+        let object = format!("{revision}:{}", path.to_string_lossy());
+        self.git_stdout(repo, ["show", &object])
+    }
+
     pub(crate) fn merge_base(&self, repo: &Path, left: &str, right: &str) -> Result<String> {
         self.git_stdout(repo, ["merge-base", left, right])
     }
@@ -422,6 +453,17 @@ mod tests {
         );
         assert_eq!(state.base_branch, "main");
         assert!(state.raw_diff.contains("println!"));
+        git(temp.path(), &["branch", "review-target"]);
+        assert_eq!(
+            Git::default().branch_candidates(temp.path()).unwrap(),
+            ["main", "review-target"]
+        );
+        assert_eq!(
+            Git::default()
+                .file_at_revision(temp.path(), "main", std::path::Path::new("demo.rs"))
+                .unwrap(),
+            "fn main() {}"
+        );
     }
 
     #[test]

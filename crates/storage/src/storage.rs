@@ -1050,6 +1050,23 @@ impl Storage {
              WHERE work_item_id = ?3",
             params![requested_operation_id, timestamp, work_item_id],
         )?;
+        // `rev` gives each question its own SDK session. Normally those
+        // sessions are also represented in `sessions`, but snapshot the
+        // question ownership table explicitly so a partial startup or an
+        // older database cannot make permanent deletion forget a remote ID.
+        tx.execute(
+            "INSERT OR IGNORE INTO prune_targets(
+                operation_id, target_key, kind, session_id, side_operation_id,
+                parent_id, state, last_error, created_at, updated_at
+             )
+             SELECT ?1, 'persistent:' || q.session_id, 'persistent',
+                    q.session_id, NULL, NULL, 'pending', NULL, ?2, ?2
+             FROM rev_question_sessions q
+             JOIN annotations a ON a.id = q.annotation_id
+             JOIN repos r ON r.id = a.repo_id
+             WHERE r.work_item_id = ?3",
+            params![requested_operation_id, timestamp, work_item_id],
+        )?;
         tx.execute(
             "INSERT OR IGNORE INTO prune_targets(
                 operation_id, target_key, kind, session_id, side_operation_id,
@@ -3429,12 +3446,20 @@ mod tests {
             storage.rev_question_session("annotation").unwrap(),
             Some(question_session)
         );
+        let operation = storage
+            .begin_prune_operation("rev-question-prune", "work", false)
+            .unwrap();
+        assert!(storage
+            .prune_targets(&operation)
+            .unwrap()
+            .iter()
+            .any(|target| {
+                target.target_key == "persistent:copilot-question-1"
+                    && target.session_id.as_deref() == Some("copilot-question-1")
+            }));
 
         storage.clear_review_history("work").unwrap();
-        assert!(storage
-            .annotation_by_id("annotation")
-            .unwrap()
-            .is_none());
+        assert!(storage.annotation_by_id("annotation").unwrap().is_none());
         assert!(storage
             .rev_question_session("annotation")
             .unwrap()

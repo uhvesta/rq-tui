@@ -673,6 +673,74 @@ pub(crate) fn start_agent(config: BridgeConfig) -> Box<dyn AgentRuntime> {
     }
 }
 
+/// Delete all SDK sessions and local data for one closed Work Item through
+/// the same durable prune journal used by the interactive application.
+pub(crate) fn prune_work_item_permanently<F>(
+    paths: &AppPaths,
+    work_item_id: &str,
+    export_first: bool,
+    mut progress: F,
+) -> Result<PruneSessionOutcome>
+where
+    F: FnMut(String, usize, usize),
+{
+    let storage = Storage::open(&paths.database)?;
+    let item = storage
+        .work_item_by_id(work_item_id)?
+        .context("the Work Item no longer exists")?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let owner_id = Uuid::new_v4().to_string();
+    let operation_id = format!("rev-delete-{}", Uuid::new_v4());
+    if env::var_os("RQ_TUI_CONTROLLED_AGENT").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        return Ok(runtime.block_on(execute_prune_operation(
+            &ControlledCleanupBackend,
+            PruneExecution {
+                ledger: &storage,
+                database_path: &paths.database,
+                owner_id: &owner_id,
+                requested_operation_id: &operation_id,
+                work_item_id,
+                export_first,
+                paths,
+            },
+            &mut progress,
+        )));
+    }
+
+    runtime.block_on(async {
+        let cli = find_copilot_cli().context(
+            "cannot locate the Copilot CLI; set COPILOT_CLI_PATH or install `copilot` on PATH",
+        )?;
+        let mut options = ClientOptions::default();
+        options.program = CliProgram::Path(cli);
+        options.working_directory = item.workspace_root;
+        options
+            .env
+            .push(("COPILOT_PLUGIN_DIR_ONLY".into(), "true".into()));
+        let client = tokio::time::timeout(SDK_CONTROL_TIMEOUT, Client::start(options))
+            .await
+            .context("Copilot CLI startup timed out during permanent deletion")??;
+        let outcome = execute_prune_operation(
+            &client,
+            PruneExecution {
+                ledger: &storage,
+                database_path: &paths.database,
+                owner_id: &owner_id,
+                requested_operation_id: &operation_id,
+                work_item_id,
+                export_first,
+                paths,
+            },
+            &mut progress,
+        )
+        .await;
+        sdk_call("Copilot client shutdown", client.stop())
+            .await
+            .ok();
+        Ok(outcome)
+    })
+}
+
 struct ControlledAgent {
     work_item_id: String,
     state: Arc<std::sync::Mutex<ControlledState>>,
