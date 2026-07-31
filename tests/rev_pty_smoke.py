@@ -6,6 +6,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 from pty_smoke import Child, git, make_fixture, terminal_text
@@ -27,18 +28,30 @@ def main() -> int:
         )
         (repo / "README.md").write_text("baseline\nchanged\n", encoding="utf-8")
 
-        opener_log = root / "browser-open.log"
-        opener = root / "browser-open"
-        opener.write_text(
-            f"#!/bin/sh\nprintf '%s\\n' \"$1\" > {opener_log!s}\n",
+        cmux_log = root / "cmux.log"
+        cmux = root / "cmux"
+        cmux.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$*\" >> {cmux_log!s}\n"
+            "case \" $* \" in\n"
+            "  *' browser '*' open-split '*) "
+            "printf '%s\\n' '{\"result\":{\"workspace_id\":\"workspace:7\","
+            "\"surface_id\":\"surface:9\"}}' ;;\n"
+            "  *) printf '%s\\n' '{\"result\":{}}' ;;\n"
+            "esac\n",
             encoding="utf-8",
         )
-        opener.chmod(0o755)
+        cmux.chmod(0o755)
         child = Child(
             binary,
             repo,
             root / "app",
-            extra_env={"REV_BROWSER_OPENER": str(opener)},
+            extra_env={
+                "CMUX_BUNDLED_CLI_PATH": str(cmux),
+                "CMUX_SOCKET_PATH": str(root / "cmux.sock"),
+                "CMUX_WORKSPACE_ID": "workspace:7",
+                "CMUX_SURFACE_ID": "surface:3",
+            },
         )
         try:
             child.resize(120, 24)
@@ -90,12 +103,20 @@ def main() -> int:
                 timeout=4,
             )
             for _ in range(40):
-                if opener_log.exists():
+                if cmux_log.exists():
                     break
                 time.sleep(0.05)
-            if not opener_log.exists():
-                raise AssertionError(child.failure("rich-diff browser opener was not invoked"))
-            opened_url = opener_log.read_text(encoding="utf-8").strip()
+            if not cmux_log.exists():
+                raise AssertionError(child.failure("cmux rich-diff opener was not invoked"))
+            open_calls = cmux_log.read_text(encoding="utf-8").splitlines()
+            if len(open_calls) != 1:
+                raise AssertionError(child.failure(f"expected one cmux open, got {open_calls!r}"))
+            if " browser --surface surface:3 open-split " not in f" {open_calls[0]} ":
+                raise AssertionError(child.failure(f"bad cmux command: {open_calls[0]!r}"))
+            opened_url = next(
+                (part for part in open_calls[0].split() if part.startswith("http://127.0.0.1:")),
+                "",
+            )
             if not (
                 opened_url.startswith("http://127.0.0.1:")
                 and "/review/" in opened_url
@@ -103,6 +124,23 @@ def main() -> int:
                 raise AssertionError(
                     child.failure(f"unexpected rich-diff URL: {opened_url!r}")
                 )
+            with urllib.request.urlopen(opened_url, timeout=2) as response:
+                if response.status != 200:
+                    raise AssertionError(child.failure("rich-diff URL was not live"))
+
+            child.send(b"jkjk")
+            time.sleep(0.35)
+            open_calls_after_scroll = cmux_log.read_text(encoding="utf-8").splitlines()
+            if open_calls_after_scroll != open_calls:
+                raise AssertionError(
+                    child.failure(
+                        "scrolling opened another cmux surface: "
+                        f"{open_calls_after_scroll!r}"
+                    )
+                )
+            with urllib.request.urlopen(opened_url, timeout=2) as response:
+                if response.status != 200:
+                    raise AssertionError(child.failure("rich-diff URL died after scrolling"))
             child.send(b"M")
             child.wait_for_screen_state(
                 required=("README.md", "NORMAL"),

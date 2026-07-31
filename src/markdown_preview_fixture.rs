@@ -28,10 +28,12 @@ fn main() -> Result<()> {
         "revision": revision,
         "focus_side": "new",
         "focus_line": 5,
+        "viewport_top": 0,
+        "cursor_fraction": 0.28,
     }))?;
     let server = MarkdownPreviewServer::start(document, focus)?;
     println!("{}", server.url());
-    println!("Enter `old LINE`, `new LINE`, or `quit`.");
+    println!("Enter `old|new LINE [VIEWPORT_TOP] [CURSOR_FRACTION]`, or `quit`.");
     for line in io::stdin().lock().lines() {
         let line = line?;
         if line == "quit" {
@@ -44,10 +46,20 @@ fn main() -> Result<()> {
         let Some(line) = parts.next().and_then(|line| line.parse::<usize>().ok()) else {
             continue;
         };
+        let viewport_top = parts
+            .next()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let cursor_fraction = parts
+            .next()
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(0.28);
         server.update_focus(serde_json::to_string(&serde_json::json!({
             "revision": revision,
             "focus_side": side,
             "focus_line": line,
+            "viewport_top": viewport_top,
+            "cursor_fraction": cursor_fraction,
         }))?);
     }
     Ok(())

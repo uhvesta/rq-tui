@@ -6,8 +6,16 @@ at upstream commit `a923f5f`.
 
 `rev` does not embed Neovim or the upstream Node/socket.io server. Its Rust
 process serves one local-only browser page and publishes review state as JSON.
-The fork keeps the upstream Markdown presentation, Mermaid renderer, source-line
-metadata, and cursor-to-rendered-document scroll model, then adds:
+The fork keeps the upstream Markdown presentation, Mermaid renderer, and
+source-line metadata, and ports the upstream cursor-to-rendered-document scroll
+model (`upstream-source/scroll.js`) as a dependency-free rewrite in
+`rev-preview.js` — same idea (animated, viewport-position-preserving scroll to
+the focused source line), but implemented with `requestAnimationFrame` instead
+of GSAP/TweenLite (not vendored), and using our block start/end line ranges to
+interpolate a line's fractional position *inside* its block rather than
+upstream's interpolation between whole-paragraph anchors. `scroll.js` and
+`linenumbers.js` under `upstream-source/` are kept only as the reference the
+port was checked against — they are not loaded by `rev-preview.js`. It then adds:
 
 - one merged rich-diff document with green added and red removed block gutters;
 - review-comment markers;

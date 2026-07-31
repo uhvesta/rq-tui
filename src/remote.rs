@@ -350,19 +350,16 @@ impl<R: ProcessRunner> RemoteResolver<R> {
         storage.upsert_repo(&record)?;
 
         let existing = storage.latest_remote_version(&repo_id)?;
-        let existing_base_sha = existing
+        let existing_snapshot = existing
             .as_ref()
             .map(|version| storage.pull_request_snapshot(&version.id))
             .transpose()?
-            .flatten()
-            .map(|snapshot| snapshot.base_sha);
+            .flatten();
+        let existing_base_sha = existing_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.base_sha.as_str());
         let created_new_version = existing.as_ref().is_none_or(|version| {
-            remote_revision_changed(
-                &version.head_sha,
-                existing_base_sha.as_deref(),
-                &head_sha,
-                &base_sha,
-            )
+            remote_revision_changed(&version.head_sha, existing_base_sha, &head_sha, &base_sha)
         });
         let version = if !created_new_version {
             existing.clone().expect("checked as present")
@@ -398,6 +395,11 @@ impl<R: ProcessRunner> RemoteResolver<R> {
                     &version,
                 )?;
             }
+        } else if existing_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.body != metadata.body)
+        {
+            self.reanchor_description_annotations(storage, &version, &metadata.body)?;
         }
         if !created_new_version || existing.is_none() {
             storage.mark_version_opened(&version.id)?;
@@ -511,6 +513,36 @@ impl<R: ProcessRunner> RemoteResolver<R> {
                 reason.as_deref(),
                 annotation.status_changed_at.as_deref(),
             )?;
+        }
+        Ok(())
+    }
+
+    fn reanchor_description_annotations(
+        &self,
+        storage: &Storage,
+        version: &Version,
+        description: &str,
+    ) -> Result<()> {
+        for (annotation, placement) in storage.annotation_history_for_version(&version.id)? {
+            if annotation.file_path != Path::new(PR_DESCRIPTION_PATH) {
+                continue;
+            }
+            let outcome = reanchor_outcome(&annotation, &placement, &version.id, description);
+            storage.upsert_placement(&outcome.placement)?;
+            let manual_override = annotation
+                .status_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("Auto-dismiss override:"));
+            if annotation.status == crate::domain::AnnotationStatus::Active
+                && !manual_override
+                && should_auto_dismiss(&placement, &outcome)
+            {
+                storage.set_annotation_status(
+                    &annotation.id,
+                    crate::domain::AnnotationStatus::AutoDismissed,
+                    Some("Auto-dismissed after the PR description selection changed"),
+                )?;
+            }
         }
         Ok(())
     }
@@ -699,11 +731,15 @@ mod tests {
 
     use super::{
         canonical_references, remote_revision_changed, remote_session_link_name,
-        remote_worktree_path, PrMetadata, PrReference, ProvisionalRemoteWorkItem,
+        remote_worktree_path, PrMetadata, PrReference, ProvisionalRemoteWorkItem, RemoteResolver,
+        PR_DESCRIPTION_PATH,
     };
     use crate::diff::DiffSet;
-    use crate::domain::{BaseBranchSource, Repo, Version, VersionKind, WorkItem};
-    use crate::storage::Storage;
+    use crate::domain::{
+        AnchorSide, Annotation, AnnotationKind, AnnotationStatus, BaseBranchSource, DeliveryState,
+        Placement, Repo, Version, VersionKind, WorkItem,
+    };
+    use crate::storage::{now, Storage};
     use crate::work_item::ReviewRepo;
     use tempfile::tempdir;
 
@@ -861,5 +897,91 @@ mod tests {
             remote_worktree_path(cache, "work-a-repo", 1),
             remote_worktree_path(cache, "work-b-repo", 1)
         );
+    }
+
+    #[test]
+    fn description_only_refresh_reanchors_and_dismisses_changed_feedback() {
+        let storage = Storage::in_memory().unwrap();
+        let item = WorkItem {
+            id: "description-work".into(),
+            name: "description".into(),
+            workspace_root: PathBuf::from("/tmp/description-work"),
+            created_at: now(),
+            updated_at: now(),
+            last_opened_at: Some(now()),
+        };
+        storage.upsert_work_item(&item).unwrap();
+        let repo = Repo {
+            id: "description-repo".into(),
+            work_item_id: item.id.clone(),
+            name: "demo".into(),
+            path: PathBuf::from("/tmp/description-repo.git"),
+            remote_pr_url: Some("https://github.com/acme/demo/pull/17".into()),
+            pr_meta_json: None,
+            base_branch: Some("main".into()),
+            base_branch_source: BaseBranchSource::Auto,
+            last_activity_at: None,
+        };
+        storage.upsert_repo(&repo).unwrap();
+        let version = Version {
+            id: "description-version".into(),
+            repo_id: repo.id.clone(),
+            version_num: 1,
+            kind: VersionKind::Remote,
+            created_at: now(),
+            head_sha: "head".into(),
+            worktree_path: Some(PathBuf::from("/tmp/description-worktree")),
+            last_opened_at: Some(now()),
+        };
+        storage.upsert_version(&version).unwrap();
+        let annotation = Annotation {
+            id: "description-feedback".into(),
+            repo_id: repo.id,
+            kind: AnnotationKind::Comment,
+            file_path: PathBuf::from(PR_DESCRIPTION_PATH),
+            anchor_snippet: "Before\nSelected text\nAfter".into(),
+            anchor_hash: "hash".into(),
+            anchor_start_offset: 1,
+            anchor_line_count: 1,
+            text: Some("Please clarify this.".into()),
+            submitted: false,
+            delivery_state: DeliveryState::Draft,
+            status: AnnotationStatus::Active,
+            status_reason: None,
+            status_changed_at: None,
+            created_at: now(),
+        };
+        let placement = Placement {
+            annotation_id: annotation.id.clone(),
+            version_id: version.id.clone(),
+            side: AnchorSide::New,
+            line_start: 2,
+            line_end: 2,
+            outdated: false,
+            ambiguous: false,
+        };
+        storage.add_annotation(&annotation, &placement).unwrap();
+
+        RemoteResolver::default()
+            .reanchor_description_annotations(
+                &storage,
+                &version,
+                "Before\nCompletely different text\nAfter",
+            )
+            .unwrap();
+
+        let (updated, updated_placement) = storage
+            .annotation_history_for_version(&version.id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(updated.status, AnnotationStatus::AutoDismissed);
+        assert_eq!(updated_placement.line_start, 2);
+        assert!(!updated_placement.ambiguous);
+        assert!(updated
+            .status_reason
+            .as_deref()
+            .unwrap()
+            .contains("PR description"));
     }
 }

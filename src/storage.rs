@@ -4,6 +4,6 @@
 // persistence service and the records it exchanges, while the implementation
 // and migration SQL remain owned by rq-tui-storage.
 pub(crate) use rq_tui_storage::{
-    now, GitHubOperationKind, GitHubOperationPreparation, PruneOperation, RevQuestionSession,
-    Storage,
+    now, GitHubOperationKind, GitHubOperationPreparation, GitHubOperationState, PruneOperation,
+    RevQuestionSession, Storage,
 };

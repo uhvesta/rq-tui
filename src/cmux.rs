@@ -176,13 +176,17 @@ fn open_args<'a>(
     surface_id: &'a str,
     url: &'a str,
 ) -> Vec<&'a std::ffi::OsStr> {
+    // `--surface` is only recognized by the `browser` subcommand parser, not as a
+    // top-level global flag (see cmux's CLI contract: `cmux browser [--surface <id>]
+    // <subcommand>`). Placing it before `browser` makes cmux's global-flag scanner
+    // treat "--surface" itself as the (unrecognized) command, and the call fails.
     [
         std::ffi::OsStr::new("--socket"),
         std::ffi::OsStr::new(socket),
         std::ffi::OsStr::new("--json"),
+        std::ffi::OsStr::new("browser"),
         std::ffi::OsStr::new("--surface"),
         std::ffi::OsStr::new(surface_id),
-        std::ffi::OsStr::new("browser"),
         std::ffi::OsStr::new("open-split"),
         std::ffi::OsStr::new(url),
         std::ffi::OsStr::new("--workspace"),
@@ -240,9 +244,9 @@ mod tests {
                 "--socket",
                 "/tmp/cmux.sock",
                 "--json",
+                "browser",
                 "--surface",
                 "surface:3",
-                "browser",
                 "open-split",
                 "http://127.0.0.1:8765/review/token",
                 "--workspace",

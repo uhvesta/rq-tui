@@ -2959,6 +2959,50 @@ impl Storage {
         Ok(())
     }
 
+    /// Explicitly abandons an `unknown` operation after the user has refreshed
+    /// GitHub and accepted the duplicate-submission risk. This is never called
+    /// automatically: absence of an idempotency marker cannot prove that
+    /// GitHub did not accept the request.
+    pub fn discard_unknown_github_operation(&self, operation_id: &str, reason: &str) -> Result<()> {
+        anyhow::ensure!(
+            !reason.trim().is_empty(),
+            "discarded-operation reason cannot be empty"
+        );
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
+            "UPDATE github_operations
+             SET state = 'failed', last_error = ?2, updated_at = ?3
+             WHERE operation_id = ?1 AND state = 'unknown'",
+            params![operation_id, reason, now()],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "GitHub operation {operation_id} is not in the unknown state"
+        );
+        let expected: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM github_operation_annotations WHERE operation_id = ?1",
+            [operation_id],
+            |row| row.get(0),
+        )?;
+        let released = tx.execute(
+            "UPDATE annotations
+             SET delivery_state = 'draft'
+             WHERE delivery_state = 'pending'
+               AND id IN (
+                   SELECT annotation_id
+                   FROM github_operation_annotations
+                   WHERE operation_id = ?1
+               )",
+            [operation_id],
+        )?;
+        anyhow::ensure!(
+            released as i64 == expected,
+            "GitHub operation {operation_id} no longer owns every pending annotation"
+        );
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn github_operation(&self, operation_id: &str) -> Result<Option<GitHubOperation>> {
         let operation = self
             .connection

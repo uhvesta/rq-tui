@@ -319,6 +319,49 @@
     }
   }
 
+  // Ported from markdown-preview.nvim's `upstream-source/scroll.js` relative-scroll
+  // model (smooth, viewport-position-preserving), rewritten without GSAP/TweenLite
+  // (not vendored) and adapted to use our block start/end line ranges - which give
+  // us a source line's fractional position *inside* its block - instead of upstream's
+  // single-line-per-block interpolation between neighboring anchors.
+  const TOOLBAR_HEIGHT = 84;
+  const FOCUS_VIEWPORT_RATIO = 0.28;
+  const SCROLL_DURATION_MS = 220;
+  let scrollAnimationFrame = null;
+  let hasScrolledOnce = false;
+  let viewportRevision = null;
+
+  function easeOutCubic(t) {
+    return 1 - (1 - t) ** 3;
+  }
+
+  function animateScrollTo(target, animate) {
+    if (scrollAnimationFrame !== null) {
+      cancelAnimationFrame(scrollAnimationFrame);
+      scrollAnimationFrame = null;
+    }
+    const from = window.scrollY;
+    const delta = target - from;
+    if (!animate || Math.abs(delta) < 1) {
+      window.scrollTo(0, Math.max(0, target));
+      return;
+    }
+    const start = performance.now();
+    const step = (now) => {
+      const progress = Math.min(1, (now - start) / SCROLL_DURATION_MS);
+      window.scrollTo(0, Math.max(0, from + delta * easeOutCubic(progress)));
+      scrollAnimationFrame = progress < 1 ? requestAnimationFrame(step) : null;
+    };
+    scrollAnimationFrame = requestAnimationFrame(step);
+  }
+
+  function blockOffsetRatio(block, line) {
+    const start = Number(block.dataset.sourceLine || line);
+    const end = Number(block.dataset.sourceEnd || start);
+    if (end <= start) return 0;
+    return Math.min(1, Math.max(0, (line - start) / (end - start)));
+  }
+
   function scrollToFocus(payload) {
     document.querySelectorAll(".source-focus").forEach((node) => node.classList.remove("source-focus"));
     const mapped = [...richDiff.querySelectorAll("[data-source-line]")];
@@ -333,9 +376,28 @@
       closestBlock(richDiff, payload.focus_line);
     if (!target) return;
     target.classList.add("source-focus");
-    const toolbarHeight = 84;
-    const top = target.getBoundingClientRect().top + window.scrollY - toolbarHeight;
-    window.scrollTo({ top: Math.max(0, top - window.innerHeight * 0.28), behavior: "auto" });
+    const rect = target.getBoundingClientRect();
+    const outsideViewport = rect.top < TOOLBAR_HEIGHT || rect.bottom > window.innerHeight;
+    const nextViewportRevision = `${payload.revision}:${payload.viewport_top}:${payload.cursor_fraction}`;
+    const viewportMoved = viewportRevision !== nextViewportRevision;
+    viewportRevision = nextViewportRevision;
+    if (!viewportMoved && !outsideViewport) return;
+    const ratio = blockOffsetRatio(target, payload.focus_line);
+    const anchor = rect.top + window.scrollY + rect.height * ratio - TOOLBAR_HEIGHT;
+    const cursorRatio = Number.isFinite(payload.cursor_fraction)
+      ? Math.max(0, Math.min(1, payload.cursor_fraction))
+      : FOCUS_VIEWPORT_RATIO;
+    const usableViewportHeight = Math.max(1, window.innerHeight - TOOLBAR_HEIGHT);
+    const desiredFocusY = TOOLBAR_HEIGHT + usableViewportHeight * cursorRatio;
+    const rawTop = anchor + TOOLBAR_HEIGHT - desiredFocusY;
+    const blockTop = rect.top + window.scrollY;
+    const minimumTop = blockTop + rect.height - window.innerHeight;
+    const maximumTop = blockTop - TOOLBAR_HEIGHT;
+    const top = rect.height <= usableViewportHeight
+      ? Math.max(minimumTop, Math.min(maximumTop, rawTop))
+      : rawTop;
+    animateScrollTo(top, hasScrolledOnce);
+    hasScrolledOnce = true;
   }
 
   async function fetchJson(path) {
@@ -348,8 +410,11 @@
     if (refreshing) return;
     refreshing = true;
     try {
-      const focus = await fetchJson("/focus.json");
-      const nextFocus = `${focus.revision}:${focus.focus_side}:${focus.focus_line}`;
+      // Fire the focus poll and the liveness heartbeat together instead of in
+      // series - ready.json doesn't depend on focus.json's result, so awaiting
+      // them one after another was adding a full extra round trip to every tick.
+      const [focus] = await Promise.all([fetchJson("/focus.json"), fetchJson("/ready.json")]);
+      const nextFocus = `${focus.revision}:${focus.focus_side}:${focus.focus_line}:${focus.viewport_top}:${focus.cursor_fraction}`;
       if (contentRevision !== focus.revision) {
         const review = await fetchJson("/document.json");
         if (review.revision !== focus.revision) return;
@@ -364,7 +429,6 @@
         scrollToFocus(focus);
       }
       status.textContent = `${focus.focus_side} · line ${focus.focus_line} · live`;
-      await fetchJson("/ready.json");
     } catch (error) {
       status.textContent = `reconnecting · ${error.message}`;
     } finally {

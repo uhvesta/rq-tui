@@ -48,7 +48,8 @@ use crate::highlight::{Highlighter, PlainHighlighter, StyledSegment, SyntectHigh
 use crate::markdown_preview::MarkdownPreviewServer;
 use crate::remote::{resolve_remote, PrReference};
 use crate::storage::{
-    now, GitHubOperationKind, GitHubOperationPreparation, RevQuestionSession, Storage,
+    now, GitHubOperationKind, GitHubOperationPreparation, GitHubOperationState, RevQuestionSession,
+    Storage,
 };
 use crate::terminal_text::{
     cell_width, floor_grapheme_boundary, grapheme_indices, next_grapheme_boundary,
@@ -59,6 +60,7 @@ use crate::work_item::{resolve_local, ResolvedWorkItem, ReviewRepo};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_EVENTS_PER_TICK: usize = 128;
+const GITHUB_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const REV_DEFAULT_MODEL_SETTING: &str = "rev.model.default.v1";
 const PR_DESCRIPTION_PATH: &str = ".rev/PR_DESCRIPTION.md";
 
@@ -98,6 +100,7 @@ struct CommandPalette {
     input: String,
     cursor: usize,
     selected: usize,
+    selection_explicit: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -372,6 +375,7 @@ struct RevState {
     github_backend: Arc<dyn GitHubBackend>,
     markdown_preview: bool,
     cmux_markdown_requested: bool,
+    cmux_open_attempted: bool,
     cmux_markdown: Option<MarkdownSurface>,
     cmux_open: Option<Receiver<Result<Option<MarkdownSurface>>>>,
     cmux_close: Option<Receiver<()>>,
@@ -391,6 +395,29 @@ fn is_remote_annotation_id(annotation_id: &str) -> bool {
 
 fn visible_github_comment_body(body: &str) -> &str {
     body.split("\n\n<!-- rev-operation:").next().unwrap_or(body)
+}
+
+fn description_review_document(snapshot: &PullRequestSnapshot) -> String {
+    let mut document = snapshot.body.clone();
+    if snapshot.reviews.is_empty() {
+        return document;
+    }
+    document.push_str("\n\n---\n\n## GitHub reviews\n");
+    for review in &snapshot.reviews {
+        document.push_str(&format!(
+            "\n### @{} · {}\n\n",
+            review.author,
+            review.state.replace('_', " ")
+        ));
+        let body = visible_github_comment_body(&review.body).trim();
+        document.push_str(if body.is_empty() {
+            "_No overall review comment._"
+        } else {
+            body
+        });
+        document.push('\n');
+    }
+    document
 }
 
 fn description_diff_file(body: &str) -> DiffFile {
@@ -537,7 +564,11 @@ impl RevState {
             for thread in &snapshot.threads {
                 inject_remote_thread_context(repo, &snapshot, thread)?;
             }
-            repo.diff.files.push(description_diff_file(&snapshot.body));
+            repo.diff
+                .files
+                .push(description_diff_file(&description_review_document(
+                    &snapshot,
+                )));
             for thread in &snapshot.threads {
                 remote_threads.insert(remote_annotation_id(&thread.node_id), thread.clone());
             }
@@ -711,6 +742,7 @@ impl RevState {
             github_backend: Arc::new(ProductionGitHubBackend),
             markdown_preview: false,
             cmux_markdown_requested: false,
+            cmux_open_attempted: false,
             cmux_markdown: None,
             cmux_open: None,
             cmux_close: None,
@@ -926,6 +958,7 @@ fn run_loop<B: Backend>(
     highlighter: &mut dyn Highlighter,
 ) -> Result<()> {
     let mut redraw_requested = true;
+    let mut footer_redrawn_at = Instant::now();
     loop {
         let previous_status = state.status.clone();
         let previous_revision = state.rows_revision;
@@ -938,9 +971,15 @@ fn run_loop<B: Backend>(
         redraw_requested |= previous_status != state.status
             || previous_revision != state.rows_revision
             || previous_activity != state.agent_activity;
+        let copilot_is_active =
+            state.streaming || state.agent.is_some() || !state.queued_questions.is_empty();
+        if copilot_is_active && footer_redrawn_at.elapsed() >= Duration::from_secs(1) {
+            redraw_requested = true;
+        }
         if redraw_requested {
             terminal.draw(|frame| render(frame, state, highlighter))?;
             redraw_requested = false;
+            footer_redrawn_at = Instant::now();
         }
         let status_before_sync = state.status.clone();
         if let Err(error) = sync_markdown_preview(state, paths) {
@@ -984,8 +1023,11 @@ fn run_loop<B: Backend>(
                         RevMode::Questions => move_question_cursor(state, 3),
                         RevMode::Command => {
                             let count = command_candidates(state).len();
+                            let selected =
+                                command_selected_index(state, &command_candidates(state));
                             state.command.selected =
-                                (state.command.selected + 1).min(count.saturating_sub(1));
+                                selected.saturating_add(1).min(count.saturating_sub(1));
+                            state.command.selection_explicit = true;
                         }
                         RevMode::Model => move_model_picker(state, 3),
                         RevMode::ConfirmClear | RevMode::ConfirmResolve => {}
@@ -1004,7 +1046,10 @@ fn run_loop<B: Backend>(
                         RevMode::FilePicker => move_file_picker(state, -3),
                         RevMode::Questions => move_question_cursor(state, -3),
                         RevMode::Command => {
-                            state.command.selected = state.command.selected.saturating_sub(1)
+                            state.command.selected =
+                                command_selected_index(state, &command_candidates(state))
+                                    .saturating_sub(1);
+                            state.command.selection_explicit = true;
                         }
                         RevMode::Model => move_model_picker(state, -3),
                         RevMode::ConfirmClear | RevMode::ConfirmResolve => {}
@@ -1214,13 +1259,17 @@ fn page_move(state: &mut RevState, highlighter: &mut dyn Highlighter, direction:
             }
         }
         RevMode::Command => {
-            let count = command_candidates(state).len();
+            let candidates = command_candidates(state);
+            let count = candidates.len();
+            let selected = command_selected_index(state, &candidates);
             if direction > 0 {
-                state.command.selected =
-                    (state.command.selected + review_step).min(count.saturating_sub(1));
+                state.command.selected = selected
+                    .saturating_add(review_step)
+                    .min(count.saturating_sub(1));
             } else {
-                state.command.selected = state.command.selected.saturating_sub(review_step);
+                state.command.selected = selected.saturating_sub(review_step);
             }
+            state.command.selection_explicit = true;
         }
         RevMode::Model => move_model_picker(state, signed),
         RevMode::ConfirmClear | RevMode::ConfirmResolve => {}
@@ -1820,6 +1869,10 @@ fn focus_question(
         state.status = "This historical question's file is no longer in the current diff".into();
         return false;
     };
+    // The question panel has already narrowed the review pane. Preserve that
+    // rendered width while switching files so wrapped rows are rebuilt for the
+    // pane the user is actually looking at, not the 100-column fallback.
+    let width = cached_row_width(state);
     state.switch_file(file_index);
     state.row_cursor = 0;
     state.visual_anchor = None;
@@ -1827,7 +1880,6 @@ fn focus_question(
     sync_file_picker_cursor(state);
     state.mode = RevMode::Normal;
     state.render_cache = None;
-    let width = cached_row_width(state);
     let rows = ensure_rows(state, width, highlighter);
     state.row_cursor = rows
         .iter()
@@ -2215,16 +2267,20 @@ fn handle_command_key(
             state.status = "Command cancelled".into();
         }
         KeyCode::Up => {
-            state.command.selected = state.command.selected.saturating_sub(1);
+            state.command.selected = command_selected_index(state, &candidates).saturating_sub(1);
+            state.command.selection_explicit = true;
         }
         KeyCode::Down => {
-            state.command.selected =
-                (state.command.selected + 1).min(candidates.len().saturating_sub(1));
+            state.command.selected = command_selected_index(state, &candidates)
+                .saturating_add(1)
+                .min(candidates.len().saturating_sub(1));
+            state.command.selection_explicit = true;
         }
         KeyCode::Tab => {
-            if let Some(candidate) = candidates.get(state.command.selected) {
+            if let Some(candidate) = candidates.get(command_selected_index(state, &candidates)) {
                 state.command.input.clone_from(candidate);
                 state.command.cursor = state.command.input.len();
+                state.command.selection_explicit = false;
             }
         }
         KeyCode::Enter => {
@@ -2246,6 +2302,7 @@ fn handle_command_key(
                     .replace_range(previous..state.command.cursor, "");
                 state.command.cursor = previous;
                 state.command.selected = 0;
+                state.command.selection_explicit = false;
             }
         }
         KeyCode::Delete => {
@@ -2255,6 +2312,8 @@ fn handle_command_key(
                     .command
                     .input
                     .replace_range(state.command.cursor..next, "");
+                state.command.selected = 0;
+                state.command.selection_explicit = false;
             }
         }
         KeyCode::Left => {
@@ -2275,6 +2334,7 @@ fn handle_command_key(
             state.command.input.insert(state.command.cursor, character);
             state.command.cursor += character.len_utf8();
             state.command.selected = 0;
+            state.command.selection_explicit = false;
         }
         _ => {}
     }
@@ -2282,12 +2342,16 @@ fn handle_command_key(
 }
 
 fn command_selected_index(state: &RevState, candidates: &[String]) -> usize {
-    let typed = state.command.input.trim();
-    candidates
-        .iter()
-        .position(|candidate| candidate == typed)
-        .unwrap_or(state.command.selected)
-        .min(candidates.len().saturating_sub(1))
+    let selected = if state.command.selection_explicit {
+        state.command.selected
+    } else {
+        let typed = state.command.input.trim();
+        candidates
+            .iter()
+            .position(|candidate| candidate == typed)
+            .unwrap_or(state.command.selected)
+    };
+    selected.min(candidates.len().saturating_sub(1))
 }
 
 fn command_candidates(state: &RevState) -> Vec<String> {
@@ -2299,6 +2363,7 @@ fn command_candidates(state: &RevState) -> Vec<String> {
         "expand below".to_owned(),
         "export feedback".to_owned(),
         "help".to_owned(),
+        "github unlock".to_owned(),
         "hide comments".to_owned(),
         "hide questions".to_owned(),
         "history".to_owned(),
@@ -2375,6 +2440,51 @@ fn execute_command(
             state.status =
                 "Global question model reset · new threads will ask you to choose".into();
         }
+        "github unlock" => {
+            state.mode = RevMode::Normal;
+            state.status = "DANGER · only after :refresh and checking GitHub · :github unlock confirm releases unknown submissions and may allow duplicates".into();
+        }
+        "github unlock confirm" => {
+            let repo_id = state
+                .current_repo()
+                .context("no current repository")?
+                .record
+                .id
+                .clone();
+            let operations = storage
+                .unresolved_github_operations()?
+                .into_iter()
+                .filter(|operation| {
+                    operation.repo_id == repo_id && operation.state == GitHubOperationState::Unknown
+                })
+                .collect::<Vec<_>>();
+            if operations.is_empty() {
+                state.mode = RevMode::Normal;
+                state.status = "No unknown GitHub operation exists for the current PR".into();
+                return Ok(());
+            }
+            let released_ids = operations
+                .iter()
+                .flat_map(|operation| operation.annotation_ids.iter().cloned())
+                .collect::<HashSet<_>>();
+            for operation in &operations {
+                storage.discard_unknown_github_operation(
+                    &operation.operation_id,
+                    "User explicitly unlocked after refreshing and checking GitHub",
+                )?;
+            }
+            for (annotation, _) in &mut state.annotations {
+                if released_ids.contains(&annotation.id) {
+                    annotation.delivery_state = DeliveryState::Draft;
+                    annotation.submitted = false;
+                }
+            }
+            state.mode = RevMode::Normal;
+            state.status = format!(
+                "Unlocked {} unknown GitHub operation(s) for this PR · drafts may be submitted again",
+                operations.len()
+            );
+        }
         "diff unified" | "unified" => {
             state.diff_layout = RevDiffLayout::Unified;
             state.invalidate_rows();
@@ -2396,6 +2506,7 @@ fn execute_command(
             expand_hunk_edge(state, false)?;
         }
         "hide comments" => {
+            preserve_source_focus(state);
             state.show_comments = false;
             state.invalidate_rows();
             state.mode = RevMode::Normal;
@@ -2404,12 +2515,14 @@ fn execute_command(
                     .into();
         }
         "show comments" => {
+            preserve_source_focus(state);
             state.show_comments = true;
             state.invalidate_rows();
             state.mode = RevMode::Normal;
             state.status = "Comments are visible in the diff".into();
         }
         "hide questions" => {
+            preserve_source_focus(state);
             state.show_questions = false;
             state.invalidate_rows();
             state.mode = RevMode::Normal;
@@ -2418,6 +2531,7 @@ fn execute_command(
                     .into();
         }
         "show questions" => {
+            preserve_source_focus(state);
             state.show_questions = true;
             state.invalidate_rows();
             state.mode = RevMode::Normal;
@@ -2588,13 +2702,13 @@ fn begin_review_submission(state: &mut RevState, decision: ReviewDecision) {
     state.compose_scroll = 0;
     state.status = match decision {
         ReviewDecision::Approve => {
-            "SUBMIT APPROVE · optional overall comment · Enter sends all pending feedback".into()
+            "SUBMIT APPROVE · optional overall comment · Enter sends current PR feedback".into()
         }
         ReviewDecision::Comment => {
-            "SUBMIT COMMENT · optional overall comment · Enter sends all pending feedback".into()
+            "SUBMIT COMMENT · optional overall comment · Enter sends current PR feedback".into()
         }
         ReviewDecision::RequestChanges => {
-            "REQUEST CHANGES · explain why · Enter sends all pending feedback".into()
+            "REQUEST CHANGES · explain why · Enter sends current PR feedback".into()
         }
     };
 }
@@ -2681,6 +2795,7 @@ fn drain_refresh(state: &mut RevState, storage: &Storage) -> Result<()> {
             let layout = state.diff_layout;
             let markdown_preview = state.markdown_preview;
             let cmux_markdown_requested = state.cmux_markdown_requested;
+            let cmux_open_attempted = state.cmux_open_attempted;
             let cmux_markdown = state.cmux_markdown.take();
             let cmux_open = state.cmux_open.take();
             let cmux_close = state.cmux_close.take();
@@ -2690,6 +2805,7 @@ fn drain_refresh(state: &mut RevState, storage: &Storage) -> Result<()> {
             replacement.diff_layout = layout;
             replacement.markdown_preview = markdown_preview;
             replacement.cmux_markdown_requested = cmux_markdown_requested;
+            replacement.cmux_open_attempted = cmux_open_attempted;
             replacement.cmux_markdown = cmux_markdown;
             replacement.cmux_open = cmux_open;
             replacement.cmux_close = cmux_close;
@@ -2730,12 +2846,16 @@ fn reconcile_github_operations(storage: &Storage, workspace: &ResolvedWorkItem) 
         let marker = format!("<!-- rev-operation:{} -->", operation.idempotency_key);
         let found = snapshots.iter().any(|(repo_id, snapshot)| {
             *repo_id == operation.repo_id
-                && snapshot.threads.iter().any(|thread| {
-                    thread
-                        .comments
-                        .iter()
-                        .any(|comment| comment.body.contains(&marker))
-                })
+                && (snapshot
+                    .reviews
+                    .iter()
+                    .any(|review| review.body.contains(&marker))
+                    || snapshot.threads.iter().any(|thread| {
+                        thread
+                            .comments
+                            .iter()
+                            .any(|comment| comment.body.contains(&marker))
+                    }))
         });
         if found {
             storage.mark_github_operation_sent(&operation.operation_id)?;
@@ -3424,6 +3544,11 @@ fn start_remote_reply(
         .first()
         .and_then(|comment| comment.database_id)
         .context("GitHub thread has no replyable root comment ID")?;
+    let root_comment_node_id = thread
+        .comments
+        .first()
+        .map(|comment| comment.node_id.clone())
+        .context("GitHub thread has no replyable root comment")?;
     let repo = state.current_repo().context("no current repository")?;
     let reference = PrReference::parse(
         repo.record
@@ -3470,11 +3595,14 @@ fn start_remote_reply(
     std::thread::spawn(move || {
         let result = backend
             .reply(&reference, root_comment_id, &body)
-            .map(|comment| GitHubOperationResult::Replied {
-                annotation_id,
-                repo_id,
-                version_id,
-                comment: Box::new(comment),
+            .map(|mut comment| {
+                comment.reply_to = Some(root_comment_node_id);
+                GitHubOperationResult::Replied {
+                    annotation_id,
+                    repo_id,
+                    version_id,
+                    comment: Box::new(comment),
+                }
             });
         sender.send(result).ok();
     });
@@ -3635,6 +3763,23 @@ fn pending_review_submission(
 }
 
 fn drain_github_operation(state: &mut RevState, storage: &Storage) -> Result<()> {
+    if state
+        .github_operation_started
+        .is_some_and(|started| started.elapsed() >= GITHUB_OPERATION_TIMEOUT)
+    {
+        state.github_operation = None;
+        state.github_operation_started = None;
+        let operation_id = state
+            .github_operation_id
+            .take()
+            .context("timed-out GitHub operation lost its durable identity")?;
+        storage.mark_github_operation_unknown(
+            &operation_id,
+            "local 30-second deadline elapsed; GitHub may still have accepted the request",
+        )?;
+        state.status = "GitHub request exceeded 30s · outcome marked unknown · UI and :quit are unblocked · :refresh reconciles safely".into();
+        return Ok(());
+    }
     let Some(receiver) = state.github_operation.as_ref() else {
         return Ok(());
     };
@@ -5871,6 +6016,7 @@ fn toggle_markdown_preview(state: &mut RevState, paths: &AppPaths) -> Result<()>
     markdown_sides(state)?;
     state.markdown_preview = true;
     state.cmux_markdown_requested = true;
+    state.cmux_open_attempted = false;
     state.markdown_sync_key = None;
     sync_markdown_preview(state, paths)?;
     state.status =
@@ -5881,6 +6027,7 @@ fn toggle_markdown_preview(state: &mut RevState, paths: &AppPaths) -> Result<()>
 fn close_markdown_preview(state: &mut RevState) {
     state.markdown_preview = false;
     state.cmux_markdown_requested = false;
+    state.cmux_open_attempted = false;
     state.markdown_sync_key = None;
     state.markdown_content_key = None;
     state.markdown_sides_cache = None;
@@ -5925,7 +6072,8 @@ fn drain_cmux_preview(state: &mut RevState) {
             state.cmux_open = None;
             if state.markdown_preview {
                 state.status =
-                    "Terminal Markdown preview active · cmux opener stopped unexpectedly".into();
+                    "Markdown server is still live · cmux opener stopped · press M twice to retry"
+                        .into();
             }
             return;
         }
@@ -5942,13 +6090,15 @@ fn drain_cmux_preview(state: &mut RevState) {
             state.markdown_server = None;
         }
         Ok(None) if state.markdown_preview => {
-            state.markdown_server = None;
-            state.status = "MARKDOWN RICH DIFF · browser opener unavailable".into();
+            state.status =
+                "Markdown server is still live · browser opener unavailable · press M twice to retry"
+                    .into();
         }
         Ok(None) => {}
         Err(error) if state.markdown_preview => {
-            state.markdown_server = None;
-            state.status = format!("Markdown rich diff unavailable: {error:#}");
+            state.status = format!(
+                "Markdown server is still live · cmux open failed once (no automatic reopen) · press M twice to retry · {error:#}"
+            );
         }
         Err(_) => {}
     }
@@ -5983,6 +6133,7 @@ fn sync_markdown_preview(state: &mut RevState, _paths: &AppPaths) -> Result<()> 
     let Some(path) = state.current_file().map(|file| file.path().to_path_buf()) else {
         state.markdown_preview = false;
         state.cmux_markdown_requested = false;
+        state.cmux_open_attempted = false;
         state.markdown_sync_key = None;
         state.markdown_content_key = None;
         state.markdown_sides_cache = None;
@@ -5998,6 +6149,7 @@ fn sync_markdown_preview(state: &mut RevState, _paths: &AppPaths) -> Result<()> 
     if !is_markdown_path(&path) {
         state.markdown_preview = false;
         state.cmux_markdown_requested = false;
+        state.cmux_open_attempted = false;
         state.markdown_content_key = None;
         state.markdown_sides_cache = None;
         if let Some(surface) = state.cmux_markdown.take() {
@@ -6033,8 +6185,8 @@ fn sync_markdown_preview(state: &mut RevState, _paths: &AppPaths) -> Result<()> 
     let cursor_fraction = state.row_cursor.saturating_sub(state.review_scroll) as f64
         / state.review_viewport_height.saturating_sub(1).max(1) as f64;
     let key = format!(
-        "{content_key}\0{focus_side}\0{focus}\0{}",
-        state.review_scroll
+        "{content_key}\0{focus_side}\0{focus}\0{}\0{cursor_fraction:.6}",
+        state.review_scroll,
     );
     if state.markdown_sync_key.as_deref() == Some(&key) {
         return Ok(());
@@ -6071,7 +6223,7 @@ fn sync_markdown_preview(state: &mut RevState, _paths: &AppPaths) -> Result<()> 
     if cfg!(test) {
         return Ok(());
     }
-    if state.cmux_markdown.is_none() && state.cmux_open.is_none() {
+    if state.cmux_markdown.is_none() && state.cmux_open.is_none() && !state.cmux_open_attempted {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let url = state
             .markdown_server
@@ -6085,6 +6237,7 @@ fn sync_markdown_preview(state: &mut RevState, _paths: &AppPaths) -> Result<()> 
                 surface.close_detached().ok();
             }
         });
+        state.cmux_open_attempted = true;
         state.cmux_open = Some(receiver);
     }
     Ok(())
@@ -6806,6 +6959,10 @@ fn help_lines() -> Vec<Line<'static>> {
             "open the versioned PR description in the shared review renderer",
         ),
         key(
+            ":github unlock",
+            "after refresh/checking GitHub, show the explicit duplicate-risk unlock command",
+        ),
+        key(
             ":submit approve",
             "send pending inline feedback in one approving GitHub review",
         ),
@@ -7507,7 +7664,11 @@ fn render_file_picker(frame: &mut Frame, state: &RevState, area: Rect) {
 }
 
 fn render_command_palette(frame: &mut Frame, state: &RevState, area: Rect) {
-    let width = area.width.saturating_sub(4).clamp(34, 84);
+    let width = if area.width < 42 {
+        area.width.saturating_sub(6).max(20)
+    } else {
+        area.width.saturating_sub(4).min(84)
+    };
     let candidates = command_candidates(state);
     let visible_capacity = area.height.saturating_sub(3).clamp(1, 8) as usize;
     let visible_count = candidates.len().clamp(1, visible_capacity);
@@ -8117,6 +8278,16 @@ fn snapshot_pull_request(head_sha: &str) -> PullRequestSnapshot {
         head_sha: head_sha.into(),
         base_sha: "base".into(),
         updated_at: now(),
+        reviews: vec![rq_tui_github_review::PullRequestReview {
+            node_id: "review-17".into(),
+            database_id: Some(117),
+            author: "maintainer".into(),
+            body: "Overall review summary.".into(),
+            state: "APPROVED".into(),
+            commit_sha: Some(head_sha.into()),
+            submitted_at: Some(now()),
+            url: "https://github.com/acme/demo/pull/17#pullrequestreview-117".into(),
+        }],
         threads: vec![ReviewThread {
             node_id: "thread-17".into(),
             path: "src/lib.rs".into(),
@@ -8338,7 +8509,7 @@ fn seed_snapshot_feedback(state: &mut RevState) {
 mod tests {
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
@@ -8348,12 +8519,13 @@ mod tests {
     use super::{
         begin_remote_reply, begin_review_submission, browser_markdown_focus,
         browser_markdown_state, build_rows, close_file_picker, close_questions,
-        current_item_yank_text, drain_github_operation, execute_command, finish_active_question,
-        handle_agent_event, handle_compose_key, handle_file_picker_key, handle_help_key,
-        handle_history_key, handle_key, handle_question_key, handle_review_key, help_lines,
-        is_expandable_fold, markdown_sides, merge_touching_hunks, move_row, open_file_picker,
-        open_questions, page_move, pending_review_submission, preserve_source_focus, question_ids,
-        queue_question_launch, rebuild_file_without_expanded_lines, render, render_snapshot,
+        current_item_yank_text, drain_cmux_preview, drain_github_operation, execute_command,
+        finish_active_question, handle_agent_event, handle_command_key, handle_compose_key,
+        handle_file_picker_key, handle_help_key, handle_history_key, handle_key,
+        handle_question_key, handle_review_key, help_lines, is_expandable_fold, markdown_sides,
+        merge_touching_hunks, move_row, open_file_picker, open_questions, page_move,
+        pending_review_submission, preserve_source_focus, question_ids, queue_question_launch,
+        rebuild_file_without_expanded_lines, reconcile_github_operations, render, render_snapshot,
         review_file_key, row_count, scroll_review_viewport, seed_snapshot_feedback,
         seed_snapshot_questions, snapshot_workspace, split_highlight_side, split_source_lines,
         style_split_side, submit_compose, visual_selection_yank_text, ComposeTarget, GitHubBackend,
@@ -8366,9 +8538,12 @@ mod tests {
         AgentCommand, AgentEvent, AgentRuntime, AgentSink, ModelOption, ModelSelection,
     };
     use crate::diff::{parse_unified, DiffLine, Hunk, LineKind};
-    use crate::domain::{AnchorSide, AnnotationKind, AnnotationStatus};
+    use crate::domain::{AnchorSide, AnnotationKind, AnnotationStatus, DeliveryState};
     use crate::highlight::PlainHighlighter;
-    use crate::storage::{now, RevQuestionSession, Storage};
+    use crate::markdown_preview::MarkdownPreviewServer;
+    use crate::storage::{
+        now, GitHubOperationKind, GitHubOperationPreparation, RevQuestionSession, Storage,
+    };
 
     struct NoopAgent;
 
@@ -8575,6 +8750,31 @@ mod tests {
         assert!(state.markdown_server.is_some());
         assert!(state.cmux_open.is_none());
         assert!(state.cmux_markdown.is_none());
+    }
+
+    #[test]
+    fn failed_cmux_open_keeps_one_live_server_and_never_auto_retries_on_scroll() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        state.markdown_preview = true;
+        state.cmux_markdown_requested = true;
+        state.cmux_open_attempted = true;
+        state.markdown_server =
+            Some(MarkdownPreviewServer::start("{}".into(), "{}".into()).unwrap());
+        let original_url = state.markdown_server.as_ref().unwrap().url();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        sender
+            .send(Err(anyhow::anyhow!("simulated cmux failure")))
+            .unwrap();
+        state.cmux_open = Some(receiver);
+
+        drain_cmux_preview(&mut state);
+
+        assert_eq!(state.markdown_server.as_ref().unwrap().url(), original_url);
+        assert!(state.cmux_open_attempted);
+        assert!(state.cmux_open.is_none());
+        assert!(state.status.contains("no automatic reopen"));
     }
 
     #[test]
@@ -10353,8 +10553,44 @@ mod tests {
         let total = state.annotations.len();
         let paths = test_paths("rev-hide-inline");
         let mut highlighter = PlainHighlighter;
+        let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.kind,
+                    RevRowKind::Source {
+                        line: DiffLine {
+                            new_line: Some(11),
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .unwrap();
 
         execute_command(&mut state, &storage, &paths, "hide comments").unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        assert!(matches!(
+            state.render_cache.as_ref().unwrap().rows[state.row_cursor].kind,
+            RevRowKind::Source {
+                line: DiffLine {
+                    new_line: Some(11),
+                    ..
+                },
+                ..
+            }
+        ));
         let rows = build_rows(&state, 80, &mut highlighter);
         assert!(!rows.iter().any(|row| {
             matches!(
@@ -10495,14 +10731,34 @@ mod tests {
         state.mode = RevMode::Command;
         state.command.input = "q".into();
         state.command.cursor = 1;
+        handle_command_key(
+            &mut state,
+            &storage,
+            &test_paths("rev-command-selection"),
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .unwrap();
         let mut highlighter = PlainHighlighter;
         let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
         terminal
             .draw(|frame| render(frame, &mut state, &mut highlighter))
             .unwrap();
         let frame = terminal.backend().to_string();
-        assert!(frame.contains("❯ q"));
+        assert!(frame.contains("❯ questions"));
         assert!(!frame.contains("❯ hide questions"));
+
+        handle_command_key(
+            &mut state,
+            &storage,
+            &test_paths("rev-command-selection"),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, RevMode::Questions);
+
+        let compact = render_snapshot(36, 9, "command").unwrap();
+        assert!(!compact.contains("┌┌"));
+        assert!(!compact.contains("└└"));
     }
 
     #[test]
@@ -10556,6 +10812,7 @@ mod tests {
                     head_sha: workspace.repos[0].version.head_sha.clone(),
                     base_sha: "base".into(),
                     updated_at: now(),
+                    reviews: Vec::new(),
                     threads: vec![rq_tui_github_review::ReviewThread {
                         node_id: "thread-17".into(),
                         path: "src/lib.rs".into(),
@@ -10712,6 +10969,128 @@ mod tests {
                 .author,
             "current-user"
         );
+        assert_eq!(
+            storage
+                .pull_request_snapshot(&state.current_repo().unwrap().version.id)
+                .unwrap()
+                .unwrap()
+                .threads[0]
+                .comments
+                .last()
+                .unwrap()
+                .reply_to
+                .as_deref(),
+            Some("comment-17")
+        );
+    }
+
+    #[test]
+    fn hung_github_operation_times_out_to_unknown_and_unblocks_the_ui() {
+        let storage = Storage::in_memory().unwrap();
+        let mut workspace = snapshot_workspace(&storage).unwrap();
+        seed_github_snapshot(&storage, &mut workspace);
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        seed_snapshot_feedback(&mut state);
+        let (feedback, placement) = state
+            .annotations
+            .iter()
+            .find(|(annotation, _)| annotation.id == "feedback-architecture")
+            .unwrap();
+        storage.add_annotation(feedback, placement).unwrap();
+        state.github_backend = Arc::new(FakeGitHubBackend::default());
+        begin_review_submission(&mut state, ReviewDecision::Approve);
+        state.compose = "Approval".into();
+        state.compose_cursor = state.compose.len();
+        submit_compose(&mut state, &storage, &test_paths("rev-github-timeout")).unwrap();
+        state.github_operation_started =
+            Some(Instant::now() - super::GITHUB_OPERATION_TIMEOUT - Duration::from_secs(1));
+
+        drain_github_operation(&mut state, &storage).unwrap();
+
+        assert!(state.github_operation.is_none());
+        assert!(state.github_operation_id.is_none());
+        assert!(state.status.contains(":quit are unblocked"));
+        assert_eq!(
+            storage.unresolved_github_operations().unwrap()[0].state,
+            rq_tui_storage::GitHubOperationState::Unknown
+        );
+
+        execute_command(
+            &mut state,
+            &storage,
+            &test_paths("rev-github-timeout"),
+            "github unlock",
+        )
+        .unwrap();
+        assert!(state.status.contains("may allow duplicates"));
+        execute_command(
+            &mut state,
+            &storage,
+            &test_paths("rev-github-timeout"),
+            "github unlock confirm",
+        )
+        .unwrap();
+        assert!(storage.unresolved_github_operations().unwrap().is_empty());
+        assert!(state.status.contains("drafts may be submitted again"));
+        assert_eq!(
+            state
+                .annotations
+                .iter()
+                .find(|(annotation, _)| annotation.id == "feedback-architecture")
+                .unwrap()
+                .0
+                .delivery_state,
+            DeliveryState::Draft
+        );
+    }
+
+    #[test]
+    fn refresh_reconciles_review_without_inline_comments_from_overall_review_body() {
+        let storage = Storage::in_memory().unwrap();
+        let mut workspace = snapshot_workspace(&storage).unwrap();
+        seed_github_snapshot(&storage, &mut workspace);
+        let repo = &workspace.repos[0];
+        let operation = GitHubOperationPreparation {
+            operation_id: "review-without-inline".into(),
+            repo_id: repo.record.id.clone(),
+            version_id: repo.version.id.clone(),
+            kind: GitHubOperationKind::Review,
+            request_json: "{}".into(),
+            idempotency_key: "marker-without-inline".into(),
+            annotation_ids: Vec::new(),
+        };
+        storage.prepare_github_operation(&operation).unwrap();
+        storage
+            .mark_github_operation_unknown(&operation.operation_id, "simulated disconnect")
+            .unwrap();
+        let mut snapshot = storage
+            .pull_request_snapshot(&repo.version.id)
+            .unwrap()
+            .unwrap();
+        snapshot
+            .reviews
+            .push(rq_tui_github_review::PullRequestReview {
+                node_id: "review-marker".into(),
+                database_id: Some(991),
+                author: "current-user".into(),
+                body: format!(
+                    "Approved\n\n<!-- rev-operation:{} -->",
+                    operation.idempotency_key
+                ),
+                state: "APPROVED".into(),
+                commit_sha: Some(repo.version.head_sha.clone()),
+                submitted_at: Some(now()),
+                url: "https://github.com/acme/demo/pull/17#pullrequestreview-991".into(),
+            });
+        storage
+            .upsert_pull_request_snapshot(&repo.version.id, &snapshot)
+            .unwrap();
+
+        assert_eq!(
+            reconcile_github_operations(&storage, &workspace).unwrap(),
+            1
+        );
+        assert!(storage.unresolved_github_operations().unwrap().is_empty());
     }
 
     #[test]
@@ -10725,6 +11104,8 @@ mod tests {
         assert!(description.contains("PR_DESCRIPTION.md"));
         assert!(description.contains("Description"));
         assert!(description.contains("rendered"));
+        assert!(description.contains("@maintainer · APPROVED"));
+        assert!(description.contains("Overall review summary"));
     }
 
     #[test]
