@@ -20,6 +20,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use rq_tui_github_review::{
+    DiffSide as GitHubDiffSide, DraftInlineComment, GitHubReviewClient,
+    PullRequestRef as GitHubPrRef, PullRequestSnapshot, ReviewDecision, ReviewSubmission,
+    ReviewThread,
+};
 use uuid::Uuid;
 
 use crate::annotations::{anchor_from_diff, create_local_annotation, AnnotationRequest};
@@ -37,6 +42,7 @@ use crate::domain::{
 };
 use crate::export::CommentExport;
 use crate::git::Git;
+use crate::github_review::GhCliTransport;
 use crate::highlight::{Highlighter, PlainHighlighter, StyledSegment, SyntectHighlighter};
 use crate::markdown_preview::MarkdownPreviewServer;
 use crate::remote::{resolve_remote, PrReference};
@@ -51,6 +57,7 @@ use crate::work_item::{resolve_local, ResolvedWorkItem, ReviewRepo};
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_EVENTS_PER_TICK: usize = 128;
 const REV_DEFAULT_MODEL_SETTING: &str = "rev.model.default.v1";
+const PR_DESCRIPTION_PATH: &str = ".rev/PR_DESCRIPTION.md";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RevMode {
@@ -96,6 +103,13 @@ enum ComposeTarget {
     EditFeedback(String),
     NewQuestion,
     FollowUp(String),
+    RemoteReply(String),
+    SubmitReview(ReviewDecision),
+}
+
+enum GitHubOperationResult {
+    Replied(String),
+    Submitted(Vec<String>),
 }
 
 enum ContextualAnnotationMatch {
@@ -296,6 +310,8 @@ struct RevState {
     annotations: Vec<(Annotation, Placement)>,
     threads: HashMap<String, Vec<AskMessage>>,
     question_sessions: HashMap<String, RevQuestionSession>,
+    pr_snapshots: HashMap<String, PullRequestSnapshot>,
+    remote_threads: HashMap<String, ReviewThread>,
     picker: Option<ModelPicker>,
     model_catalog: Option<Receiver<Result<Vec<ModelOption>>>>,
     model_catalog_started: Option<Instant>,
@@ -312,6 +328,8 @@ struct RevState {
     pending_resolve: Option<String>,
     refresh: Option<Receiver<Result<ResolvedWorkItem>>>,
     refresh_started: Option<Instant>,
+    github_operation: Option<Receiver<Result<GitHubOperationResult>>>,
+    github_operation_started: Option<Instant>,
     markdown_preview: bool,
     cmux_markdown_requested: bool,
     cmux_markdown: Option<MarkdownSurface>,
@@ -323,8 +341,129 @@ struct RevState {
     markdown_sides_cache: Option<MarkdownSides>,
 }
 
+fn remote_annotation_id(thread_id: &str) -> String {
+    format!("github-thread:{thread_id}")
+}
+
+fn is_remote_annotation_id(annotation_id: &str) -> bool {
+    annotation_id.starts_with("github-thread:")
+}
+
+fn description_diff_file(body: &str) -> DiffFile {
+    let lines = if body.is_empty() {
+        vec![String::new()]
+    } else {
+        body.lines().map(str::to_owned).collect()
+    };
+    let count = lines.len();
+    DiffFile {
+        old_path: Some(PathBuf::from(PR_DESCRIPTION_PATH)),
+        new_path: Some(PathBuf::from(PR_DESCRIPTION_PATH)),
+        display_path: PathBuf::from(PR_DESCRIPTION_PATH),
+        status: FileStatus::Modified,
+        additions: 0,
+        deletions: 0,
+        hunks: vec![Hunk {
+            header: format!("@@ -1,{count} +1,{count} @@"),
+            old_start: 1,
+            old_count: count,
+            new_start: 1,
+            new_count: count,
+            lines: lines
+                .into_iter()
+                .enumerate()
+                .map(|(index, content)| DiffLine {
+                    kind: LineKind::Context,
+                    old_line: Some(index + 1),
+                    new_line: Some(index + 1),
+                    content,
+                })
+                .collect(),
+        }],
+    }
+}
+
+fn inject_remote_thread_context(
+    repo: &mut ReviewRepo,
+    snapshot: &PullRequestSnapshot,
+    thread: &ReviewThread,
+) -> Result<()> {
+    let Some(line_number) = thread.line.or(thread.original_line) else {
+        return Ok(());
+    };
+    let Some(file) = repo
+        .diff
+        .files
+        .iter_mut()
+        .find(|file| file.path() == Path::new(&thread.path))
+    else {
+        return Ok(());
+    };
+    let line_number = usize::try_from(line_number).context("GitHub line exceeds address space")?;
+    if file.visible_lines().any(|line| match thread.side {
+        GitHubDiffSide::Left => line.old_line == Some(line_number),
+        GitHubDiffSide::Right => line.new_line == Some(line_number),
+    }) {
+        return Ok(());
+    }
+    let source = match thread.side {
+        GitHubDiffSide::Right => {
+            let root = repo
+                .version
+                .worktree_path
+                .as_deref()
+                .unwrap_or(&repo.record.path);
+            std::fs::read_to_string(root.join(&thread.path)).unwrap_or_default()
+        }
+        GitHubDiffSide::Left => Git::default()
+            .file_at_revision(
+                &repo.record.path,
+                &snapshot.base_sha,
+                Path::new(&thread.path),
+            )
+            .unwrap_or_default(),
+    };
+    let content = source
+        .lines()
+        .nth(line_number.saturating_sub(1))
+        .unwrap_or_default()
+        .to_owned();
+    file.hunks.push(Hunk {
+        header: format!("@@ -{line_number},1 +{line_number},1 @@"),
+        old_start: line_number,
+        old_count: 1,
+        new_start: line_number,
+        new_count: 1,
+        lines: vec![DiffLine {
+            kind: LineKind::Context,
+            old_line: Some(line_number),
+            new_line: Some(line_number),
+            content,
+        }],
+    });
+    file.hunks
+        .sort_by_key(|hunk| (hunk.new_start, hunk.old_start));
+    merge_touching_hunks(&mut file.hunks);
+    Ok(())
+}
+
 impl RevState {
-    fn load(workspace: ResolvedWorkItem, storage: &Storage) -> Result<Self> {
+    fn load(mut workspace: ResolvedWorkItem, storage: &Storage) -> Result<Self> {
+        let mut pr_snapshots = HashMap::new();
+        let mut remote_threads = HashMap::new();
+        for repo in &mut workspace.repos {
+            let Some(snapshot) = storage.pull_request_snapshot(&repo.version.id)? else {
+                continue;
+            };
+            for thread in &snapshot.threads {
+                inject_remote_thread_context(repo, &snapshot, thread)?;
+            }
+            repo.diff.files.push(description_diff_file(&snapshot.body));
+            for thread in &snapshot.threads {
+                remote_threads.insert(remote_annotation_id(&thread.node_id), thread.clone());
+            }
+            pr_snapshots.insert(repo.record.id.clone(), snapshot);
+        }
         let files = workspace
             .repos
             .iter()
@@ -349,6 +488,49 @@ impl RevState {
                     }
                 }
                 annotations.push(pair);
+            }
+            if let Some(snapshot) = pr_snapshots.get(&repo.record.id) {
+                for thread in &snapshot.threads {
+                    let Some(line) = thread.line.or(thread.original_line) else {
+                        continue;
+                    };
+                    let id = remote_annotation_id(&thread.node_id);
+                    let first = thread.comments.first();
+                    annotations.push((
+                        Annotation {
+                            id: id.clone(),
+                            repo_id: repo.record.id.clone(),
+                            kind: AnnotationKind::Comment,
+                            file_path: PathBuf::from(&thread.path),
+                            anchor_snippet: first
+                                .map_or_else(String::new, |item| item.body.clone()),
+                            anchor_hash: thread.node_id.clone(),
+                            anchor_start_offset: 0,
+                            anchor_line_count: 1,
+                            text: first.map(|item| item.body.clone()),
+                            submitted: true,
+                            delivery_state: DeliveryState::Sent,
+                            status: AnnotationStatus::Active,
+                            status_reason: thread.is_outdated.then(|| "Outdated on GitHub".into()),
+                            status_changed_at: None,
+                            created_at: first.map_or_else(now, |item| item.created_at.clone()),
+                        },
+                        Placement {
+                            annotation_id: id,
+                            version_id: repo.version.id.clone(),
+                            side: match thread.side {
+                                GitHubDiffSide::Left => AnchorSide::Old,
+                                GitHubDiffSide::Right => AnchorSide::New,
+                            },
+                            line_start: i64::try_from(line)
+                                .context("GitHub line exceeds SQLite range")?,
+                            line_end: i64::try_from(line)
+                                .context("GitHub line exceeds SQLite range")?,
+                            outdated: thread.is_outdated,
+                            ambiguous: false,
+                        },
+                    ));
+                }
             }
         }
         let branch_candidates = workspace
@@ -411,6 +593,8 @@ impl RevState {
             annotations,
             threads,
             question_sessions,
+            pr_snapshots,
+            remote_threads,
             picker: None,
             model_catalog: None,
             model_catalog_started: None,
@@ -431,6 +615,8 @@ impl RevState {
             pending_resolve: None,
             refresh: None,
             refresh_started: None,
+            github_operation: None,
+            github_operation_started: None,
             markdown_preview: false,
             cmux_markdown_requested: false,
             cmux_markdown: None,
@@ -645,6 +831,7 @@ fn run_loop<B: Backend>(
 ) -> Result<()> {
     loop {
         drain_refresh(state, storage)?;
+        drain_github_operation(state, storage)?;
         drain_agent_events(state, storage, paths)?;
         drain_model_catalog(state)?;
         drain_cmux_preview(state);
@@ -816,7 +1003,9 @@ fn handle_key(
                     }
                     state.agent.take();
                     storage.clear_review_history(&state.workspace.item.id)?;
-                    state.annotations.clear();
+                    state
+                        .annotations
+                        .retain(|(annotation, _)| is_remote_annotation_id(&annotation.id));
                     state.threads.clear();
                     state.question_sessions.clear();
                     state.invalidate_rows();
@@ -1036,7 +1225,15 @@ fn handle_review_key(
                     "YANK · press y again to copy the current line or chat message".into();
             }
         }
-        KeyCode::Char('d') => delete_contextual_comment(state, storage, highlighter)?,
+        KeyCode::Char('d') => {
+            if current_annotation_id(state, highlighter)
+                .is_some_and(|id| is_remote_annotation_id(&id))
+            {
+                state.status = "GitHub comments are read-only here · Enter replies".into();
+            } else {
+                delete_contextual_comment(state, storage, highlighter)?;
+            }
+        }
         KeyCode::Char('m') => {
             if let Some(id) = current_question_id_from_cache(state) {
                 start_model_switch(state, paths, &id);
@@ -1047,6 +1244,12 @@ fn handle_review_key(
             }
         }
         KeyCode::Char('a') => {
+            if let Some(id) =
+                current_annotation_id(state, highlighter).filter(|id| is_remote_annotation_id(id))
+            {
+                begin_remote_question(state, highlighter, &id);
+                return Ok(());
+            }
             match contextual_annotation(state, highlighter, AnnotationKind::Ask) {
                 ContextualAnnotationMatch::Match(id) => begin_follow_up(state, highlighter, id),
                 ContextualAnnotationMatch::None => {
@@ -1056,6 +1259,14 @@ fn handle_review_key(
             }
         }
         KeyCode::Char('c') => {
+            if current_annotation_id(state, highlighter)
+                .is_some_and(|id| is_remote_annotation_id(&id))
+            {
+                state.status =
+                    "GitHub review threads cannot be edited · Enter replies · a asks Copilot"
+                        .into();
+                return Ok(());
+            }
             match contextual_annotation(state, highlighter, AnnotationKind::Comment) {
                 ContextualAnnotationMatch::Match(id) => begin_edit_feedback(state, highlighter, id),
                 ContextualAnnotationMatch::None => {
@@ -1066,6 +1277,10 @@ fn handle_review_key(
         }
         KeyCode::Char('i') | KeyCode::Enter => {
             if let Some(id) = current_annotation_id(state, highlighter) {
+                if is_remote_annotation_id(&id) {
+                    begin_remote_reply(state, id);
+                    return Ok(());
+                }
                 if state
                     .annotation(&id)
                     .is_some_and(|(annotation, _)| annotation.kind == AnnotationKind::Ask)
@@ -1078,7 +1293,13 @@ fn handle_review_key(
             if state.mode == RevMode::Visual && state.visual_anchor.is_some() {
                 retract_selected_context(state, highlighter)?;
             } else if let Some(id) = current_annotation_id(state, highlighter) {
-                begin_resolve(state, id);
+                if is_remote_annotation_id(&id) {
+                    state.status =
+                        "Remote thread resolution stays on GitHub · Enter replies · a asks Copilot"
+                            .into();
+                } else {
+                    begin_resolve(state, id);
+                }
             } else {
                 state.mode = RevMode::History;
                 state.history_cursor = 0;
@@ -1759,6 +1980,51 @@ fn begin_compose(state: &mut RevState, highlighter: &mut dyn Highlighter, target
     state.status = "INSERT · Enter submit · Shift-Enter newline · Esc cancel".into();
 }
 
+fn begin_remote_reply(state: &mut RevState, annotation_id: String) {
+    let Some(thread) = state.remote_threads.get(&annotation_id) else {
+        state.status = "GitHub thread is unavailable for this revision".into();
+        return;
+    };
+    if !thread.viewer_can_reply {
+        state.status = "GitHub says you cannot reply to this review thread".into();
+        return;
+    }
+    state.mode = RevMode::Compose;
+    state.compose_target = Some(ComposeTarget::RemoteReply(annotation_id));
+    state.compose.clear();
+    state.compose_cursor = 0;
+    state.compose_scroll = 0;
+    state.status = "REPLY TO GITHUB · Enter submit · Shift-Enter newline · Esc cancel".into();
+}
+
+fn begin_remote_question(
+    state: &mut RevState,
+    highlighter: &mut dyn Highlighter,
+    annotation_id: &str,
+) {
+    let Some(source) = current_source_index(state, highlighter) else {
+        state.status = "GitHub thread has no source anchor in this revision".into();
+        return;
+    };
+    let Some(thread) = state.remote_threads.get(annotation_id) else {
+        state.status = "GitHub thread is unavailable for this revision".into();
+        return;
+    };
+    let context = thread
+        .comments
+        .iter()
+        .map(|comment| format!("@{}: {}", comment.author, comment.body))
+        .collect::<Vec<_>>()
+        .join("\n");
+    state.visual_anchor = Some(source);
+    state.visual_row_anchor = None;
+    begin_compose(state, highlighter, ComposeTarget::NewQuestion);
+    state.compose = format!("About this GitHub review thread:\n\n{context}\n\nMy question: ");
+    state.compose_cursor = state.compose.len();
+    state.status =
+        "ASK ABOUT GITHUB THREAD · add your question · Enter submits · Esc keeps selection".into();
+}
+
 fn handle_command_key(
     state: &mut RevState,
     storage: &Storage,
@@ -1853,6 +2119,7 @@ fn command_candidates(state: &RevState) -> Vec<String> {
         "history".to_owned(),
         "model".to_owned(),
         "model reset".to_owned(),
+        "pr description".to_owned(),
         "questions".to_owned(),
         "refresh".to_owned(),
         "retract all".to_owned(),
@@ -1861,6 +2128,9 @@ fn command_candidates(state: &RevState) -> Vec<String> {
         "clear".to_owned(),
         "show comments".to_owned(),
         "show questions".to_owned(),
+        "submit approve".to_owned(),
+        "submit comment".to_owned(),
+        "submit request changes".to_owned(),
         "q".to_owned(),
         "quit".to_owned(),
     ];
@@ -1899,6 +2169,7 @@ fn execute_command(
             state.status = "j/k or arrows scroll · Esc closes · q opens questions".into();
         }
         "questions" | "threads" => open_questions(state),
+        "pr description" | "description" => open_pr_description(state),
         "model" => {
             start_global_model_picker(state);
         }
@@ -1970,6 +2241,11 @@ fn execute_command(
         "retract all" => {
             state.mode = RevMode::Normal;
             retract_all_context(state)?;
+        }
+        "submit approve" => begin_review_submission(state, ReviewDecision::Approve),
+        "submit comment" => begin_review_submission(state, ReviewDecision::Comment),
+        "submit request changes" | "submit request-changes" => {
+            begin_review_submission(state, ReviewDecision::RequestChanges)
         }
         "export feedback" | "feedback" | "export" => {
             state.mode = RevMode::Normal;
@@ -2083,9 +2359,64 @@ fn execute_command(
     Ok(())
 }
 
+fn open_pr_description(state: &mut RevState) {
+    let Some(repo_id) = state.current_repo().map(|repo| repo.record.id.clone()) else {
+        state.status = "No current repository".into();
+        return;
+    };
+    let Some(target) = state.files.iter().position(|(repo_index, file_index)| {
+        let repo = &state.workspace.repos[*repo_index];
+        repo.record.id == repo_id
+            && repo.diff.files[*file_index].path() == Path::new(PR_DESCRIPTION_PATH)
+    }) else {
+        state.status = "The current review is local and has no GitHub PR description".into();
+        return;
+    };
+    state.switch_file(target);
+    state.mode = RevMode::Normal;
+    state.status = "PR DESCRIPTION · v selects · a asks Copilot · M opens rendered Markdown".into();
+}
+
+fn begin_review_submission(state: &mut RevState, decision: ReviewDecision) {
+    if state
+        .current_repo()
+        .and_then(|repo| repo.record.remote_pr_url.as_ref())
+        .is_none()
+    {
+        state.status = "Review submission is available only for GitHub pull requests".into();
+        state.mode = RevMode::Normal;
+        return;
+    }
+    if state.github_operation.is_some() {
+        state.status = "A GitHub operation is already running in the background".into();
+        state.mode = RevMode::Normal;
+        return;
+    }
+    state.mode = RevMode::Compose;
+    state.compose_target = Some(ComposeTarget::SubmitReview(decision));
+    state.compose.clear();
+    state.compose_cursor = 0;
+    state.compose_scroll = 0;
+    state.status = match decision {
+        ReviewDecision::Approve => {
+            "SUBMIT APPROVE · optional overall comment · Enter sends all pending feedback".into()
+        }
+        ReviewDecision::Comment => {
+            "SUBMIT COMMENT · optional overall comment · Enter sends all pending feedback".into()
+        }
+        ReviewDecision::RequestChanges => {
+            "REQUEST CHANGES · explain why · Enter sends all pending feedback".into()
+        }
+    };
+}
+
 fn start_refresh(state: &mut RevState, paths: &AppPaths) -> Result<()> {
     if state.refresh.is_some() {
         state.status = "Refresh already running · the review remains usable".into();
+        return Ok(());
+    }
+    if state.github_operation.is_some() {
+        state.status = "Wait for the active GitHub reply/review before refreshing".into();
         return Ok(());
     }
     if state.agent.is_some() || !state.queued_questions.is_empty() {
@@ -2208,6 +2539,13 @@ fn is_expandable_fold(line: &DiffLine) -> bool {
 }
 
 fn expand_fold(state: &mut RevState, all: bool) -> Result<()> {
+    if state
+        .current_file()
+        .is_some_and(|file| file.path() == Path::new(PR_DESCRIPTION_PATH))
+    {
+        state.status = "The PR description is already shown in full".into();
+        return Ok(());
+    }
     let visible_index = state
         .render_cache
         .as_ref()
@@ -2289,6 +2627,13 @@ fn expand_fold(state: &mut RevState, all: bool) -> Result<()> {
 
 fn expand_hunk_edge(state: &mut RevState, above: bool) -> Result<()> {
     const STEP: usize = 5;
+    if state
+        .current_file()
+        .is_some_and(|file| file.path() == Path::new(PR_DESCRIPTION_PATH))
+    {
+        state.status = "The PR description is already shown in full".into();
+        return Ok(());
+    }
 
     let Some(visible_index) = state.render_cache.as_ref().and_then(|cache| {
         cache.rows.get(state.row_cursor).map(|row| match row.kind {
@@ -2730,7 +3075,13 @@ fn handle_compose_key(
 
 fn submit_compose(state: &mut RevState, storage: &Storage, paths: &AppPaths) -> Result<()> {
     let text = state.compose.trim().to_owned();
-    if text.is_empty() {
+    let empty_allowed = matches!(
+        state.compose_target,
+        Some(ComposeTarget::SubmitReview(
+            ReviewDecision::Approve | ReviewDecision::Comment
+        ))
+    );
+    if text.is_empty() && !empty_allowed {
         state.status = "Enter some text before submitting".into();
         return Ok(());
     }
@@ -2794,7 +3145,201 @@ fn submit_compose(state: &mut RevState, storage: &Storage, paths: &AppPaths) -> 
         ComposeTarget::FollowUp(annotation_id) => {
             create_follow_up(state, storage, paths, &annotation_id, &text)
         }
+        ComposeTarget::RemoteReply(annotation_id) => {
+            start_remote_reply(state, &annotation_id, &text)
+        }
+        ComposeTarget::SubmitReview(decision) => {
+            start_review_submission(state, storage, decision, &text)
+        }
     }
+}
+
+fn start_remote_reply(state: &mut RevState, annotation_id: &str, text: &str) -> Result<()> {
+    if state.github_operation.is_some() {
+        state.status = "A GitHub operation is already running in the background".into();
+        return Ok(());
+    }
+    let thread = state
+        .remote_threads
+        .get(annotation_id)
+        .context("GitHub thread is unavailable")?;
+    let root_comment_id = thread
+        .comments
+        .first()
+        .and_then(|comment| comment.database_id)
+        .context("GitHub thread has no replyable root comment ID")?;
+    let repo = state.current_repo().context("no current repository")?;
+    let reference = PrReference::parse(
+        repo.record
+            .remote_pr_url
+            .as_deref()
+            .context("current repository is not a GitHub pull request")?,
+    )?;
+    let reference = GitHubPrRef {
+        owner: reference.owner,
+        repository: reference.repo,
+        number: reference.number,
+    };
+    let body = text.to_owned();
+    let id = annotation_id.to_owned();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = GitHubReviewClient::new(GhCliTransport)
+            .reply(&reference, root_comment_id, &body)
+            .map(|_| GitHubOperationResult::Replied(id));
+        sender.send(result).ok();
+    });
+    state.github_operation = Some(receiver);
+    state.github_operation_started = Some(Instant::now());
+    state.status = "GITHUB REPLY · sending in background · navigation remains active".into();
+    Ok(())
+}
+
+fn start_review_submission(
+    state: &mut RevState,
+    storage: &Storage,
+    decision: ReviewDecision,
+    body: &str,
+) -> Result<()> {
+    if state.github_operation.is_some() {
+        state.status = "A GitHub operation is already running in the background".into();
+        return Ok(());
+    }
+    let (reference, submission, ids) = pending_review_submission(state, decision, body)?;
+    storage.mark_comments_delivery(&ids, DeliveryState::Pending)?;
+    for (annotation, _) in &mut state.annotations {
+        if ids.contains(&annotation.id) {
+            annotation.delivery_state = DeliveryState::Pending;
+        }
+    }
+    let result_ids = ids.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = GitHubReviewClient::new(GhCliTransport)
+            .submit_review(&reference, &submission)
+            .map(|_| GitHubOperationResult::Submitted(result_ids));
+        sender.send(result).ok();
+    });
+    state.github_operation = Some(receiver);
+    state.github_operation_started = Some(Instant::now());
+    state.status = format!(
+        "GITHUB REVIEW · sending {} inline comment(s) in one batch · UI remains active",
+        ids.len()
+    );
+    Ok(())
+}
+
+fn pending_review_submission(
+    state: &RevState,
+    decision: ReviewDecision,
+    body: &str,
+) -> Result<(GitHubPrRef, ReviewSubmission, Vec<String>)> {
+    let repo = state.current_repo().context("no current repository")?;
+    let repo_id = repo.record.id.clone();
+    let version_id = repo.version.id.clone();
+    let head_sha = repo.version.head_sha.clone();
+    let reference = PrReference::parse(
+        repo.record
+            .remote_pr_url
+            .as_deref()
+            .context("review submission requires a GitHub pull request")?,
+    )?;
+    let mut ids = Vec::new();
+    let mut comments = Vec::new();
+    for (annotation, placement) in &state.annotations {
+        if is_remote_annotation_id(&annotation.id)
+            || annotation.kind != AnnotationKind::Comment
+            || annotation.repo_id != repo_id
+            || annotation.status != AnnotationStatus::Active
+            || annotation.submitted
+            || placement.version_id != version_id
+            || placement.outdated
+        {
+            continue;
+        }
+        ids.push(annotation.id.clone());
+        comments.push(DraftInlineComment {
+            local_id: annotation.id.clone(),
+            path: annotation.file_path.display().to_string(),
+            line: u64::try_from(placement.line_end).context("comment line is negative")?,
+            start_line: (placement.line_start != placement.line_end)
+                .then(|| u64::try_from(placement.line_start))
+                .transpose()
+                .context("comment start line is negative")?,
+            side: match placement.side {
+                AnchorSide::Old => GitHubDiffSide::Left,
+                AnchorSide::New => GitHubDiffSide::Right,
+            },
+            body: annotation.text.clone().unwrap_or_default(),
+        });
+    }
+    let submission = ReviewSubmission {
+        commit_id: head_sha,
+        decision,
+        body: body.to_owned(),
+        comments,
+    };
+    let reference = GitHubPrRef {
+        owner: reference.owner,
+        repository: reference.repo,
+        number: reference.number,
+    };
+    Ok((reference, submission, ids))
+}
+
+fn drain_github_operation(state: &mut RevState, storage: &Storage) -> Result<()> {
+    let Some(receiver) = state.github_operation.as_ref() else {
+        return Ok(());
+    };
+    let result = match receiver.try_recv() {
+        Ok(result) => result,
+        Err(TryRecvError::Empty) => {
+            let elapsed = state
+                .github_operation_started
+                .map_or(0, |started| started.elapsed().as_secs());
+            if elapsed > 0 {
+                state.status = format!(
+                    "GITHUB · request in progress · {elapsed}s elapsed · navigation remains active"
+                );
+            }
+            return Ok(());
+        }
+        Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!(
+            "GitHub worker stopped before reporting a result"
+        )),
+    };
+    state.github_operation = None;
+    state.github_operation_started = None;
+    match result {
+        Ok(GitHubOperationResult::Replied(annotation_id)) => {
+            state.status =
+                format!("GitHub reply submitted · :refresh reloads thread {annotation_id}");
+        }
+        Ok(GitHubOperationResult::Submitted(ids)) => {
+            storage.mark_comments_delivery(&ids, DeliveryState::Sent)?;
+            for (annotation, _) in &mut state.annotations {
+                if ids.contains(&annotation.id) {
+                    annotation.delivery_state = DeliveryState::Sent;
+                    annotation.submitted = true;
+                }
+            }
+            state.status = format!(
+                "GitHub review submitted with {} inline comment(s) · :refresh reloads it",
+                ids.len()
+            );
+        }
+        Err(error) => {
+            let pending = storage.pending_comment_delivery_ids(&state.workspace.item.id)?;
+            storage.mark_comments_delivery(&pending, DeliveryState::Draft)?;
+            for (annotation, _) in &mut state.annotations {
+                if pending.contains(&annotation.id) {
+                    annotation.delivery_state = DeliveryState::Draft;
+                }
+            }
+            state.status = format!("GitHub operation failed · drafts retained · {error:#}");
+        }
+    }
+    Ok(())
 }
 
 fn create_feedback(state: &mut RevState, storage: &Storage, text: &str) -> Result<()> {
@@ -3935,6 +4480,10 @@ fn handle_history_key(state: &mut RevState, storage: &Storage, key: KeyEvent) ->
         }
         KeyCode::Char('u') => {
             if let Some((annotation, _)) = state.annotations.get_mut(state.history_cursor) {
+                if is_remote_annotation_id(&annotation.id) {
+                    state.status = "GitHub thread state is updated by :refresh".into();
+                    return Ok(());
+                }
                 if annotation.status == AnnotationStatus::Active {
                     state.status = "This review item is already active".into();
                     return Ok(());
@@ -3960,6 +4509,11 @@ fn handle_history_key(state: &mut RevState, storage: &Storage, key: KeyEvent) ->
                 return Ok(());
             }
             if let Some((annotation, _)) = state.annotations.get(state.history_cursor).cloned() {
+                if is_remote_annotation_id(&annotation.id) {
+                    state.history_delete_armed = None;
+                    state.status = "GitHub review threads cannot be deleted locally".into();
+                    return Ok(());
+                }
                 if annotation.kind != AnnotationKind::Comment {
                     state.history_delete_armed = None;
                     state.status =
@@ -4297,10 +4851,11 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
         .iter()
         .filter(|(annotation, _)| {
             annotation.status == AnnotationStatus::Active
-                && match annotation.kind {
-                    AnnotationKind::Comment => state.show_comments,
-                    AnnotationKind::Ask => state.show_questions,
-                }
+                && (is_remote_annotation_id(&annotation.id)
+                    || match annotation.kind {
+                        AnnotationKind::Comment => state.show_comments,
+                        AnnotationKind::Ask => state.show_questions,
+                    })
                 && annotation.repo_id == repo.record.id
                 && annotation.file_path.to_string_lossy() == file_path
         })
@@ -4334,7 +4889,15 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
             };
             source_line.is_some_and(|source_line| placement.line_end == source_line as i64)
         }) {
-            let annotation_item_text = if annotation.kind == AnnotationKind::Ask {
+            let remote_thread = state.remote_threads.get(&annotation.id);
+            let annotation_item_text = if let Some(thread) = remote_thread {
+                thread
+                    .comments
+                    .iter()
+                    .map(|comment| format!("@{}: {}", comment.author, comment.body))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            } else if annotation.kind == AnnotationKind::Ask {
                 state
                     .threads
                     .get(&annotation.id)
@@ -4344,15 +4907,35 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
             } else {
                 annotation.text.clone().unwrap_or_default()
             };
-            let title = match annotation.kind {
-                AnnotationKind::Comment => format!(
-                    "Feedback · lines {}-{}",
-                    placement.line_start, placement.line_end
-                ),
-                AnnotationKind::Ask => format!(
-                    "Question · lines {}-{} · isolated session",
-                    placement.line_start, placement.line_end
-                ),
+            let title = if let Some(thread) = remote_thread {
+                let author = thread
+                    .comments
+                    .first()
+                    .map_or("unknown", |comment| comment.author.as_str());
+                format!(
+                    "GitHub · @{author} · {}{}",
+                    if thread.is_outdated {
+                        "outdated"
+                    } else {
+                        "current"
+                    },
+                    if thread.is_resolved {
+                        " · resolved"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                match annotation.kind {
+                    AnnotationKind::Comment => format!(
+                        "Feedback · lines {}-{}",
+                        placement.line_start, placement.line_end
+                    ),
+                    AnnotationKind::Ask => format!(
+                        "Question · lines {}-{} · isolated session",
+                        placement.line_start, placement.line_end
+                    ),
+                }
             };
             rows.push(RevRow {
                 kind: RevRowKind::Annotation {
@@ -4439,7 +5022,7 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
                     item_text: annotation_item_text.clone(),
                 });
             } else {
-                let feedback = annotation.text.as_deref().unwrap_or_default();
+                let feedback = annotation_item_text.as_str();
                 for mapped in
                     render_markdown_mapped(feedback, width.saturating_sub(4).max(1), highlighter)
                         .rows
@@ -4469,7 +5052,11 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
                         anchor_visible_index: visible_index,
                     },
                     line: Some(Line::styled(
-                        "╰─ saved · c/C edit · e copy structured prompt",
+                        if remote_thread.is_some() {
+                            "╰─ Enter reply · a ask Copilot · author and version retained"
+                        } else {
+                            "╰─ saved · c/C edit · e copy structured prompt"
+                        },
                         Style::default().fg(Color::DarkGray),
                     )),
                     yank_text: String::new(),
@@ -4787,6 +5374,17 @@ fn markdown_sides(state: &RevState) -> Result<MarkdownSides> {
     let (repo_index, file_index) = state.current_indices().context("no current file")?;
     let repo = &state.workspace.repos[repo_index];
     let file = &repo.diff.files[file_index];
+    if file.path() == Path::new(PR_DESCRIPTION_PATH) {
+        let body = state
+            .pr_snapshots
+            .get(&repo.record.id)
+            .map_or("", |snapshot| snapshot.body.as_str())
+            .to_owned();
+        return Ok(MarkdownSides {
+            old: body.clone(),
+            new: body,
+        });
+    }
     if !is_markdown_path(file.path()) {
         anyhow::bail!("{} is not a Markdown file", file.path().display());
     }
@@ -5001,7 +5599,12 @@ fn sync_markdown_preview(state: &mut RevState, _paths: &AppPaths) -> Result<()> 
         state.status = "MARKDOWN DIFF · waiting for the previous cmux pane to close…".into();
         return Ok(());
     }
-    let key = format!("{content_key}\0{focus_side}\0{focus}");
+    let cursor_fraction = state.row_cursor.saturating_sub(state.review_scroll) as f64
+        / state.review_viewport_height.saturating_sub(1).max(1) as f64;
+    let key = format!(
+        "{content_key}\0{focus_side}\0{focus}\0{}",
+        state.review_scroll
+    );
     if state.markdown_sync_key.as_deref() == Some(&key) {
         return Ok(());
     }
@@ -5016,7 +5619,13 @@ fn sync_markdown_preview(state: &mut RevState, _paths: &AppPaths) -> Result<()> 
         .markdown_sides_cache
         .as_ref()
         .context("Markdown content cache was not initialized")?;
-    let focus_state = browser_markdown_focus(&content_key, focus_side, focus)?;
+    let focus_state = browser_markdown_focus_with_viewport(
+        &content_key,
+        focus_side,
+        focus,
+        state.review_scroll,
+        cursor_fraction,
+    )?;
     if let Some(server) = &state.markdown_server {
         if content_changed {
             server.update_document(browser_markdown_state(state, sides, &content_key)?);
@@ -5175,11 +5784,24 @@ fn browser_markdown_state(
     }))?)
 }
 
+#[cfg(test)]
 fn browser_markdown_focus(revision: &str, focus_side: &str, focus: usize) -> Result<String> {
+    browser_markdown_focus_with_viewport(revision, focus_side, focus, 0, 0.28)
+}
+
+fn browser_markdown_focus_with_viewport(
+    revision: &str,
+    focus_side: &str,
+    focus: usize,
+    viewport_top: usize,
+    cursor_fraction: f64,
+) -> Result<String> {
     Ok(serde_json::to_string(&serde_json::json!({
         "revision": revision,
         "focus_side": focus_side,
         "focus_line": focus,
+        "viewport_top": viewport_top,
+        "cursor_fraction": cursor_fraction.clamp(0.0, 1.0),
     }))?)
 }
 
@@ -5725,6 +6347,22 @@ fn help_lines() -> Vec<Line<'static>> {
         key(":show comments", "show hidden local feedback again"),
         key(":show questions", "show hidden local question threads again"),
         key(
+            ":pr description",
+            "open the versioned PR description in the shared review renderer",
+        ),
+        key(
+            ":submit approve",
+            "send pending inline feedback in one approving GitHub review",
+        ),
+        key(
+            ":submit request changes",
+            "send pending feedback and a required overall explanation",
+        ),
+        key(
+            ":submit comment",
+            "send pending feedback as a non-decision GitHub review",
+        ),
+        key(
             ":base <ref>",
             "rebuild the review relative to an autocompleted ref",
         ),
@@ -6094,6 +6732,12 @@ fn render_composer(frame: &mut Frame, state: &mut RevState, area: Rect) {
         Some(ComposeTarget::EditFeedback(_)) => " edit feedback ",
         Some(ComposeTarget::NewQuestion) => " question ",
         Some(ComposeTarget::FollowUp(_)) => " follow-up ",
+        Some(ComposeTarget::RemoteReply(_)) => " GitHub reply ",
+        Some(ComposeTarget::SubmitReview(ReviewDecision::Approve)) => " submit approve ",
+        Some(ComposeTarget::SubmitReview(ReviewDecision::Comment)) => " submit review comment ",
+        Some(ComposeTarget::SubmitReview(ReviewDecision::RequestChanges)) => {
+            " submit request changes "
+        }
         None => " input ",
     };
     let content_width = area.width.saturating_sub(2).max(1) as usize;
@@ -7193,12 +7837,13 @@ mod tests {
         handle_agent_event, handle_compose_key, handle_file_picker_key, handle_help_key,
         handle_history_key, handle_key, handle_question_key, handle_review_key, help_lines,
         is_expandable_fold, markdown_sides, merge_touching_hunks, move_row, open_file_picker,
-        open_questions, page_move, question_ids, queue_question_launch,
+        open_questions, page_move, pending_review_submission, question_ids, queue_question_launch,
         rebuild_file_without_expanded_lines, render, render_snapshot, review_file_key, row_count,
         seed_snapshot_feedback, seed_snapshot_questions, snapshot_workspace, split_highlight_side,
         split_source_lines, style_split_side, visual_selection_yank_text, ComposeTarget,
-        ModelPicker, PendingSend, PickerScope, PickerStage, QuestionLaunch, RevAgentSlot,
-        RevDiffLayout, RevMode, RevRowKind, RevState,
+        GitHubDiffSide, ModelPicker, PendingSend, PickerScope, PickerStage, QuestionLaunch,
+        RevAgentSlot, RevDiffLayout, RevMode, RevRowKind, RevState, ReviewDecision,
+        PR_DESCRIPTION_PATH,
     };
     use crate::config::AppPaths;
     use crate::copilot::{
@@ -7207,7 +7852,7 @@ mod tests {
     use crate::diff::{parse_unified, DiffLine, Hunk, LineKind};
     use crate::domain::{AnchorSide, AnnotationKind, AnnotationStatus};
     use crate::highlight::PlainHighlighter;
-    use crate::storage::{RevQuestionSession, Storage};
+    use crate::storage::{now, RevQuestionSession, Storage};
 
     struct NoopAgent;
 
@@ -9252,6 +9897,105 @@ mod tests {
                 .get(&review_file_key("rev-snapshot-repo", file.path()))
                 .unwrap()
         );
+    }
+
+    fn seed_github_snapshot(storage: &Storage, workspace: &mut super::ResolvedWorkItem) {
+        workspace.repos[0].record.remote_pr_url =
+            Some("https://github.com/acme/demo/pull/17".into());
+        storage
+            .upsert_pull_request_snapshot(
+                &workspace.repos[0].version.id,
+                &rq_tui_github_review::PullRequestSnapshot {
+                    node_id: "PR_17".into(),
+                    title: "Review the renderer".into(),
+                    body: "# Description\n\nThis is **rendered** Markdown.".into(),
+                    url: "https://github.com/acme/demo/pull/17".into(),
+                    author: "author".into(),
+                    head_sha: workspace.repos[0].version.head_sha.clone(),
+                    base_sha: "base".into(),
+                    updated_at: now(),
+                    threads: vec![rq_tui_github_review::ReviewThread {
+                        node_id: "thread-17".into(),
+                        path: "src/lib.rs".into(),
+                        line: Some(11),
+                        original_line: Some(11),
+                        side: rq_tui_github_review::DiffSide::Right,
+                        is_outdated: true,
+                        is_resolved: false,
+                        viewer_can_reply: true,
+                        comments: vec![rq_tui_github_review::ReviewComment {
+                            node_id: "comment-17".into(),
+                            database_id: Some(170),
+                            author: "reviewer".into(),
+                            body: "Can this state transition be simpler?".into(),
+                            created_at: now(),
+                            url: "https://github.com/acme/demo/pull/17#discussion_r170".into(),
+                            reply_to: None,
+                        }],
+                    }],
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn github_description_and_threads_use_the_shared_review_renderer() {
+        let storage = Storage::in_memory().unwrap();
+        let mut workspace = snapshot_workspace(&storage).unwrap();
+        seed_github_snapshot(&storage, &mut workspace);
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        seed_snapshot_feedback(&mut state);
+        let mut highlighter = PlainHighlighter;
+        let paths = test_paths("rev-github-render");
+
+        let rows = build_rows(&state, 80, &mut highlighter);
+        assert!(rows.iter().any(|row| row
+            .line
+            .as_ref()
+            .is_some_and(|line| line.to_string().contains("@reviewer"))));
+        execute_command(&mut state, &storage, &paths, "hide comments").unwrap();
+        let hidden = build_rows(&state, 80, &mut highlighter);
+        assert!(hidden.iter().any(|row| row
+            .line
+            .as_ref()
+            .is_some_and(|line| line.to_string().contains("@reviewer"))));
+        assert!(!hidden.iter().any(|row| {
+            matches!(
+                &row.kind,
+                RevRowKind::Annotation { annotation_id, .. }
+                    if annotation_id == "feedback-architecture"
+            )
+        }));
+
+        execute_command(&mut state, &storage, &paths, "pr description").unwrap();
+        assert_eq!(
+            state.current_file().unwrap().path(),
+            std::path::Path::new(PR_DESCRIPTION_PATH)
+        );
+        let sides = markdown_sides(&state).unwrap();
+        assert_eq!(sides.old, sides.new);
+        assert!(sides.new.contains("**rendered**"));
+    }
+
+    #[test]
+    fn github_review_batch_is_version_pinned_and_excludes_remote_threads() {
+        let storage = Storage::in_memory().unwrap();
+        let mut workspace = snapshot_workspace(&storage).unwrap();
+        seed_github_snapshot(&storage, &mut workspace);
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        seed_snapshot_feedback(&mut state);
+        let (reference, submission, ids) =
+            pending_review_submission(&state, ReviewDecision::Approve, "Overall note").unwrap();
+
+        assert_eq!(reference.number, 17);
+        assert_eq!(
+            submission.commit_id,
+            state.current_repo().unwrap().version.head_sha
+        );
+        assert_eq!(submission.comments.len(), 1);
+        assert_eq!(ids, vec!["feedback-architecture"]);
+        assert_eq!(submission.comments[0].path, "src/lib.rs");
+        assert_eq!(submission.comments[0].side, GitHubDiffSide::Right);
     }
 
     #[test]

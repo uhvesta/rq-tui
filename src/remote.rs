@@ -28,6 +28,7 @@ pub(crate) fn resolve_remote(
 ) -> Result<ResolvedWorkItem> {
     let workspace = RemoteResolver::default().resolve(references, paths, storage)?;
     let client = GitHubReviewClient::new(GhCliTransport);
+    let resolver = RemoteResolver::default();
     for repo in &workspace.repos {
         let Some(url) = repo.record.remote_pr_url.as_deref() else {
             continue;
@@ -41,6 +42,17 @@ pub(crate) fn resolve_remote(
         anyhow::ensure!(
             snapshot.head_sha == repo.version.head_sha,
             "pull request changed while loading review threads; run :refresh"
+        );
+        let fetched_base = resolver.git_dir_stdout(
+            &repo.record.path,
+            [
+                "rev-parse",
+                &format!("refs/rq-tui/pr/{}/base", reference.number),
+            ],
+        )?;
+        anyhow::ensure!(
+            snapshot.base_sha == fetched_base,
+            "pull request base changed while loading review threads; run :refresh"
         );
         storage.upsert_pull_request_snapshot(&repo.version.id, &snapshot)?;
     }
@@ -337,9 +349,20 @@ impl<R: ProcessRunner> RemoteResolver<R> {
         storage.upsert_repo(&record)?;
 
         let existing = storage.latest_remote_version(&repo_id)?;
-        let created_new_version = !existing
+        let existing_base_sha = existing
             .as_ref()
-            .is_some_and(|version| version.head_sha == head_sha);
+            .map(|version| storage.pull_request_snapshot(&version.id))
+            .transpose()?
+            .flatten()
+            .map(|snapshot| snapshot.base_sha);
+        let created_new_version = existing.as_ref().is_none_or(|version| {
+            remote_revision_changed(
+                &version.head_sha,
+                existing_base_sha.as_deref(),
+                &head_sha,
+                &base_sha,
+            )
+        });
         let version = if !created_new_version {
             existing.clone().expect("checked as present")
         } else {
@@ -538,6 +561,15 @@ impl<R: ProcessRunner> RemoteResolver<R> {
     }
 }
 
+fn remote_revision_changed(
+    previous_head: &str,
+    previous_base: Option<&str>,
+    head: &str,
+    base: &str,
+) -> bool {
+    previous_head != head || previous_base.is_some_and(|previous_base| previous_base != base)
+}
+
 struct ProvisionalRemoteWorkItem<'a> {
     storage: &'a Storage,
     id: String,
@@ -652,8 +684,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        canonical_references, remote_session_link_name, remote_worktree_path, PrMetadata,
-        PrReference, ProvisionalRemoteWorkItem,
+        canonical_references, remote_revision_changed, remote_session_link_name,
+        remote_worktree_path, PrMetadata, PrReference, ProvisionalRemoteWorkItem,
     };
     use crate::diff::DiffSet;
     use crate::domain::{BaseBranchSource, Repo, Version, VersionKind, WorkItem};
@@ -693,6 +725,28 @@ mod tests {
             reference.cache_relative_path(),
             PathBuf::from("acme/api/pr-42")
         );
+    }
+
+    #[test]
+    fn base_only_updates_create_a_distinct_review_version() {
+        assert!(!remote_revision_changed(
+            "head",
+            Some("base-1"),
+            "head",
+            "base-1"
+        ));
+        assert!(remote_revision_changed(
+            "head",
+            Some("base-1"),
+            "head",
+            "base-2"
+        ));
+        assert!(remote_revision_changed(
+            "head-1",
+            Some("base"),
+            "head-2",
+            "base"
+        ));
     }
 
     #[test]
