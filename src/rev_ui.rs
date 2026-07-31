@@ -54,6 +54,7 @@ enum RevMode {
     Command,
     Model,
     History,
+    FilePicker,
     Help,
     ConfirmClear,
 }
@@ -195,6 +196,15 @@ struct RenderCache {
     rows: Vec<RevRow>,
 }
 
+#[derive(Clone, Copy)]
+enum FilePickerRow {
+    Repo(usize),
+    File {
+        repo_index: usize,
+        flat_index: usize,
+    },
+}
+
 struct RevState {
     workspace: ResolvedWorkItem,
     files: Vec<(usize, usize)>,
@@ -211,6 +221,9 @@ struct RevState {
     compose_cursor: usize,
     compose_scroll: u16,
     help_scroll: u16,
+    file_picker_cursor: usize,
+    file_picker_return_mode: RevMode,
+    collapsed_repos: HashSet<usize>,
     status: String,
     annotations: Vec<(Annotation, Placement)>,
     threads: HashMap<String, Vec<AskMessage>>,
@@ -278,6 +291,9 @@ impl RevState {
             compose_cursor: 0,
             compose_scroll: 0,
             help_scroll: 0,
+            file_picker_cursor: 0,
+            file_picker_return_mode: RevMode::Normal,
+            collapsed_repos: HashSet::new(),
             status: "j/k stay in this file · h/l change files".into(),
             annotations,
             threads,
@@ -505,6 +521,7 @@ fn run_loop<B: Backend>(
                                 .min(state.annotations.len().saturating_sub(1))
                         }
                         RevMode::Help => state.help_scroll = state.help_scroll.saturating_add(3),
+                        RevMode::FilePicker => move_file_picker(state, 3),
                         RevMode::Command => {
                             let count = command_candidates(state).len();
                             state.command.selected =
@@ -521,6 +538,7 @@ fn run_loop<B: Backend>(
                             state.history_cursor = state.history_cursor.saturating_sub(3)
                         }
                         RevMode::Help => state.help_scroll = state.help_scroll.saturating_sub(3),
+                        RevMode::FilePicker => move_file_picker(state, -3),
                         RevMode::Command => {
                             state.command.selected = state.command.selected.saturating_sub(1)
                         }
@@ -563,6 +581,10 @@ fn handle_key(
         RevMode::Command => handle_command_key(state, storage, paths, key),
         RevMode::Model => handle_model_key(state, storage, paths, key),
         RevMode::History => handle_history_key(state, storage, key),
+        RevMode::FilePicker => {
+            handle_file_picker_key(state, key);
+            Ok(())
+        }
         RevMode::Help => {
             handle_help_key(state, key);
             Ok(())
@@ -635,9 +657,10 @@ fn handle_review_key(
             } else if let Some(source) = current_source_index(state, highlighter) {
                 state.visual_anchor = Some(source);
                 state.mode = RevMode::Visual;
-                state.status = "VISUAL · j/k selects source rows in this file".into();
+                state.status = "Selection started · j/k extends · a asks · c saves feedback".into();
             }
         }
+        KeyCode::Char('t') => open_file_picker(state),
         KeyCode::Char('a') => begin_compose(state, highlighter, ComposeTarget::NewQuestion),
         KeyCode::Char('c') => begin_compose(state, highlighter, ComposeTarget::Feedback),
         KeyCode::Char('i') | KeyCode::Enter => {
@@ -683,6 +706,156 @@ fn handle_review_key(
     }
     let _ = paths;
     Ok(())
+}
+
+fn open_file_picker(state: &mut RevState) {
+    state.file_picker_return_mode = if state.mode == RevMode::Visual {
+        RevMode::Visual
+    } else {
+        RevMode::Normal
+    };
+    if let Some((repo_index, _)) = state.current_indices() {
+        state.collapsed_repos.remove(&repo_index);
+    }
+    state.mode = RevMode::FilePicker;
+    state.file_picker_cursor = file_picker_rows(state)
+        .iter()
+        .position(|row| {
+            matches!(
+                row,
+                FilePickerRow::File { flat_index, .. } if *flat_index == state.file_index
+            )
+        })
+        .unwrap_or(0);
+    state.status = "j/k move · h/l collapse/expand · Enter open · t/Esc close".into();
+}
+
+fn close_file_picker(state: &mut RevState) {
+    state.mode =
+        if state.file_picker_return_mode == RevMode::Visual && state.visual_anchor.is_some() {
+            RevMode::Visual
+        } else {
+            RevMode::Normal
+        };
+    state.status = if state.mode == RevMode::Visual {
+        "Selection retained · j/k extends · v/Esc clears".into()
+    } else {
+        "Back to review".into()
+    };
+}
+
+fn handle_file_picker_key(state: &mut RevState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('t') | KeyCode::Esc | KeyCode::Char('q') => close_file_picker(state),
+        KeyCode::Char('j') | KeyCode::Down => move_file_picker(state, 1),
+        KeyCode::Char('k') | KeyCode::Up => move_file_picker(state, -1),
+        KeyCode::Char('g') | KeyCode::Home => state.file_picker_cursor = 0,
+        KeyCode::Char('G') | KeyCode::End => {
+            state.file_picker_cursor = file_picker_rows(state).len().saturating_sub(1)
+        }
+        KeyCode::Char('h') | KeyCode::Left => collapse_picker_repo(state),
+        KeyCode::Char('l') | KeyCode::Right => expand_picker_repo(state),
+        KeyCode::Enter => activate_file_picker_row(state),
+        _ => {}
+    }
+}
+
+fn move_file_picker(state: &mut RevState, delta: isize) {
+    let row_count = file_picker_rows(state).len();
+    if delta >= 0 {
+        state.file_picker_cursor =
+            (state.file_picker_cursor + delta as usize).min(row_count.saturating_sub(1));
+    } else {
+        state.file_picker_cursor = state
+            .file_picker_cursor
+            .saturating_sub(delta.unsigned_abs());
+    }
+}
+
+fn file_picker_rows(state: &RevState) -> Vec<FilePickerRow> {
+    let mut rows = Vec::new();
+    for repo_index in 0..state.workspace.repos.len() {
+        rows.push(FilePickerRow::Repo(repo_index));
+        if state.collapsed_repos.contains(&repo_index) {
+            continue;
+        }
+        rows.extend(
+            state
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(_, (candidate_repo, _))| *candidate_repo == repo_index)
+                .map(|(flat_index, _)| FilePickerRow::File {
+                    repo_index,
+                    flat_index,
+                }),
+        );
+    }
+    rows
+}
+
+fn selected_file_picker_row(state: &RevState) -> Option<FilePickerRow> {
+    let rows = file_picker_rows(state);
+    rows.get(state.file_picker_cursor.min(rows.len().saturating_sub(1)))
+        .copied()
+}
+
+fn selected_file_picker_repo(state: &RevState) -> Option<usize> {
+    match selected_file_picker_row(state)? {
+        FilePickerRow::Repo(repo_index) | FilePickerRow::File { repo_index, .. } => {
+            Some(repo_index)
+        }
+    }
+}
+
+fn collapse_picker_repo(state: &mut RevState) {
+    let Some(repo_index) = selected_file_picker_repo(state) else {
+        return;
+    };
+    state.collapsed_repos.insert(repo_index);
+    state.file_picker_cursor = file_picker_rows(state)
+        .iter()
+        .position(|row| matches!(row, FilePickerRow::Repo(index) if *index == repo_index))
+        .unwrap_or(0);
+    state.status = "Repository collapsed · l/Right expands".into();
+}
+
+fn expand_picker_repo(state: &mut RevState) {
+    let Some(repo_index) = selected_file_picker_repo(state) else {
+        return;
+    };
+    state.collapsed_repos.remove(&repo_index);
+    state.status = "Repository expanded · h/Left collapses".into();
+}
+
+fn activate_file_picker_row(state: &mut RevState) {
+    match selected_file_picker_row(state) {
+        Some(FilePickerRow::Repo(repo_index)) => {
+            if state.collapsed_repos.remove(&repo_index) {
+                state.status = "Repository expanded".into();
+            } else {
+                state.collapsed_repos.insert(repo_index);
+                state.status = "Repository collapsed".into();
+            }
+            state.file_picker_cursor = file_picker_rows(state)
+                .iter()
+                .position(|row| matches!(row, FilePickerRow::Repo(index) if *index == repo_index))
+                .unwrap_or(0);
+        }
+        Some(FilePickerRow::File { flat_index, .. }) => {
+            if state.file_index == flat_index {
+                close_file_picker(state);
+                return;
+            }
+            state.file_index = flat_index;
+            state.row_cursor = 0;
+            state.visual_anchor = None;
+            state.mode = RevMode::Normal;
+            state.render_cache = None;
+            state.status = "Opened file from tree · j/k stay bounded · t reopens files".into();
+        }
+        None => close_file_picker(state),
+    }
 }
 
 fn begin_compose(state: &mut RevState, highlighter: &mut dyn Highlighter, target: ComposeTarget) {
@@ -1139,7 +1312,7 @@ fn handle_compose_key(
             state.compose_cursor = 0;
             state.compose_scroll = 0;
             state.status = if retain_selection {
-                "VISUAL · empty box closed · selection retained · Esc clears it".into()
+                "Empty box closed · selection retained · Esc clears it".into()
             } else {
                 "Draft cancelled".into()
             };
@@ -1987,7 +2160,16 @@ fn move_row(state: &mut RevState, highlighter: &mut dyn Highlighter, delta: isiz
     } else {
         state.row_cursor = state.row_cursor.saturating_sub(delta.unsigned_abs());
     }
-    state.status = if state.row_cursor == 0 && delta < 0 {
+    state.status = if state.mode == RevMode::Visual {
+        let active = current_source_index_from_rows(&rows, state.row_cursor)
+            .or(state.visual_anchor)
+            .unwrap_or(0);
+        let anchor = state.visual_anchor.unwrap_or(active);
+        format!(
+            "{} source row(s) selected · j/k extend · a ask · c feedback · v/Esc clear",
+            active.abs_diff(anchor) + 1
+        )
+    } else if state.row_cursor == 0 && delta < 0 {
         "Top of this file · press h for the previous file".into()
     } else if state.row_cursor + 1 == rows.len() && delta > 0 {
         "End of this file and its Q&A · press l for the next file".into()
@@ -2239,6 +2421,8 @@ fn render(frame: &mut Frame, state: &mut RevState, highlighter: &mut dyn Highlig
     render_footer(frame, state, vertical[3]);
     if state.mode == RevMode::Model {
         render_model_picker(frame, state, vertical[1]);
+    } else if state.mode == RevMode::FilePicker {
+        render_file_picker(frame, state, vertical[1]);
     } else if state.mode == RevMode::Command {
         render_command_palette(frame, state, vertical[1]);
     } else if state.mode == RevMode::ConfirmClear {
@@ -2280,20 +2464,13 @@ fn render_review(
     area: Rect,
     highlighter: &mut dyn Highlighter,
 ) {
-    let border = if state.mode == RevMode::Visual {
+    let visual_mode = state.mode == RevMode::Visual;
+    let border = if visual_mode {
         Color::Magenta
     } else {
         Color::Cyan
     };
-    let block = Block::default()
-        .title(format!(
-            " review · {} · j/k bounded · h/l files · Shift+↑/↓ expand ",
-            state.diff_layout.label()
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = Block::default().borders(Borders::ALL).inner(area);
     let width = inner.width.max(1) as usize;
     let rows = ensure_rows(state, width, highlighter).to_vec();
     state.clamp_cursor(rows.len());
@@ -2307,6 +2484,24 @@ fn render_review(
         .visual_anchor
         .zip(current_source_index_from_rows(&rows, state.row_cursor))
         .map(|(a, b)| (a.min(b), a.max(b)));
+    let title = if let Some((start, end)) = selection.filter(|_| visual_mode) {
+        format!(
+            " VISUAL LINE · {} selected · j/k extend · a ask · c feedback · v/Esc clear ",
+            end.saturating_sub(start) + 1
+        )
+    } else {
+        format!(
+            " review · {} · j/k bounded · h/l files · t files · v select · Shift+↑/↓ expand ",
+            state.diff_layout.label()
+        )
+    };
+    frame.render_widget(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border)),
+        area,
+    );
     let mut visible = Vec::new();
     for (index, row) in rows.iter().enumerate().skip(start).take(viewport) {
         let selected = index == state.row_cursor;
@@ -2343,7 +2538,7 @@ fn render_review(
             RevRowKind::Annotation { .. } => false,
         };
         if selected || visually_selected {
-            line = line.style(Style::default().bg(if state.mode == RevMode::Visual {
+            line = line.style(Style::default().bg(if visual_mode {
                 Color::Rgb(52, 35, 63)
             } else {
                 Color::Rgb(35, 45, 58)
@@ -2414,10 +2609,11 @@ fn help_lines() -> Vec<Line<'static>> {
         key("G / End", "last rendered row"),
         key(
             "mouse wheel",
-            "scroll the active review, composer, palette, history, or help",
+            "scroll the active review, file tree, composer, palette, history, or help",
         ),
         Line::raw(""),
         section("Diff and selection"),
+        key("t", "open or close the repository/file tree"),
         key("v", "start or clear a source-line selection"),
         key("Esc", "clear the current selection"),
         key(
@@ -2428,6 +2624,13 @@ fn help_lines() -> Vec<Line<'static>> {
             "Shift+↓",
             "reveal five unchanged lines below the active hunk",
         ),
+        Line::raw(""),
+        section("File tree"),
+        key("j/k / ↑/↓", "move through repository and file rows"),
+        key("h/l / ←/→", "collapse or expand the selected repository"),
+        key("g/G / Home/End", "jump to the first or last tree row"),
+        key("Enter", "toggle a repository or open a file"),
+        key("t / Esc / q", "close the tree and return to the review"),
         Line::raw(""),
         section("Review actions"),
         key(
@@ -2772,6 +2975,7 @@ fn render_footer(frame: &mut Frame, state: &RevState, area: Rect) {
         RevMode::Command => "COMMAND",
         RevMode::Model => "MODEL",
         RevMode::History => "HISTORY",
+        RevMode::FilePicker => "FILES",
         RevMode::Help => "HELP",
         RevMode::ConfirmClear => "CONFIRM",
     };
@@ -2779,8 +2983,8 @@ fn render_footer(frame: &mut Frame, state: &RevState, area: Rect) {
         format!("{mode} · {}", state.status)
     } else {
         format!(
-            "{mode} · {} · : commands · a ask · c feedback · r history · e copy · q quit",
-            state.status
+            "{mode} · t files · v select · a ask · c feedback · : commands · q quit · {}",
+            state.status,
         )
     };
     let elapsed = state.agent_last_event.elapsed();
@@ -2804,6 +3008,103 @@ fn render_footer(frame: &mut Frame, state: &RevState, area: Rect) {
         .block(Block::default().borders(Borders::TOP)),
         area,
     );
+}
+
+fn render_file_picker(frame: &mut Frame, state: &RevState, area: Rect) {
+    let rows = file_picker_rows(state);
+    let selected = state.file_picker_cursor.min(rows.len().saturating_sub(1));
+    let width = area.width.saturating_sub(2).clamp(1, 96);
+    let height = (rows.len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+    let popup = centered_rect(area, width, height);
+    frame.render_widget(Clear, popup);
+    let viewport = popup.height.saturating_sub(2).max(1) as usize;
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(viewport)
+        .min(rows.len().saturating_sub(viewport));
+    let end = (start + viewport).min(rows.len());
+    let range = if rows.len() > viewport {
+        format!(" · {}-{}/{}", start + 1, end, rows.len())
+    } else {
+        String::new()
+    };
+    let block = Block::default()
+        .title(format!(
+            " files{range} · j/k move · h/l fold · Enter open · t/Esc close "
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let lines = rows
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(viewport)
+        .map(|(row_index, row)| {
+            let selected_row = row_index == selected;
+            let text = match *row {
+                FilePickerRow::Repo(repo_index) => {
+                    let repo = &state.workspace.repos[repo_index];
+                    format!(
+                        "{} {} {} ({} files)",
+                        if selected_row { "❯" } else { " " },
+                        if state.collapsed_repos.contains(&repo_index) {
+                            "▸"
+                        } else {
+                            "▾"
+                        },
+                        repo.record.name,
+                        repo.diff.files.len()
+                    )
+                }
+                FilePickerRow::File {
+                    repo_index,
+                    flat_index,
+                } => {
+                    let (_, file_index) = state.files[flat_index];
+                    let file = &state.workspace.repos[repo_index].diff.files[file_index];
+                    let status = match file.status {
+                        FileStatus::Added => "A",
+                        FileStatus::Deleted => "D",
+                        FileStatus::Renamed => "R",
+                        FileStatus::Modified => "M",
+                    };
+                    format!(
+                        "{}   {} {} {} +{} -{}",
+                        if selected_row { "❯" } else { " " },
+                        if flat_index == state.file_index {
+                            "●"
+                        } else {
+                            " "
+                        },
+                        status,
+                        file.path().display(),
+                        file.additions,
+                        file.deletions
+                    )
+                }
+            };
+            Line::styled(
+                fit_text(&text, inner.width as usize),
+                if selected_row {
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Rgb(48, 48, 60))
+                        .add_modifier(Modifier::BOLD)
+                } else if matches!(row, FilePickerRow::Repo(_)) {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_command_palette(frame: &mut Frame, state: &RevState, area: Rect) {
@@ -3106,6 +3407,14 @@ pub(crate) fn render_snapshot(width: u16, height: u16, snapshot: &str) -> Result
             state.command.input = "diff".into();
             state.command.cursor = state.command.input.len();
         }
+        "files" => open_file_picker(&mut state),
+        "visual" => {
+            state.mode = RevMode::Visual;
+            state.visual_anchor = Some(0);
+            state.row_cursor = 2;
+            state.status =
+                "3 source row(s) selected · j/k extend · a ask · c feedback · v/Esc clear".into();
+        }
         "composer" => {
             state.mode = RevMode::Compose;
             state.compose_target = Some(ComposeTarget::NewQuestion);
@@ -3199,6 +3508,13 @@ fn snapshot_workspace(storage: &Storage) -> Result<ResolvedWorkItem> {
         "+    let isolated_questions = true;\n",
         "     finish();\n",
         " }\n",
+        "diff --git a/README.md b/README.md\n",
+        "--- a/README.md\n",
+        "+++ b/README.md\n",
+        "@@ -1,2 +1,3 @@\n",
+        " # Demo\n",
+        "+Use the file tree.\n",
+        " Review changes.\n",
     ))?;
     Ok(ResolvedWorkItem {
         item,
@@ -3219,10 +3535,10 @@ mod tests {
     use ratatui::Terminal;
 
     use super::{
-        execute_command, handle_compose_key, handle_help_key, handle_review_key, help_lines,
-        merge_touching_hunks, queue_question_launch, render, render_snapshot, row_count,
-        snapshot_workspace, ComposeTarget, PendingSend, QuestionLaunch, RevAgentSlot, RevMode,
-        RevState,
+        execute_command, handle_compose_key, handle_file_picker_key, handle_help_key,
+        handle_review_key, help_lines, merge_touching_hunks, queue_question_launch, render,
+        render_snapshot, row_count, snapshot_workspace, ComposeTarget, PendingSend, QuestionLaunch,
+        RevAgentSlot, RevMode, RevState,
     };
     use crate::config::AppPaths;
     use crate::copilot::{AgentCommand, AgentEvent, AgentRuntime, AgentSink, ModelSelection};
@@ -3265,6 +3581,16 @@ mod tests {
         let command = render_snapshot(100, 28, "command").unwrap();
         assert!(command.contains("command palette"));
         assert!(command.contains("❯ diff split"));
+
+        let files = render_snapshot(100, 28, "files").unwrap();
+        assert!(files.contains("files · j/k move · h/l fold"));
+        assert!(files.contains("▾ demo (2 files)"));
+        assert!(files.contains("src/lib.rs +1 -0"));
+        assert!(files.contains("README.md +1 -0"));
+
+        let visual = render_snapshot(100, 28, "visual").unwrap();
+        assert!(visual.contains("VISUAL LINE · 3 selected"));
+        assert!(visual.contains("VISUAL ·"));
 
         let composer = render_snapshot(100, 28, "composer").unwrap();
         assert!(composer.contains("rows 13-30 of 30"));
@@ -3320,6 +3646,114 @@ mod tests {
 
         handle_help_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(state.mode, RevMode::Normal);
+    }
+
+    #[test]
+    fn file_tree_opens_with_t_navigates_groups_and_selects_a_file() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        let mut highlighter = PlainHighlighter;
+        let paths = AppPaths {
+            data: "/tmp/rev-files/data".into(),
+            cache: "/tmp/rev-files/cache".into(),
+            database: "/tmp/rev-files/rev.db".into(),
+            roots: "/tmp/rev-files/roots".into(),
+            prs: "/tmp/rev-files/prs".into(),
+            exports: "/tmp/rev-files/exports".into(),
+            skills: "/tmp/rev-files/skills".into(),
+            plugins: "/tmp/rev-files/plugins".into(),
+        };
+
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, RevMode::FilePicker);
+        assert_eq!(state.file_picker_cursor, 1);
+
+        handle_file_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        handle_file_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(state.mode, RevMode::Normal);
+        assert_eq!(state.file_index, 1);
+        assert_eq!(state.row_cursor, 0);
+
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle_file_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+        );
+        assert!(state.collapsed_repos.contains(&0));
+        assert_eq!(state.file_picker_cursor, 0);
+        handle_file_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+        );
+        assert!(!state.collapsed_repos.contains(&0));
+    }
+
+    #[test]
+    fn visual_mode_is_explicit_and_survives_a_file_tree_round_trip() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        let mut highlighter = PlainHighlighter;
+        let paths = AppPaths {
+            data: "/tmp/rev-visual/data".into(),
+            cache: "/tmp/rev-visual/cache".into(),
+            database: "/tmp/rev-visual/rev.db".into(),
+            roots: "/tmp/rev-visual/roots".into(),
+            prs: "/tmp/rev-visual/prs".into(),
+            exports: "/tmp/rev-visual/exports".into(),
+            skills: "/tmp/rev-visual/skills".into(),
+            plugins: "/tmp/rev-visual/plugins".into(),
+        };
+
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, RevMode::Visual);
+        assert_eq!(state.visual_anchor, Some(0));
+
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, RevMode::FilePicker);
+
+        handle_file_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        );
+        assert_eq!(state.mode, RevMode::Visual);
+        assert_eq!(state.visual_anchor, Some(0));
+        assert!(state.status.contains("Selection retained"));
     }
 
     #[test]

@@ -81,7 +81,9 @@ bazel run //:rev -- delete . --export --yes
 ```
 
 Inside `rev`, `j/k` stop at the first/last rendered row of the current file,
-including its inline questions and answers; only `h/l` changes files.
+including its inline questions and answers; only `h/l` changes files. `t`
+opens a grouped repository/file tree, and `v` enters a clearly labeled visual
+line-selection mode.
 `Shift+Up` reveals five unchanged lines above the active hunk and
 `Shift+Down` reveals five below. Revealed context has a muted gray background,
 and overlapping expansions merge into one continuous region.
@@ -106,6 +108,8 @@ Deterministic states can be inspected without a TTY or production data:
 bazel run //:rev -- ui-snapshot --state review --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state split --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state expanded --width 100 --height 28
+bazel run //:rev -- ui-snapshot --state files --width 100 --height 28
+bazel run //:rev -- ui-snapshot --state visual --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state command --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state composer --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state history --width 100 --height 28
