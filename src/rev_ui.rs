@@ -476,7 +476,7 @@ pub(crate) fn run(workspace: ResolvedWorkItem, storage: &Storage, paths: &AppPat
     terminal.show_cursor().ok();
     if let Some(receiver) = state.cmux_open.take() {
         eprintln!("rev · waiting for pending cmux Markdown pane before cleanup");
-        if let Ok(Ok(Some(surface))) = receiver.recv_timeout(Duration::from_secs(4)) {
+        if let Ok(Ok(Some(surface))) = receiver.recv_timeout(Duration::from_millis(500)) {
             surface.close_detached().ok();
         }
     }
