@@ -66,18 +66,30 @@ impl<R: CommandRunner> Git<R> {
         }
 
         let mut repositories = Vec::new();
-        for entry in WalkDir::new(&root)
+        let mut entries = WalkDir::new(&root)
             .min_depth(1)
             .max_depth(4)
             .follow_links(false)
-            .into_iter()
-            .filter_entry(should_descend)
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_dir())
-        {
+            .into_iter();
+        while let Some(entry) = entries.next() {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            if !should_descend(&entry) {
+                entries.skip_current_dir();
+                continue;
+            }
             let path = entry.path();
             if path.join(".git").exists() && self.repository_root(path).is_ok() {
                 repositories.push(path.to_path_buf());
+                // A discovered repository owns its complete subtree. Nested
+                // package-manager checkouts, worktrees, and vendored
+                // repositories are implementation details of that repository,
+                // not additional workspace roots.
+                entries.skip_current_dir();
             }
         }
         repositories.sort();
@@ -477,6 +489,30 @@ mod tests {
             "origin/main"
         );
         assert_eq!(git.runner.commands.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn repository_discovery_stops_at_each_discovered_repository() {
+        let temp = tempdir().unwrap();
+        let outer = temp.path().join("avestacode");
+        let nested = outer.join(".build/checkouts/tree-sitter-swift");
+        let sibling = temp.path().join("another-repository");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        git(&outer, &["init", "-b", "main"]);
+        git(&nested, &["init", "-b", "main"]);
+        git(&sibling, &["init", "-b", "main"]);
+
+        let repositories = Git::default().discover_repositories(temp.path()).unwrap();
+
+        assert_eq!(
+            repositories,
+            [
+                sibling.canonicalize().unwrap(),
+                outer.canonicalize().unwrap()
+            ]
+        );
+        assert!(!repositories.contains(&nested.canonicalize().unwrap()));
     }
 
     #[test]
