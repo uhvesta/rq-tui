@@ -6,8 +6,9 @@ use clap::{Parser, Subcommand};
 
 use crate::config::AppPaths;
 use crate::export::{CommentExport, ReviewArchive};
+use crate::remote::{PrReference, RemoteResolver};
 use crate::storage::Storage;
-use crate::work_item::resolve_local;
+use crate::work_item::{resolve_local, ResolvedWorkItem};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -20,9 +21,9 @@ use crate::work_item::resolve_local;
     arg_required_else_help = true
 )]
 struct RevCli {
-    /// Open this workspace directly. Equivalent to `rev review PATH`.
-    #[arg(value_name = "PATH")]
-    path: Option<PathBuf>,
+    /// Open a workspace path or GitHub pull-request URL directly.
+    #[arg(value_name = "PATH_OR_PR_URL")]
+    target: Option<String>,
 
     /// Override the base branch while opening a workspace directly.
     #[arg(long, global = true)]
@@ -37,37 +38,42 @@ enum RevCommand {
     /// Open the review TUI.
     Review {
         #[arg(default_value = ".")]
-        path: PathBuf,
+        target: String,
+    },
+    /// Refresh a local workspace or fetch the latest pull-request revision.
+    Refresh {
+        #[arg(default_value = ".")]
+        target: String,
     },
     /// Print persisted comments and question/answer history.
     History {
-        path: Option<PathBuf>,
+        target: Option<String>,
         #[arg(long)]
         json: bool,
     },
     /// Print a structured, paste-ready agent feedback prompt.
     Feedback {
         #[arg(default_value = ".")]
-        path: PathBuf,
+        target: String,
     },
     /// Export the paste-ready feedback prompt, optionally to a file.
     Export {
         #[arg(default_value = ".")]
-        path: PathBuf,
+        target: String,
         #[arg(long)]
         output: Option<PathBuf>,
     },
     /// Clear comments and questions but retain the workspace entry.
     Clear {
         #[arg(default_value = ".")]
-        path: PathBuf,
+        target: String,
         #[arg(long)]
         yes: bool,
     },
     /// Permanently remove the current workspace and all local review history.
     Delete {
         #[arg(default_value = ".")]
-        path: PathBuf,
+        target: String,
         /// Save a Markdown archive before deletion.
         #[arg(long)]
         export: bool,
@@ -90,14 +96,22 @@ enum RevCommand {
 pub(crate) fn run() -> Result<()> {
     let cli = RevCli::parse();
     let paths = AppPaths::discover()?;
-    match (cli.path, cli.command) {
-        (Some(path), None) => open(path, cli.base.as_deref(), paths),
-        (None, Some(RevCommand::Review { path })) => open(path, cli.base.as_deref(), paths),
-        (None, Some(RevCommand::History { path, json })) => history(path, json, paths),
-        (None, Some(RevCommand::Feedback { path })) => feedback(path, paths),
-        (None, Some(RevCommand::Export { path, output })) => export(path, output, paths),
-        (None, Some(RevCommand::Clear { path, yes })) => clear(path, yes, paths),
-        (None, Some(RevCommand::Delete { path, export, yes })) => delete(path, export, yes, paths),
+    match (cli.target, cli.command) {
+        (Some(target), None) => open(target, cli.base.as_deref(), paths),
+        (None, Some(RevCommand::Review { target })) => open(target, cli.base.as_deref(), paths),
+        (None, Some(RevCommand::Refresh { target })) => refresh(target, cli.base.as_deref(), paths),
+        (None, Some(RevCommand::History { target, json })) => history(target, json, paths),
+        (None, Some(RevCommand::Feedback { target })) => feedback(target, paths),
+        (None, Some(RevCommand::Export { target, output })) => export(target, output, paths),
+        (None, Some(RevCommand::Clear { target, yes })) => clear(target, yes, paths),
+        (
+            None,
+            Some(RevCommand::Delete {
+                target,
+                export,
+                yes,
+            }),
+        ) => delete(target, export, yes, paths),
         (
             None,
             Some(RevCommand::UiSnapshot {
@@ -114,21 +128,21 @@ pub(crate) fn run() -> Result<()> {
     }
 }
 
-fn open(path: PathBuf, base: Option<&str>, paths: AppPaths) -> Result<()> {
+fn open(target: String, base: Option<&str>, paths: AppPaths) -> Result<()> {
     require_tty()?;
-    let workspace = invocation_path(&path);
+    let target = ReviewTarget::parse(&target)?;
     eprintln!(
-        "rev · inspecting workspace {} · Ctrl-C cancels · progress updates every second",
-        workspace.display()
+        "rev · resolving {} · Ctrl-C cancels · progress updates every second",
+        target.label()
     );
-    let worker_workspace = workspace.clone();
+    let worker_target = target.clone();
     let worker_base = base.map(str::to_owned);
     let worker_paths = paths.clone();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let result = Storage::open(&worker_paths.database).and_then(|storage| {
-            resolve_local(
-                &worker_workspace,
+            resolve_target(
+                &worker_target,
                 worker_base.as_deref(),
                 &worker_paths,
                 &storage,
@@ -141,7 +155,8 @@ fn open(path: PathBuf, base: Option<&str>, paths: AppPaths) -> Result<()> {
         match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
             Ok(result) => break result?,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => eprintln!(
-                "rev · still inspecting local Git repositories · {}s elapsed · Ctrl-C cancels",
+                "rev · still resolving {} · {}s elapsed · Ctrl-C cancels",
+                target.label(),
                 started.elapsed().as_secs()
             ),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -150,17 +165,33 @@ fn open(path: PathBuf, base: Option<&str>, paths: AppPaths) -> Result<()> {
         }
     };
     let storage = Storage::open(&paths.database)?;
+    mark_opened(&storage, &resolved)?;
     eprintln!(
-        "rev · workspace ready in {}ms · opening terminal",
+        "rev · review ready in {}ms · opening terminal",
         started.elapsed().as_millis()
     );
     crate::rev_ui::run(resolved, &storage, &paths)
 }
 
-fn history(path: Option<PathBuf>, json: bool, paths: AppPaths) -> Result<()> {
+fn refresh(target: String, base: Option<&str>, paths: AppPaths) -> Result<()> {
     let storage = Storage::open(&paths.database)?;
-    if let Some(path) = path {
-        let item = current_item(&storage, &path)?;
+    let target = ReviewTarget::parse(&target)?;
+    eprintln!("rev · refreshing {} · Ctrl-C cancels", target.label());
+    let resolved = resolve_target(&target, base, &paths, &storage)?;
+    mark_opened(&storage, &resolved)?;
+    for repo in resolved.repos {
+        println!(
+            "{}\tv{}\t{}",
+            repo.record.name, repo.version.version_num, repo.version.head_sha
+        );
+    }
+    Ok(())
+}
+
+fn history(target: Option<String>, json: bool, paths: AppPaths) -> Result<()> {
+    let storage = Storage::open(&paths.database)?;
+    if let Some(target) = target {
+        let item = current_item(&storage, &ReviewTarget::parse(&target)?)?;
         let archive = ReviewArchive::load(&storage, &item)?;
         if json {
             println!("{}", serde_json::to_string_pretty(&archive)?);
@@ -190,9 +221,9 @@ fn history(path: Option<PathBuf>, json: bool, paths: AppPaths) -> Result<()> {
     Ok(())
 }
 
-fn feedback(path: PathBuf, paths: AppPaths) -> Result<()> {
+fn feedback(target: String, paths: AppPaths) -> Result<()> {
     let storage = Storage::open(&paths.database)?;
-    let item = current_item(&storage, &path)?;
+    let item = current_item(&storage, &ReviewTarget::parse(&target)?)?;
     let export = CommentExport::load(&storage, &item)?;
     if export.comments.is_empty() {
         println!("No feedback has been recorded for this workspace.");
@@ -202,9 +233,9 @@ fn feedback(path: PathBuf, paths: AppPaths) -> Result<()> {
     Ok(())
 }
 
-fn export(path: PathBuf, output: Option<PathBuf>, paths: AppPaths) -> Result<()> {
+fn export(target: String, output: Option<PathBuf>, paths: AppPaths) -> Result<()> {
     let storage = Storage::open(&paths.database)?;
-    let item = current_item(&storage, &path)?;
+    let item = current_item(&storage, &ReviewTarget::parse(&target)?)?;
     let export = CommentExport::load(&storage, &item)?;
     if export.comments.is_empty() {
         println!("No feedback has been recorded for this workspace.");
@@ -220,12 +251,12 @@ fn export(path: PathBuf, output: Option<PathBuf>, paths: AppPaths) -> Result<()>
     Ok(())
 }
 
-fn clear(path: PathBuf, confirmed: bool, paths: AppPaths) -> Result<()> {
+fn clear(target: String, confirmed: bool, paths: AppPaths) -> Result<()> {
     if !confirmed {
         bail!("refusing to clear review history without --yes");
     }
     let storage = Storage::open(&paths.database)?;
-    let item = current_item(&storage, &path)?;
+    let item = current_item(&storage, &ReviewTarget::parse(&target)?)?;
     storage.clear_review_history(&item.id)?;
     println!(
         "Cleared comments and questions for {}. Workspace metadata was retained.",
@@ -234,12 +265,12 @@ fn clear(path: PathBuf, confirmed: bool, paths: AppPaths) -> Result<()> {
     Ok(())
 }
 
-fn delete(path: PathBuf, export: bool, confirmed: bool, paths: AppPaths) -> Result<()> {
+fn delete(target: String, export: bool, confirmed: bool, paths: AppPaths) -> Result<()> {
     if !confirmed {
         bail!("refusing permanent workspace deletion without --yes");
     }
     let storage = Storage::open(&paths.database)?;
-    let item = current_item(&storage, &path)?;
+    let item = current_item(&storage, &ReviewTarget::parse(&target)?)?;
     eprintln!(
         "rev · deleting durable Copilot sessions before local history · Ctrl-C cancels safely"
     );
@@ -265,19 +296,90 @@ fn delete(path: PathBuf, export: bool, confirmed: bool, paths: AppPaths) -> Resu
     Ok(())
 }
 
-fn current_item(storage: &Storage, path: &Path) -> Result<crate::domain::WorkItem> {
-    let workspace = invocation_path(path)
-        .canonicalize()
-        .with_context(|| format!("cannot resolve workspace {}", path.display()))?;
-    for candidate in workspace.ancestors() {
-        if let Some(item) = storage.work_item_by_root(candidate)? {
-            return Ok(item);
+#[derive(Clone, Debug)]
+enum ReviewTarget {
+    Local(PathBuf),
+    PullRequest(PrReference),
+}
+
+impl ReviewTarget {
+    fn parse(value: &str) -> Result<Self> {
+        if looks_like_pull_request(value) {
+            return Ok(Self::PullRequest(PrReference::parse(value)?));
+        }
+        Ok(Self::Local(invocation_path(Path::new(value))))
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Local(path) => format!("workspace {}", path.display()),
+            Self::PullRequest(reference) => reference.canonical_url(),
         }
     }
-    Err(anyhow::anyhow!(
-        "no persisted review for {} or any parent workspace",
-        workspace.display()
-    ))
+}
+
+fn looks_like_pull_request(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("https://github.com/")
+        || value.starts_with("http://github.com/")
+        || value.starts_with("github.com/")
+        || (value.contains('/') && value.rsplit_once('#').is_some())
+}
+
+fn resolve_target(
+    target: &ReviewTarget,
+    base: Option<&str>,
+    paths: &AppPaths,
+    storage: &Storage,
+) -> Result<ResolvedWorkItem> {
+    match target {
+        ReviewTarget::Local(path) => resolve_local(path, base, paths, storage),
+        ReviewTarget::PullRequest(reference) => {
+            if base.is_some() {
+                bail!("--base applies only to local workspaces; GitHub PRs use their remote base");
+            }
+            RemoteResolver::default().resolve(std::slice::from_ref(reference), paths, storage)
+        }
+    }
+}
+
+fn mark_opened(storage: &Storage, resolved: &ResolvedWorkItem) -> Result<()> {
+    for repo in &resolved.repos {
+        storage.mark_version_opened(&repo.version.id)?;
+    }
+    Ok(())
+}
+
+fn current_item(storage: &Storage, target: &ReviewTarget) -> Result<crate::domain::WorkItem> {
+    match target {
+        ReviewTarget::Local(path) => {
+            let workspace = path
+                .canonicalize()
+                .with_context(|| format!("cannot resolve workspace {}", path.display()))?;
+            for candidate in workspace.ancestors() {
+                if let Some(item) = storage.work_item_by_root(candidate)? {
+                    return Ok(item);
+                }
+            }
+            Err(anyhow::anyhow!(
+                "no persisted review for {} or any parent workspace",
+                workspace.display()
+            ))
+        }
+        ReviewTarget::PullRequest(reference) => {
+            let url = reference.canonical_url();
+            for item in storage.list_work_items()? {
+                if storage
+                    .repos_for_work_item(&item.id)?
+                    .iter()
+                    .any(|repo| repo.remote_pr_url.as_deref() == Some(url.as_str()))
+                {
+                    return Ok(item);
+                }
+            }
+            Err(anyhow::anyhow!("no persisted review for {url}"))
+        }
+    }
 }
 
 fn invocation_path(path: &Path) -> PathBuf {
@@ -304,7 +406,7 @@ fn require_tty() -> Result<()> {
 mod tests {
     use clap::Parser;
 
-    use super::{RevCli, RevCommand};
+    use super::{RevCli, RevCommand, ReviewTarget};
 
     #[test]
     fn bare_rev_prints_help_instead_of_entering_the_tui() {
@@ -314,8 +416,31 @@ mod tests {
     #[test]
     fn workspace_path_is_the_short_review_form() {
         let cli = RevCli::try_parse_from(["rev", "."]).unwrap();
-        assert!(cli.path.is_some());
+        assert_eq!(cli.target.as_deref(), Some("."));
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn github_url_is_the_short_review_form() {
+        let cli = RevCli::try_parse_from(["rev", "https://github.com/acme/api/pull/42"]).unwrap();
+        assert_eq!(
+            cli.target.as_deref(),
+            Some("https://github.com/acme/api/pull/42")
+        );
+        assert!(matches!(
+            ReviewTarget::parse(cli.target.as_deref().unwrap()).unwrap(),
+            ReviewTarget::PullRequest(_)
+        ));
+    }
+
+    #[test]
+    fn refresh_accepts_a_github_url_without_entering_the_tui() {
+        let cli = RevCli::try_parse_from(["rev", "refresh", "https://github.com/acme/api/pull/42"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(RevCommand::Refresh { target }) if target.ends_with("/pull/42")
+        ));
     }
 
     #[test]

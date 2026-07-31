@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -35,6 +36,7 @@ use crate::domain::{
 use crate::export::CommentExport;
 use crate::git::Git;
 use crate::highlight::{Highlighter, PlainHighlighter, StyledSegment, SyntectHighlighter};
+use crate::remote::{PrReference, RemoteResolver};
 use crate::storage::{now, RevQuestionSession, Storage};
 use crate::terminal_text::{
     cell_width, floor_grapheme_boundary, grapheme_indices, next_grapheme_boundary,
@@ -263,6 +265,8 @@ struct RevState {
     render_cache: Option<RenderCache>,
     history_cursor: usize,
     history_delete_armed: Option<String>,
+    refresh: Option<Receiver<Result<ResolvedWorkItem>>>,
+    refresh_started: Option<Instant>,
 }
 
 impl RevState {
@@ -346,6 +350,8 @@ impl RevState {
             render_cache: None,
             history_cursor: 0,
             history_delete_armed: None,
+            refresh: None,
+            refresh_started: None,
         })
     }
 
@@ -539,6 +545,7 @@ fn run_loop<B: Backend>(
     highlighter: &mut dyn Highlighter,
 ) -> Result<()> {
     loop {
+        drain_refresh(state, storage)?;
         drain_agent_events(state, storage, paths)?;
         terminal.draw(|frame| render(frame, state, highlighter))?;
         if state.status == "quit" {
@@ -1534,6 +1541,7 @@ fn command_candidates(state: &RevState) -> Vec<String> {
         "history".to_owned(),
         "model".to_owned(),
         "questions".to_owned(),
+        "refresh".to_owned(),
         "clear".to_owned(),
         "q".to_owned(),
         "quit".to_owned(),
@@ -1612,6 +1620,10 @@ fn execute_command(
             state.status =
                 "HISTORY · j/k move · d d deletes saved feedback only · Esc return".into();
         }
+        "refresh" => {
+            state.mode = RevMode::Normal;
+            start_refresh(state, paths)?;
+        }
         "clear" => {
             state.mode = RevMode::ConfirmClear;
             state.status = "Clear every saved comment and question here? y/n".into();
@@ -1627,6 +1639,16 @@ fn execute_command(
             }
         }
         _ if command.starts_with("base ") => {
+            if state
+                .current_repo()
+                .is_some_and(|repo| repo.record.remote_pr_url.is_some())
+            {
+                state.mode = RevMode::Normal;
+                state.status =
+                    "GitHub PR bases come from GitHub · use :refresh after the PR base changes"
+                        .into();
+                return Ok(());
+            }
             if state.streaming || state.agent.is_some() || !state.queued_questions.is_empty() {
                 state.mode = RevMode::Normal;
                 state.status =
@@ -1667,6 +1689,101 @@ fn execute_command(
         }
         _ => {
             state.status = format!("Unknown command: {command}");
+        }
+    }
+    Ok(())
+}
+
+fn start_refresh(state: &mut RevState, paths: &AppPaths) -> Result<()> {
+    if state.refresh.is_some() {
+        state.status = "Refresh already running · the review remains usable".into();
+        return Ok(());
+    }
+    if state.agent.is_some() || !state.queued_questions.is_empty() {
+        state.status = "Finish or cancel active questions before refreshing the revision".into();
+        return Ok(());
+    }
+    let remote = state
+        .workspace
+        .repos
+        .iter()
+        .filter_map(|repo| repo.record.remote_pr_url.as_deref())
+        .map(PrReference::parse)
+        .collect::<Result<Vec<_>>>()?;
+    let local_root = state.workspace.item.workspace_root.clone();
+    let worker_paths = paths.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = Storage::open(&worker_paths.database).and_then(|storage| {
+            if remote.is_empty() {
+                resolve_local(&local_root, None, &worker_paths, &storage)
+            } else {
+                RemoteResolver::default().resolve(&remote, &worker_paths, &storage)
+            }
+        });
+        sender.send(result).ok();
+    });
+    state.refresh = Some(receiver);
+    state.refresh_started = Some(Instant::now());
+    state.status =
+        "REFRESHING in background · navigation remains active · :refresh shows status".into();
+    Ok(())
+}
+
+fn drain_refresh(state: &mut RevState, storage: &Storage) -> Result<()> {
+    let Some(receiver) = state.refresh.as_ref() else {
+        return Ok(());
+    };
+    let result = match receiver.try_recv() {
+        Ok(result) => result,
+        Err(TryRecvError::Empty) => {
+            if state
+                .refresh_started
+                .is_some_and(|started| started.elapsed() >= Duration::from_secs(2))
+            {
+                let elapsed = state
+                    .refresh_started
+                    .map_or(0, |started| started.elapsed().as_secs());
+                state.status = format!(
+                    "REFRESHING in background · {elapsed}s elapsed · navigation remains active"
+                );
+            }
+            return Ok(());
+        }
+        Err(TryRecvError::Disconnected) => {
+            state.refresh = None;
+            state.refresh_started = None;
+            state.status = "Refresh worker stopped unexpectedly · review remains open".into();
+            return Ok(());
+        }
+    };
+    state.refresh = None;
+    let elapsed = state
+        .refresh_started
+        .take()
+        .map_or(0, |time| time.elapsed().as_millis());
+    match result {
+        Ok(workspace) => {
+            for repo in &workspace.repos {
+                storage.mark_version_opened(&repo.version.id)?;
+            }
+            let selected = state.current_file().map(|file| file.path().to_path_buf());
+            let layout = state.diff_layout;
+            let mut replacement = RevState::load(workspace, storage)?;
+            replacement.diff_layout = layout;
+            if let Some(selected) = selected {
+                if let Some(index) = replacement.files.iter().position(|(repo, file)| {
+                    replacement.workspace.repos[*repo].diff.files[*file].path() == selected
+                }) {
+                    replacement.file_index = index;
+                }
+            }
+            replacement.status =
+                format!("Refresh complete in {elapsed}ms · latest PR/workspace revision is open");
+            *state = replacement;
+        }
+        Err(error) => {
+            state.status = format!("Refresh failed after {elapsed}ms: {error:#}");
         }
     }
     Ok(())
@@ -3810,6 +3927,10 @@ fn help_lines() -> Vec<Line<'static>> {
             "rebuild the review relative to an autocompleted ref",
         ),
         key(":history", "open persisted review history"),
+        key(
+            ":refresh",
+            "refresh local changes or fetch the latest GitHub PR revision in the background",
+        ),
         key(":questions", "open the right-side question-thread panel"),
         key(
             ":model",
@@ -3821,6 +3942,10 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::raw(""),
         section("Non-interactive CLI"),
         key("rev history PATH", "print saved diff-related history"),
+        key(
+            "rev refresh PATH_OR_PR_URL",
+            "refresh without entering the TUI",
+        ),
         key("rev feedback PATH", "print the structured feedback prompt"),
         key(
             "rev export PATH",

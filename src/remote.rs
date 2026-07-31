@@ -48,11 +48,13 @@ impl PrReference {
                 .trim_start_matches("github.com/")
                 .split_once('/')
                 .context("PR reference must include owner and repository")?;
-            return Ok(Self {
+            let reference = Self {
                 owner: owner.to_owned(),
                 repo: repo.to_owned(),
                 number: number.parse().context("invalid PR number")?,
-            });
+            };
+            reference.validate()?;
+            return Ok(reference);
         }
 
         let parts = value
@@ -60,13 +62,32 @@ impl PrReference {
             .split('/')
             .collect::<Vec<_>>();
         if let [owner, repo, "pull", number] = parts.as_slice() {
-            return Ok(Self {
+            let reference = Self {
                 owner: (*owner).to_owned(),
                 repo: (*repo).to_owned(),
                 number: number.parse().context("invalid PR number")?,
-            });
+            };
+            reference.validate()?;
+            return Ok(reference);
         }
         bail!("invalid PR reference: {input}")
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (label, value) in [("owner", &self.owner), ("repository", &self.repo)] {
+            if value.is_empty()
+                || matches!(value.as_str(), "." | "..")
+                || !value
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+            {
+                bail!("invalid GitHub {label} in pull-request reference")
+            }
+        }
+        if self.number == 0 {
+            bail!("pull-request number must be greater than zero")
+        }
+        Ok(())
     }
 
     pub(crate) fn canonical_url(&self) -> String {
@@ -80,8 +101,10 @@ impl PrReference {
         format!("{}/{}#{}", self.owner, self.repo, self.number)
     }
 
-    pub(crate) fn cache_key(&self) -> String {
-        format!("{}_{}_{}", self.owner, self.repo, self.number).replace(['/', '\\', ':'], "_")
+    pub(crate) fn cache_relative_path(&self) -> PathBuf {
+        PathBuf::from(&self.owner)
+            .join(&self.repo)
+            .join(format!("pr-{}", self.number))
     }
 }
 
@@ -247,7 +270,7 @@ impl<R: ProcessRunner> RemoteResolver<R> {
         paths: &AppPaths,
         storage: &Storage,
     ) -> Result<ReviewRepo> {
-        let cache = paths.prs.join(reference.cache_key());
+        let cache = paths.prs.join(reference.cache_relative_path());
         let bare = cache.join("repo.git");
         fs::create_dir_all(&cache)?;
         self.ensure_bare_clone(reference, &bare)?;
@@ -607,6 +630,18 @@ mod tests {
     fn rejects_incomplete_pr_references() {
         assert!(PrReference::parse("api#42").is_err());
         assert!(PrReference::parse("acme/api").is_err());
+        assert!(PrReference::parse("../api#42").is_err());
+        assert!(PrReference::parse("acme/../pull/42").is_err());
+        assert!(PrReference::parse("acme/api#0").is_err());
+    }
+
+    #[test]
+    fn cache_is_namespaced_by_owner_repository_and_pr_number() {
+        let reference = PrReference::parse("https://github.com/acme/api/pull/42").unwrap();
+        assert_eq!(
+            reference.cache_relative_path(),
+            PathBuf::from("acme/api/pr-42")
+        );
     }
 
     #[test]
