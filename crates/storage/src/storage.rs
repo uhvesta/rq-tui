@@ -24,6 +24,7 @@ pub const MIGRATION_8: &str = include_str!("../migrations/0008_rev_question_sess
 pub const MIGRATION_9: &str = include_str!("../migrations/0009_annotation_status.sql");
 pub const MIGRATION_10: &str = include_str!("../migrations/0010_github_pull_request_snapshots.sql");
 pub const MIGRATION_11: &str = include_str!("../migrations/0011_github_operation_outbox.sql");
+pub const MIGRATION_12: &str = include_str!("../migrations/0012_github_multiline_threads.sql");
 
 pub struct Storage {
     connection: Connection,
@@ -271,6 +272,7 @@ impl Storage {
             (9, MIGRATION_9),
             (10, MIGRATION_10),
             (11, MIGRATION_11),
+            (12, MIGRATION_12),
         ] {
             let applied = tx
                 .query_row(
@@ -886,16 +888,23 @@ impl Storage {
         for (thread_ordinal, thread) in snapshot.threads.iter().enumerate() {
             tx.execute(
                 "INSERT INTO pull_request_review_threads(
-                    version_id, node_id, ordinal, path, line, original_line,
+                    version_id, node_id, ordinal, path, start_line,
+                    original_start_line, line, original_line, start_side,
                     side, is_outdated, is_resolved, viewer_can_reply
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     version_id,
                     thread.node_id,
                     sql_ordinal(thread_ordinal)?,
                     thread.path,
+                    sql_optional_u64(thread.start_line, "review-thread start line")?,
+                    sql_optional_u64(
+                        thread.original_start_line,
+                        "review-thread original start line"
+                    )?,
                     sql_optional_u64(thread.line, "review-thread line")?,
                     sql_optional_u64(thread.original_line, "review-thread original line")?,
+                    thread.start_side.map(diff_side_name),
                     diff_side_name(thread.side),
                     sql_bool(thread.is_outdated),
                     sql_bool(thread.is_resolved),
@@ -958,8 +967,9 @@ impl Storage {
 
         let threads = {
             let mut statement = self.connection.prepare(
-                "SELECT node_id, path, line, original_line, side, is_outdated,
-                        is_resolved, viewer_can_reply
+                "SELECT node_id, path, start_line, original_start_line, line,
+                        original_line, start_side, side, is_outdated, is_resolved,
+                        viewer_can_reply
                  FROM pull_request_review_threads
                  WHERE version_id = ?1
                  ORDER BY ordinal",
@@ -971,10 +981,13 @@ impl Storage {
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<i64>>(2)?,
                         row.get::<_, Option<i64>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)? != 0,
-                        row.get::<_, i64>(6)? != 0,
-                        row.get::<_, i64>(7)? != 0,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)? != 0,
+                        row.get::<_, i64>(9)? != 0,
+                        row.get::<_, i64>(10)? != 0,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -985,8 +998,11 @@ impl Storage {
         for (
             thread_node_id,
             path,
+            start_line,
+            original_start_line,
             line,
             original_line,
+            start_side,
             side,
             is_outdated,
             is_resolved,
@@ -1037,8 +1053,14 @@ impl Storage {
             review_threads.push(ReviewThread {
                 node_id: thread_node_id,
                 path,
+                start_line: sql_to_optional_u64(start_line, "review-thread start line")?,
+                original_start_line: sql_to_optional_u64(
+                    original_start_line,
+                    "review-thread original start line",
+                )?,
                 line: sql_to_optional_u64(line, "review-thread line")?,
                 original_line: sql_to_optional_u64(original_line, "review-thread original line")?,
+                start_side: start_side.as_deref().map(diff_side_from_name).transpose()?,
                 side: diff_side_from_name(&side)?,
                 is_outdated,
                 is_resolved,
@@ -3496,8 +3518,11 @@ mod tests {
             threads: vec![ReviewThread {
                 node_id: format!("thread-{suffix}"),
                 path: "src/lib.rs".into(),
+                start_line: None,
+                original_start_line: None,
                 line: Some(42),
                 original_line: Some(40),
+                start_side: None,
                 side: DiffSide::Right,
                 is_outdated: suffix == "old",
                 is_resolved: false,

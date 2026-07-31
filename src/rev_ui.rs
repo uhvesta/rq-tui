@@ -453,13 +453,22 @@ fn inject_remote_thread_context(
             repo.diff.files.len() - 1
         });
     let line_number = usize::try_from(line_number).context("GitHub line exceeds address space")?;
-    if repo.diff.files[file_index]
+    let start_line = usize::try_from(
+        thread
+            .start_line
+            .or(thread.original_start_line)
+            .unwrap_or(line_number as u64),
+    )
+    .context("GitHub start line exceeds address space")?
+    .min(line_number);
+    let visible = repo.diff.files[file_index]
         .visible_lines()
-        .any(|line| match thread.side {
-            GitHubDiffSide::Left => line.old_line == Some(line_number),
-            GitHubDiffSide::Right => line.new_line == Some(line_number),
+        .filter_map(|line| match thread.side {
+            GitHubDiffSide::Left => line.old_line,
+            GitHubDiffSide::Right => line.new_line,
         })
-    {
+        .collect::<HashSet<_>>();
+    if (start_line..=line_number).all(|line| visible.contains(&line)) {
         return Ok(());
     }
     let source = match thread.side {
@@ -479,24 +488,27 @@ fn inject_remote_thread_context(
             )
             .unwrap_or_default(),
     };
-    let content = source
-        .lines()
-        .nth(line_number.saturating_sub(1))
-        .unwrap_or_default()
-        .to_owned();
+    let source_lines = source.lines().collect::<Vec<_>>();
+    let count = line_number.saturating_sub(start_line).saturating_add(1);
     let file = &mut repo.diff.files[file_index];
     file.hunks.push(Hunk {
-        header: format!("@@ -{line_number},1 +{line_number},1 @@"),
-        old_start: line_number,
-        old_count: 1,
-        new_start: line_number,
-        new_count: 1,
-        lines: vec![DiffLine {
-            kind: LineKind::Context,
-            old_line: Some(line_number),
-            new_line: Some(line_number),
-            content,
-        }],
+        header: format!("@@ -{start_line},{count} +{start_line},{count} @@"),
+        old_start: start_line,
+        old_count: count,
+        new_start: start_line,
+        new_count: count,
+        lines: (start_line..=line_number)
+            .map(|number| DiffLine {
+                kind: LineKind::Context,
+                old_line: Some(number),
+                new_line: Some(number),
+                content: source_lines
+                    .get(number.saturating_sub(1))
+                    .copied()
+                    .unwrap_or_default()
+                    .to_owned(),
+            })
+            .collect(),
     });
     file.hunks
         .sort_by_key(|hunk| (hunk.new_start, hunk.old_start));
@@ -561,6 +573,10 @@ impl RevState {
                     let Some(line) = thread.line.or(thread.original_line) else {
                         continue;
                     };
+                    let start_line = thread
+                        .start_line
+                        .or(thread.original_start_line)
+                        .unwrap_or(line);
                     let id = remote_annotation_id(&thread.node_id);
                     let first = thread.comments.first();
                     annotations.push((
@@ -589,7 +605,7 @@ impl RevState {
                                 GitHubDiffSide::Left => AnchorSide::Old,
                                 GitHubDiffSide::Right => AnchorSide::New,
                             },
-                            line_start: i64::try_from(line)
+                            line_start: i64::try_from(start_line)
                                 .context("GitHub line exceeds SQLite range")?,
                             line_end: i64::try_from(line)
                                 .context("GitHub line exceeds SQLite range")?,
@@ -5575,8 +5591,23 @@ fn render_header(frame: &mut Frame, state: &RevState, area: Rect) {
         .current_file()
         .map(|file| file.path().display().to_string())
         .unwrap_or_else(|| "no files".into());
+    let pane_notice = if state.file_tree_open && state.questions_open && area.width < 108 {
+        if state.mode == RevMode::Questions {
+            " · files pane hidden at this width"
+        } else if state.mode == RevMode::FilePicker || area.width >= 68 {
+            " · questions pane hidden at this width"
+        } else {
+            " · side panes hidden at this width"
+        }
+    } else if state.file_tree_open && area.width < 68 && state.mode != RevMode::FilePicker {
+        " · files pane hidden at this width"
+    } else if state.questions_open && area.width < 72 && state.mode != RevMode::Questions {
+        " · questions pane hidden at this width"
+    } else {
+        ""
+    };
     let title = format!(
-        " rev · {} · {} > {} · {} · base {} · file {}/{} ",
+        " rev · {} · {} > {} · {} · base {} · file {}/{}{} ",
         state.workspace.item.name,
         repo,
         file,
@@ -5586,7 +5617,8 @@ fn render_header(frame: &mut Frame, state: &RevState, area: Rect) {
             .and_then(|repo| repo.record.base_branch.as_deref())
             .unwrap_or("auto"),
         state.file_index.saturating_add(1),
-        state.files.len()
+        state.files.len(),
+        pane_notice
     );
     frame.render_widget(
         Paragraph::new(fit_text(&title, area.width as usize))
@@ -8088,8 +8120,11 @@ fn snapshot_pull_request(head_sha: &str) -> PullRequestSnapshot {
         threads: vec![ReviewThread {
             node_id: "thread-17".into(),
             path: "src/lib.rs".into(),
+            start_line: None,
+            original_start_line: None,
             line: Some(11),
             original_line: Some(11),
+            start_side: None,
             side: GitHubDiffSide::Right,
             is_outdated: true,
             is_resolved: false,
@@ -8317,14 +8352,14 @@ mod tests {
         handle_agent_event, handle_compose_key, handle_file_picker_key, handle_help_key,
         handle_history_key, handle_key, handle_question_key, handle_review_key, help_lines,
         is_expandable_fold, markdown_sides, merge_touching_hunks, move_row, open_file_picker,
-        open_questions, page_move, pending_review_submission, question_ids, queue_question_launch,
-        rebuild_file_without_expanded_lines, render, render_snapshot, review_file_key, row_count,
-        scroll_review_viewport, seed_snapshot_feedback, seed_snapshot_questions,
-        snapshot_workspace, split_highlight_side, split_source_lines, style_split_side,
-        submit_compose, visual_selection_yank_text, ComposeTarget, GitHubBackend, GitHubDiffSide,
-        GitHubPrRef, ModelPicker, PendingSend, PickerScope, PickerStage, QuestionLaunch,
-        RevAgentSlot, RevDiffLayout, RevMode, RevRowKind, RevState, ReviewComment, ReviewDecision,
-        ReviewSubmission, PR_DESCRIPTION_PATH,
+        open_questions, page_move, pending_review_submission, preserve_source_focus, question_ids,
+        queue_question_launch, rebuild_file_without_expanded_lines, render, render_snapshot,
+        review_file_key, row_count, scroll_review_viewport, seed_snapshot_feedback,
+        seed_snapshot_questions, snapshot_workspace, split_highlight_side, split_source_lines,
+        style_split_side, submit_compose, visual_selection_yank_text, ComposeTarget, GitHubBackend,
+        GitHubDiffSide, GitHubPrRef, ModelPicker, PendingSend, PickerScope, PickerStage,
+        QuestionLaunch, RevAgentSlot, RevDiffLayout, RevMode, RevRowKind, RevState, ReviewComment,
+        ReviewDecision, ReviewSubmission, PR_DESCRIPTION_PATH,
     };
     use crate::config::AppPaths;
     use crate::copilot::{
@@ -9308,7 +9343,7 @@ mod tests {
             .iter()
             .position(|row| {
                 matches!(
-                    row.kind,
+                    &row.kind,
                     super::RevRowKind::Source {
                         visible_index: 1,
                         ..
@@ -10409,6 +10444,68 @@ mod tests {
     }
 
     #[test]
+    fn width_changes_preserve_the_focused_source_line() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        let mut highlighter = PlainHighlighter;
+        let mut wide = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        wide.draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        let rows = state.render_cache.as_ref().unwrap().rows.clone();
+        state.row_cursor = rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.kind,
+                    RevRowKind::Source {
+                        line: DiffLine {
+                            new_line: Some(11),
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        preserve_source_focus(&mut state);
+        state.render_cache = None;
+
+        let mut narrow = Terminal::new(TestBackend::new(45, 24)).unwrap();
+        narrow
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        assert!(matches!(
+            &state.render_cache.as_ref().unwrap().rows[state.row_cursor].kind,
+            RevRowKind::Source {
+                line: DiffLine {
+                    new_line: Some(11),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn compact_command_palette_highlights_the_command_enter_executes() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        state.mode = RevMode::Command;
+        state.command.input = "q".into();
+        state.command.cursor = 1;
+        let mut highlighter = PlainHighlighter;
+        let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        let frame = terminal.backend().to_string();
+        assert!(frame.contains("❯ q"));
+        assert!(!frame.contains("❯ hide questions"));
+    }
+
+    #[test]
     fn retract_restores_original_diff_and_never_removes_changed_lines() {
         let storage = Storage::in_memory().unwrap();
         let workspace = snapshot_workspace(&storage).unwrap();
@@ -10462,8 +10559,11 @@ mod tests {
                     threads: vec![rq_tui_github_review::ReviewThread {
                         node_id: "thread-17".into(),
                         path: "src/lib.rs".into(),
+                        start_line: None,
+                        original_start_line: None,
                         line: Some(11),
                         original_line: Some(11),
+                        start_side: None,
                         side: rq_tui_github_review::DiffSide::Right,
                         is_outdated: true,
                         is_resolved: false,

@@ -37,8 +37,14 @@ pub struct PullRequestSnapshot {
 pub struct ReviewThread {
     pub node_id: String,
     pub path: String,
+    #[serde(default)]
+    pub start_line: Option<u64>,
+    #[serde(default)]
+    pub original_start_line: Option<u64>,
     pub line: Option<u64>,
     pub original_line: Option<u64>,
+    #[serde(default)]
+    pub start_side: Option<DiffSide>,
     pub side: DiffSide,
     pub is_outdated: bool,
     pub is_resolved: bool,
@@ -135,8 +141,11 @@ query RevPullRequest($owner: String!, $repository: String!, $number: Int!, $thre
         nodes {
           id
           path
+          startLine
+          originalStartLine
           line
           originalLine
+          startDiffSide
           diffSide
           isOutdated
           isResolved
@@ -462,8 +471,11 @@ fn parse_thread(value: &Value) -> Result<(ReviewThread, PageInfo)> {
     let thread = ReviewThread {
         node_id: required_string(value, "id")?,
         path: required_string(value, "path")?,
+        start_line: optional_u64(value, "startLine")?,
+        original_start_line: optional_u64(value, "originalStartLine")?,
         line: optional_u64(value, "line")?,
         original_line: optional_u64(value, "originalLine")?,
+        start_side: parse_optional_side(value.get("startDiffSide"))?,
         side: parse_side(value.get("diffSide"))?,
         is_outdated: required_bool(value, "isOutdated")?,
         is_resolved: required_bool(value, "isResolved")?,
@@ -543,6 +555,13 @@ fn parse_side(value: Option<&Value>) -> Result<DiffSide> {
         Some("RIGHT") => Ok(DiffSide::Right),
         Some(side) => bail!("unsupported GitHub GraphQL diff side {side}"),
         None => bail!("GitHub GraphQL thread did not contain diffSide"),
+    }
+}
+
+fn parse_optional_side(value: Option<&Value>) -> Result<Option<DiffSide>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        value => parse_side(value).map(Some),
     }
 }
 
