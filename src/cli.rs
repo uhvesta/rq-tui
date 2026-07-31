@@ -10,7 +10,7 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use crate::app::AppState;
 use crate::config::AppPaths;
-use crate::remote::{PrReference, RemoteResolver};
+use crate::remote::{resolve_remote, PrReference};
 use crate::storage::Storage;
 use crate::work_item::{combine_resolved, resolve_local};
 
@@ -107,7 +107,7 @@ pub(crate) fn run_review(args: ReviewArgs, paths: AppPaths) -> Result<()> {
                 .iter()
                 .map(|reference| PrReference::parse(reference))
                 .collect::<Result<Vec<_>>>()?;
-            RemoteResolver::default().resolve(&references, &paths, &storage)?
+            resolve_remote(&references, &paths, &storage)?
         }
         (Some(_), false) => {
             progress.stage("Inspecting local repositories and computing diffs");
@@ -123,7 +123,7 @@ pub(crate) fn run_review(args: ReviewArgs, paths: AppPaths) -> Result<()> {
                 .iter()
                 .map(|reference| PrReference::parse(reference))
                 .collect::<Result<Vec<_>>>()?;
-            let remote = RemoteResolver::default().resolve(&references, &paths, &storage)?;
+            let remote = resolve_remote(&references, &paths, &storage)?;
             combine_resolved(local, remote, &paths, &storage)?
         }
         (None, true) => unreachable!("clap requires a target"),

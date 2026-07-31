@@ -39,7 +39,7 @@ use crate::export::CommentExport;
 use crate::git::Git;
 use crate::highlight::{Highlighter, PlainHighlighter, StyledSegment, SyntectHighlighter};
 use crate::markdown_preview::MarkdownPreviewServer;
-use crate::remote::{PrReference, RemoteResolver};
+use crate::remote::{resolve_remote, PrReference};
 use crate::storage::{now, RevQuestionSession, Storage};
 use crate::terminal_text::{
     cell_width, floor_grapheme_boundary, grapheme_indices, next_grapheme_boundary,
@@ -2107,7 +2107,7 @@ fn start_refresh(state: &mut RevState, paths: &AppPaths) -> Result<()> {
             if remote.is_empty() {
                 resolve_local(&local_root, None, &worker_paths, &storage)
             } else {
-                RemoteResolver::default().resolve(&remote, &worker_paths, &storage)
+                resolve_remote(&remote, &worker_paths, &storage)
             }
         });
         sender.send(result).ok();

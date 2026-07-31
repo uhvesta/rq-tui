@@ -4,6 +4,7 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use rq_tui_github_review::{GitHubReviewClient, PullRequestRef as ReviewPullRequestRef};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -13,11 +14,38 @@ use crate::diff::parse_unified;
 use crate::domain::{
     BaseBranchSource, DeliveryState, Repo, ReviewContext, Version, VersionKind, WorkItem,
 };
+use crate::github_review::GhCliTransport;
 use crate::process_control::output_with_timeout;
 use crate::storage::{now, Storage};
 use crate::work_item::{ResolvedWorkItem, ReviewRepo};
 
 const NETWORK_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+
+pub(crate) fn resolve_remote(
+    references: &[PrReference],
+    paths: &AppPaths,
+    storage: &Storage,
+) -> Result<ResolvedWorkItem> {
+    let workspace = RemoteResolver::default().resolve(references, paths, storage)?;
+    let client = GitHubReviewClient::new(GhCliTransport);
+    for repo in &workspace.repos {
+        let Some(url) = repo.record.remote_pr_url.as_deref() else {
+            continue;
+        };
+        let reference = PrReference::parse(url)?;
+        let snapshot = client.load_snapshot(&ReviewPullRequestRef {
+            owner: reference.owner,
+            repository: reference.repo,
+            number: reference.number,
+        })?;
+        anyhow::ensure!(
+            snapshot.head_sha == repo.version.head_sha,
+            "pull request changed while loading review threads; run :refresh"
+        );
+        storage.upsert_pull_request_snapshot(&repo.version.id, &snapshot)?;
+    }
+    Ok(workspace)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PrReference {

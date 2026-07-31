@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 
 use crate::config::AppPaths;
 use crate::export::{CommentExport, ReviewArchive};
-use crate::remote::{PrReference, RemoteResolver};
+use crate::remote::{resolve_remote, PrReference};
 use crate::storage::Storage;
 use crate::work_item::{resolve_local, ResolvedWorkItem};
 
@@ -338,7 +338,7 @@ fn resolve_target(
             if base.is_some() {
                 bail!("--base applies only to local workspaces; GitHub PRs use their remote base");
             }
-            RemoteResolver::default().resolve(std::slice::from_ref(reference), paths, storage)
+            resolve_remote(std::slice::from_ref(reference), paths, storage)
         }
     }
 }
