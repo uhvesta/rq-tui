@@ -31,7 +31,7 @@ use crate::copilot::{
 };
 use crate::diff::{DiffFile, DiffLine, FileStatus, Hunk, LineKind};
 use crate::domain::{
-    Annotation, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState, Placement,
+    AnchorSide, Annotation, AnnotationKind, AskMessage, BaseBranchSource, DeliveryState, Placement,
 };
 use crate::export::CommentExport;
 use crate::git::Git;
@@ -55,6 +55,7 @@ enum RevMode {
     Model,
     History,
     FilePicker,
+    Questions,
     Help,
     ConfirmClear,
 }
@@ -99,6 +100,7 @@ enum PickerStage {
 #[derive(Clone, Debug)]
 struct ModelPicker {
     models: Vec<ModelOption>,
+    initial_selection: ModelSelection,
     stage: PickerStage,
     index: usize,
     model_index: usize,
@@ -106,12 +108,17 @@ struct ModelPicker {
 }
 
 impl ModelPicker {
-    fn new(models: Vec<ModelOption>) -> Self {
+    fn new(models: Vec<ModelOption>, initial_selection: ModelSelection) -> Self {
+        let model_index = models
+            .iter()
+            .position(|model| model.id == initial_selection.model_id)
+            .unwrap_or(0);
         Self {
             models,
+            initial_selection,
             stage: PickerStage::Model,
-            index: 0,
-            model_index: 0,
+            index: model_index,
+            model_index,
             reasoning_effort: None,
         }
     }
@@ -158,7 +165,7 @@ struct PendingSend {
 #[derive(Clone, Debug)]
 struct QuestionLaunch {
     annotation_id: String,
-    pending: PendingSend,
+    pending: Option<PendingSend>,
     existing: Option<RevQuestionSession>,
 }
 
@@ -170,6 +177,7 @@ struct RevAgentSlot {
     session_id: Option<String>,
     selection: ModelSelection,
     needs_model_picker: bool,
+    model_switch_only: bool,
 }
 
 #[derive(Clone)]
@@ -224,9 +232,13 @@ struct RevState {
     file_picker_cursor: usize,
     file_picker_return_mode: RevMode,
     collapsed_repos: HashSet<usize>,
+    question_cursor: usize,
+    question_return_mode: RevMode,
+    model_return_mode: RevMode,
     status: String,
     annotations: Vec<(Annotation, Placement)>,
     threads: HashMap<String, Vec<AskMessage>>,
+    question_sessions: HashMap<String, RevQuestionSession>,
     picker: Option<ModelPicker>,
     agent: Option<RevAgentSlot>,
     queued_questions: VecDeque<QuestionLaunch>,
@@ -251,6 +263,7 @@ impl RevState {
             .collect::<Vec<_>>();
         let mut annotations = Vec::new();
         let mut threads = HashMap::new();
+        let mut question_sessions = HashMap::new();
         for repo in &workspace.repos {
             for pair in storage.annotations_for_version(&repo.version.id)? {
                 let annotation = &pair.0;
@@ -259,6 +272,9 @@ impl RevState {
                         annotation.id.clone(),
                         storage.ask_messages_for_annotation(&annotation.id)?,
                     );
+                    if let Some(session) = storage.rev_question_session(&annotation.id)? {
+                        question_sessions.insert(annotation.id.clone(), session);
+                    }
                 }
                 annotations.push(pair);
             }
@@ -294,9 +310,13 @@ impl RevState {
             file_picker_cursor: 0,
             file_picker_return_mode: RevMode::Normal,
             collapsed_repos: HashSet::new(),
+            question_cursor: 0,
+            question_return_mode: RevMode::Normal,
+            model_return_mode: RevMode::Normal,
             status: "j/k stay in this file · h/l change files".into(),
             annotations,
             threads,
+            question_sessions,
             picker: None,
             agent: None,
             queued_questions: VecDeque::new(),
@@ -447,14 +467,14 @@ fn recover_pending_questions(
             paths,
             QuestionLaunch {
                 annotation_id: annotation.id.clone(),
-                pending: PendingSend {
+                pending: Some(PendingSend {
                     annotation_id: annotation.id.clone(),
                     user_message_id: message.id,
                     assistant_message_id: Uuid::new_v4().to_string(),
                     assistant_seq: message.seq + 1,
                     prompt,
                     needs_model_picker: existing.is_none(),
-                },
+                }),
                 existing,
             },
         );
@@ -522,6 +542,7 @@ fn run_loop<B: Backend>(
                         }
                         RevMode::Help => state.help_scroll = state.help_scroll.saturating_add(3),
                         RevMode::FilePicker => move_file_picker(state, 3),
+                        RevMode::Questions => move_question_cursor(state, 3),
                         RevMode::Command => {
                             let count = command_candidates(state).len();
                             state.command.selected =
@@ -539,6 +560,7 @@ fn run_loop<B: Backend>(
                         }
                         RevMode::Help => state.help_scroll = state.help_scroll.saturating_sub(3),
                         RevMode::FilePicker => move_file_picker(state, -3),
+                        RevMode::Questions => move_question_cursor(state, -3),
                         RevMode::Command => {
                             state.command.selected = state.command.selected.saturating_sub(1)
                         }
@@ -585,6 +607,10 @@ fn handle_key(
             handle_file_picker_key(state, key);
             Ok(())
         }
+        RevMode::Questions => {
+            handle_question_key(state, paths, highlighter, key);
+            Ok(())
+        }
         RevMode::Help => {
             handle_help_key(state, key);
             Ok(())
@@ -602,6 +628,7 @@ fn handle_key(
                     storage.clear_review_history(&state.workspace.item.id)?;
                     state.annotations.clear();
                     state.threads.clear();
+                    state.question_sessions.clear();
                     state.invalidate_rows();
                     state.mode = RevMode::Normal;
                     state.status = "Workspace review history cleared".into();
@@ -661,6 +688,16 @@ fn handle_review_key(
             }
         }
         KeyCode::Char('t') => open_file_picker(state),
+        KeyCode::Char('Q') => open_questions(state),
+        KeyCode::Char('m') => {
+            if let Some(id) = current_question_id_from_cache(state) {
+                start_model_switch(state, paths, &id);
+            } else {
+                state.status =
+                    "Move onto a question thread or press Q to choose one before switching models"
+                        .into();
+            }
+        }
         KeyCode::Char('a') => begin_compose(state, highlighter, ComposeTarget::NewQuestion),
         KeyCode::Char('c') => begin_compose(state, highlighter, ComposeTarget::Feedback),
         KeyCode::Char('i') | KeyCode::Enter => {
@@ -669,7 +706,7 @@ fn handle_review_key(
                     .annotation(&id)
                     .is_some_and(|(annotation, _)| annotation.kind == AnnotationKind::Ask)
                 {
-                    begin_compose(state, highlighter, ComposeTarget::FollowUp(id));
+                    begin_follow_up(state, highlighter, id);
                 }
             }
         }
@@ -858,6 +895,198 @@ fn activate_file_picker_row(state: &mut RevState) {
     }
 }
 
+fn question_ids(state: &RevState) -> Vec<String> {
+    state
+        .annotations
+        .iter()
+        .filter(|(annotation, _)| annotation.kind == AnnotationKind::Ask)
+        .map(|(annotation, _)| annotation.id.clone())
+        .collect()
+}
+
+fn selected_question_id(state: &RevState) -> Option<String> {
+    let ids = question_ids(state);
+    ids.get(state.question_cursor.min(ids.len().saturating_sub(1)))
+        .cloned()
+}
+
+fn current_question_id_from_cache(state: &RevState) -> Option<String> {
+    let annotation_id = match &state
+        .render_cache
+        .as_ref()?
+        .rows
+        .get(state.row_cursor)?
+        .kind
+    {
+        RevRowKind::Annotation { annotation_id, .. } => annotation_id,
+        RevRowKind::Source { .. } => return None,
+    };
+    state
+        .annotation(annotation_id)
+        .filter(|(annotation, _)| annotation.kind == AnnotationKind::Ask)
+        .map(|_| annotation_id.clone())
+}
+
+fn open_questions(state: &mut RevState) {
+    let ids = question_ids(state);
+    if ids.is_empty() {
+        if state.mode == RevMode::Command {
+            state.mode = RevMode::Normal;
+        }
+        state.status = "No question threads yet · select source lines and press a to ask".into();
+        return;
+    }
+    state.question_return_mode = if state.mode == RevMode::Visual {
+        RevMode::Visual
+    } else {
+        RevMode::Normal
+    };
+    if let Some(current) = current_question_id_from_cache(state) {
+        state.question_cursor = ids.iter().position(|id| id == &current).unwrap_or(0);
+    } else {
+        state.question_cursor = state.question_cursor.min(ids.len().saturating_sub(1));
+    }
+    state.mode = RevMode::Questions;
+    state.status = "j/k choose · Enter jump · i continue · m switch model · Q/Esc close".into();
+}
+
+fn close_questions(state: &mut RevState) {
+    state.mode = if state.question_return_mode == RevMode::Visual && state.visual_anchor.is_some() {
+        RevMode::Visual
+    } else {
+        RevMode::Normal
+    };
+    state.status = if state.mode == RevMode::Visual {
+        "Selection retained · j/k extends · v/Esc clears".into()
+    } else {
+        "Back to review".into()
+    };
+}
+
+fn move_question_cursor(state: &mut RevState, delta: isize) {
+    let count = question_ids(state).len();
+    if delta >= 0 {
+        state.question_cursor =
+            (state.question_cursor + delta as usize).min(count.saturating_sub(1));
+    } else {
+        state.question_cursor = state.question_cursor.saturating_sub(delta.unsigned_abs());
+    }
+}
+
+fn handle_question_key(
+    state: &mut RevState,
+    paths: &AppPaths,
+    highlighter: &mut dyn Highlighter,
+    key: KeyEvent,
+) {
+    match key.code {
+        KeyCode::Char('Q') | KeyCode::Esc | KeyCode::Char('q') => close_questions(state),
+        KeyCode::Char('j') | KeyCode::Down => move_question_cursor(state, 1),
+        KeyCode::Char('k') | KeyCode::Up => move_question_cursor(state, -1),
+        KeyCode::Char('g') | KeyCode::Home => state.question_cursor = 0,
+        KeyCode::Char('G') | KeyCode::End => {
+            state.question_cursor = question_ids(state).len().saturating_sub(1)
+        }
+        KeyCode::Enter => {
+            if let Some(id) = selected_question_id(state) {
+                focus_question(state, highlighter, &id);
+            }
+        }
+        KeyCode::Char('i') | KeyCode::Char('a') => {
+            if let Some(id) = selected_question_id(state) {
+                if focus_question(state, highlighter, &id) {
+                    begin_follow_up(state, highlighter, id);
+                }
+            }
+        }
+        KeyCode::Char('m') => {
+            if let Some(id) = selected_question_id(state) {
+                start_model_switch(state, paths, &id);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn focus_question(
+    state: &mut RevState,
+    highlighter: &mut dyn Highlighter,
+    annotation_id: &str,
+) -> bool {
+    let Some((annotation, _)) = state.annotation(annotation_id).cloned() else {
+        state.status = "Question no longer exists".into();
+        return false;
+    };
+    let file_index = state.files.iter().position(|(repo_index, file_index)| {
+        let repo = &state.workspace.repos[*repo_index];
+        repo.record.id == annotation.repo_id
+            && repo.diff.files[*file_index].path() == annotation.file_path
+    });
+    let Some(file_index) = file_index else {
+        state.status = "This historical question's file is no longer in the current diff".into();
+        return false;
+    };
+    state.file_index = file_index;
+    state.row_cursor = 0;
+    state.visual_anchor = None;
+    state.mode = RevMode::Normal;
+    state.render_cache = None;
+    let width = cached_row_width(state);
+    let rows = ensure_rows(state, width, highlighter);
+    state.row_cursor = rows
+        .iter()
+        .position(|row| {
+            matches!(
+                &row.kind,
+                RevRowKind::Annotation {
+                    annotation_id: candidate,
+                    ..
+                } if candidate == annotation_id
+            )
+        })
+        .unwrap_or(0);
+    state.status = "Question focused · i/Enter continues this thread · m switches model".into();
+    true
+}
+
+fn begin_follow_up(state: &mut RevState, highlighter: &mut dyn Highlighter, annotation_id: String) {
+    if !state.question_sessions.contains_key(&annotation_id) {
+        state.status =
+            "This question session is still starting · wait for it to become ready before following up"
+                .into();
+        return;
+    }
+    begin_compose(state, highlighter, ComposeTarget::FollowUp(annotation_id));
+    state.status = "FOLLOW-UP · Enter sends · Shift-Enter newline · Esc cancels".into();
+}
+
+fn start_model_switch(state: &mut RevState, paths: &AppPaths, annotation_id: &str) {
+    if state.agent.is_some() || !state.queued_questions.is_empty() {
+        state.status =
+            "Finish or cancel active and queued questions before switching a thread's model".into();
+        return;
+    }
+    let Some(session) = state.question_sessions.get(annotation_id).cloned() else {
+        state.status =
+            "This question has no ready Copilot session yet, so its model cannot be changed".into();
+        return;
+    };
+    state.model_return_mode = if state.mode == RevMode::Questions {
+        RevMode::Questions
+    } else {
+        RevMode::Normal
+    };
+    start_question_agent(
+        state,
+        paths,
+        QuestionLaunch {
+            annotation_id: annotation_id.to_owned(),
+            pending: None,
+            existing: Some(session),
+        },
+    );
+}
+
 fn begin_compose(state: &mut RevState, highlighter: &mut dyn Highlighter, target: ComposeTarget) {
     if matches!(target, ComposeTarget::Feedback | ComposeTarget::NewQuestion) {
         let Some((start, end)) = selected_source_range(state, highlighter) else {
@@ -970,6 +1199,8 @@ fn command_candidates(state: &RevState) -> Vec<String> {
         "export feedback".to_owned(),
         "help".to_owned(),
         "history".to_owned(),
+        "model".to_owned(),
+        "questions".to_owned(),
         "clear".to_owned(),
         "quit".to_owned(),
     ];
@@ -1006,6 +1237,16 @@ fn execute_command(
             state.mode = RevMode::Help;
             state.help_scroll = 0;
             state.status = "j/k or arrows scroll · Esc/q close".into();
+        }
+        "questions" | "threads" => open_questions(state),
+        "model" => {
+            if let Some(id) = current_question_id_from_cache(state) {
+                start_model_switch(state, paths, &id);
+            } else {
+                state.mode = RevMode::Normal;
+                state.status =
+                    "Move onto a question thread or use :questions before running :model".into();
+            }
         }
         "diff unified" | "unified" => {
             state.diff_layout = RevDiffLayout::Unified;
@@ -1496,14 +1737,14 @@ fn create_question(
         paths,
         QuestionLaunch {
             annotation_id: annotation_id.clone(),
-            pending: PendingSend {
+            pending: Some(PendingSend {
                 annotation_id,
                 user_message_id: user.id,
                 assistant_message_id: Uuid::new_v4().to_string(),
                 assistant_seq: 1,
                 prompt,
                 needs_model_picker: true,
-            },
+            }),
             existing: None,
         },
     );
@@ -1549,14 +1790,14 @@ fn create_follow_up(
         paths,
         QuestionLaunch {
             annotation_id: annotation_id.to_owned(),
-            pending: PendingSend {
+            pending: Some(PendingSend {
                 annotation_id: annotation_id.to_owned(),
                 user_message_id: user.id,
                 assistant_message_id: Uuid::new_v4().to_string(),
                 assistant_seq: seq + 1,
                 prompt: text.to_owned(),
                 needs_model_picker: false,
-            },
+            }),
             existing: Some(existing),
         },
     );
@@ -1599,6 +1840,11 @@ fn queue_question_launch(state: &mut RevState, paths: &AppPaths, launch: Questio
 
 fn start_question_agent(state: &mut RevState, paths: &AppPaths, launch: QuestionLaunch) {
     debug_assert!(state.agent.is_none());
+    let model_switch_only = launch.pending.is_none();
+    let needs_model_picker = launch
+        .pending
+        .as_ref()
+        .is_none_or(|pending| pending.needs_model_picker);
     let selection = launch
         .existing
         .as_ref()
@@ -1647,22 +1893,29 @@ fn start_question_agent(state: &mut RevState, paths: &AppPaths, launch: Question
     state.agent = Some(RevAgentSlot {
         question_id: launch.annotation_id,
         runtime,
-        pending: Some(launch.pending.clone()),
+        pending: launch.pending,
         outbound_id: None,
         session_id: launch
             .existing
             .as_ref()
             .map(|session| session.session_id.clone()),
         selection,
-        needs_model_picker: launch.pending.needs_model_picker,
+        needs_model_picker,
+        model_switch_only,
     });
-    state.agent_activity = if launch.existing.is_some() {
+    state.agent_activity = if model_switch_only {
+        "Resuming this question to load model choices…".into()
+    } else if launch.existing.is_some() {
         "Resuming this question's Copilot session…".into()
     } else {
         "Creating a new Copilot session for this question…".into()
     };
     state.agent_last_event = Instant::now();
-    state.status = "Question session starting in the background · input remains responsive".into();
+    state.status = if model_switch_only {
+        "Opening this question's model picker · UI remains responsive".into()
+    } else {
+        "Question session starting in the background · input remains responsive".into()
+    };
 }
 
 fn drain_agent_events(state: &mut RevState, storage: &Storage, paths: &AppPaths) -> Result<()> {
@@ -1705,7 +1958,7 @@ fn handle_agent_event(
             agent.session_id = Some(session_id.clone());
             let timestamp = now();
             let existing = storage.rev_question_session(&agent.question_id)?;
-            storage.upsert_rev_question_session(&RevQuestionSession {
+            let saved = RevQuestionSession {
                 annotation_id: agent.question_id.clone(),
                 session_id,
                 model_id: agent.selection.model_id.clone(),
@@ -1717,7 +1970,11 @@ fn handle_agent_event(
                     .map(|session| session.created_at.clone())
                     .unwrap_or_else(|| timestamp.clone()),
                 updated_at: timestamp,
-            })?;
+            };
+            storage.upsert_rev_question_session(&saved)?;
+            state
+                .question_sessions
+                .insert(saved.annotation_id.clone(), saved);
             if agent.needs_model_picker {
                 agent.runtime.send(AgentCommand::ListModels)?;
                 state.agent_activity = "Loading models for this question…".into();
@@ -1739,41 +1996,78 @@ fn handle_agent_event(
             if models.is_empty() {
                 anyhow::bail!("Copilot returned no selectable models");
             }
-            state.picker = Some(ModelPicker::new(models));
+            let initial_selection = state
+                .agent
+                .as_ref()
+                .map(|agent| agent.selection.clone())
+                .context("models listed without an active question")?;
+            if !state
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.model_switch_only)
+            {
+                state.model_return_mode = RevMode::Normal;
+            }
+            state.picker = Some(ModelPicker::new(models, initial_selection));
             state.mode = RevMode::Model;
             state.status = "MODEL 1/3 · choose a model for this question".into();
         }
         AgentEvent::ModelSelectionChanged(selection) => {
-            let agent = state
-                .agent
-                .as_mut()
-                .context("model changed without an active question")?;
-            agent.selection = selection.clone();
-            agent.needs_model_picker = false;
-            let session_id = agent
-                .session_id
-                .clone()
-                .context("model changed before session creation")?;
+            let (question_id, session_id, pending, model_switch_only) = {
+                let agent = state
+                    .agent
+                    .as_mut()
+                    .context("model changed without an active question")?;
+                agent.selection = selection.clone();
+                agent.needs_model_picker = false;
+                (
+                    agent.question_id.clone(),
+                    agent
+                        .session_id
+                        .clone()
+                        .context("model changed before session creation")?,
+                    agent.pending.take(),
+                    agent.model_switch_only,
+                )
+            };
             let timestamp = now();
-            let existing = storage.rev_question_session(&agent.question_id)?;
-            storage.upsert_rev_question_session(&RevQuestionSession {
-                annotation_id: agent.question_id.clone(),
+            let existing = storage.rev_question_session(&question_id)?;
+            let saved = RevQuestionSession {
+                annotation_id: question_id,
                 session_id,
-                model_id: selection.model_id,
-                reasoning_effort: selection.reasoning_effort,
-                context_tier: selection.context_tier,
+                model_id: selection.model_id.clone(),
+                reasoning_effort: selection.reasoning_effort.clone(),
+                context_tier: selection.context_tier.clone(),
                 state: "ready".into(),
                 created_at: existing
                     .as_ref()
                     .map(|session| session.created_at.clone())
                     .unwrap_or_else(|| timestamp.clone()),
                 updated_at: timestamp,
-            })?;
-            if let Some(pending) = agent.pending.take() {
+            };
+            storage.upsert_rev_question_session(&saved)?;
+            state
+                .question_sessions
+                .insert(saved.annotation_id.clone(), saved);
+            if let Some(pending) = pending {
+                let agent = state
+                    .agent
+                    .as_mut()
+                    .context("selected model lost its question agent")?;
                 send_pending(agent, pending)?;
                 state.streaming = true;
                 state.mode = RevMode::Normal;
                 state.status = "Question sent in its own selected-model session".into();
+            } else if model_switch_only {
+                let return_mode = state.model_return_mode;
+                state.agent.take();
+                state.picker = None;
+                state.mode = return_mode;
+                state.agent_activity = format!("Question model changed to {}", selection.model_id);
+                state.status = format!(
+                    "Model changed to {} · future follow-ups use this selection",
+                    selection.model_id
+                );
             }
         }
         AgentEvent::ResponseStarted {
@@ -1926,9 +2220,20 @@ fn pending_metadata(
 }
 
 fn finish_active_question(state: &mut RevState, paths: &AppPaths) {
+    let return_mode = if state
+        .agent
+        .as_ref()
+        .is_some_and(|agent| agent.model_switch_only)
+    {
+        state.model_return_mode
+    } else if state.mode == RevMode::Model {
+        RevMode::Normal
+    } else {
+        state.mode
+    };
     state.agent.take();
     state.picker = None;
-    state.mode = RevMode::Normal;
+    state.mode = return_mode;
     if let Some(next) = state.queued_questions.pop_front() {
         start_question_agent(state, paths, next);
     }
@@ -1990,6 +2295,10 @@ fn handle_model_key(
     let picker = state.picker.as_mut().context("model mode has no picker")?;
     match key.code {
         KeyCode::Esc => {
+            let model_switch_only = state
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.model_switch_only);
             if let Some(message_id) = state
                 .agent
                 .as_ref()
@@ -1998,10 +2307,18 @@ fn handle_model_key(
             {
                 storage.discard_pending_ask(&message_id)?;
             }
-            state.mode = RevMode::Normal;
+            state.mode = if model_switch_only {
+                state.model_return_mode
+            } else {
+                RevMode::Normal
+            };
             state.agent.take();
             state.picker = None;
-            state.status = "Question kept as a draft; model selection cancelled".into();
+            state.status = if model_switch_only {
+                "Model change cancelled · the question keeps its previous model".into()
+            } else {
+                "Question kept as a draft; model selection cancelled".into()
+            };
             if let Some(next) = state.queued_questions.pop_front() {
                 start_question_agent(state, paths, next);
             }
@@ -2013,7 +2330,22 @@ fn handle_model_key(
         KeyCode::Enter => match picker.stage {
             PickerStage::Model => {
                 picker.model_index = picker.index;
-                picker.index = 0;
+                picker.index = if picker.model().id == picker.initial_selection.model_id {
+                    picker
+                        .initial_selection
+                        .reasoning_effort
+                        .as_ref()
+                        .and_then(|current| {
+                            picker
+                                .model()
+                                .supported_reasoning_efforts
+                                .iter()
+                                .position(|effort| effort == current)
+                        })
+                        .map_or(0, |index| index + 1)
+                } else {
+                    0
+                };
                 picker.stage = PickerStage::Reasoning;
                 state.status = "MODEL 2/3 · choose thinking level".into();
             }
@@ -2023,7 +2355,22 @@ fn handle_model_key(
                     .checked_sub(1)
                     .and_then(|index| picker.model().supported_reasoning_efforts.get(index))
                     .cloned();
-                picker.index = 0;
+                picker.index = if picker.model().id == picker.initial_selection.model_id {
+                    picker
+                        .initial_selection
+                        .context_tier
+                        .as_ref()
+                        .and_then(|current| {
+                            picker
+                                .model()
+                                .context_tiers
+                                .iter()
+                                .position(|tier| &tier.id == current)
+                        })
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
                 picker.stage = PickerStage::Context;
                 state.status = "MODEL 3/3 · choose context window".into();
             }
@@ -2077,6 +2424,7 @@ fn handle_history_key(state: &mut RevState, storage: &Storage, key: KeyEvent) ->
                 storage.delete_annotation(&annotation.id)?;
                 state.annotations.remove(state.history_cursor);
                 state.threads.remove(&annotation.id);
+                state.question_sessions.remove(&annotation.id);
                 state.history_delete_armed = None;
                 state.history_cursor = state
                     .history_cursor
@@ -2359,7 +2707,7 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
                         anchor_visible_index: visible_index,
                     },
                     line: Some(Line::styled(
-                        "╰─ i/Enter follow up",
+                        "╰─ i/Enter follow up · m switch model · Q threads",
                         Style::default().fg(Color::DarkGray),
                     )),
                 });
@@ -2412,6 +2760,17 @@ fn render(frame: &mut Frame, state: &mut RevState, highlighter: &mut dyn Highlig
         render_history(frame, state, vertical[1]);
     } else if state.mode == RevMode::Help {
         render_help(frame, state, vertical[1]);
+    } else if state.mode == RevMode::Questions {
+        if vertical[1].width >= 72 {
+            let horizontal = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(36), Constraint::Length(42)])
+                .split(vertical[1]);
+            render_review(frame, state, horizontal[0], highlighter);
+            render_questions(frame, state, horizontal[1]);
+        } else {
+            render_questions(frame, state, vertical[1]);
+        }
     } else {
         render_review(frame, state, vertical[1], highlighter);
     }
@@ -2609,7 +2968,7 @@ fn help_lines() -> Vec<Line<'static>> {
         key("G / End", "last rendered row"),
         key(
             "mouse wheel",
-            "scroll the active review, file tree, composer, palette, history, or help",
+            "scroll the active review, files, questions, composer, palette, history, or help",
         ),
         Line::raw(""),
         section("Diff and selection"),
@@ -2639,6 +2998,8 @@ fn help_lines() -> Vec<Line<'static>> {
         ),
         key("c", "save feedback on the selected lines"),
         key("i / Enter", "follow up on the question under the cursor"),
+        key("m", "switch the model for the question under the cursor"),
+        key("Q", "open or close the right-side question-thread panel"),
         key("r", "open persisted review history"),
         key("e", "copy the structured feedback prompt using OSC 52"),
         key("C", "clear all saved review history after confirmation"),
@@ -2671,12 +3032,22 @@ fn help_lines() -> Vec<Line<'static>> {
         key("Enter", "choose one picker stage and continue to the next"),
         key(
             "Esc",
-            "cancel model selection and retain the question as a draft",
+            "cancel; a draft stays saved or an existing thread keeps its model",
         ),
         key(
             "queue",
             "later questions wait FIFO while the active one runs",
         ),
+        Line::raw(""),
+        section("Question threads"),
+        key("j/k / ↑/↓", "move through saved question threads"),
+        key("Enter", "jump to the selected inline thread"),
+        key(
+            "i / a",
+            "continue the selected thread in the sticky composer",
+        ),
+        key("m", "choose a new model, thinking level, and context tier"),
+        key("Q / Esc / q", "close the question panel"),
         Line::raw(""),
         section("History"),
         key(
@@ -2704,6 +3075,11 @@ fn help_lines() -> Vec<Line<'static>> {
             "rebuild the review relative to an autocompleted ref",
         ),
         key(":history", "open persisted review history"),
+        key(":questions", "open the right-side question-thread panel"),
+        key(
+            ":model",
+            "switch the model for the question under the cursor",
+        ),
         key(":export feedback", "copy the structured feedback prompt"),
         key(":clear", "clear this workspace's saved review history"),
         key(":quit", "quit"),
@@ -2976,6 +3352,7 @@ fn render_footer(frame: &mut Frame, state: &RevState, area: Rect) {
         RevMode::Model => "MODEL",
         RevMode::History => "HISTORY",
         RevMode::FilePicker => "FILES",
+        RevMode::Questions => "QUESTIONS",
         RevMode::Help => "HELP",
         RevMode::ConfirmClear => "CONFIRM",
     };
@@ -2983,7 +3360,7 @@ fn render_footer(frame: &mut Frame, state: &RevState, area: Rect) {
         format!("{mode} · {}", state.status)
     } else {
         format!(
-            "{mode} · t files · v select · a ask · c feedback · : commands · q quit · {}",
+            "{mode} · t files · v select · Q threads · a ask · c feedback · : commands · q quit · {}",
             state.status,
         )
     };
@@ -3008,6 +3385,143 @@ fn render_footer(frame: &mut Frame, state: &RevState, area: Rect) {
         .block(Block::default().borders(Borders::TOP)),
         area,
     );
+}
+
+fn render_questions(frame: &mut Frame, state: &RevState, area: Rect) {
+    let ids = question_ids(state);
+    let selected = state.question_cursor.min(ids.len().saturating_sub(1));
+    let block = Block::default()
+        .title(" questions · j/k · ↵ · i ask · m model ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if ids.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No question threads yet.\n\nSelect source lines and press a to ask.")
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
+    let entry_height = 3usize;
+    let visible_entries = (inner.height as usize / entry_height).max(1);
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible_entries)
+        .min(ids.len().saturating_sub(visible_entries));
+    let mut lines = Vec::new();
+    for (index, id) in ids.iter().enumerate().skip(start).take(visible_entries) {
+        let Some((annotation, placement)) = state.annotation(id) else {
+            continue;
+        };
+        let selected_row = index == selected;
+        let question = state
+            .threads
+            .get(id)
+            .and_then(|thread| thread.iter().find(|message| message.role == "user"))
+            .map(|message| message.text.as_str())
+            .unwrap_or("Question");
+        let turns = state.threads.get(id).map_or(0, |thread| {
+            thread
+                .iter()
+                .filter(|message| message.role == "user")
+                .count()
+        });
+        let model = state
+            .question_sessions
+            .get(id)
+            .map(|session| session.model_id.as_str())
+            .unwrap_or("session starting");
+        let activity = if state
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.question_id == id.as_str())
+        {
+            if state.streaming {
+                "answering"
+            } else {
+                "starting"
+            }
+        } else if let Some(position) = state
+            .queued_questions
+            .iter()
+            .position(|launch| launch.annotation_id == id.as_str())
+        {
+            lines.push(Line::styled(
+                fit_text(
+                    &format!("{} {}", if selected_row { "❯" } else { " " }, question),
+                    inner.width as usize,
+                ),
+                question_style(selected_row),
+            ));
+            lines.push(Line::styled(
+                fit_text(
+                    &format!(
+                        "  {}:{} · {}",
+                        annotation.file_path.display(),
+                        placement.line_start,
+                        model
+                    ),
+                    inner.width as usize,
+                ),
+                question_style(selected_row),
+            ));
+            lines.push(Line::styled(
+                fit_text(
+                    &format!("  queued #{} · {turns} turn(s)", position + 1),
+                    inner.width as usize,
+                ),
+                question_style(selected_row),
+            ));
+            continue;
+        } else {
+            "ready"
+        };
+        let reasoning = state
+            .question_sessions
+            .get(id)
+            .and_then(|session| session.reasoning_effort.as_deref())
+            .map(|effort| format!(" · {effort}"))
+            .unwrap_or_default();
+        lines.push(Line::styled(
+            fit_text(
+                &format!("{} {}", if selected_row { "❯" } else { " " }, question),
+                inner.width as usize,
+            ),
+            question_style(selected_row),
+        ));
+        lines.push(Line::styled(
+            fit_text(
+                &format!(
+                    "  {}:{} · {model}{reasoning}",
+                    annotation.file_path.display(),
+                    placement.line_start
+                ),
+                inner.width as usize,
+            ),
+            question_style(selected_row),
+        ));
+        lines.push(Line::styled(
+            fit_text(
+                &format!("  {activity} · {turns} turn(s)"),
+                inner.width as usize,
+            ),
+            question_style(selected_row),
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn question_style(selected: bool) -> Style {
+    if selected {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Rgb(52, 35, 63))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
 }
 
 fn render_file_picker(frame: &mut Frame, state: &RevState, area: Rect) {
@@ -3185,7 +3699,16 @@ fn render_model_picker(frame: &mut Frame, state: &RevState, area: Rect) {
                         .max_context_tokens
                         .map(|tokens| format!(" · {tokens} ctx"))
                         .unwrap_or_default();
-                    format!("{}{}", model.name, context)
+                    format!(
+                        "{}{}{}",
+                        model.name,
+                        context,
+                        if model.id == picker.initial_selection.model_id {
+                            " · current"
+                        } else {
+                            ""
+                        }
+                    )
                 })
                 .collect::<Vec<_>>(),
         ),
@@ -3408,6 +3931,47 @@ pub(crate) fn render_snapshot(width: u16, height: u16, snapshot: &str) -> Result
             state.command.cursor = state.command.input.len();
         }
         "files" => open_file_picker(&mut state),
+        "questions" => {
+            seed_snapshot_questions(&mut state);
+            open_questions(&mut state);
+        }
+        "question-models" => {
+            state.mode = RevMode::Model;
+            state.status = "MODEL 1/3 · choose a model for this question".into();
+            state.picker = Some(ModelPicker::new(
+                vec![
+                    ModelOption {
+                        id: "gpt-5.2".into(),
+                        name: "GPT-5.2".into(),
+                        supported_reasoning_efforts: vec!["low".into(), "high".into()],
+                        default_reasoning_effort: Some("high".into()),
+                        max_context_tokens: Some(128_000),
+                        context_tiers: vec![],
+                    },
+                    ModelOption {
+                        id: "claude-sonnet-4.5".into(),
+                        name: "Claude Sonnet 4.5".into(),
+                        supported_reasoning_efforts: vec![],
+                        default_reasoning_effort: None,
+                        max_context_tokens: Some(200_000),
+                        context_tiers: vec![],
+                    },
+                    ModelOption {
+                        id: "gemini-3-pro".into(),
+                        name: "Gemini 3 Pro".into(),
+                        supported_reasoning_efforts: vec!["medium".into(), "high".into()],
+                        default_reasoning_effort: Some("medium".into()),
+                        max_context_tokens: Some(1_000_000),
+                        context_tiers: vec![],
+                    },
+                ],
+                ModelSelection {
+                    model_id: "gpt-5.2".into(),
+                    reasoning_effort: Some("high".into()),
+                    context_tier: None,
+                },
+            ));
+        }
         "visual" => {
             state.mode = RevMode::Visual;
             state.visual_anchor = Some(0);
@@ -3527,6 +4091,98 @@ fn snapshot_workspace(storage: &Storage) -> Result<ResolvedWorkItem> {
     })
 }
 
+fn seed_snapshot_questions(state: &mut RevState) {
+    let repo = &state.workspace.repos[0];
+    let created_at = now();
+    let questions = [
+        (
+            "question-architecture",
+            PathBuf::from("src/lib.rs"),
+            11,
+            "Why should every review question use an isolated session?",
+            "It keeps model choice, history, and follow-ups scoped to one thread.",
+            Some(("gpt-5.2", Some("high"))),
+        ),
+        (
+            "question-docs",
+            PathBuf::from("README.md"),
+            2,
+            "Should the file-tree shortcut be documented here?",
+            "Yes. Keep the discoverable shortcut next to bounded navigation.",
+            Some(("claude-sonnet-4.5", None)),
+        ),
+    ];
+    for (index, (id, file_path, line, question, answer, model)) in questions.into_iter().enumerate()
+    {
+        state.annotations.push((
+            Annotation {
+                id: id.into(),
+                repo_id: repo.record.id.clone(),
+                kind: AnnotationKind::Ask,
+                file_path,
+                anchor_snippet: question.into(),
+                anchor_hash: format!("snapshot-{index}"),
+                anchor_start_offset: 0,
+                anchor_line_count: 1,
+                text: None,
+                submitted: true,
+                delivery_state: DeliveryState::Sent,
+                created_at: created_at.clone(),
+            },
+            Placement {
+                annotation_id: id.into(),
+                version_id: repo.version.id.clone(),
+                side: AnchorSide::New,
+                line_start: line,
+                line_end: line,
+                outdated: false,
+                ambiguous: false,
+            },
+        ));
+        state.threads.insert(
+            id.into(),
+            vec![
+                AskMessage {
+                    id: format!("{id}-user"),
+                    annotation_id: id.into(),
+                    seq: 0,
+                    role: "user".into(),
+                    text: question.into(),
+                    sent: true,
+                    delivery_state: DeliveryState::Sent,
+                    ts: created_at.clone(),
+                },
+                AskMessage {
+                    id: format!("{id}-assistant"),
+                    annotation_id: id.into(),
+                    seq: 1,
+                    role: "assistant".into(),
+                    text: answer.into(),
+                    sent: true,
+                    delivery_state: DeliveryState::Sent,
+                    ts: created_at.clone(),
+                },
+            ],
+        );
+        if let Some((model_id, reasoning_effort)) = model {
+            state.question_sessions.insert(
+                id.into(),
+                RevQuestionSession {
+                    annotation_id: id.into(),
+                    session_id: format!("session-{index}"),
+                    model_id: model_id.into(),
+                    reasoning_effort: reasoning_effort.map(str::to_owned),
+                    context_tier: Some("standard".into()),
+                    state: "ready".into(),
+                    created_at: created_at.clone(),
+                    updated_at: created_at.clone(),
+                },
+            );
+        }
+    }
+    state.invalidate_rows();
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -3535,13 +4191,16 @@ mod tests {
     use ratatui::Terminal;
 
     use super::{
-        execute_command, handle_compose_key, handle_file_picker_key, handle_help_key,
-        handle_review_key, help_lines, merge_touching_hunks, queue_question_launch, render,
-        render_snapshot, row_count, snapshot_workspace, ComposeTarget, PendingSend, QuestionLaunch,
-        RevAgentSlot, RevMode, RevState,
+        execute_command, finish_active_question, handle_agent_event, handle_compose_key,
+        handle_file_picker_key, handle_help_key, handle_question_key, handle_review_key,
+        help_lines, merge_touching_hunks, queue_question_launch, render, render_snapshot,
+        row_count, seed_snapshot_questions, snapshot_workspace, ComposeTarget, ModelPicker,
+        PendingSend, QuestionLaunch, RevAgentSlot, RevMode, RevState,
     };
     use crate::config::AppPaths;
-    use crate::copilot::{AgentCommand, AgentEvent, AgentRuntime, AgentSink, ModelSelection};
+    use crate::copilot::{
+        AgentCommand, AgentEvent, AgentRuntime, AgentSink, ModelOption, ModelSelection,
+    };
     use crate::diff::{DiffLine, Hunk, LineKind};
     use crate::highlight::PlainHighlighter;
     use crate::storage::Storage;
@@ -3591,6 +4250,18 @@ mod tests {
         let visual = render_snapshot(100, 28, "visual").unwrap();
         assert!(visual.contains("VISUAL LINE · 3 selected"));
         assert!(visual.contains("VISUAL ·"));
+
+        let questions = render_snapshot(120, 30, "questions").unwrap();
+        assert!(questions.contains("questions · j/k · ↵ · i ask · m model"));
+        assert!(questions.contains("Why should every review"));
+        assert!(questions.contains("gpt-5.2 · high"));
+        assert!(questions.contains("claude-sonnet-4.5"));
+
+        let models = render_snapshot(100, 28, "question-models").unwrap();
+        assert!(models.contains("model 1/3"));
+        assert!(models.contains("GPT-5.2 · 128000 ctx · current"));
+        assert!(models.contains("Claude Sonnet 4.5 · 200000 ctx"));
+        assert!(models.contains("Gemini 3 Pro · 1000000 ctx"));
 
         let composer = render_snapshot(100, 28, "composer").unwrap();
         assert!(composer.contains("rows 13-30 of 30"));
@@ -3757,6 +4428,214 @@ mod tests {
     }
 
     #[test]
+    fn question_panel_navigates_to_a_thread_and_starts_a_follow_up() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        seed_snapshot_questions(&mut state);
+        let mut highlighter = PlainHighlighter;
+        let paths = AppPaths {
+            data: "/tmp/rev-questions/data".into(),
+            cache: "/tmp/rev-questions/cache".into(),
+            database: "/tmp/rev-questions/rev.db".into(),
+            roots: "/tmp/rev-questions/roots".into(),
+            prs: "/tmp/rev-questions/prs".into(),
+            exports: "/tmp/rev-questions/exports".into(),
+            skills: "/tmp/rev-questions/skills".into(),
+            plugins: "/tmp/rev-questions/plugins".into(),
+        };
+
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, RevMode::Questions);
+
+        handle_question_key(
+            &mut state,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE),
+        );
+        assert_eq!(state.mode, RevMode::Normal);
+        execute_command(&mut state, &storage, &paths, "questions").unwrap();
+        assert_eq!(state.mode, RevMode::Questions);
+
+        handle_question_key(
+            &mut state,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        handle_question_key(
+            &mut state,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(state.file_index, 1);
+        assert_eq!(state.mode, RevMode::Compose);
+        assert!(matches!(
+            state.compose_target,
+            Some(ComposeTarget::FollowUp(ref id)) if id == "question-docs"
+        ));
+        assert!(state.status.contains("FOLLOW-UP"));
+    }
+
+    #[test]
+    fn model_switch_updates_the_existing_question_session_without_sending_a_prompt() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        seed_snapshot_questions(&mut state);
+        let (annotation, placement) = state.annotations[0].clone();
+        storage.add_annotation(&annotation, &placement).unwrap();
+        let original = state
+            .question_sessions
+            .get("question-architecture")
+            .cloned()
+            .unwrap();
+        storage.upsert_rev_question_session(&original).unwrap();
+        state.mode = RevMode::Model;
+        state.model_return_mode = RevMode::Questions;
+        state.agent = Some(RevAgentSlot {
+            question_id: "question-architecture".into(),
+            runtime: Box::new(NoopAgent),
+            pending: None,
+            outbound_id: None,
+            session_id: Some(original.session_id.clone()),
+            selection: ModelSelection {
+                model_id: original.model_id,
+                reasoning_effort: original.reasoning_effort,
+                context_tier: original.context_tier,
+            },
+            needs_model_picker: false,
+            model_switch_only: true,
+        });
+        let paths = AppPaths {
+            data: "/tmp/rev-model-switch/data".into(),
+            cache: "/tmp/rev-model-switch/cache".into(),
+            database: "/tmp/rev-model-switch/rev.db".into(),
+            roots: "/tmp/rev-model-switch/roots".into(),
+            prs: "/tmp/rev-model-switch/prs".into(),
+            exports: "/tmp/rev-model-switch/exports".into(),
+            skills: "/tmp/rev-model-switch/skills".into(),
+            plugins: "/tmp/rev-model-switch/plugins".into(),
+        };
+
+        handle_agent_event(
+            &mut state,
+            &storage,
+            &paths,
+            AgentEvent::ModelSelectionChanged(ModelSelection {
+                model_id: "gpt-5.3-codex".into(),
+                reasoning_effort: Some("high".into()),
+                context_tier: Some("large".into()),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(state.mode, RevMode::Questions);
+        assert!(state.agent.is_none());
+        assert_eq!(
+            state
+                .question_sessions
+                .get("question-architecture")
+                .map(|session| session.model_id.as_str()),
+            Some("gpt-5.3-codex")
+        );
+        assert_eq!(
+            storage
+                .rev_question_session("question-architecture")
+                .unwrap()
+                .map(|session| session.model_id),
+            Some("gpt-5.3-codex".into())
+        );
+        assert!(state.status.contains("future follow-ups"));
+    }
+
+    #[test]
+    fn model_picker_starts_on_the_threads_current_runtime_model() {
+        let picker = ModelPicker::new(
+            vec![
+                ModelOption {
+                    id: "fast".into(),
+                    name: "Fast".into(),
+                    supported_reasoning_efforts: vec![],
+                    default_reasoning_effort: None,
+                    max_context_tokens: None,
+                    context_tiers: vec![],
+                },
+                ModelOption {
+                    id: "deep".into(),
+                    name: "Deep".into(),
+                    supported_reasoning_efforts: vec!["high".into()],
+                    default_reasoning_effort: Some("high".into()),
+                    max_context_tokens: Some(128_000),
+                    context_tiers: vec![],
+                },
+            ],
+            ModelSelection {
+                model_id: "deep".into(),
+                reasoning_effort: Some("high".into()),
+                context_tier: None,
+            },
+        );
+
+        assert_eq!(picker.index, 1);
+        assert_eq!(picker.model_index, 1);
+        assert_eq!(picker.model().id, "deep");
+    }
+
+    #[test]
+    fn completed_background_answer_does_not_close_an_unrelated_composer() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        state.mode = RevMode::Compose;
+        state.compose_target = Some(ComposeTarget::NewQuestion);
+        state.compose = "keep this draft".into();
+        state.agent = Some(RevAgentSlot {
+            question_id: "background".into(),
+            runtime: Box::new(NoopAgent),
+            pending: None,
+            outbound_id: None,
+            session_id: Some("session".into()),
+            selection: ModelSelection {
+                model_id: "test".into(),
+                reasoning_effort: None,
+                context_tier: None,
+            },
+            needs_model_picker: false,
+            model_switch_only: false,
+        });
+        let paths = AppPaths {
+            data: "/tmp/rev-background/data".into(),
+            cache: "/tmp/rev-background/cache".into(),
+            database: "/tmp/rev-background/rev.db".into(),
+            roots: "/tmp/rev-background/roots".into(),
+            prs: "/tmp/rev-background/prs".into(),
+            exports: "/tmp/rev-background/exports".into(),
+            skills: "/tmp/rev-background/skills".into(),
+            plugins: "/tmp/rev-background/plugins".into(),
+        };
+
+        finish_active_question(&mut state, &paths);
+
+        assert_eq!(state.mode, RevMode::Compose);
+        assert_eq!(state.compose, "keep this draft");
+        assert!(matches!(
+            state.compose_target,
+            Some(ComposeTarget::NewQuestion)
+        ));
+    }
+
+    #[test]
     fn revealed_context_has_a_distinct_muted_background() {
         let storage = Storage::in_memory().unwrap();
         let workspace = snapshot_workspace(&storage).unwrap();
@@ -3839,6 +4718,7 @@ mod tests {
                 context_tier: None,
             },
             needs_model_picker: true,
+            model_switch_only: false,
         });
         let paths = AppPaths {
             data: "/tmp/rev-queue/data".into(),
@@ -3855,14 +4735,14 @@ mod tests {
             &paths,
             QuestionLaunch {
                 annotation_id: "second".into(),
-                pending: PendingSend {
+                pending: Some(PendingSend {
                     annotation_id: "second".into(),
                     user_message_id: "user".into(),
                     assistant_message_id: "assistant".into(),
                     assistant_seq: 1,
                     prompt: "question".into(),
                     needs_model_picker: true,
-                },
+                }),
                 existing: None,
             },
         );

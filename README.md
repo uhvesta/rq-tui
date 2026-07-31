@@ -83,7 +83,10 @@ bazel run //:rev -- delete . --export --yes
 Inside `rev`, `j/k` stop at the first/last rendered row of the current file,
 including its inline questions and answers; only `h/l` changes files. `t`
 opens a grouped repository/file tree, and `v` enters a clearly labeled visual
-line-selection mode.
+line-selection mode. `Q` opens the right-side question-thread panel; `i`
+continues its selected thread and `m` changes that thread's model, reasoning
+level, and context tier. The same controls work on an inline question, and
+`:questions`/`:model` expose them through the command palette.
 `Shift+Up` reveals five unchanged lines above the active hunk and
 `Shift+Down` reveals five below. Revealed context has a muted gray background,
 and overlapping expansions merge into one continuous region.
@@ -92,7 +95,7 @@ Press `:` for a scrollable palette. `:help` opens a scrollable reference for
 every mode, shortcut, and command. The palette also includes `diff unified`, `diff split`,
 `expand above`, `expand below`, `base <ref>` with local branch/ref
 autocomplete for the current repository, `export feedback`, `history`,
-`clear`, and `quit`. `a` asks, `c` records feedback, `v` selects source rows,
+`questions`, `model`, `clear`, and `quit`. `a` asks, `c` records feedback, `v` selects source rows,
 `r` opens persisted diff-related history, and `Ctrl-C` cancels an active
 question. The sticky composer grows up to the terminal’s available height,
 then scrolls with arrows, page keys, or the mouse.
@@ -110,6 +113,8 @@ bazel run //:rev -- ui-snapshot --state split --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state expanded --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state files --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state visual --width 100 --height 28
+bazel run //:rev -- ui-snapshot --state questions --width 120 --height 30
+bazel run //:rev -- ui-snapshot --state question-models --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state command --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state composer --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state history --width 100 --height 28
