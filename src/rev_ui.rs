@@ -1108,9 +1108,26 @@ fn handle_compose_key(
 ) -> Result<()> {
     match key.code {
         KeyCode::Esc => {
-            state.mode = RevMode::Normal;
+            let retain_selection = state.compose.trim().is_empty()
+                && state.visual_anchor.is_some()
+                && matches!(
+                    state.compose_target,
+                    Some(ComposeTarget::Feedback | ComposeTarget::NewQuestion)
+                );
+            state.mode = if retain_selection {
+                RevMode::Visual
+            } else {
+                RevMode::Normal
+            };
             state.compose_target = None;
-            state.status = "Draft cancelled".into();
+            state.compose.clear();
+            state.compose_cursor = 0;
+            state.compose_scroll = 0;
+            state.status = if retain_selection {
+                "VISUAL · empty box closed · selection retained · Esc clears it".into()
+            } else {
+                "Draft cancelled".into()
+            };
             Ok(())
         }
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -2987,9 +3004,9 @@ mod tests {
     use ratatui::Terminal;
 
     use super::{
-        handle_review_key, merge_touching_hunks, queue_question_launch, render, render_snapshot,
-        row_count, snapshot_workspace, PendingSend, QuestionLaunch, RevAgentSlot, RevMode,
-        RevState,
+        handle_compose_key, handle_review_key, merge_touching_hunks, queue_question_launch, render,
+        render_snapshot, row_count, snapshot_workspace, ComposeTarget, PendingSend, QuestionLaunch,
+        RevAgentSlot, RevMode, RevState,
     };
     use crate::config::AppPaths;
     use crate::copilot::{AgentCommand, AgentEvent, AgentRuntime, AgentSink, ModelSelection};
@@ -3156,6 +3173,54 @@ mod tests {
         );
         assert_eq!(state.queued_questions.len(), 1);
         assert!(state.status.contains("1 waiting"));
+    }
+
+    #[test]
+    fn empty_ask_and_feedback_escape_close_then_preserve_selection_until_second_escape() {
+        for target in [ComposeTarget::NewQuestion, ComposeTarget::Feedback] {
+            let storage = Storage::in_memory().unwrap();
+            let workspace = snapshot_workspace(&storage).unwrap();
+            let mut state = RevState::load(workspace, &storage).unwrap();
+            let mut highlighter = PlainHighlighter;
+            let paths = AppPaths {
+                data: "/tmp/rev-escape/data".into(),
+                cache: "/tmp/rev-escape/cache".into(),
+                database: "/tmp/rev-escape/rev.db".into(),
+                roots: "/tmp/rev-escape/roots".into(),
+                prs: "/tmp/rev-escape/prs".into(),
+                exports: "/tmp/rev-escape/exports".into(),
+                skills: "/tmp/rev-escape/skills".into(),
+                plugins: "/tmp/rev-escape/plugins".into(),
+            };
+            state.visual_anchor = Some(0);
+            state.mode = RevMode::Compose;
+            state.compose_target = Some(target);
+
+            handle_compose_key(
+                &mut state,
+                &storage,
+                &paths,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            )
+            .unwrap();
+
+            assert_eq!(state.mode, RevMode::Visual);
+            assert_eq!(state.visual_anchor, Some(0));
+            assert!(state.compose_target.is_none());
+            assert!(state.status.contains("selection retained"));
+
+            handle_review_key(
+                &mut state,
+                &storage,
+                &paths,
+                &mut highlighter,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            )
+            .unwrap();
+
+            assert_eq!(state.mode, RevMode::Normal);
+            assert_eq!(state.visual_anchor, None);
+        }
     }
 
     #[test]
