@@ -214,6 +214,7 @@ pub(crate) fn run(
         database_path: paths.database.clone(),
         app_paths: paths.clone(),
         existing_session_id,
+        persistent_session_active: true,
         model,
         reasoning_effort: state.reasoning_effort.clone(),
         context_tier: state.context_tier.clone(),

@@ -86,7 +86,12 @@ opens a grouped repository/file tree, and `v` enters a clearly labeled visual
 line-selection mode. `Q` opens the right-side question-thread panel; `i`
 continues its selected thread and `m` changes that thread's model, reasoning
 level, and context tier. The same controls work on an inline question, and
-`:questions`/`:model` expose them through the command palette.
+`:questions`/`:model` expose them through the command palette. Pressing `a`
+on a source selection that already owns a question continues that exact
+thread; otherwise it creates a new isolated question. `c` follows the same
+contextual rule for feedback: an exact saved selection opens the existing
+comment for editing, while a new selection creates feedback. `C` is an
+explicit edit-feedback alias.
 `Shift+Up` reveals five unchanged lines above the active hunk and
 `Shift+Down` reveals five below. Revealed context has a muted gray background,
 and overlapping expansions merge into one continuous region.
@@ -95,7 +100,10 @@ Press `:` for a scrollable palette. `:help` opens a scrollable reference for
 every mode, shortcut, and command. The palette also includes `diff unified`, `diff split`,
 `expand above`, `expand below`, `base <ref>` with local branch/ref
 autocomplete for the current repository, `export feedback`, `history`,
-`questions`, `model`, `clear`, and `quit`. `a` asks, `c` records feedback, `v` selects source rows,
+`questions`, `model`, `clear`, and `quit`. In a question follow-up composer,
+`/clear` erases only that thread and detaches its old Copilot context; the next
+`a` starts it fresh with the staged model picker. `a` asks, `c` records or
+edits feedback, `v` selects source rows,
 `r` opens persisted diff-related history, and `Ctrl-C` cancels an active
 question. The sticky composer grows up to the terminal’s available height,
 then scrolls with arrows, page keys, or the mouse.
@@ -114,6 +122,8 @@ bazel run //:rev -- ui-snapshot --state expanded --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state files --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state visual --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state questions --width 120 --height 30
+bazel run //:rev -- ui-snapshot --state cleared-question --width 100 --height 28
+bazel run //:rev -- ui-snapshot --state edit-feedback --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state question-models --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state command --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state composer --width 100 --height 28

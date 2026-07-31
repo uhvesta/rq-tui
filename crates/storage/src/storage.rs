@@ -289,19 +289,59 @@ impl Storage {
         Ok(())
     }
 
-    pub fn upsert_rev_question_session(&self, session: &RevQuestionSession) -> Result<()> {
-        self.connection.execute(
+    pub fn upsert_rev_question_session(
+        &self,
+        session: &RevQuestionSession,
+        expected_message_id: Option<&str>,
+        expected_session_id: Option<&str>,
+    ) -> Result<()> {
+        let updated = self.connection.execute(
             "INSERT INTO rev_question_sessions(
                 annotation_id, session_id, model_id, reasoning_effort,
                 context_tier, state, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             )
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+             WHERE (
+                    ?9 IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1 FROM ask_messages
+                        WHERE id = ?9 AND annotation_id = ?1
+                    )
+                 )
+                OR (
+                    ?10 IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1 FROM rev_question_sessions
+                        WHERE annotation_id = ?1
+                          AND session_id = ?10
+                          AND state != 'cleared'
+                    )
+                )
              ON CONFLICT(annotation_id) DO UPDATE SET
                 session_id = excluded.session_id,
                 model_id = excluded.model_id,
                 reasoning_effort = excluded.reasoning_effort,
                 context_tier = excluded.context_tier,
+                created_at = CASE
+                    WHEN rev_question_sessions.state = 'cleared'
+                    THEN excluded.created_at
+                    ELSE rev_question_sessions.created_at
+                END,
                 state = excluded.state,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at
+             WHERE (
+                    ?9 IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1 FROM ask_messages
+                        WHERE id = ?9
+                          AND annotation_id = excluded.annotation_id
+                    )
+                 )
+                OR (
+                    ?10 IS NOT NULL
+                    AND rev_question_sessions.session_id = ?10
+                    AND rev_question_sessions.state != 'cleared'
+                )",
             params![
                 session.annotation_id,
                 session.session_id,
@@ -311,14 +351,54 @@ impl Storage {
                 session.state,
                 session.created_at,
                 session.updated_at,
+                expected_message_id,
+                expected_session_id,
             ],
         )?;
+        anyhow::ensure!(
+            updated == 1,
+            "Question session {} was cleared while it was starting",
+            session.annotation_id
+        );
         Ok(())
     }
 
     pub fn rev_question_session(&self, annotation_id: &str) -> Result<Option<RevQuestionSession>> {
         Ok(self
             .connection
+            .query_row(
+                "SELECT annotation_id, session_id, model_id, reasoning_effort,
+                        context_tier, state, created_at, updated_at
+                 FROM rev_question_sessions
+                 WHERE annotation_id = ?1 AND state != 'cleared'",
+                [annotation_id],
+                |row| {
+                    Ok(RevQuestionSession {
+                        annotation_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        model_id: row.get(2)?,
+                        reasoning_effort: row.get(3)?,
+                        context_tier: row.get(4)?,
+                        state: row.get(5)?,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Clear one `rev` question transcript and detach its Copilot session.
+    ///
+    /// The canonical `sessions` row is deliberately retained. It is the
+    /// durable ownership ledger used by permanent workspace deletion to clean
+    /// up every remote session, including sessions detached by `/clear`.
+    pub fn clear_rev_question_thread(
+        &self,
+        annotation_id: &str,
+    ) -> Result<Option<RevQuestionSession>> {
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let session = tx
             .query_row(
                 "SELECT annotation_id, session_id, model_id, reasoning_effort,
                         context_tier, state, created_at, updated_at
@@ -337,7 +417,35 @@ impl Storage {
                     })
                 },
             )
-            .optional()?)
+            .optional()?;
+        let updated = tx.execute(
+            "UPDATE annotations
+             SET delivery_state = 'draft'
+             WHERE id = ?1 AND kind = 'ask'",
+            [annotation_id],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "Question thread {annotation_id} no longer exists"
+        );
+        tx.execute(
+            "DELETE FROM ask_messages WHERE annotation_id = ?1",
+            [annotation_id],
+        )?;
+        if let Some(session) = &session {
+            tx.execute(
+                "UPDATE sessions SET active = 0 WHERE id = ?1",
+                [&session.session_id],
+            )?;
+            tx.execute(
+                "UPDATE rev_question_sessions
+                 SET state = 'cleared', updated_at = ?2
+                 WHERE annotation_id = ?1",
+                params![annotation_id, now()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(session)
     }
 
     pub fn work_item_by_root(&self, root: &Path) -> Result<Option<WorkItem>> {
@@ -713,19 +821,24 @@ impl Storage {
                 "the Work Item is being pruned; the late Copilot session was captured for cleanup"
             );
         }
-        tx.execute(
-            "UPDATE sessions SET active = 0 WHERE work_item_id = ?1",
-            [&session.work_item_id],
-        )?;
+        if session.active {
+            tx.execute(
+                "UPDATE sessions SET active = 0 WHERE work_item_id = ?1",
+                [&session.work_item_id],
+            )?;
+        }
         tx.execute(
             "INSERT INTO sessions(id, work_item_id, parent_id, active, ephemeral, created_at)
-             VALUES (?1, ?2, ?3, 1, ?4, ?5)
-             ON CONFLICT(id) DO UPDATE SET active = 1, parent_id = excluded.parent_id
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                active = excluded.active,
+                parent_id = excluded.parent_id
              WHERE sessions.ephemeral = 0",
             params![
                 session.id,
                 session.work_item_id,
                 session.parent_id,
+                session.active as i64,
                 0,
                 session.created_at
             ],
@@ -1879,10 +1992,11 @@ impl Storage {
     }
 
     pub fn update_annotation_text(&self, annotation_id: &str, text: &str) -> Result<()> {
-        self.connection.execute(
+        let updated = self.connection.execute(
             "UPDATE annotations SET text = ?2 WHERE id = ?1",
             params![annotation_id, text],
         )?;
+        anyhow::ensure!(updated == 1, "Annotation {annotation_id} no longer exists");
         Ok(())
     }
 
@@ -2126,18 +2240,96 @@ impl Storage {
         Ok(())
     }
 
+    /// Append a `rev` follow-up only if it still belongs to the session
+    /// generation the caller observed. A fresh post-`/clear` prompt must opt
+    /// in explicitly and can only claim an empty draft thread.
+    pub fn append_rev_question_message(
+        &self,
+        message: &AskMessage,
+        expected_session_id: Option<&str>,
+        start_fresh: bool,
+    ) -> Result<()> {
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let allowed = if let Some(expected_session_id) = expected_session_id {
+            tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM rev_question_sessions
+                    WHERE annotation_id = ?1
+                      AND session_id = ?2
+                      AND state != 'cleared'
+                )",
+                params![message.annotation_id, expected_session_id],
+                |row| row.get::<_, i64>(0),
+            )? != 0
+        } else if start_fresh {
+            tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM annotations a
+                    WHERE a.id = ?1
+                      AND a.kind = 'ask'
+                      AND a.delivery_state = 'draft'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM ask_messages m
+                          WHERE m.annotation_id = a.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM rev_question_sessions q
+                          WHERE q.annotation_id = a.id
+                            AND q.state != 'cleared'
+                      )
+                )",
+                [&message.annotation_id],
+                |row| row.get::<_, i64>(0),
+            )? != 0
+        } else {
+            false
+        };
+        anyhow::ensure!(
+            allowed,
+            "Question thread {} changed or was cleared before this follow-up was saved",
+            message.annotation_id
+        );
+        tx.execute(
+            "INSERT INTO ask_messages(
+                id, annotation_id, seq, role, text, sent, delivery_state, ts
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                message.id,
+                message.annotation_id,
+                message.seq,
+                message.role,
+                message.text,
+                message.sent as i64,
+                message.delivery_state.as_str(),
+                message.ts,
+            ],
+        )?;
+        if message.delivery_state == DeliveryState::Pending {
+            tx.execute(
+                "UPDATE annotations SET delivery_state = 'pending' WHERE id = ?1",
+                [&message.annotation_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn acknowledge_ask_with_response_start(
         &self,
         user_message_id: &str,
         response: &AskMessage,
     ) -> Result<()> {
         let tx = self.connection.unchecked_transaction()?;
-        tx.execute(
+        let updated = tx.execute(
             "UPDATE ask_messages
              SET sent = 1, delivery_state = 'sent'
-             WHERE id = ?1",
+             WHERE id = ?1 AND delivery_state = 'pending'",
             [user_message_id],
         )?;
+        anyhow::ensure!(
+            updated == 1,
+            "Ask message {user_message_id} was cleared or is no longer pending"
+        );
         tx.execute(
             "UPDATE annotations
              SET delivery_state = 'sent'
@@ -3440,11 +3632,166 @@ mod tests {
             updated_at: "later".into(),
         };
         storage
-            .upsert_rev_question_session(&question_session)
+            .upsert_rev_question_session(&question_session, Some("user"), None)
             .unwrap();
         assert_eq!(
             storage.rev_question_session("annotation").unwrap(),
+            Some(question_session.clone())
+        );
+        storage
+            .activate_session(&SessionRecord {
+                id: "normal-main-session".into(),
+                work_item_id: "work".into(),
+                parent_id: None,
+                active: true,
+                created_at: "before-question".into(),
+            })
+            .unwrap();
+        storage
+            .activate_session(&SessionRecord {
+                id: question_session.session_id.clone(),
+                work_item_id: "work".into(),
+                parent_id: None,
+                active: false,
+                created_at: "now".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            storage.active_session("work").unwrap().unwrap().id,
+            "normal-main-session"
+        );
+        assert_eq!(
+            storage.clear_rev_question_thread("annotation").unwrap(),
             Some(question_session)
+        );
+        assert!(storage
+            .ask_messages_for_annotation("annotation")
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .rev_question_session("annotation")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            storage
+                .annotation_by_id("annotation")
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            DeliveryState::Draft
+        );
+        let sessions = storage.sessions_for_work_item("work").unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions
+            .iter()
+            .any(|session| session.id == "normal-main-session" && session.active));
+        assert!(sessions
+            .iter()
+            .any(|session| session.id == "copilot-question-1" && !session.active));
+        assert!(storage
+            .upsert_rev_question_session(
+                &RevQuestionSession {
+                    annotation_id: "annotation".into(),
+                    session_id: "copilot-question-1".into(),
+                    model_id: "gpt-5".into(),
+                    reasoning_effort: None,
+                    context_tier: None,
+                    state: "ready".into(),
+                    created_at: "now".into(),
+                    updated_at: "late".into(),
+                },
+                Some("user"),
+                Some("copilot-question-1")
+            )
+            .is_err());
+        assert!(storage
+            .acknowledge_ask_with_response_start(
+                "user",
+                &AskMessage {
+                    id: "late-assistant".into(),
+                    annotation_id: "annotation".into(),
+                    seq: 1,
+                    role: "assistant".into(),
+                    text: "late response".into(),
+                    sent: true,
+                    delivery_state: DeliveryState::Sent,
+                    ts: "late".into(),
+                },
+            )
+            .is_err());
+        assert!(storage
+            .ask_messages_for_annotation("annotation")
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .append_rev_question_message(
+                &AskMessage {
+                    id: "stale-follow-up".into(),
+                    annotation_id: "annotation".into(),
+                    seq: 2,
+                    role: "user".into(),
+                    text: "stale".into(),
+                    sent: false,
+                    delivery_state: DeliveryState::Pending,
+                    ts: "late".into(),
+                },
+                Some("copilot-question-1"),
+                false,
+            )
+            .is_err());
+        let fresh_user = AskMessage {
+            id: "fresh-user".into(),
+            annotation_id: "annotation".into(),
+            seq: 0,
+            role: "user".into(),
+            text: "start fresh".into(),
+            sent: false,
+            delivery_state: DeliveryState::Pending,
+            ts: "fresh".into(),
+        };
+        storage
+            .append_rev_question_message(&fresh_user, None, true)
+            .unwrap();
+        let fresh_session = RevQuestionSession {
+            annotation_id: "annotation".into(),
+            session_id: "copilot-question-2".into(),
+            model_id: "gpt-5".into(),
+            reasoning_effort: None,
+            context_tier: None,
+            state: "ready".into(),
+            created_at: "fresh".into(),
+            updated_at: "fresh".into(),
+        };
+        storage
+            .upsert_rev_question_session(&fresh_session, Some("fresh-user"), None)
+            .unwrap();
+        assert_eq!(
+            storage.rev_question_session("annotation").unwrap(),
+            Some(fresh_session)
+        );
+        assert!(storage
+            .upsert_rev_question_session(
+                &RevQuestionSession {
+                    annotation_id: "annotation".into(),
+                    session_id: "copilot-question-1".into(),
+                    model_id: "gpt-5".into(),
+                    reasoning_effort: None,
+                    context_tier: None,
+                    state: "ready".into(),
+                    created_at: "now".into(),
+                    updated_at: "very-late".into(),
+                },
+                Some("user"),
+                None,
+            )
+            .is_err());
+        assert_eq!(
+            storage
+                .rev_question_session("annotation")
+                .unwrap()
+                .unwrap()
+                .session_id,
+            "copilot-question-2"
         );
         let operation = storage
             .begin_prune_operation("rev-question-prune", "work", false)

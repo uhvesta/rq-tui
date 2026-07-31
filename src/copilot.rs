@@ -67,6 +67,10 @@ pub(crate) struct BridgeConfig {
     pub(crate) database_path: PathBuf,
     pub(crate) app_paths: AppPaths,
     pub(crate) existing_session_id: Option<String>,
+    /// Whether a newly created persistent session becomes the Work Item's
+    /// globally resumable MAIN session. `rev` question threads keep their
+    /// ownership in `rev_question_sessions` instead.
+    pub(crate) persistent_session_active: bool,
     pub(crate) model: String,
     /// Optional runtime-approved thinking level selected after the model.
     pub(crate) reasoning_effort: Option<String>,
@@ -7072,7 +7076,7 @@ async fn create_tracked_session(
         id: session_id.clone(),
         work_item_id: config.work_item_id.clone(),
         parent_id: None,
-        active: true,
+        active: config.persistent_session_active,
         created_at: now(),
     })?;
     let session = client
@@ -8054,6 +8058,7 @@ mod tests {
             database_path: paths.database.clone(),
             app_paths: paths.clone(),
             existing_session_id: None,
+            persistent_session_active: true,
             model: "controlled-fast".into(),
             reasoning_effort: None,
             context_tier: None,
@@ -8159,6 +8164,7 @@ mod tests {
             database_path: PathBuf::from("review.db"),
             app_paths: test_app_paths(PathBuf::from("/tmp/rq-tui-resume-config")),
             existing_session_id: Some("previous".into()),
+            persistent_session_active: true,
             model: "controlled-fast".into(),
             reasoning_effort: Some("high".into()),
             context_tier: Some("long_context".into()),
@@ -9780,6 +9786,7 @@ mod tests {
             database_path: live_state.path().join("review.db"),
             app_paths: test_app_paths(live_state.path().to_path_buf()),
             existing_session_id: None,
+            persistent_session_active: true,
             model,
             reasoning_effort: None,
             context_tier: None,

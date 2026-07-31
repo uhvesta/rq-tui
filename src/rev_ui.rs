@@ -22,7 +22,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use uuid::Uuid;
 
-use crate::annotations::{create_local_annotation, AnnotationRequest};
+use crate::annotations::{anchor_from_diff, create_local_annotation, AnnotationRequest};
 use crate::chat_render::render_markdown_mapped;
 use crate::config::AppPaths;
 use crate::copilot::{
@@ -86,8 +86,15 @@ struct CommandPalette {
 #[derive(Clone, Debug)]
 enum ComposeTarget {
     Feedback,
+    EditFeedback(String),
     NewQuestion,
     FollowUp(String),
+}
+
+enum ContextualAnnotationMatch {
+    None,
+    Match(String),
+    Blocked(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -698,8 +705,24 @@ fn handle_review_key(
                         .into();
             }
         }
-        KeyCode::Char('a') => begin_compose(state, highlighter, ComposeTarget::NewQuestion),
-        KeyCode::Char('c') => begin_compose(state, highlighter, ComposeTarget::Feedback),
+        KeyCode::Char('a') => {
+            match contextual_annotation(state, highlighter, AnnotationKind::Ask) {
+                ContextualAnnotationMatch::Match(id) => begin_follow_up(state, highlighter, id),
+                ContextualAnnotationMatch::None => {
+                    begin_compose(state, highlighter, ComposeTarget::NewQuestion)
+                }
+                ContextualAnnotationMatch::Blocked(message) => state.status = message,
+            }
+        }
+        KeyCode::Char('c') => {
+            match contextual_annotation(state, highlighter, AnnotationKind::Comment) {
+                ContextualAnnotationMatch::Match(id) => begin_edit_feedback(state, highlighter, id),
+                ContextualAnnotationMatch::None => {
+                    begin_compose(state, highlighter, ComposeTarget::Feedback)
+                }
+                ContextualAnnotationMatch::Blocked(message) => state.status = message,
+            }
+        }
         KeyCode::Char('i') | KeyCode::Enter => {
             if let Some(id) = current_annotation_id(state, highlighter) {
                 if state
@@ -717,8 +740,14 @@ fn handle_review_key(
         }
         KeyCode::Char('e') => copy_feedback_prompt(state, storage)?,
         KeyCode::Char('C') => {
-            state.mode = RevMode::ConfirmClear;
-            state.status = "Clear every saved comment and question here? y/n".into();
+            match contextual_annotation(state, highlighter, AnnotationKind::Comment) {
+                ContextualAnnotationMatch::Match(id) => begin_edit_feedback(state, highlighter, id),
+                ContextualAnnotationMatch::None => {
+                    state.status =
+                        "Select exactly the original commented lines before editing feedback".into()
+                }
+                ContextualAnnotationMatch::Blocked(message) => state.status = message,
+            }
         }
         KeyCode::Char(':') => {
             state.mode = RevMode::Command;
@@ -1050,14 +1079,161 @@ fn focus_question(
 }
 
 fn begin_follow_up(state: &mut RevState, highlighter: &mut dyn Highlighter, annotation_id: String) {
-    if !state.question_sessions.contains_key(&annotation_id) {
+    let session_starting = state
+        .agent
+        .as_ref()
+        .is_some_and(|agent| agent.question_id == annotation_id)
+        || state
+            .queued_questions
+            .iter()
+            .any(|launch| launch.annotation_id == annotation_id);
+    if !state.question_sessions.contains_key(&annotation_id) && session_starting {
         state.status =
             "This question session is still starting · wait for it to become ready before following up"
                 .into();
         return;
     }
     begin_compose(state, highlighter, ComposeTarget::FollowUp(annotation_id));
-    state.status = "FOLLOW-UP · Enter sends · Shift-Enter newline · Esc cancels".into();
+    state.status =
+        "FOLLOW-UP · Enter sends · /clear resets this thread · Shift-Enter newline · Esc cancels"
+            .into();
+}
+
+fn contextual_annotation(
+    state: &mut RevState,
+    highlighter: &mut dyn Highlighter,
+    kind: AnnotationKind,
+) -> ContextualAnnotationMatch {
+    if state.mode != RevMode::Visual {
+        if let Some(annotation_id) = current_annotation_id(state, highlighter) {
+            let Some((annotation, _)) = state.annotation(&annotation_id) else {
+                return ContextualAnnotationMatch::None;
+            };
+            if annotation.kind == kind {
+                return ContextualAnnotationMatch::Match(annotation_id);
+            }
+            return ContextualAnnotationMatch::Blocked(format!(
+                "This row is {} · move onto source lines or the intended {}",
+                annotation.kind.as_str(),
+                if kind == AnnotationKind::Ask {
+                    "question"
+                } else {
+                    "feedback"
+                }
+            ));
+        }
+    }
+    let Some((start, end)) = selected_source_range(state, highlighter) else {
+        return ContextualAnnotationMatch::None;
+    };
+    let Some((repo_index, file_index)) = state.current_indices() else {
+        return ContextualAnnotationMatch::None;
+    };
+    let repo = &state.workspace.repos[repo_index];
+    let file = &repo.diff.files[file_index];
+    let Ok(anchor) = anchor_from_diff(file, start, end) else {
+        return ContextualAnnotationMatch::None;
+    };
+    let matches = state
+        .annotations
+        .iter()
+        .rev()
+        .filter(|(annotation, placement)| {
+            annotation.kind == kind
+                && annotation.repo_id == repo.record.id
+                && annotation.file_path == file.display_path
+                && !placement.outdated
+                && !placement.ambiguous
+                && placement.side == anchor.side
+                && placement.line_start == anchor.line_start as i64
+                && placement.line_end == anchor.line_end as i64
+        })
+        .map(|(annotation, _)| annotation.id.clone())
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => ContextualAnnotationMatch::None,
+        [annotation_id] => ContextualAnnotationMatch::Match(annotation_id.clone()),
+        _ => ContextualAnnotationMatch::Blocked(format!(
+            "Multiple saved {} items share this exact selection · move onto the intended inline item",
+            kind.as_str()
+        )),
+    }
+}
+
+fn begin_edit_feedback(
+    state: &mut RevState,
+    highlighter: &mut dyn Highlighter,
+    annotation_id: String,
+) {
+    let Some((annotation, placement)) = state.annotation(&annotation_id).cloned() else {
+        state.status = "That feedback no longer exists".into();
+        return;
+    };
+    if annotation.kind != AnnotationKind::Comment {
+        state.status = "Only saved feedback can be edited with c/C".into();
+        return;
+    }
+    if placement.outdated || placement.ambiguous {
+        state.status =
+            "This feedback anchor is outdated or ambiguous · reselect exact current lines to create new feedback"
+                .into();
+        return;
+    }
+    let Some((start, end)) = visible_selection_for_placement(state, &annotation, &placement) else {
+        state.status =
+            "The original commented range is not visible · reveal its context before editing"
+                .into();
+        return;
+    };
+    state.visual_anchor = Some(start);
+    state.mode = RevMode::Compose;
+    state.compose_target = Some(ComposeTarget::EditFeedback(annotation_id));
+    state.compose = annotation.text.unwrap_or_default();
+    state.compose_cursor = state.compose.len();
+    state.compose_scroll = u16::MAX;
+    let previous_cursor = state.row_cursor;
+    let width = cached_row_width(state);
+    let rows = ensure_rows(state, width, highlighter);
+    state.row_cursor = rows
+        .iter()
+        .position(|row| {
+            matches!(
+                row.kind,
+                RevRowKind::Source {
+                    visible_index,
+                    ..
+                } if visible_index == end
+            )
+        })
+        .unwrap_or(previous_cursor);
+    state.status =
+        "EDIT FEEDBACK · original selection restored · Enter saves · Esc keeps selection".into();
+}
+
+fn visible_selection_for_placement(
+    state: &RevState,
+    annotation: &Annotation,
+    placement: &Placement,
+) -> Option<(usize, usize)> {
+    let (repo_index, file_index) = state.current_indices()?;
+    let repo = &state.workspace.repos[repo_index];
+    let file = &repo.diff.files[file_index];
+    if annotation.repo_id != repo.record.id || annotation.file_path != file.display_path {
+        return None;
+    }
+    let count = usize::try_from(annotation.anchor_line_count).ok()?.max(1);
+    let line_count = file.visible_lines().count();
+    (0..line_count).find_map(|start| {
+        let end = start.checked_add(count - 1)?;
+        if end >= line_count {
+            return None;
+        }
+        let anchor = anchor_from_diff(file, start, end).ok()?;
+        (anchor.side == placement.side
+            && anchor.line_start as i64 == placement.line_start
+            && anchor.line_end as i64 == placement.line_end)
+            .then_some((start, end))
+    })
 }
 
 fn start_model_switch(state: &mut RevState, paths: &AppPaths, annotation_id: &str) {
@@ -1537,12 +1713,15 @@ fn handle_compose_key(
 ) -> Result<()> {
     match key.code {
         KeyCode::Esc => {
-            let retain_selection = state.compose.trim().is_empty()
-                && state.visual_anchor.is_some()
-                && matches!(
-                    state.compose_target,
-                    Some(ComposeTarget::Feedback | ComposeTarget::NewQuestion)
-                );
+            let editing_feedback =
+                matches!(state.compose_target, Some(ComposeTarget::EditFeedback(_)));
+            let retain_selection = state.visual_anchor.is_some()
+                && (editing_feedback
+                    || (state.compose.trim().is_empty()
+                        && matches!(
+                            state.compose_target,
+                            Some(ComposeTarget::Feedback | ComposeTarget::NewQuestion)
+                        )));
             state.mode = if retain_selection {
                 RevMode::Visual
             } else {
@@ -1552,7 +1731,9 @@ fn handle_compose_key(
             state.compose.clear();
             state.compose_cursor = 0;
             state.compose_scroll = 0;
-            state.status = if retain_selection {
+            state.status = if editing_feedback {
+                "Edit cancelled · original selection retained · Esc clears it".into()
+            } else if retain_selection {
                 "Empty box closed · selection retained · Esc clears it".into()
             } else {
                 "Draft cancelled".into()
@@ -1639,6 +1820,51 @@ fn submit_compose(state: &mut RevState, storage: &Storage, paths: &AppPaths) -> 
         state.status = "Enter some text before submitting".into();
         return Ok(());
     }
+    if text == "/clear" {
+        let annotation_id = match state.compose_target.as_ref() {
+            Some(ComposeTarget::FollowUp(annotation_id)) => annotation_id.clone(),
+            Some(ComposeTarget::NewQuestion) => {
+                state.status = "There is no existing question thread to clear here".into();
+                return Ok(());
+            }
+            _ => {
+                state.status = "/clear is available only inside a question thread".into();
+                return Ok(());
+            }
+        };
+        if state
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.question_id == annotation_id)
+            || state
+                .queued_questions
+                .iter()
+                .any(|launch| launch.annotation_id == annotation_id)
+        {
+            state.status =
+                "This thread is active or queued · Ctrl-C the active turn or let it finish first"
+                    .into();
+            return Ok(());
+        }
+        state.compose_target = None;
+        state.compose.clear();
+        state.compose_cursor = 0;
+        state.compose_scroll = 0;
+        state.mode = RevMode::Normal;
+        return clear_question_thread(state, storage, &annotation_id);
+    }
+    if let Some(ComposeTarget::EditFeedback(annotation_id)) = state.compose_target.clone() {
+        if let Err(error) = update_feedback(state, storage, &annotation_id, &text) {
+            state.mode = RevMode::Compose;
+            state.status = format!("Feedback save failed · draft and selection retained · {error}");
+            return Ok(());
+        }
+        state.compose_target = None;
+        state.compose.clear();
+        state.compose_cursor = 0;
+        state.compose_scroll = 0;
+        return Ok(());
+    }
     let target = state
         .compose_target
         .take()
@@ -1649,6 +1875,7 @@ fn submit_compose(state: &mut RevState, storage: &Storage, paths: &AppPaths) -> 
     state.mode = RevMode::Normal;
     match target {
         ComposeTarget::Feedback => create_feedback(state, storage, &text),
+        ComposeTarget::EditFeedback(_) => unreachable!("feedback edits return before dispatch"),
         ComposeTarget::NewQuestion => create_question(state, storage, paths, &text),
         ComposeTarget::FollowUp(annotation_id) => {
             create_follow_up(state, storage, paths, &annotation_id, &text)
@@ -1685,6 +1912,50 @@ fn create_feedback(state: &mut RevState, storage: &Storage, text: &str) -> Resul
     state.invalidate_rows();
     state.status =
         "Feedback saved · e copies a structured prompt · `rev feedback` prints it".into();
+    Ok(())
+}
+
+fn update_feedback(
+    state: &mut RevState,
+    storage: &Storage,
+    annotation_id: &str,
+    text: &str,
+) -> Result<()> {
+    let Some((annotation, _)) = state
+        .annotations
+        .iter_mut()
+        .find(|(annotation, _)| annotation.id == annotation_id)
+    else {
+        anyhow::bail!("Feedback {annotation_id} no longer exists");
+    };
+    anyhow::ensure!(
+        annotation.kind == AnnotationKind::Comment,
+        "Only saved feedback can be edited"
+    );
+    storage.update_annotation_text(annotation_id, text)?;
+    annotation.text = Some(text.to_owned());
+    state.mode = RevMode::Normal;
+    state.visual_anchor = None;
+    state.invalidate_rows();
+    state.status = "Feedback updated · e copies the refreshed structured prompt".into();
+    Ok(())
+}
+
+fn clear_question_thread(
+    state: &mut RevState,
+    storage: &Storage,
+    annotation_id: &str,
+) -> Result<()> {
+    storage.clear_rev_question_thread(annotation_id)?;
+    state.threads.insert(annotation_id.to_owned(), Vec::new());
+    state.question_sessions.remove(annotation_id);
+    state.invalidate_rows();
+    state.status =
+        "Question thread cleared · press a to ask again with a fresh model and context".into();
+    if state.agent.is_none() {
+        state.agent_activity =
+            "Cleared thread is detached from its previous Copilot session".into();
+    }
     Ok(())
 }
 
@@ -1759,9 +2030,7 @@ fn create_follow_up(
     annotation_id: &str,
     text: &str,
 ) -> Result<()> {
-    let existing = storage
-        .rev_question_session(annotation_id)?
-        .context("this question has no isolated Copilot session to resume")?;
+    let existing = storage.rev_question_session(annotation_id)?;
     let seq = state
         .threads
         .get(annotation_id)
@@ -1778,7 +2047,35 @@ fn create_follow_up(
         delivery_state: DeliveryState::Pending,
         ts: now(),
     };
-    storage.append_ask_message(&user)?;
+    let (prompt, needs_model_picker) = if existing.is_some() {
+        (text.to_owned(), false)
+    } else {
+        let (annotation, placement) = state
+            .annotation(annotation_id)
+            .cloned()
+            .context("this question thread no longer exists")?;
+        let repo = state
+            .workspace
+            .repos
+            .iter()
+            .find(|repo| repo.record.id == annotation.repo_id)
+            .context("question repository is no longer in this workspace")?;
+        let file = repo
+            .diff
+            .files
+            .iter()
+            .find(|file| file.path() == annotation.file_path)
+            .context("question file is no longer in the current diff")?;
+        (
+            question_prompt(&repo.record.name, file, &placement, &annotation, text),
+            true,
+        )
+    };
+    storage.append_rev_question_message(
+        &user,
+        existing.as_ref().map(|session| session.session_id.as_str()),
+        existing.is_none(),
+    )?;
     state
         .threads
         .entry(annotation_id.to_owned())
@@ -1795,10 +2092,10 @@ fn create_follow_up(
                 user_message_id: user.id,
                 assistant_message_id: Uuid::new_v4().to_string(),
                 assistant_seq: seq + 1,
-                prompt: text.to_owned(),
-                needs_model_picker: false,
+                prompt,
+                needs_model_picker,
             }),
-            existing: Some(existing),
+            existing,
         },
     );
     Ok(())
@@ -1884,6 +2181,7 @@ fn start_question_agent(state: &mut RevState, paths: &AppPaths, launch: Question
             .existing
             .as_ref()
             .map(|session| session.session_id.clone()),
+        persistent_session_active: false,
         model: selection.model_id.clone(),
         reasoning_effort: selection.reasoning_effort.clone(),
         context_tier: selection.context_tier.clone(),
@@ -1955,6 +2253,11 @@ fn handle_agent_event(
                 .agent
                 .as_mut()
                 .context("session ready without agent")?;
+            let expected_message_id = agent
+                .pending
+                .as_ref()
+                .map(|pending| pending.user_message_id.clone());
+            let expected_session_id = agent.session_id.clone();
             agent.session_id = Some(session_id.clone());
             let timestamp = now();
             let existing = storage.rev_question_session(&agent.question_id)?;
@@ -1971,7 +2274,11 @@ fn handle_agent_event(
                     .unwrap_or_else(|| timestamp.clone()),
                 updated_at: timestamp,
             };
-            storage.upsert_rev_question_session(&saved)?;
+            storage.upsert_rev_question_session(
+                &saved,
+                expected_message_id.as_deref(),
+                expected_session_id.as_deref(),
+            )?;
             state
                 .question_sessions
                 .insert(saved.annotation_id.clone(), saved);
@@ -2013,7 +2320,7 @@ fn handle_agent_event(
             state.status = "MODEL 1/3 · choose a model for this question".into();
         }
         AgentEvent::ModelSelectionChanged(selection) => {
-            let (question_id, session_id, pending, model_switch_only) = {
+            let (question_id, session_id, expected_message_id, pending, model_switch_only) = {
                 let agent = state
                     .agent
                     .as_mut()
@@ -2026,6 +2333,10 @@ fn handle_agent_event(
                         .session_id
                         .clone()
                         .context("model changed before session creation")?,
+                    agent
+                        .pending
+                        .as_ref()
+                        .map(|pending| pending.user_message_id.clone()),
                     agent.pending.take(),
                     agent.model_switch_only,
                 )
@@ -2045,7 +2356,11 @@ fn handle_agent_event(
                     .unwrap_or_else(|| timestamp.clone()),
                 updated_at: timestamp,
             };
-            storage.upsert_rev_question_session(&saved)?;
+            storage.upsert_rev_question_session(
+                &saved,
+                expected_message_id.as_deref(),
+                Some(&saved.session_id),
+            )?;
             state
                 .question_sessions
                 .insert(saved.annotation_id.clone(), saved);
@@ -2631,11 +2946,13 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
             },
             line: None,
         });
-        let source_line = line.new_line.or(line.old_line).unwrap_or(0) as i64;
-        for (annotation, placement) in annotations
-            .iter()
-            .filter(|(_, placement)| placement.line_end == source_line)
-        {
+        for (annotation, placement) in annotations.iter().filter(|(_, placement)| {
+            let source_line = match placement.side {
+                AnchorSide::Old => line.old_line,
+                AnchorSide::New => line.new_line,
+            };
+            source_line.is_some_and(|source_line| placement.line_end == source_line as i64)
+        }) {
             let title = match annotation.kind {
                 AnnotationKind::Comment => format!(
                     "Feedback · lines {}-{} · {}",
@@ -2707,7 +3024,13 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
                         anchor_visible_index: visible_index,
                     },
                     line: Some(Line::styled(
-                        "╰─ i/Enter follow up · m switch model · Q threads",
+                        if state.threads.get(&annotation.id).is_some_and(Vec::is_empty)
+                            && !state.question_sessions.contains_key(&annotation.id)
+                        {
+                            "╰─ cleared · a/i/Enter starts fresh · Q threads"
+                        } else {
+                            "╰─ a/i/Enter follow up · /clear resets · m model · Q threads"
+                        },
                         Style::default().fg(Color::DarkGray),
                     )),
                 });
@@ -2718,7 +3041,7 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
                         anchor_visible_index: visible_index,
                     },
                     line: Some(Line::styled(
-                        "╰─ saved · e copy structured prompt",
+                        "╰─ saved · c/C edit · e copy structured prompt",
                         Style::default().fg(Color::DarkGray),
                     )),
                 });
@@ -2824,7 +3147,9 @@ fn render_review(
     highlighter: &mut dyn Highlighter,
 ) {
     let visual_mode = state.mode == RevMode::Visual;
-    let border = if visual_mode {
+    let editing_feedback = matches!(state.compose_target, Some(ComposeTarget::EditFeedback(_)));
+    let selection_mode = visual_mode || editing_feedback;
+    let border = if selection_mode {
         Color::Magenta
     } else {
         Color::Cyan
@@ -2843,7 +3168,12 @@ fn render_review(
         .visual_anchor
         .zip(current_source_index_from_rows(&rows, state.row_cursor))
         .map(|(a, b)| (a.min(b), a.max(b)));
-    let title = if let Some((start, end)) = selection.filter(|_| visual_mode) {
+    let title = if let Some((start, end)) = selection.filter(|_| editing_feedback) {
+        format!(
+            " EDIT FEEDBACK · {} original line(s) selected · Enter saves · Esc cancels ",
+            end.saturating_sub(start) + 1
+        )
+    } else if let Some((start, end)) = selection.filter(|_| visual_mode) {
         format!(
             " VISUAL LINE · {} selected · j/k extend · a ask · c feedback · v/Esc clear ",
             end.saturating_sub(start) + 1
@@ -2897,7 +3227,7 @@ fn render_review(
             RevRowKind::Annotation { .. } => false,
         };
         if selected || visually_selected {
-            line = line.style(Style::default().bg(if visual_mode {
+            line = line.style(Style::default().bg(if selection_mode {
                 Color::Rgb(52, 35, 63)
             } else {
                 Color::Rgb(35, 45, 58)
@@ -2994,15 +3324,18 @@ fn help_lines() -> Vec<Line<'static>> {
         section("Review actions"),
         key(
             "a",
-            "ask about the selected lines in an isolated Copilot session",
+            "ask on new lines; continue a question on its exact saved selection",
         ),
-        key("c", "save feedback on the selected lines"),
+        key(
+            "c",
+            "save feedback on new lines; edit it on its exact saved selection",
+        ),
+        key("C", "explicitly edit feedback on its exact saved selection"),
         key("i / Enter", "follow up on the question under the cursor"),
         key("m", "switch the model for the question under the cursor"),
         key("Q", "open or close the right-side question-thread panel"),
         key("r", "open persisted review history"),
         key("e", "copy the structured feedback prompt using OSC 52"),
-        key("C", "clear all saved review history after confirmation"),
         key("y / n", "confirm or cancel clearing saved review history"),
         key(":", "open the command palette"),
         key("q", "quit when no questions are active or queued"),
@@ -3015,6 +3348,10 @@ fn help_lines() -> Vec<Line<'static>> {
         key("↑ / ↓", "scroll one row"),
         key("PgUp / PgDn", "scroll five rows"),
         key("Backspace / Del", "delete before or after the cursor"),
+        key(
+            "/clear",
+            "inside a follow-up, clear only that thread and reset its context",
+        ),
         key(
             "Esc",
             "cancel; an empty anchored box retains selection until Esc again",
@@ -3314,6 +3651,7 @@ fn render_composer(frame: &mut Frame, state: &mut RevState, area: Rect) {
     text.insert(cursor, '▏');
     let label = match state.compose_target {
         Some(ComposeTarget::Feedback) => " feedback ",
+        Some(ComposeTarget::EditFeedback(_)) => " edit feedback ",
         Some(ComposeTarget::NewQuestion) => " question ",
         Some(ComposeTarget::FollowUp(_)) => " follow-up ",
         None => " input ",
@@ -3391,7 +3729,7 @@ fn render_questions(frame: &mut Frame, state: &RevState, area: Rect) {
     let ids = question_ids(state);
     let selected = state.question_cursor.min(ids.len().saturating_sub(1));
     let block = Block::default()
-        .title(" questions · j/k · ↵ · i ask · m model ")
+        .title(" questions · j/k · ↵ · a/i ask · m model ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Magenta));
     let inner = block.inner(area);
@@ -3432,7 +3770,13 @@ fn render_questions(frame: &mut Frame, state: &RevState, area: Rect) {
             .question_sessions
             .get(id)
             .map(|session| session.model_id.as_str())
-            .unwrap_or("session starting");
+            .unwrap_or_else(|| {
+                if state.threads.get(id).is_some_and(Vec::is_empty) {
+                    "cleared · fresh on next ask"
+                } else {
+                    "session starting"
+                }
+            });
         let activity = if state
             .agent
             .as_ref()
@@ -3935,6 +4279,35 @@ pub(crate) fn render_snapshot(width: u16, height: u16, snapshot: &str) -> Result
             seed_snapshot_questions(&mut state);
             open_questions(&mut state);
         }
+        "cleared-question" => {
+            seed_snapshot_questions(&mut state);
+            state
+                .threads
+                .insert("question-architecture".into(), Vec::new());
+            state.question_sessions.remove("question-architecture");
+            state.row_cursor = 2;
+            state.status =
+                "Question thread cleared · press a to ask again with a fresh model and context"
+                    .into();
+            state.agent_activity =
+                "Cleared thread is detached from its previous Copilot session".into();
+            state.invalidate_rows();
+        }
+        "edit-feedback" => {
+            seed_snapshot_feedback(&mut state);
+            state.visual_anchor = Some(0);
+            state.row_cursor = 1;
+            state.mode = RevMode::Compose;
+            state.compose_target =
+                Some(ComposeTarget::EditFeedback("feedback-architecture".into()));
+            state.compose =
+                "Keep isolated question sessions so follow-ups cannot leak context.".into();
+            state.compose_cursor = state.compose.len();
+            state.compose_scroll = u16::MAX;
+            state.status =
+                "EDIT FEEDBACK · original selection restored · Enter saves · Esc keeps selection"
+                    .into();
+        }
         "question-models" => {
             state.mode = RevMode::Model;
             state.status = "MODEL 1/3 · choose a model for this question".into();
@@ -4183,6 +4556,36 @@ fn seed_snapshot_questions(state: &mut RevState) {
     state.invalidate_rows();
 }
 
+fn seed_snapshot_feedback(state: &mut RevState) {
+    let repo = &state.workspace.repos[0];
+    state.annotations.push((
+        Annotation {
+            id: "feedback-architecture".into(),
+            repo_id: repo.record.id.clone(),
+            kind: AnnotationKind::Comment,
+            file_path: PathBuf::from("src/lib.rs"),
+            anchor_snippet: "fn review() {\n    let isolated_questions = true;".into(),
+            anchor_hash: "snapshot-feedback".into(),
+            anchor_start_offset: 0,
+            anchor_line_count: 2,
+            text: Some("Keep isolated question sessions so follow-ups cannot leak context.".into()),
+            submitted: false,
+            delivery_state: DeliveryState::Draft,
+            created_at: now(),
+        },
+        Placement {
+            annotation_id: "feedback-architecture".into(),
+            version_id: repo.version.id.clone(),
+            side: AnchorSide::New,
+            line_start: 10,
+            line_end: 11,
+            outdated: false,
+            ambiguous: false,
+        },
+    ));
+    state.invalidate_rows();
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -4201,9 +4604,9 @@ mod tests {
     use crate::copilot::{
         AgentCommand, AgentEvent, AgentRuntime, AgentSink, ModelOption, ModelSelection,
     };
-    use crate::diff::{DiffLine, Hunk, LineKind};
+    use crate::diff::{parse_unified, DiffLine, Hunk, LineKind};
     use crate::highlight::PlainHighlighter;
-    use crate::storage::Storage;
+    use crate::storage::{RevQuestionSession, Storage};
 
     struct NoopAgent;
 
@@ -4216,6 +4619,20 @@ mod tests {
     impl AgentRuntime for NoopAgent {
         fn try_recv(&self) -> Option<AgentEvent> {
             None
+        }
+    }
+
+    fn test_paths(name: &str) -> AppPaths {
+        let root = std::path::PathBuf::from("/tmp").join(name);
+        AppPaths {
+            data: root.join("data"),
+            cache: root.join("cache"),
+            database: root.join("rev.db"),
+            roots: root.join("roots"),
+            prs: root.join("prs"),
+            exports: root.join("exports"),
+            skills: root.join("skills"),
+            plugins: root.join("plugins"),
         }
     }
 
@@ -4252,10 +4669,20 @@ mod tests {
         assert!(visual.contains("VISUAL ·"));
 
         let questions = render_snapshot(120, 30, "questions").unwrap();
-        assert!(questions.contains("questions · j/k · ↵ · i ask · m model"));
+        assert!(questions.contains("questions · j/k · ↵ · a/i ask · m model"));
         assert!(questions.contains("Why should every review"));
         assert!(questions.contains("gpt-5.2 · high"));
         assert!(questions.contains("claude-sonnet-4.5"));
+
+        let cleared = render_snapshot(100, 28, "cleared-question").unwrap();
+        assert!(cleared.contains("cleared · a/i/Enter starts fresh"));
+        assert!(cleared.contains("Question thread"));
+        assert!(cleared.contains("detached from its previous Copilot session"));
+
+        let editing = render_snapshot(100, 28, "edit-feedback").unwrap();
+        assert!(editing.contains("edit feedback"));
+        assert!(editing.contains("Keep isolated question sessions"));
+        assert!(editing.contains("EDIT FEEDBACK"));
 
         let models = render_snapshot(100, 28, "question-models").unwrap();
         assert!(models.contains("model 1/3"));
@@ -4488,6 +4915,563 @@ mod tests {
     }
 
     #[test]
+    fn a_resumes_the_question_on_the_exact_source_anchor_and_asks_elsewhere() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        seed_snapshot_questions(&mut state);
+        let mut highlighter = PlainHighlighter;
+        let paths = test_paths("rev-contextual-a");
+
+        row_count(&mut state, &mut highlighter);
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.kind,
+                    super::RevRowKind::Source {
+                        visible_index: 1,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(matches!(
+            state.compose_target,
+            Some(ComposeTarget::FollowUp(ref id)) if id == "question-architecture"
+        ));
+
+        state.mode = RevMode::Normal;
+        state.compose_target = None;
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.kind,
+                    super::RevRowKind::Source {
+                        visible_index: 0,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(matches!(
+            state.compose_target,
+            Some(ComposeTarget::NewQuestion)
+        ));
+    }
+
+    #[test]
+    fn contextual_actions_refuse_duplicate_anchors_and_wrong_inline_kinds() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        seed_snapshot_questions(&mut state);
+        let (mut duplicate, mut duplicate_placement) =
+            state.annotation("question-architecture").unwrap().clone();
+        duplicate.id = "question-architecture-duplicate".into();
+        duplicate_placement.annotation_id = duplicate.id.clone();
+        state
+            .annotations
+            .push((duplicate.clone(), duplicate_placement.clone()));
+        state.threads.insert(duplicate.id.clone(), Vec::new());
+        state.question_sessions.insert(
+            duplicate.id.clone(),
+            RevQuestionSession {
+                annotation_id: duplicate.id.clone(),
+                session_id: "duplicate-session".into(),
+                model_id: "gpt-5".into(),
+                reasoning_effort: None,
+                context_tier: None,
+                state: "ready".into(),
+                created_at: crate::storage::now(),
+                updated_at: crate::storage::now(),
+            },
+        );
+        let comment = crate::domain::Annotation {
+            id: "comment-on-question-anchor".into(),
+            kind: crate::domain::AnnotationKind::Comment,
+            text: Some("Same anchor, different kind".into()),
+            ..duplicate
+        };
+        let comment_placement = crate::domain::Placement {
+            annotation_id: comment.id.clone(),
+            ..duplicate_placement
+        };
+        state.annotations.push((comment, comment_placement));
+        state.invalidate_rows();
+        let mut highlighter = PlainHighlighter;
+        let paths = test_paths("rev-ambiguous-anchor");
+        row_count(&mut state, &mut highlighter);
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.kind,
+                    super::RevRowKind::Source {
+                        visible_index: 1,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, RevMode::Normal);
+        assert!(state.compose_target.is_none());
+        assert!(state.status.contains("Multiple saved ask items"));
+
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    &row.kind,
+                    super::RevRowKind::Annotation { annotation_id, .. }
+                        if annotation_id == "comment-on-question-anchor"
+                )
+            })
+            .unwrap();
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, RevMode::Normal);
+        assert!(state.compose_target.is_none());
+        assert!(state.status.contains("This row is comment"));
+    }
+
+    #[test]
+    fn old_side_multiline_annotation_ending_on_context_is_rendered() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        state.workspace.repos[0].diff = parse_unified(concat!(
+            "diff --git a/src/lib.rs b/src/lib.rs\n",
+            "--- a/src/lib.rs\n",
+            "+++ b/src/lib.rs\n",
+            "@@ -10,3 +10,2 @@\n",
+            " context ten\n",
+            "-removed eleven\n",
+            " context twelve\n",
+        ))
+        .unwrap();
+        let repo = &state.workspace.repos[0];
+        state.annotations.push((
+            crate::domain::Annotation {
+                id: "old-side-feedback".into(),
+                repo_id: repo.record.id.clone(),
+                kind: crate::domain::AnnotationKind::Comment,
+                file_path: "src/lib.rs".into(),
+                anchor_snippet: "removed eleven\ncontext twelve".into(),
+                anchor_hash: "old-side".into(),
+                anchor_start_offset: 0,
+                anchor_line_count: 2,
+                text: Some("Review the removed flow".into()),
+                submitted: false,
+                delivery_state: crate::domain::DeliveryState::Draft,
+                created_at: crate::storage::now(),
+            },
+            crate::domain::Placement {
+                annotation_id: "old-side-feedback".into(),
+                version_id: repo.version.id.clone(),
+                side: crate::domain::AnchorSide::Old,
+                line_start: 11,
+                line_end: 12,
+                outdated: false,
+                ambiguous: false,
+            },
+        ));
+        state.invalidate_rows();
+        let mut highlighter = PlainHighlighter;
+        row_count(&mut state, &mut highlighter);
+
+        assert!(state.render_cache.as_ref().unwrap().rows.iter().any(|row| {
+            matches!(
+                &row.kind,
+                super::RevRowKind::Annotation { annotation_id, .. }
+                    if annotation_id == "old-side-feedback"
+            )
+        }));
+    }
+
+    #[test]
+    fn c_edits_only_feedback_with_the_exact_original_multiline_selection() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        let repo = &state.workspace.repos[0];
+        let annotation = crate::domain::Annotation {
+            id: "feedback-lines-10-11".into(),
+            repo_id: repo.record.id.clone(),
+            kind: crate::domain::AnnotationKind::Comment,
+            file_path: "src/lib.rs".into(),
+            anchor_snippet: "fn review() {\n    let isolated_questions = true;".into(),
+            anchor_hash: "comment-anchor".into(),
+            anchor_start_offset: 0,
+            anchor_line_count: 2,
+            text: Some("Original feedback".into()),
+            submitted: false,
+            delivery_state: crate::domain::DeliveryState::Draft,
+            created_at: crate::storage::now(),
+        };
+        let placement = crate::domain::Placement {
+            annotation_id: annotation.id.clone(),
+            version_id: repo.version.id.clone(),
+            side: crate::domain::AnchorSide::New,
+            line_start: 10,
+            line_end: 11,
+            outdated: false,
+            ambiguous: false,
+        };
+        storage.add_annotation(&annotation, &placement).unwrap();
+        state.annotations.push((annotation, placement));
+        state.invalidate_rows();
+        let mut highlighter = PlainHighlighter;
+        let paths = test_paths("rev-contextual-c");
+        row_count(&mut state, &mut highlighter);
+        state.visual_anchor = Some(0);
+        state.mode = RevMode::Visual;
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.kind,
+                    super::RevRowKind::Source {
+                        visible_index: 1,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(matches!(
+            state.compose_target,
+            Some(ComposeTarget::EditFeedback(ref id)) if id == "feedback-lines-10-11"
+        ));
+        assert_eq!(state.compose, "Original feedback");
+
+        state.compose = "Updated feedback".into();
+        state.compose_cursor = state.compose.len();
+        handle_compose_key(
+            &mut state,
+            &storage,
+            &paths,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            storage
+                .annotation_by_id("feedback-lines-10-11")
+                .unwrap()
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("Updated feedback")
+        );
+
+        row_count(&mut state, &mut highlighter);
+        state.visual_anchor = Some(0);
+        state.mode = RevMode::Visual;
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.kind,
+                    super::RevRowKind::Source {
+                        visible_index: 1,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        storage.delete_annotation("feedback-lines-10-11").unwrap();
+        state.compose = "Draft that must survive a failed save".into();
+        state.compose_cursor = state.compose.len();
+        handle_compose_key(
+            &mut state,
+            &storage,
+            &paths,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, RevMode::Compose);
+        assert!(matches!(
+            state.compose_target,
+            Some(ComposeTarget::EditFeedback(ref id)) if id == "feedback-lines-10-11"
+        ));
+        assert_eq!(state.compose, "Draft that must survive a failed save");
+        assert_eq!(state.visual_anchor, Some(0));
+        assert!(state.status.contains("draft and selection retained"));
+
+        state.compose.clear();
+        state.compose_target = None;
+        row_count(&mut state, &mut highlighter);
+        state.visual_anchor = Some(2);
+        state.mode = RevMode::Visual;
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    &row.kind,
+                    super::RevRowKind::Annotation { annotation_id, .. }
+                        if annotation_id == "feedback-lines-10-11"
+                )
+            })
+            .unwrap();
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(matches!(
+            state.compose_target,
+            Some(ComposeTarget::Feedback)
+        ));
+        assert!(state.compose.is_empty());
+
+        state.compose_target = None;
+        state.compose.clear();
+        state.mode = RevMode::Normal;
+        state.visual_anchor = None;
+        state
+            .annotations
+            .iter_mut()
+            .find(|(annotation, _)| annotation.id == "feedback-lines-10-11")
+            .unwrap()
+            .1
+            .outdated = true;
+        state.invalidate_rows();
+        row_count(&mut state, &mut highlighter);
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    &row.kind,
+                    super::RevRowKind::Annotation { annotation_id, .. }
+                        if annotation_id == "feedback-lines-10-11"
+                )
+            })
+            .unwrap();
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, RevMode::Normal);
+        assert!(state.compose_target.is_none());
+        assert!(state.status.contains("outdated or ambiguous"));
+    }
+
+    #[test]
+    fn slash_clear_resets_only_one_question_and_next_a_starts_fresh_context() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        seed_snapshot_questions(&mut state);
+        let (annotation, placement) = state.annotation("question-architecture").unwrap().clone();
+        storage.add_annotation(&annotation, &placement).unwrap();
+        for message in state.threads["question-architecture"].clone() {
+            storage.append_ask_message(&message).unwrap();
+        }
+        let session = state.question_sessions["question-architecture"].clone();
+        storage
+            .upsert_rev_question_session(
+                &session,
+                state.threads["question-architecture"]
+                    .first()
+                    .map(|message| message.id.as_str()),
+                None,
+            )
+            .unwrap();
+        storage
+            .activate_session(&crate::domain::SessionRecord {
+                id: session.session_id,
+                work_item_id: state.workspace.item.id.clone(),
+                parent_id: None,
+                active: true,
+                created_at: crate::storage::now(),
+            })
+            .unwrap();
+        state.agent = Some(RevAgentSlot {
+            question_id: "different-background-question".into(),
+            runtime: Box::new(NoopAgent),
+            pending: None,
+            outbound_id: None,
+            session_id: Some("different-session".into()),
+            selection: ModelSelection {
+                model_id: "test".into(),
+                reasoning_effort: None,
+                context_tier: None,
+            },
+            needs_model_picker: false,
+            model_switch_only: false,
+        });
+        state.agent_activity = "Answering the unrelated question".into();
+        state.mode = RevMode::Compose;
+        state.compose_target = Some(ComposeTarget::FollowUp("question-architecture".into()));
+        state.compose = "/clear".into();
+        state.compose_cursor = state.compose.len();
+        let paths = test_paths("rev-thread-clear");
+
+        handle_compose_key(
+            &mut state,
+            &storage,
+            &paths,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.threads["question-architecture"].is_empty());
+        assert!(!state
+            .question_sessions
+            .contains_key("question-architecture"));
+        assert!(storage
+            .ask_messages_for_annotation("question-architecture")
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .rev_question_session("question-architecture")
+            .unwrap()
+            .is_none());
+        assert!(storage
+            .active_session(&state.workspace.item.id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            state.agent_activity, "Answering the unrelated question",
+            "clearing an idle thread must not hide another thread's progress"
+        );
+
+        let mut highlighter = PlainHighlighter;
+        row_count(&mut state, &mut highlighter);
+        state.row_cursor = state
+            .render_cache
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.kind,
+                    super::RevRowKind::Source {
+                        visible_index: 1,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        handle_review_key(
+            &mut state,
+            &storage,
+            &paths,
+            &mut highlighter,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(matches!(
+            state.compose_target,
+            Some(ComposeTarget::FollowUp(ref id)) if id == "question-architecture"
+        ));
+        state.compose = "Start over from this anchor".into();
+        state.compose_cursor = state.compose.len();
+        handle_compose_key(
+            &mut state,
+            &storage,
+            &paths,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let launch = state.queued_questions.back().unwrap();
+        assert!(launch.existing.is_none());
+        assert!(launch.pending.as_ref().unwrap().needs_model_picker);
+        assert!(launch
+            .pending
+            .as_ref()
+            .unwrap()
+            .prompt
+            .contains("Selected code:"));
+    }
+
+    #[test]
     fn model_switch_updates_the_existing_question_session_without_sending_a_prompt() {
         let storage = Storage::in_memory().unwrap();
         let workspace = snapshot_workspace(&storage).unwrap();
@@ -4500,7 +5484,18 @@ mod tests {
             .get("question-architecture")
             .cloned()
             .unwrap();
-        storage.upsert_rev_question_session(&original).unwrap();
+        for message in state.threads["question-architecture"].clone() {
+            storage.append_ask_message(&message).unwrap();
+        }
+        storage
+            .upsert_rev_question_session(
+                &original,
+                state.threads["question-architecture"]
+                    .first()
+                    .map(|message| message.id.as_str()),
+                None,
+            )
+            .unwrap();
         state.mode = RevMode::Model;
         state.model_return_mode = RevMode::Questions;
         state.agent = Some(RevAgentSlot {
