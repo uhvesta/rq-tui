@@ -54,6 +54,7 @@ enum RevMode {
     Command,
     Model,
     History,
+    Help,
     ConfirmClear,
 }
 
@@ -209,6 +210,7 @@ struct RevState {
     compose: String,
     compose_cursor: usize,
     compose_scroll: u16,
+    help_scroll: u16,
     status: String,
     annotations: Vec<(Annotation, Placement)>,
     threads: HashMap<String, Vec<AskMessage>>,
@@ -275,6 +277,7 @@ impl RevState {
             compose: String::new(),
             compose_cursor: 0,
             compose_scroll: 0,
+            help_scroll: 0,
             status: "j/k stay in this file · h/l change files".into(),
             annotations,
             threads,
@@ -501,6 +504,7 @@ fn run_loop<B: Backend>(
                             state.history_cursor = (state.history_cursor + 3)
                                 .min(state.annotations.len().saturating_sub(1))
                         }
+                        RevMode::Help => state.help_scroll = state.help_scroll.saturating_add(3),
                         RevMode::Command => {
                             let count = command_candidates(state).len();
                             state.command.selected =
@@ -516,6 +520,7 @@ fn run_loop<B: Backend>(
                         RevMode::History => {
                             state.history_cursor = state.history_cursor.saturating_sub(3)
                         }
+                        RevMode::Help => state.help_scroll = state.help_scroll.saturating_sub(3),
                         RevMode::Command => {
                             state.command.selected = state.command.selected.saturating_sub(1)
                         }
@@ -558,6 +563,10 @@ fn handle_key(
         RevMode::Command => handle_command_key(state, storage, paths, key),
         RevMode::Model => handle_model_key(state, storage, paths, key),
         RevMode::History => handle_history_key(state, storage, key),
+        RevMode::Help => {
+            handle_help_key(state, key);
+            Ok(())
+        }
         RevMode::ConfirmClear => {
             match key.code {
                 KeyCode::Char('y') => {
@@ -786,6 +795,7 @@ fn command_candidates(state: &RevState) -> Vec<String> {
         "expand above".to_owned(),
         "expand below".to_owned(),
         "export feedback".to_owned(),
+        "help".to_owned(),
         "history".to_owned(),
         "clear".to_owned(),
         "quit".to_owned(),
@@ -819,6 +829,11 @@ fn execute_command(
 ) -> Result<()> {
     let command = command.trim();
     match command {
+        "help" | "?" => {
+            state.mode = RevMode::Help;
+            state.help_scroll = 0;
+            state.status = "j/k or arrows scroll · Esc/q close".into();
+        }
         "diff unified" | "unified" => {
             state.diff_layout = RevDiffLayout::Unified;
             state.invalidate_rows();
@@ -1902,6 +1917,29 @@ fn handle_history_key(state: &mut RevState, storage: &Storage, key: KeyEvent) ->
     Ok(())
 }
 
+fn handle_help_key(state: &mut RevState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            state.mode = RevMode::Normal;
+            state.status = "Back to review".into();
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            state.help_scroll = state.help_scroll.saturating_add(1)
+        }
+        KeyCode::Char('k') | KeyCode::Up => state.help_scroll = state.help_scroll.saturating_sub(1),
+        KeyCode::PageDown => state.help_scroll = state.help_scroll.saturating_add(10),
+        KeyCode::PageUp => state.help_scroll = state.help_scroll.saturating_sub(10),
+        KeyCode::Char('g') | KeyCode::Home => state.help_scroll = 0,
+        KeyCode::Char('G') | KeyCode::End => state.help_scroll = u16::MAX,
+        KeyCode::Char(':') => {
+            state.mode = RevMode::Command;
+            state.command = CommandPalette::default();
+            state.status = "COMMAND · type to filter · ↑/↓ select · Enter run · Esc return".into();
+        }
+        _ => {}
+    }
+}
+
 fn copy_feedback_prompt(state: &mut RevState, storage: &Storage) -> Result<()> {
     let export = CommentExport::load(storage, &state.workspace.item)?;
     if export.comments.is_empty() {
@@ -2190,6 +2228,8 @@ fn render(frame: &mut Frame, state: &mut RevState, highlighter: &mut dyn Highlig
     render_header(frame, state, vertical[0]);
     if state.mode == RevMode::History {
         render_history(frame, state, vertical[1]);
+    } else if state.mode == RevMode::Help {
+        render_help(frame, state, vertical[1]);
     } else {
         render_review(frame, state, vertical[1], highlighter);
     }
@@ -2314,6 +2354,170 @@ fn render_review(
         visible.push(line);
     }
     frame.render_widget(Paragraph::new(Text::from(visible)), inner);
+}
+
+fn render_help(frame: &mut Frame, state: &mut RevState, area: Rect) {
+    let block = Block::default()
+        .title(" help · j/k/↑/↓ scroll · PgUp/PgDn · g/G · Esc/q close ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = help_lines();
+    let width = inner.width.max(1) as usize;
+    let total_rows = lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum::<usize>();
+    let visible_rows = inner.height.max(1) as usize;
+    let max_scroll = total_rows.saturating_sub(visible_rows) as u16;
+    state.help_scroll = state.help_scroll.min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((state.help_scroll, 0)),
+        inner,
+    );
+}
+
+fn help_lines() -> Vec<Line<'static>> {
+    let section = |title: &'static str| {
+        Line::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let key = |binding: &'static str, description: &'static str| {
+        Line::from(vec![
+            Span::styled(
+                format!("  {binding:<18}"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(description),
+        ])
+    };
+    vec![
+        section("Review navigation"),
+        key("j / ↓", "next rendered row; stops at the end of this file"),
+        key(
+            "k / ↑",
+            "previous rendered row; stops at the start of this file",
+        ),
+        key("h / ←", "previous file"),
+        key("l / →", "next file"),
+        key("g / Home", "first rendered row"),
+        key("G / End", "last rendered row"),
+        key(
+            "mouse wheel",
+            "scroll the active review, composer, palette, history, or help",
+        ),
+        Line::raw(""),
+        section("Diff and selection"),
+        key("v", "start or clear a source-line selection"),
+        key("Esc", "clear the current selection"),
+        key(
+            "Shift+↑",
+            "reveal five unchanged lines above the active hunk",
+        ),
+        key(
+            "Shift+↓",
+            "reveal five unchanged lines below the active hunk",
+        ),
+        Line::raw(""),
+        section("Review actions"),
+        key(
+            "a",
+            "ask about the selected lines in an isolated Copilot session",
+        ),
+        key("c", "save feedback on the selected lines"),
+        key("i / Enter", "follow up on the question under the cursor"),
+        key("r", "open persisted review history"),
+        key("e", "copy the structured feedback prompt using OSC 52"),
+        key("C", "clear all saved review history after confirmation"),
+        key("y / n", "confirm or cancel clearing saved review history"),
+        key(":", "open the command palette"),
+        key("q", "quit when no questions are active or queued"),
+        Line::raw(""),
+        section("Question and feedback composer"),
+        key("Enter", "submit"),
+        key("Shift+Enter", "insert a newline"),
+        key("← / →", "move by terminal grapheme"),
+        key("Home / End", "move to the start or end"),
+        key("↑ / ↓", "scroll one row"),
+        key("PgUp / PgDn", "scroll five rows"),
+        key("Backspace / Del", "delete before or after the cursor"),
+        key(
+            "Esc",
+            "cancel; an empty anchored box retains selection until Esc again",
+        ),
+        Line::raw(""),
+        section("Copilot and model selection"),
+        key(
+            "Ctrl-C",
+            "request cancellation of the active question from any mode",
+        ),
+        key(
+            "j/k / ↑/↓",
+            "move through model, thinking, and context options",
+        ),
+        key("Enter", "choose one picker stage and continue to the next"),
+        key(
+            "Esc",
+            "cancel model selection and retain the question as a draft",
+        ),
+        key(
+            "queue",
+            "later questions wait FIFO while the active one runs",
+        ),
+        Line::raw(""),
+        section("History"),
+        key(
+            "j/k / ↑/↓",
+            "move through saved comments and question threads",
+        ),
+        key("d, then d", "permanently delete the selected review item"),
+        key("r / Esc", "return to the review"),
+        Line::raw(""),
+        section("Command palette"),
+        key("type", "filter commands and branch completions"),
+        key("↑ / ↓", "move through the scrollable results"),
+        key("Tab", "complete the selected result"),
+        key("Enter", "run the selected or typed command"),
+        key("Esc", "close the palette"),
+        Line::raw(""),
+        section("Commands"),
+        key(":help", "open this shortcut and command reference"),
+        key(":diff unified", "render one full-width diff stream"),
+        key(":diff split", "render old and new sides in two columns"),
+        key(":expand above", "reveal five lines above the active hunk"),
+        key(":expand below", "reveal five lines below the active hunk"),
+        key(
+            ":base <ref>",
+            "rebuild the review relative to an autocompleted ref",
+        ),
+        key(":history", "open persisted review history"),
+        key(":export feedback", "copy the structured feedback prompt"),
+        key(":clear", "clear this workspace's saved review history"),
+        key(":quit", "quit"),
+        Line::raw(""),
+        section("Non-interactive CLI"),
+        key("rev history PATH", "print saved diff-related history"),
+        key("rev feedback PATH", "print the structured feedback prompt"),
+        key(
+            "rev export PATH",
+            "write or print the structured feedback prompt",
+        ),
+        key("rev clear PATH", "remove local comments and Q&A"),
+        key(
+            "rev delete PATH",
+            "permanently remove the workspace and review data",
+        ),
+    ]
 }
 
 fn is_expanded_context(state: &RevState, line: &DiffLine) -> bool {
@@ -2568,6 +2772,7 @@ fn render_footer(frame: &mut Frame, state: &RevState, area: Rect) {
         RevMode::Command => "COMMAND",
         RevMode::Model => "MODEL",
         RevMode::History => "HISTORY",
+        RevMode::Help => "HELP",
         RevMode::ConfirmClear => "CONFIRM",
     };
     let first = if area.width < 80 {
@@ -2912,6 +3117,16 @@ pub(crate) fn render_snapshot(width: u16, height: u16, snapshot: &str) -> Result
             state.compose_scroll = u16::MAX;
         }
         "history" => state.mode = RevMode::History,
+        "help" => {
+            state.mode = RevMode::Help;
+            state.help_scroll = 0;
+            state.status = "j/k or arrows scroll · Esc/q close".into();
+        }
+        "help-bottom" => {
+            state.mode = RevMode::Help;
+            state.help_scroll = u16::MAX;
+            state.status = "j/k or arrows scroll · Esc/q close".into();
+        }
         "streaming" => {
             state.streaming = true;
             state.agent_activity =
@@ -3004,9 +3219,10 @@ mod tests {
     use ratatui::Terminal;
 
     use super::{
-        handle_compose_key, handle_review_key, merge_touching_hunks, queue_question_launch, render,
-        render_snapshot, row_count, snapshot_workspace, ComposeTarget, PendingSend, QuestionLaunch,
-        RevAgentSlot, RevMode, RevState,
+        execute_command, handle_compose_key, handle_help_key, handle_review_key, help_lines,
+        merge_touching_hunks, queue_question_launch, render, render_snapshot, row_count,
+        snapshot_workspace, ComposeTarget, PendingSend, QuestionLaunch, RevAgentSlot, RevMode,
+        RevState,
     };
     use crate::config::AppPaths;
     use crate::copilot::{AgentCommand, AgentEvent, AgentRuntime, AgentSink, ModelSelection};
@@ -3054,6 +3270,56 @@ mod tests {
         assert!(composer.contains("rows 13-30 of 30"));
         assert!(composer.contains("↑/↓ scroll"));
         assert!(composer.contains("COPILOT"));
+
+        let help = render_snapshot(100, 28, "help").unwrap();
+        assert!(help.contains("Review navigation"));
+        assert!(help.contains("Shift+↑"));
+        assert!(help.contains("HELP ·"));
+
+        let help_bottom = render_snapshot(100, 28, "help-bottom").unwrap();
+        assert!(help_bottom.contains("Non-interactive CLI"));
+        assert!(help_bottom.contains("rev delete PATH"));
+
+        let complete_help = help_lines().into_iter().flat_map(|line| line.spans).fold(
+            String::new(),
+            |mut text, span| {
+                text.push_str(span.content.as_ref());
+                text
+            },
+        );
+        assert!(complete_help.contains("Ctrl-C"));
+        assert!(complete_help.contains(":diff split"));
+        assert!(complete_help.contains("rev delete PATH"));
+    }
+
+    #[test]
+    fn help_command_opens_a_scrollable_reference_and_escape_closes_it() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        let paths = AppPaths {
+            data: "/tmp/rev-help/data".into(),
+            cache: "/tmp/rev-help/cache".into(),
+            database: "/tmp/rev-help/rev.db".into(),
+            roots: "/tmp/rev-help/roots".into(),
+            prs: "/tmp/rev-help/prs".into(),
+            exports: "/tmp/rev-help/exports".into(),
+            skills: "/tmp/rev-help/skills".into(),
+            plugins: "/tmp/rev-help/plugins".into(),
+        };
+
+        execute_command(&mut state, &storage, &paths, "help").unwrap();
+        assert_eq!(state.mode, RevMode::Help);
+        assert_eq!(state.help_scroll, 0);
+
+        handle_help_key(
+            &mut state,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        );
+        assert_eq!(state.help_scroll, 10);
+
+        handle_help_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(state.mode, RevMode::Normal);
     }
 
     #[test]

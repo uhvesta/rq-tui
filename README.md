@@ -86,7 +86,8 @@ including its inline questions and answers; only `h/l` changes files.
 `Shift+Down` reveals five below. Revealed context has a muted gray background,
 and overlapping expansions merge into one continuous region.
 
-Press `:` for a scrollable palette. It includes `diff unified`, `diff split`,
+Press `:` for a scrollable palette. `:help` opens a scrollable reference for
+every mode, shortcut, and command. The palette also includes `diff unified`, `diff split`,
 `expand above`, `expand below`, `base <ref>` with local branch/ref
 autocomplete for the current repository, `export feedback`, `history`,
 `clear`, and `quit`. `a` asks, `c` records feedback, `v` selects source rows,
@@ -108,6 +109,8 @@ bazel run //:rev -- ui-snapshot --state expanded --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state command --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state composer --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state history --width 100 --height 28
+bazel run //:rev -- ui-snapshot --state help --width 100 --height 28
+bazel run //:rev -- ui-snapshot --state help-bottom --width 100 --height 28
 bazel run //:rev -- ui-snapshot --state streaming --width 100 --height 28
 ```
 
