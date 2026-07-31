@@ -20,6 +20,7 @@ use crate::storage::{now, Storage};
 use crate::work_item::{ResolvedWorkItem, ReviewRepo};
 
 const NETWORK_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const PR_DESCRIPTION_PATH: &str = ".rev/PR_DESCRIPTION.md";
 
 pub(crate) fn resolve_remote(
     references: &[PrReference],
@@ -388,7 +389,14 @@ impl<R: ProcessRunner> RemoteResolver<R> {
         };
         if created_new_version {
             if let Some(previous) = existing.as_ref() {
-                self.carry_forward_annotations(storage, &bare, &base_sha, previous, &version)?;
+                self.carry_forward_annotations(
+                    storage,
+                    &bare,
+                    &base_sha,
+                    &metadata.body,
+                    previous,
+                    &version,
+                )?;
             }
         }
         if !created_new_version || existing.is_none() {
@@ -424,6 +432,7 @@ impl<R: ProcessRunner> RemoteResolver<R> {
         storage: &Storage,
         bare: &Path,
         base_sha: &str,
+        pr_description: &str,
         previous: &Version,
         current: &Version,
     ) -> Result<()> {
@@ -458,22 +467,27 @@ impl<R: ProcessRunner> RemoteResolver<R> {
             if renamed_to.is_some() {
                 follow_rename(storage, &mut annotation, renamed_to.map(PathBuf::as_path))?;
             }
-            let (content, allow_dismiss) = match previous_placement.side {
-                crate::domain::AnchorSide::Old => {
-                    let object = format!("{base_sha}:{}", previous_path.display());
-                    (
-                        self.git_dir_stdout(bare, ["show", object.as_str()])
-                            .unwrap_or_default(),
-                        false,
-                    )
-                }
-                crate::domain::AnchorSide::New => {
-                    match fs::read_to_string(current_worktree.join(&annotation.file_path)) {
-                        Ok(content) => (content, true),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            (String::new(), true)
+            let (content, allow_dismiss) = if annotation.file_path == Path::new(PR_DESCRIPTION_PATH)
+            {
+                (pr_description.to_owned(), true)
+            } else {
+                match previous_placement.side {
+                    crate::domain::AnchorSide::Old => {
+                        let object = format!("{base_sha}:{}", previous_path.display());
+                        (
+                            self.git_dir_stdout(bare, ["show", object.as_str()])
+                                .unwrap_or_default(),
+                            false,
+                        )
+                    }
+                    crate::domain::AnchorSide::New => {
+                        match fs::read_to_string(current_worktree.join(&annotation.file_path)) {
+                            Ok(content) => (content, true),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                (String::new(), true)
+                            }
+                            Err(_) => (String::new(), false),
                         }
-                        Err(_) => (String::new(), false),
                     }
                 }
             };

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -22,8 +23,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use rq_tui_github_review::{
     DiffSide as GitHubDiffSide, DraftInlineComment, GitHubReviewClient,
-    PullRequestRef as GitHubPrRef, PullRequestSnapshot, ReviewDecision, ReviewSubmission,
-    ReviewThread,
+    PullRequestRef as GitHubPrRef, PullRequestSnapshot, ReviewComment, ReviewDecision,
+    ReviewSubmission, ReviewThread,
 };
 use uuid::Uuid;
 
@@ -46,7 +47,9 @@ use crate::github_review::GhCliTransport;
 use crate::highlight::{Highlighter, PlainHighlighter, StyledSegment, SyntectHighlighter};
 use crate::markdown_preview::MarkdownPreviewServer;
 use crate::remote::{resolve_remote, PrReference};
-use crate::storage::{now, RevQuestionSession, Storage};
+use crate::storage::{
+    now, GitHubOperationKind, GitHubOperationPreparation, RevQuestionSession, Storage,
+};
 use crate::terminal_text::{
     cell_width, floor_grapheme_boundary, grapheme_indices, next_grapheme_boundary,
     previous_grapheme_boundary,
@@ -108,8 +111,42 @@ enum ComposeTarget {
 }
 
 enum GitHubOperationResult {
-    Replied(String),
+    Replied {
+        annotation_id: String,
+        repo_id: String,
+        version_id: String,
+        comment: Box<ReviewComment>,
+    },
     Submitted(Vec<String>),
+}
+
+trait GitHubBackend: Send + Sync {
+    fn reply(
+        &self,
+        reference: &GitHubPrRef,
+        root_comment_id: u64,
+        body: &str,
+    ) -> Result<ReviewComment>;
+    fn submit_review(&self, reference: &GitHubPrRef, submission: &ReviewSubmission) -> Result<()>;
+}
+
+struct ProductionGitHubBackend;
+
+impl GitHubBackend for ProductionGitHubBackend {
+    fn reply(
+        &self,
+        reference: &GitHubPrRef,
+        root_comment_id: u64,
+        body: &str,
+    ) -> Result<ReviewComment> {
+        GitHubReviewClient::new(GhCliTransport).reply(reference, root_comment_id, body)
+    }
+
+    fn submit_review(&self, reference: &GitHubPrRef, submission: &ReviewSubmission) -> Result<()> {
+        GitHubReviewClient::new(GhCliTransport)
+            .submit_review(reference, submission)
+            .map(|_| ())
+    }
 }
 
 enum ContextualAnnotationMatch {
@@ -323,6 +360,7 @@ struct RevState {
     agent_last_event: Instant,
     rows_revision: u64,
     render_cache: Option<RenderCache>,
+    pending_source_focus: Option<(LineKind, Option<usize>, Option<usize>)>,
     history_cursor: usize,
     history_delete_armed: Option<String>,
     pending_resolve: Option<String>,
@@ -330,6 +368,8 @@ struct RevState {
     refresh_started: Option<Instant>,
     github_operation: Option<Receiver<Result<GitHubOperationResult>>>,
     github_operation_started: Option<Instant>,
+    github_operation_id: Option<String>,
+    github_backend: Arc<dyn GitHubBackend>,
     markdown_preview: bool,
     cmux_markdown_requested: bool,
     cmux_markdown: Option<MarkdownSurface>,
@@ -347,6 +387,10 @@ fn remote_annotation_id(thread_id: &str) -> String {
 
 fn is_remote_annotation_id(annotation_id: &str) -> bool {
     annotation_id.starts_with("github-thread:")
+}
+
+fn visible_github_comment_body(body: &str) -> &str {
+    body.split("\n\n<!-- rev-operation:").next().unwrap_or(body)
 }
 
 fn description_diff_file(body: &str) -> DiffFile {
@@ -391,19 +435,31 @@ fn inject_remote_thread_context(
     let Some(line_number) = thread.line.or(thread.original_line) else {
         return Ok(());
     };
-    let Some(file) = repo
+    let file_index = repo
         .diff
         .files
-        .iter_mut()
-        .find(|file| file.path() == Path::new(&thread.path))
-    else {
-        return Ok(());
-    };
+        .iter()
+        .position(|file| file.path() == Path::new(&thread.path))
+        .unwrap_or_else(|| {
+            repo.diff.files.push(DiffFile {
+                old_path: Some(PathBuf::from(&thread.path)),
+                new_path: Some(PathBuf::from(&thread.path)),
+                display_path: PathBuf::from(&thread.path),
+                status: FileStatus::Modified,
+                additions: 0,
+                deletions: 0,
+                hunks: Vec::new(),
+            });
+            repo.diff.files.len() - 1
+        });
     let line_number = usize::try_from(line_number).context("GitHub line exceeds address space")?;
-    if file.visible_lines().any(|line| match thread.side {
-        GitHubDiffSide::Left => line.old_line == Some(line_number),
-        GitHubDiffSide::Right => line.new_line == Some(line_number),
-    }) {
+    if repo.diff.files[file_index]
+        .visible_lines()
+        .any(|line| match thread.side {
+            GitHubDiffSide::Left => line.old_line == Some(line_number),
+            GitHubDiffSide::Right => line.new_line == Some(line_number),
+        })
+    {
         return Ok(());
     }
     let source = match thread.side {
@@ -428,6 +484,7 @@ fn inject_remote_thread_context(
         .nth(line_number.saturating_sub(1))
         .unwrap_or_default()
         .to_owned();
+    let file = &mut repo.diff.files[file_index];
     file.hunks.push(Hunk {
         header: format!("@@ -{line_number},1 +{line_number},1 @@"),
         old_start: line_number,
@@ -449,6 +506,16 @@ fn inject_remote_thread_context(
 
 impl RevState {
     fn load(mut workspace: ResolvedWorkItem, storage: &Storage) -> Result<Self> {
+        let workspace_repo_ids = workspace
+            .repos
+            .iter()
+            .map(|repo| repo.record.id.as_str())
+            .collect::<HashSet<_>>();
+        let unresolved_github_count = storage
+            .recover_unresolved_github_operations()?
+            .iter()
+            .filter(|operation| workspace_repo_ids.contains(operation.repo_id.as_str()))
+            .count();
         let mut pr_snapshots = HashMap::new();
         let mut remote_threads = HashMap::new();
         for repo in &mut workspace.repos {
@@ -589,7 +656,13 @@ impl RevState {
             question_return_mode: RevMode::Normal,
             questions_open: false,
             model_return_mode: RevMode::Normal,
-            status: "j/k stay in this file · h/l change files".into(),
+            status: if unresolved_github_count == 0 {
+                "j/k stay in this file · h/l change files".into()
+            } else {
+                format!(
+                    "{unresolved_github_count} GitHub operation(s) need reconciliation · :refresh before submitting again"
+                )
+            },
             annotations,
             threads,
             question_sessions,
@@ -610,6 +683,7 @@ impl RevState {
             agent_last_event: Instant::now(),
             rows_revision: 1,
             render_cache: None,
+            pending_source_focus: None,
             history_cursor: 0,
             history_delete_armed: None,
             pending_resolve: None,
@@ -617,6 +691,8 @@ impl RevState {
             refresh_started: None,
             github_operation: None,
             github_operation_started: None,
+            github_operation_id: None,
+            github_backend: Arc::new(ProductionGitHubBackend),
             markdown_preview: false,
             cmux_markdown_requested: false,
             cmux_markdown: None,
@@ -647,6 +723,10 @@ impl RevState {
     }
 
     fn invalidate_rows(&mut self) {
+        if self.pending_source_focus.is_none() {
+            self.pending_source_focus =
+                focused_diff_line(self).map(|line| (line.kind, line.old_line, line.new_line));
+        }
         self.rows_revision = self.rows_revision.wrapping_add(1).max(1);
         self.render_cache = None;
     }
@@ -829,16 +909,28 @@ fn run_loop<B: Backend>(
     paths: &AppPaths,
     highlighter: &mut dyn Highlighter,
 ) -> Result<()> {
+    let mut redraw_requested = true;
     loop {
+        let previous_status = state.status.clone();
+        let previous_revision = state.rows_revision;
+        let previous_activity = state.agent_activity.clone();
         drain_refresh(state, storage)?;
         drain_github_operation(state, storage)?;
         drain_agent_events(state, storage, paths)?;
         drain_model_catalog(state)?;
         drain_cmux_preview(state);
+        redraw_requested |= previous_status != state.status
+            || previous_revision != state.rows_revision
+            || previous_activity != state.agent_activity;
+        if redraw_requested {
+            terminal.draw(|frame| render(frame, state, highlighter))?;
+            redraw_requested = false;
+        }
+        let status_before_sync = state.status.clone();
         if let Err(error) = sync_markdown_preview(state, paths) {
             state.status = format!("Markdown rich diff sync failed: {error:#}");
         }
-        terminal.draw(|frame| render(frame, state, highlighter))?;
+        redraw_requested |= status_before_sync != state.status;
         if state.status == "quit" {
             return Ok(());
         }
@@ -861,7 +953,9 @@ fn run_loop<B: Backend>(
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollDown => match state.mode {
-                        RevMode::Normal | RevMode::Visual => move_row(state, highlighter, 3),
+                        RevMode::Normal | RevMode::Visual => {
+                            scroll_review_viewport(state, highlighter, 3)
+                        }
                         RevMode::Compose => {
                             state.compose_scroll = state.compose_scroll.saturating_add(3)
                         }
@@ -881,7 +975,9 @@ fn run_loop<B: Backend>(
                         RevMode::ConfirmClear | RevMode::ConfirmResolve => {}
                     },
                     MouseEventKind::ScrollUp => match state.mode {
-                        RevMode::Normal | RevMode::Visual => move_row(state, highlighter, -3),
+                        RevMode::Normal | RevMode::Visual => {
+                            scroll_review_viewport(state, highlighter, -3)
+                        }
                         RevMode::Compose => {
                             state.compose_scroll = state.compose_scroll.saturating_sub(3)
                         }
@@ -899,9 +995,14 @@ fn run_loop<B: Backend>(
                     },
                     _ => {}
                 },
-                Event::Resize(_, _) => state.render_cache = None,
+                Event::Resize(_, _) => {
+                    state.pending_source_focus = focused_diff_line(state)
+                        .map(|line| (line.kind, line.old_line, line.new_line));
+                    state.render_cache = None;
+                }
                 _ => {}
             }
+            redraw_requested = true;
             if !event::poll(Duration::ZERO)? {
                 break;
             }
@@ -1110,6 +1211,40 @@ fn page_move(state: &mut RevState, highlighter: &mut dyn Highlighter, direction:
     }
 }
 
+fn scroll_review_viewport(state: &mut RevState, highlighter: &mut dyn Highlighter, delta: isize) {
+    let count = row_count(state, highlighter);
+    let viewport = state.review_viewport_height.max(1);
+    let maximum = count.saturating_sub(viewport);
+    state.review_scroll = if delta >= 0 {
+        state
+            .review_scroll
+            .saturating_add(delta as usize)
+            .min(maximum)
+    } else {
+        state.review_scroll.saturating_sub(delta.unsigned_abs())
+    };
+
+    let first = state.review_scroll;
+    let last = first
+        .saturating_add(viewport.saturating_sub(1))
+        .min(count.saturating_sub(1));
+    if state.row_cursor < first {
+        move_row(
+            state,
+            highlighter,
+            first.saturating_sub(state.row_cursor) as isize,
+        );
+    } else if state.row_cursor > last {
+        move_row(
+            state,
+            highlighter,
+            -(state.row_cursor.saturating_sub(last) as isize),
+        );
+    }
+    state.status =
+        "Scrolled review viewport · cursor stays put until it would leave the screen".into();
+}
+
 fn handle_review_key(
     state: &mut RevState,
     storage: &Storage,
@@ -1259,6 +1394,15 @@ fn handle_review_key(
             }
         }
         KeyCode::Char('c') => {
+            if state
+                .current_file()
+                .is_some_and(|file| file.path() == Path::new(PR_DESCRIPTION_PATH))
+            {
+                state.status =
+                    "PR description supports questions, not inline GitHub feedback · press a"
+                        .into();
+                return Ok(());
+            }
             if current_annotation_id(state, highlighter)
                 .is_some_and(|id| is_remote_annotation_id(&id))
             {
@@ -1336,6 +1480,7 @@ fn handle_review_key(
 }
 
 fn open_file_picker(state: &mut RevState) {
+    preserve_source_focus(state);
     state.file_picker_return_mode = if state.mode == RevMode::Visual {
         RevMode::Visual
     } else {
@@ -1359,6 +1504,7 @@ fn open_file_picker(state: &mut RevState) {
 }
 
 fn close_file_picker(state: &mut RevState) {
+    preserve_source_focus(state);
     state.file_tree_open = false;
     if state.questions_open
         && state.file_picker_return_mode == RevMode::Visual
@@ -1542,6 +1688,7 @@ fn current_question_id_from_cache(state: &RevState) -> Option<String> {
 }
 
 fn open_questions(state: &mut RevState) {
+    preserve_source_focus(state);
     let ids = question_ids(state);
     state.question_return_mode = if state.mode == RevMode::FilePicker && state.file_tree_open {
         RevMode::FilePicker
@@ -1567,6 +1714,7 @@ fn open_questions(state: &mut RevState) {
 }
 
 fn close_questions(state: &mut RevState) {
+    preserve_source_focus(state);
     state.questions_open = false;
     state.mode = if state.question_return_mode == RevMode::FilePicker && state.file_tree_open {
         RevMode::FilePicker
@@ -1584,6 +1732,13 @@ fn close_questions(state: &mut RevState) {
     } else {
         "Back to review".into()
     };
+}
+
+fn preserve_source_focus(state: &mut RevState) {
+    if state.pending_source_focus.is_none() {
+        state.pending_source_focus =
+            focused_diff_line(state).map(|line| (line.kind, line.old_line, line.new_line));
+    }
 }
 
 fn move_question_cursor(state: &mut RevState, delta: isize) {
@@ -2013,7 +2168,13 @@ fn begin_remote_question(
     let context = thread
         .comments
         .iter()
-        .map(|comment| format!("@{}: {}", comment.author, comment.body))
+        .map(|comment| {
+            format!(
+                "@{}: {}",
+                comment.author,
+                visible_github_comment_body(&comment.body)
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     state.visual_anchor = Some(source);
@@ -2052,11 +2213,10 @@ fn handle_command_key(
         }
         KeyCode::Enter => {
             let typed = state.command.input.trim();
+            let selected = command_selected_index(state, &candidates);
             let command = candidates
-                .iter()
-                .find(|candidate| candidate.as_str() == typed)
+                .get(selected)
                 .cloned()
-                .or_else(|| candidates.get(state.command.selected).cloned())
                 .unwrap_or_else(|| typed.to_owned());
             execute_command(state, storage, paths, &command)?;
         }
@@ -2103,6 +2263,15 @@ fn handle_command_key(
         _ => {}
     }
     Ok(())
+}
+
+fn command_selected_index(state: &RevState, candidates: &[String]) -> usize {
+    let typed = state.command.input.trim();
+    candidates
+        .iter()
+        .position(|candidate| candidate == typed)
+        .unwrap_or(state.command.selected)
+        .min(candidates.len().saturating_sub(1))
 }
 
 fn command_candidates(state: &RevState) -> Vec<String> {
@@ -2290,11 +2459,13 @@ fn execute_command(
             state.status = "Clear every saved comment and question here? y/n".into();
         }
         "quit" | "q" => {
-            if state.agent.is_some() || !state.queued_questions.is_empty() {
+            if state.agent.is_some()
+                || !state.queued_questions.is_empty()
+                || state.github_operation.is_some()
+            {
                 state.mode = RevMode::Normal;
                 state.status =
-                    "Questions are active or queued · Ctrl-C cancels the active one before :quit"
-                        .into();
+                    "Question or GitHub work is active or queued · wait for it before :quit".into();
             } else {
                 state.status = "quit".into();
             }
@@ -2325,6 +2496,7 @@ fn execute_command(
             let layout = state.diff_layout;
             let show_comments = state.show_comments;
             let show_questions = state.show_questions;
+            let github_backend = Arc::clone(&state.github_backend);
             let mut selected_repo = state
                 .current_repo()
                 .map(|repo| repo.record.clone())
@@ -2344,6 +2516,7 @@ fn execute_command(
             replacement.diff_layout = layout;
             replacement.show_comments = show_comments;
             replacement.show_questions = show_questions;
+            replacement.github_backend = github_backend;
             replacement.status =
                 format!("Diff base for {} changed to {branch}", selected_repo.name);
             *state = replacement;
@@ -2487,6 +2660,7 @@ fn drain_refresh(state: &mut RevState, storage: &Storage) -> Result<()> {
             for repo in &workspace.repos {
                 storage.mark_version_opened(&repo.version.id)?;
             }
+            let reconciled = reconcile_github_operations(storage, &workspace)?;
             let selected = state.current_file().map(|file| file.path().to_path_buf());
             let layout = state.diff_layout;
             let markdown_preview = state.markdown_preview;
@@ -2494,6 +2668,7 @@ fn drain_refresh(state: &mut RevState, storage: &Storage) -> Result<()> {
             let cmux_markdown = state.cmux_markdown.take();
             let cmux_open = state.cmux_open.take();
             let cmux_close = state.cmux_close.take();
+            let github_backend = Arc::clone(&state.github_backend);
             let markdown_server = state.markdown_server.take();
             let mut replacement = RevState::load(workspace, storage)?;
             replacement.diff_layout = layout;
@@ -2503,6 +2678,7 @@ fn drain_refresh(state: &mut RevState, storage: &Storage) -> Result<()> {
             replacement.cmux_open = cmux_open;
             replacement.cmux_close = cmux_close;
             replacement.markdown_server = markdown_server;
+            replacement.github_backend = github_backend;
             if let Some(selected) = selected {
                 if let Some(index) = replacement.files.iter().position(|(repo, file)| {
                     replacement.workspace.repos[*repo].diff.files[*file].path() == selected
@@ -2510,8 +2686,13 @@ fn drain_refresh(state: &mut RevState, storage: &Storage) -> Result<()> {
                     replacement.file_index = index;
                 }
             }
-            replacement.status =
-                format!("Refresh complete in {elapsed}ms · latest PR/workspace revision is open");
+            replacement.status = if reconciled == 0 {
+                format!("Refresh complete in {elapsed}ms · latest PR/workspace revision is open")
+            } else {
+                format!(
+                    "Refresh complete in {elapsed}ms · reconciled {reconciled} GitHub operation(s)"
+                )
+            };
             *state = replacement;
         }
         Err(error) => {
@@ -2519,6 +2700,33 @@ fn drain_refresh(state: &mut RevState, storage: &Storage) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn reconcile_github_operations(storage: &Storage, workspace: &ResolvedWorkItem) -> Result<usize> {
+    let mut snapshots = Vec::new();
+    for repo in &workspace.repos {
+        if let Some(snapshot) = storage.pull_request_snapshot(&repo.version.id)? {
+            snapshots.push((repo.record.id.as_str(), snapshot));
+        }
+    }
+    let mut reconciled = 0;
+    for operation in storage.unresolved_github_operations()? {
+        let marker = format!("<!-- rev-operation:{} -->", operation.idempotency_key);
+        let found = snapshots.iter().any(|(repo_id, snapshot)| {
+            *repo_id == operation.repo_id
+                && snapshot.threads.iter().any(|thread| {
+                    thread
+                        .comments
+                        .iter()
+                        .any(|comment| comment.body.contains(&marker))
+                })
+        });
+        if found {
+            storage.mark_github_operation_sent(&operation.operation_id)?;
+            reconciled += 1;
+        }
+    }
+    Ok(reconciled)
 }
 
 fn cursor_is_fold(state: &RevState) -> bool {
@@ -3077,9 +3285,7 @@ fn submit_compose(state: &mut RevState, storage: &Storage, paths: &AppPaths) -> 
     let text = state.compose.trim().to_owned();
     let empty_allowed = matches!(
         state.compose_target,
-        Some(ComposeTarget::SubmitReview(
-            ReviewDecision::Approve | ReviewDecision::Comment
-        ))
+        Some(ComposeTarget::SubmitReview(ReviewDecision::Approve))
     );
     if text.is_empty() && !empty_allowed {
         state.status = "Enter some text before submitting".into();
@@ -3146,18 +3352,52 @@ fn submit_compose(state: &mut RevState, storage: &Storage, paths: &AppPaths) -> 
             create_follow_up(state, storage, paths, &annotation_id, &text)
         }
         ComposeTarget::RemoteReply(annotation_id) => {
-            start_remote_reply(state, &annotation_id, &text)
+            if let Err(error) = start_remote_reply(state, storage, &annotation_id, &text) {
+                restore_remote_composer(
+                    state,
+                    ComposeTarget::RemoteReply(annotation_id),
+                    &text,
+                    &error,
+                );
+            }
+            Ok(())
         }
         ComposeTarget::SubmitReview(decision) => {
-            start_review_submission(state, storage, decision, &text)
+            if let Err(error) = start_review_submission(state, storage, decision, &text) {
+                restore_remote_composer(
+                    state,
+                    ComposeTarget::SubmitReview(decision),
+                    &text,
+                    &error,
+                );
+            }
+            Ok(())
         }
     }
 }
 
-fn start_remote_reply(state: &mut RevState, annotation_id: &str, text: &str) -> Result<()> {
+fn restore_remote_composer(
+    state: &mut RevState,
+    target: ComposeTarget,
+    text: &str,
+    error: &anyhow::Error,
+) {
+    state.mode = RevMode::Compose;
+    state.compose_target = Some(target);
+    state.compose = text.to_owned();
+    state.compose_cursor = state.compose.len();
+    state.compose_scroll = u16::MAX;
+    state.status = format!("GitHub action could not start · draft retained · {error:#}");
+}
+
+fn start_remote_reply(
+    state: &mut RevState,
+    storage: &Storage,
+    annotation_id: &str,
+    text: &str,
+) -> Result<()> {
     if state.github_operation.is_some() {
-        state.status = "A GitHub operation is already running in the background".into();
-        return Ok(());
+        anyhow::bail!("a GitHub operation is already running in the background");
     }
     let thread = state
         .remote_threads
@@ -3180,17 +3420,51 @@ fn start_remote_reply(state: &mut RevState, annotation_id: &str, text: &str) -> 
         repository: reference.repo,
         number: reference.number,
     };
-    let body = text.to_owned();
-    let id = annotation_id.to_owned();
+    let repo_id = repo.record.id.clone();
+    let version_id = repo.version.id.clone();
+    if storage
+        .unresolved_github_operations()?
+        .iter()
+        .any(|operation| operation.repo_id == repo_id)
+    {
+        anyhow::bail!(
+            "this pull request has an unresolved GitHub operation; :refresh must reconcile it before another submission"
+        );
+    }
+    let operation_id = Uuid::new_v4().to_string();
+    let idempotency_key = operation_id.clone();
+    let body = format!("{text}\n\n<!-- rev-operation:{idempotency_key} -->");
+    storage.prepare_github_operation(&GitHubOperationPreparation {
+        operation_id: operation_id.clone(),
+        repo_id: repo_id.clone(),
+        version_id: version_id.clone(),
+        kind: GitHubOperationKind::Reply,
+        request_json: serde_json::json!({
+            "thread": annotation_id,
+            "root_comment_id": root_comment_id,
+            "body": body,
+        })
+        .to_string(),
+        idempotency_key,
+        annotation_ids: Vec::new(),
+    })?;
+    let annotation_id = annotation_id.to_owned();
+    let backend = Arc::clone(&state.github_backend);
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let result = GitHubReviewClient::new(GhCliTransport)
+        let result = backend
             .reply(&reference, root_comment_id, &body)
-            .map(|_| GitHubOperationResult::Replied(id));
+            .map(|comment| GitHubOperationResult::Replied {
+                annotation_id,
+                repo_id,
+                version_id,
+                comment: Box::new(comment),
+            });
         sender.send(result).ok();
     });
     state.github_operation = Some(receiver);
     state.github_operation_started = Some(Instant::now());
+    state.github_operation_id = Some(operation_id);
     state.status = "GITHUB REPLY · sending in background · navigation remains active".into();
     Ok(())
 }
@@ -3202,26 +3476,81 @@ fn start_review_submission(
     body: &str,
 ) -> Result<()> {
     if state.github_operation.is_some() {
-        state.status = "A GitHub operation is already running in the background".into();
-        return Ok(());
+        anyhow::bail!("a GitHub operation is already running in the background");
     }
-    let (reference, submission, ids) = pending_review_submission(state, decision, body)?;
-    storage.mark_comments_delivery(&ids, DeliveryState::Pending)?;
+    let (reference, mut submission, ids) = pending_review_submission(state, decision, body)?;
+    let repo = state.current_repo().context("no current repository")?;
+    if storage
+        .unresolved_github_operations()?
+        .iter()
+        .any(|operation| operation.repo_id == repo.record.id)
+    {
+        anyhow::bail!(
+            "this pull request has an unresolved GitHub operation; :refresh must reconcile it before another submission"
+        );
+    }
+    let operation_id = Uuid::new_v4().to_string();
+    let idempotency_key = operation_id.clone();
+    submission.body = format!(
+        "{}{}<!-- rev-operation:{idempotency_key} -->",
+        submission.body,
+        if submission.body.is_empty() {
+            ""
+        } else {
+            "\n\n"
+        }
+    );
+    for comment in &mut submission.comments {
+        comment.body = format!(
+            "{}\n\n<!-- rev-operation:{idempotency_key} -->",
+            comment.body
+        );
+    }
+    let request_json = serde_json::json!({
+        "reference": {
+            "owner": &reference.owner,
+            "repository": &reference.repository,
+            "number": reference.number,
+        },
+        "commit_id": &submission.commit_id,
+        "decision": format!("{:?}", submission.decision),
+        "body": &submission.body,
+        "comments": submission.comments.iter().map(|comment| serde_json::json!({
+            "local_id": &comment.local_id,
+            "path": &comment.path,
+            "line": comment.line,
+            "start_line": comment.start_line,
+            "side": format!("{:?}", comment.side),
+            "body": &comment.body,
+        })).collect::<Vec<_>>(),
+    })
+    .to_string();
+    storage.prepare_github_operation(&GitHubOperationPreparation {
+        operation_id: operation_id.clone(),
+        repo_id: repo.record.id.clone(),
+        version_id: repo.version.id.clone(),
+        kind: GitHubOperationKind::Review,
+        request_json,
+        idempotency_key,
+        annotation_ids: ids.clone(),
+    })?;
     for (annotation, _) in &mut state.annotations {
         if ids.contains(&annotation.id) {
             annotation.delivery_state = DeliveryState::Pending;
         }
     }
     let result_ids = ids.clone();
+    let backend = Arc::clone(&state.github_backend);
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let result = GitHubReviewClient::new(GhCliTransport)
+        let result = backend
             .submit_review(&reference, &submission)
             .map(|_| GitHubOperationResult::Submitted(result_ids));
         sender.send(result).ok();
     });
     state.github_operation = Some(receiver);
     state.github_operation_started = Some(Instant::now());
+    state.github_operation_id = Some(operation_id);
     state.status = format!(
         "GITHUB REVIEW · sending {} inline comment(s) in one batch · UI remains active",
         ids.len()
@@ -3254,6 +3583,8 @@ fn pending_review_submission(
             || annotation.submitted
             || placement.version_id != version_id
             || placement.outdated
+            || placement.ambiguous
+            || annotation.file_path == Path::new(PR_DESCRIPTION_PATH)
         {
             continue;
         }
@@ -3310,13 +3641,66 @@ fn drain_github_operation(state: &mut RevState, storage: &Storage) -> Result<()>
     };
     state.github_operation = None;
     state.github_operation_started = None;
+    let operation_id = state
+        .github_operation_id
+        .take()
+        .context("GitHub operation completed without its durable identity")?;
     match result {
-        Ok(GitHubOperationResult::Replied(annotation_id)) => {
-            state.status =
-                format!("GitHub reply submitted · :refresh reloads thread {annotation_id}");
+        Ok(GitHubOperationResult::Replied {
+            annotation_id,
+            repo_id,
+            version_id,
+            comment,
+        }) => {
+            storage.mark_github_operation_sent(&operation_id)?;
+            let (thread_text, message_count) = {
+                let thread = state
+                    .remote_threads
+                    .get_mut(&annotation_id)
+                    .context("submitted GitHub thread disappeared from this revision")?;
+                thread.comments.push(comment.as_ref().clone());
+                (
+                    thread
+                        .comments
+                        .iter()
+                        .map(|comment| {
+                            format!(
+                                "@{}: {}",
+                                comment.author,
+                                visible_github_comment_body(&comment.body)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    thread.comments.len(),
+                )
+            };
+            let snapshot = state
+                .pr_snapshots
+                .get_mut(&repo_id)
+                .context("submitted GitHub pull-request snapshot disappeared")?;
+            let snapshot_thread = snapshot
+                .threads
+                .iter_mut()
+                .find(|candidate| remote_annotation_id(&candidate.node_id) == annotation_id)
+                .context("submitted GitHub thread disappeared from its snapshot")?;
+            snapshot_thread.comments.push(*comment);
+            storage.upsert_pull_request_snapshot(&version_id, snapshot)?;
+            if let Some((annotation, _)) = state
+                .annotations
+                .iter_mut()
+                .find(|(annotation, _)| annotation.id == annotation_id)
+            {
+                annotation.text = Some(thread_text);
+            }
+            state.invalidate_rows();
+            state.status = format!(
+                "GitHub thread reply persisted locally · {} message(s) now visible",
+                message_count
+            );
         }
         Ok(GitHubOperationResult::Submitted(ids)) => {
-            storage.mark_comments_delivery(&ids, DeliveryState::Sent)?;
+            storage.mark_github_operation_sent(&operation_id)?;
             for (annotation, _) in &mut state.annotations {
                 if ids.contains(&annotation.id) {
                     annotation.delivery_state = DeliveryState::Sent;
@@ -3329,14 +3713,10 @@ fn drain_github_operation(state: &mut RevState, storage: &Storage) -> Result<()>
             );
         }
         Err(error) => {
-            let pending = storage.pending_comment_delivery_ids(&state.workspace.item.id)?;
-            storage.mark_comments_delivery(&pending, DeliveryState::Draft)?;
-            for (annotation, _) in &mut state.annotations {
-                if pending.contains(&annotation.id) {
-                    annotation.delivery_state = DeliveryState::Draft;
-                }
-            }
-            state.status = format!("GitHub operation failed · drafts retained · {error:#}");
+            storage.mark_github_operation_unknown(&operation_id, &format!("{error:#}"))?;
+            state.status = format!(
+                "GitHub outcome is unknown · submission is locked against duplicates · :refresh to reconcile · {error:#}"
+            );
         }
     }
     Ok(())
@@ -4894,7 +5274,13 @@ fn build_rows(state: &RevState, width: usize, highlighter: &mut dyn Highlighter)
                 thread
                     .comments
                     .iter()
-                    .map(|comment| format!("@{}: {}", comment.author, comment.body))
+                    .map(|comment| {
+                        format!(
+                            "@{}: {}",
+                            comment.author,
+                            visible_github_comment_body(&comment.body)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n\n")
             } else if annotation.kind == AnnotationKind::Ask {
@@ -5226,6 +5612,19 @@ fn render_review(
     let inner = Block::default().borders(Borders::ALL).inner(area);
     let width = inner.width.max(1) as usize;
     let rows = ensure_rows(state, width, highlighter).to_vec();
+    if let Some((kind, old_line, new_line)) = state.pending_source_focus.take() {
+        if let Some(cursor) = rows.iter().position(|row| {
+            matches!(
+                &row.kind,
+                RevRowKind::Source { line, .. }
+                    if line.kind == kind
+                        && line.old_line == old_line
+                        && line.new_line == new_line
+            )
+        }) {
+            state.row_cursor = cursor;
+        }
+    }
     state.clamp_cursor(rows.len());
     let viewport = inner.height.max(1) as usize;
     state.review_viewport_height = viewport;
@@ -5746,22 +6145,43 @@ fn browser_markdown_state(
                 if annotation.repo_id != repo.record.id
                     || annotation.file_path != file.display_path
                     || annotation.status != AnnotationStatus::Active
-                    || match annotation.kind {
-                        AnnotationKind::Comment => !state.show_comments,
-                        AnnotationKind::Ask => !state.show_questions,
-                    }
+                    || (!is_remote_annotation_id(&annotation.id)
+                        && match annotation.kind {
+                            AnnotationKind::Comment => !state.show_comments,
+                            AnnotationKind::Ask => !state.show_questions,
+                        })
                 {
                     continue;
                 }
-                let text = annotation.text.clone().or_else(|| {
-                    state
-                        .threads
-                        .get(&annotation.id)
-                        .and_then(|messages| messages.iter().find(|message| message.role == "user"))
-                        .map(|message| message.text.clone())
-                });
+                let remote = state.remote_threads.get(&annotation.id);
+                let text = remote
+                    .map(|thread| {
+                        thread
+                            .comments
+                            .iter()
+                            .map(|comment| {
+                                format!(
+                                    "@{}: {}",
+                                    comment.author,
+                                    visible_github_comment_body(&comment.body)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n\n")
+                    })
+                    .or_else(|| {
+                        annotation.text.clone().or_else(|| {
+                            state
+                                .threads
+                                .get(&annotation.id)
+                                .and_then(|messages| {
+                                    messages.iter().find(|message| message.role == "user")
+                                })
+                                .map(|message| message.text.clone())
+                        })
+                    });
                 notes.push(serde_json::json!({
-                    "kind": annotation.kind.as_str(),
+                    "kind": if remote.is_some() { "github_thread" } else { annotation.kind.as_str() },
                     "side": match placement.side {
                         AnchorSide::Old => "old",
                         AnchorSide::New => "new",
@@ -5769,6 +6189,9 @@ fn browser_markdown_state(
                     "line_start": placement.line_start,
                     "line_end": placement.line_end,
                     "text": text.unwrap_or_else(|| "Question thread".into()),
+                    "author": remote.and_then(|thread| thread.comments.first()).map(|comment| &comment.author),
+                    "outdated": remote.is_some_and(|thread| thread.is_outdated),
+                    "resolved": remote.is_some_and(|thread| thread.is_resolved),
                 }));
             }
         }
@@ -7054,7 +7477,8 @@ fn render_file_picker(frame: &mut Frame, state: &RevState, area: Rect) {
 fn render_command_palette(frame: &mut Frame, state: &RevState, area: Rect) {
     let width = area.width.saturating_sub(4).clamp(34, 84);
     let candidates = command_candidates(state);
-    let visible_count = candidates.len().clamp(1, 8);
+    let visible_capacity = area.height.saturating_sub(3).clamp(1, 8) as usize;
+    let visible_count = candidates.len().clamp(1, visible_capacity);
     let height = (visible_count as u16 + 3).min(area.height);
     let popup = centered_rect(area, width, height);
     frame.render_widget(Clear, popup);
@@ -7066,11 +7490,8 @@ fn render_command_palette(frame: &mut Frame, state: &RevState, area: Rect) {
     frame.render_widget(inner, popup);
     let mut input = state.command.input.clone();
     input.insert(floor_grapheme_boundary(&input, state.command.cursor), '▏');
-    let start = state
-        .command
-        .selected
-        .saturating_add(1)
-        .saturating_sub(visible_count);
+    let selected = command_selected_index(state, &candidates);
+    let start = selected.saturating_add(1).saturating_sub(visible_count);
     let mut lines = vec![Line::styled(
         format!(
             ":{}",
@@ -7090,14 +7511,10 @@ fn render_command_palette(frame: &mut Frame, state: &RevState, area: Rect) {
                 Line::styled(
                     format!(
                         "{} {}",
-                        if index == state.command.selected {
-                            "❯"
-                        } else {
-                            " "
-                        },
+                        if index == selected { "❯" } else { " " },
                         candidate
                     ),
-                    if index == state.command.selected {
+                    if index == selected {
                         Style::default().bg(Color::Rgb(48, 48, 60))
                     } else {
                         Style::default().fg(Color::Gray)
@@ -7885,6 +8302,8 @@ fn seed_snapshot_feedback(state: &mut RevState) {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
@@ -7892,18 +8311,20 @@ mod tests {
     use ratatui::Terminal;
 
     use super::{
-        browser_markdown_focus, browser_markdown_state, build_rows, close_file_picker,
-        close_questions, current_item_yank_text, execute_command, finish_active_question,
+        begin_remote_reply, begin_review_submission, browser_markdown_focus,
+        browser_markdown_state, build_rows, close_file_picker, close_questions,
+        current_item_yank_text, drain_github_operation, execute_command, finish_active_question,
         handle_agent_event, handle_compose_key, handle_file_picker_key, handle_help_key,
         handle_history_key, handle_key, handle_question_key, handle_review_key, help_lines,
         is_expandable_fold, markdown_sides, merge_touching_hunks, move_row, open_file_picker,
         open_questions, page_move, pending_review_submission, question_ids, queue_question_launch,
         rebuild_file_without_expanded_lines, render, render_snapshot, review_file_key, row_count,
-        seed_snapshot_feedback, seed_snapshot_questions, snapshot_workspace, split_highlight_side,
-        split_source_lines, style_split_side, visual_selection_yank_text, ComposeTarget,
-        GitHubDiffSide, ModelPicker, PendingSend, PickerScope, PickerStage, QuestionLaunch,
-        RevAgentSlot, RevDiffLayout, RevMode, RevRowKind, RevState, ReviewDecision,
-        PR_DESCRIPTION_PATH,
+        scroll_review_viewport, seed_snapshot_feedback, seed_snapshot_questions,
+        snapshot_workspace, split_highlight_side, split_source_lines, style_split_side,
+        submit_compose, visual_selection_yank_text, ComposeTarget, GitHubBackend, GitHubDiffSide,
+        GitHubPrRef, ModelPicker, PendingSend, PickerScope, PickerStage, QuestionLaunch,
+        RevAgentSlot, RevDiffLayout, RevMode, RevRowKind, RevState, ReviewComment, ReviewDecision,
+        ReviewSubmission, PR_DESCRIPTION_PATH,
     };
     use crate::config::AppPaths;
     use crate::copilot::{
@@ -7915,6 +8336,44 @@ mod tests {
     use crate::storage::{now, RevQuestionSession, Storage};
 
     struct NoopAgent;
+
+    #[derive(Default)]
+    struct FakeGitHubBackend {
+        replies: Mutex<Vec<(u64, String)>>,
+        submissions: Mutex<Vec<ReviewSubmission>>,
+    }
+
+    impl GitHubBackend for FakeGitHubBackend {
+        fn reply(
+            &self,
+            _reference: &GitHubPrRef,
+            root_comment_id: u64,
+            body: &str,
+        ) -> anyhow::Result<ReviewComment> {
+            self.replies
+                .lock()
+                .unwrap()
+                .push((root_comment_id, body.into()));
+            Ok(ReviewComment {
+                node_id: format!("reply-{root_comment_id}"),
+                database_id: Some(root_comment_id + 1),
+                author: "current-user".into(),
+                body: body.into(),
+                created_at: "2026-07-31T00:00:00Z".into(),
+                url: "https://github.com/acme/demo/pull/17#discussion_r171".into(),
+                reply_to: None,
+            })
+        }
+
+        fn submit_review(
+            &self,
+            _reference: &GitHubPrRef,
+            submission: &ReviewSubmission,
+        ) -> anyhow::Result<()> {
+            self.submissions.lock().unwrap().push(submission.clone());
+            Ok(())
+        }
+    }
 
     impl AgentSink for NoopAgent {
         fn send(&self, _command: AgentCommand) -> anyhow::Result<()> {
@@ -9924,6 +10383,32 @@ mod tests {
     }
 
     #[test]
+    fn mouse_style_scrolling_preserves_the_cursor_until_it_leaves_the_viewport() {
+        let storage = Storage::in_memory().unwrap();
+        let workspace = snapshot_workspace(&storage).unwrap();
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        let mut highlighter = PlainHighlighter;
+        let mut terminal = Terminal::new(TestBackend::new(80, 9)).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &mut highlighter))
+            .unwrap();
+        state.review_viewport_height = 2;
+        state.row_cursor = 1;
+        scroll_review_viewport(&mut state, &mut highlighter, 1);
+        assert_eq!(state.review_scroll, 1);
+        assert_eq!(state.row_cursor, 1);
+
+        scroll_review_viewport(&mut state, &mut highlighter, 1);
+        assert_eq!(state.review_scroll, 2);
+        assert_eq!(state.row_cursor, 2);
+
+        scroll_review_viewport(&mut state, &mut highlighter, -1);
+        assert_eq!(state.review_scroll, 1);
+        assert_eq!(state.row_cursor, 2);
+    }
+
+    #[test]
     fn retract_restores_original_diff_and_never_removes_changed_lines() {
         let storage = Storage::in_memory().unwrap();
         let workspace = snapshot_workspace(&storage).unwrap();
@@ -10056,6 +10541,77 @@ mod tests {
         assert_eq!(ids, vec!["feedback-architecture"]);
         assert_eq!(submission.comments[0].path, "src/lib.rs");
         assert_eq!(submission.comments[0].side, GitHubDiffSide::Right);
+    }
+
+    #[test]
+    fn github_composers_run_end_to_end_through_a_fake_backend() {
+        let storage = Storage::in_memory().unwrap();
+        let mut workspace = snapshot_workspace(&storage).unwrap();
+        seed_github_snapshot(&storage, &mut workspace);
+        let mut state = RevState::load(workspace, &storage).unwrap();
+        seed_snapshot_feedback(&mut state);
+        let (feedback, placement) = state
+            .annotations
+            .iter()
+            .find(|(annotation, _)| annotation.id == "feedback-architecture")
+            .unwrap();
+        storage.add_annotation(feedback, placement).unwrap();
+        let backend = Arc::new(FakeGitHubBackend::default());
+        state.github_backend = backend.clone();
+        let paths = test_paths("rev-github-e2e");
+
+        begin_review_submission(&mut state, ReviewDecision::Approve);
+        state.compose = "Overall approval".into();
+        state.compose_cursor = state.compose.len();
+        submit_compose(&mut state, &storage, &paths).unwrap();
+        for _ in 0..1_000 {
+            drain_github_operation(&mut state, &storage).unwrap();
+            if state.github_operation.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(state.github_operation.is_none());
+        assert_eq!(backend.submissions.lock().unwrap().len(), 1);
+        assert!(
+            state
+                .annotations
+                .iter()
+                .find(|(annotation, _)| annotation.id == "feedback-architecture")
+                .unwrap()
+                .0
+                .submitted
+        );
+
+        begin_remote_reply(&mut state, "github-thread:thread-17".into());
+        state.compose = "Thanks; I checked the updated transition.".into();
+        state.compose_cursor = state.compose.len();
+        submit_compose(&mut state, &storage, &paths).unwrap();
+        for _ in 0..1_000 {
+            drain_github_operation(&mut state, &storage).unwrap();
+            if state.github_operation.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let replies = backend.replies.lock().unwrap();
+        assert_eq!(replies[0].0, 170);
+        assert!(replies[0]
+            .1
+            .starts_with("Thanks; I checked the updated transition."));
+        assert!(replies[0].1.contains("<!-- rev-operation:"));
+        assert_eq!(
+            storage
+                .pull_request_snapshot(&state.current_repo().unwrap().version.id)
+                .unwrap()
+                .unwrap()
+                .threads[0]
+                .comments
+                .last()
+                .unwrap()
+                .author,
+            "current-user"
+        );
     }
 
     #[test]

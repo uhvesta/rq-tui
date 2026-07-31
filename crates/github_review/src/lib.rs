@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -199,7 +201,8 @@ impl<T: GitHubTransport> GitHubReviewClient<T> {
     /// fake without coupling this crate to `gh` or an HTTP implementation.
     pub fn load_snapshot(&self, reference: &PullRequestRef) -> Result<PullRequestSnapshot> {
         let mut thread_cursor = None;
-        let mut snapshot = None;
+        let mut seen_thread_cursors = HashSet::new();
+        let mut snapshot: Option<PullRequestSnapshot> = None;
         let mut threads = Vec::new();
 
         loop {
@@ -229,8 +232,15 @@ impl<T: GitHubTransport> GitHubReviewClient<T> {
                 );
             }
 
-            if snapshot.is_none() {
-                snapshot = Some(parse_snapshot_metadata(pull_request)?);
+            let page_snapshot = parse_snapshot_metadata(pull_request)?;
+            if let Some(first) = snapshot.as_ref() {
+                if first.head_sha != page_snapshot.head_sha
+                    || first.base_sha != page_snapshot.base_sha
+                {
+                    bail!("pull-request revision changed while GitHub pages were loading; refresh again");
+                }
+            } else {
+                snapshot = Some(page_snapshot);
             }
 
             let review_threads = pull_request
@@ -246,10 +256,14 @@ impl<T: GitHubTransport> GitHubReviewClient<T> {
                 let mut thread = thread;
                 let mut comments_cursor = comments_page.end_cursor;
                 let mut has_more_comments = comments_page.has_next_page;
+                let mut seen_comment_cursors = HashSet::new();
                 while has_more_comments {
                     let cursor = comments_cursor
                         .clone()
                         .context("GitHub returned hasNextPage without endCursor for comments")?;
+                    if !seen_comment_cursors.insert(cursor.clone()) {
+                        bail!("GitHub repeated a review-comment pagination cursor");
+                    }
                     let response = self.transport.execute(ApiRequest {
                         method: "POST",
                         path: "/graphql".into(),
@@ -288,11 +302,13 @@ impl<T: GitHubTransport> GitHubReviewClient<T> {
             if !page_info.has_next_page {
                 break;
             }
-            thread_cursor = Some(
-                page_info
-                    .end_cursor
-                    .context("GitHub returned hasNextPage without endCursor for reviewThreads")?,
-            );
+            let cursor = page_info
+                .end_cursor
+                .context("GitHub returned hasNextPage without endCursor for reviewThreads")?;
+            if !seen_thread_cursors.insert(cursor.clone()) {
+                bail!("GitHub repeated a review-thread pagination cursor");
+            }
+            thread_cursor = Some(cursor);
         }
 
         let mut snapshot = snapshot.context("GitHub returned no pull-request snapshot")?;
@@ -305,10 +321,12 @@ impl<T: GitHubTransport> GitHubReviewClient<T> {
         reference: &PullRequestRef,
         submission: &ReviewSubmission,
     ) -> Result<Value> {
-        if submission.decision == ReviewDecision::RequestChanges
-            && submission.body.trim().is_empty()
+        if matches!(
+            submission.decision,
+            ReviewDecision::RequestChanges | ReviewDecision::Comment
+        ) && submission.body.trim().is_empty()
         {
-            bail!("request-changes reviews require an overall body");
+            bail!("comment and request-changes reviews require an overall body");
         }
         let comments = submission
             .comments
@@ -344,20 +362,42 @@ impl<T: GitHubTransport> GitHubReviewClient<T> {
         reference: &PullRequestRef,
         root_comment_id: u64,
         body: &str,
-    ) -> Result<Value> {
+    ) -> Result<ReviewComment> {
         if body.trim().is_empty() {
             bail!("reply body cannot be empty");
         }
-        self.transport.execute(ApiRequest {
+        let response = self.transport.execute(ApiRequest {
             method: "POST",
             path: reference.api_path(&format!("/comments/{root_comment_id}/replies")),
             body: json!({ "body": body }),
-        })
+        })?;
+        parse_rest_review_comment(&response)
     }
 
     pub fn parse_snapshot(value: Value) -> Result<PullRequestSnapshot> {
         serde_json::from_value(value).context("invalid GitHub pull-request snapshot")
     }
+}
+
+fn parse_rest_review_comment(value: &Value) -> Result<ReviewComment> {
+    Ok(ReviewComment {
+        node_id: required_string(value, "node_id")?,
+        database_id: value.get("id").and_then(Value::as_u64),
+        author: value
+            .get("user")
+            .and_then(|user| user.get("login"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned(),
+        body: required_string(value, "body")?,
+        created_at: required_string(value, "created_at")?,
+        url: value
+            .get("html_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        reply_to: None,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -428,7 +468,10 @@ fn parse_thread(value: &Value) -> Result<(ReviewThread, PageInfo)> {
         is_outdated: required_bool(value, "isOutdated")?,
         is_resolved: required_bool(value, "isResolved")?,
         viewer_can_reply: required_bool(value, "viewerCanReply")?,
-        comments: nodes.iter().map(parse_comment).collect::<Result<Vec<_>>>()?,
+        comments: nodes
+            .iter()
+            .map(parse_comment)
+            .collect::<Result<Vec<_>>>()?,
     };
     Ok((thread, parse_page_info(comments)?))
 }
@@ -565,10 +608,22 @@ mod tests {
 
     #[test]
     fn replies_target_the_existing_root_comment() {
-        let client = GitHubReviewClient::new(FakeTransport::default());
-        client
+        let client = GitHubReviewClient::new(FakeTransport {
+            requests: RefCell::new(Vec::new()),
+            responses: RefCell::new(VecDeque::from([json!({
+                "node_id": "reply-node",
+                "id": 100,
+                "user": { "login": "octocat" },
+                "body": "I checked this against the updated code.",
+                "created_at": "2026-07-31T00:00:00Z",
+                "html_url": "https://github.com/acme/api/pull/17#discussion_r100"
+            })])),
+        });
+        let reply = client
             .reply(&reference(), 99, "I checked this against the updated code.")
             .unwrap();
+        assert_eq!(reply.author, "octocat");
+        assert_eq!(reply.database_id, Some(100));
         let requests = client.transport.requests.borrow();
         assert_eq!(
             requests[0].path,
@@ -672,11 +727,7 @@ mod tests {
         })
     }
 
-    fn pull_request_page(
-        threads: Value,
-        has_next: bool,
-        end_cursor: Option<&str>,
-    ) -> Value {
+    fn pull_request_page(threads: Value, has_next: bool, end_cursor: Option<&str>) -> Value {
         json!({
             "data": {
                 "repository": {
@@ -702,7 +753,12 @@ mod tests {
         })
     }
 
-    fn comments_page(thread_id: &str, comments: Value, has_next: bool, cursor: Option<&str>) -> Value {
+    fn comments_page(
+        thread_id: &str,
+        comments: Value,
+        has_next: bool,
+        cursor: Option<&str>,
+    ) -> Value {
         json!({
             "data": {
                 "node": {
@@ -727,7 +783,12 @@ mod tests {
                 pull_request_page(
                     json!([thread(
                         "thread-1",
-                        json!([comment("comment-1", "reviewer-one", "Please simplify this.", None)]),
+                        json!([comment(
+                            "comment-1",
+                            "reviewer-one",
+                            "Please simplify this.",
+                            None
+                        )]),
                         true,
                         Some("comments-cursor-1"),
                         "RIGHT",
@@ -752,7 +813,12 @@ mod tests {
                 pull_request_page(
                     json!([thread(
                         "thread-2",
-                        json!([comment("comment-2", "reviewer-two", "This is resolved.", Some("comment-root"))]),
+                        json!([comment(
+                            "comment-2",
+                            "reviewer-two",
+                            "This is resolved.",
+                            Some("comment-root")
+                        )]),
                         false,
                         None,
                         "LEFT",
@@ -779,7 +845,10 @@ mod tests {
         assert!(snapshot.threads[0].viewer_can_reply);
         assert_eq!(snapshot.threads[0].comments.len(), 2);
         assert_eq!(snapshot.threads[0].comments[1].author, "octocat");
-        assert_eq!(snapshot.threads[0].comments[1].reply_to.as_deref(), Some("comment-1"));
+        assert_eq!(
+            snapshot.threads[0].comments[1].reply_to.as_deref(),
+            Some("comment-1")
+        );
         assert!(!snapshot.threads[1].viewer_can_reply);
         assert!(snapshot.threads[1].is_resolved);
         assert_eq!(snapshot.threads[1].side, DiffSide::Left);
@@ -805,8 +874,14 @@ mod tests {
         assert_eq!(requests[0].body["variables"]["threadsCursor"], Value::Null);
         assert_eq!(requests[1].body["operationName"], "RevThreadComments");
         assert_eq!(requests[1].body["variables"]["threadId"], "thread-1");
-        assert_eq!(requests[1].body["variables"]["commentsCursor"], "comments-cursor-1");
-        assert_eq!(requests[2].body["variables"]["threadsCursor"], "threads-cursor-1");
+        assert_eq!(
+            requests[1].body["variables"]["commentsCursor"],
+            "comments-cursor-1"
+        );
+        assert_eq!(
+            requests[2].body["variables"]["threadsCursor"],
+            "threads-cursor-1"
+        );
     }
 
     #[test]
@@ -826,14 +901,40 @@ mod tests {
     fn missing_pagination_cursor_is_a_hard_error() {
         let transport = FakeTransport {
             requests: RefCell::new(Vec::new()),
-            responses: RefCell::new(VecDeque::from([pull_request_page(
-                json!([]),
-                true,
-                None,
-            )])),
+            responses: RefCell::new(VecDeque::from([pull_request_page(json!([]), true, None)])),
         };
         let client = GitHubReviewClient::new(transport);
         let error = client.load_snapshot(&reference()).unwrap_err();
         assert!(error.to_string().contains("hasNextPage without endCursor"));
+    }
+
+    #[test]
+    fn repeated_pagination_cursors_are_rejected_instead_of_looping() {
+        let transport = FakeTransport {
+            requests: RefCell::new(Vec::new()),
+            responses: RefCell::new(VecDeque::from([
+                pull_request_page(json!([]), true, Some("same-cursor")),
+                pull_request_page(json!([]), true, Some("same-cursor")),
+            ])),
+        };
+        let error = GitHubReviewClient::new(transport)
+            .load_snapshot(&reference())
+            .unwrap_err();
+        assert!(error.to_string().contains("repeated a review-thread"));
+    }
+
+    #[test]
+    fn revision_changes_during_pagination_are_rejected() {
+        let first = pull_request_page(json!([]), true, Some("next"));
+        let mut second = pull_request_page(json!([]), false, None);
+        second["data"]["repository"]["pullRequest"]["headRefOid"] = json!("newer-head");
+        let transport = FakeTransport {
+            requests: RefCell::new(Vec::new()),
+            responses: RefCell::new(VecDeque::from([first, second])),
+        };
+        let error = GitHubReviewClient::new(transport)
+            .load_snapshot(&reference())
+            .unwrap_err();
+        assert!(error.to_string().contains("revision changed"));
     }
 }

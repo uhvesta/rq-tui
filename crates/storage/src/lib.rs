@@ -7,6 +7,6 @@
 mod storage;
 
 pub use storage::{
-    now, PruneOperation, PruneTarget, RevQuestionSession, ReviewHistoryItem, SideSessionRecord,
-    Storage,
+    now, GitHubOperation, GitHubOperationKind, GitHubOperationPreparation, GitHubOperationState,
+    PruneOperation, PruneTarget, RevQuestionSession, ReviewHistoryItem, SideSessionRecord, Storage,
 };

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -22,6 +23,7 @@ pub const MIGRATION_7: &str = include_str!("../migrations/0007_session_ephemeral
 pub const MIGRATION_8: &str = include_str!("../migrations/0008_rev_question_sessions.sql");
 pub const MIGRATION_9: &str = include_str!("../migrations/0009_annotation_status.sql");
 pub const MIGRATION_10: &str = include_str!("../migrations/0010_github_pull_request_snapshots.sql");
+pub const MIGRATION_11: &str = include_str!("../migrations/0011_github_operation_outbox.sql");
 
 pub struct Storage {
     connection: Connection,
@@ -72,6 +74,98 @@ pub struct PruneTarget {
     pub last_error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// The externally visible GitHub request recorded in the durable outbox.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitHubOperation {
+    pub operation_id: String,
+    pub repo_id: String,
+    pub version_id: String,
+    pub kind: GitHubOperationKind,
+    pub request_json: String,
+    pub idempotency_key: String,
+    pub state: GitHubOperationState,
+    pub last_error: Option<String>,
+    pub annotation_ids: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Input for atomically reserving precisely the annotations a GitHub request
+/// will submit. Annotation IDs may be empty: approval-only reviews and replies
+/// to remote review threads have no local annotation to reserve. `request_json`
+/// is opaque to storage and intentionally kept as the exact wire-ready request
+/// for reconciliation after a crash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitHubOperationPreparation {
+    pub operation_id: String,
+    pub repo_id: String,
+    pub version_id: String,
+    pub kind: GitHubOperationKind,
+    pub request_json: String,
+    pub idempotency_key: String,
+    pub annotation_ids: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitHubOperationKind {
+    Review,
+    Reply,
+}
+
+impl GitHubOperationKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Review => "review",
+            Self::Reply => "reply",
+        }
+    }
+}
+
+impl TryFrom<&str> for GitHubOperationKind {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "review" => Ok(Self::Review),
+            "reply" => Ok(Self::Reply),
+            other => anyhow::bail!("invalid GitHub operation kind: {other}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitHubOperationState {
+    Prepared,
+    Sent,
+    Unknown,
+    Failed,
+}
+
+impl GitHubOperationState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Sent => "sent",
+            Self::Unknown => "unknown",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl TryFrom<&str> for GitHubOperationState {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "prepared" => Ok(Self::Prepared),
+            "sent" => Ok(Self::Sent),
+            "unknown" => Ok(Self::Unknown),
+            "failed" => Ok(Self::Failed),
+            other => anyhow::bail!("invalid GitHub operation state: {other}"),
+        }
+    }
 }
 
 /// The canonical persisted representation of a SIDE session.
@@ -176,6 +270,7 @@ impl Storage {
             (8, MIGRATION_8),
             (9, MIGRATION_9),
             (10, MIGRATION_10),
+            (11, MIGRATION_11),
         ] {
             let applied = tx
                 .query_row(
@@ -2523,6 +2618,381 @@ impl Storage {
         Ok(())
     }
 
+    /// Atomically records a GitHub request and reserves only its explicit
+    /// annotation set.  A caller must invoke this before starting its network
+    /// request; a crash after this point is recovered as `Unknown`, never
+    /// silently retried as a fresh operation.
+    pub fn prepare_github_operation(
+        &self,
+        preparation: &GitHubOperationPreparation,
+    ) -> Result<GitHubOperation> {
+        anyhow::ensure!(
+            !preparation.operation_id.trim().is_empty(),
+            "GitHub operation id cannot be empty"
+        );
+        anyhow::ensure!(
+            !preparation.idempotency_key.trim().is_empty(),
+            "GitHub operation idempotency key cannot be empty"
+        );
+        anyhow::ensure!(
+            !preparation.request_json.trim().is_empty(),
+            "GitHub operation request payload cannot be empty"
+        );
+        let unique_ids = preparation.annotation_ids.iter().collect::<HashSet<_>>();
+        anyhow::ensure!(
+            unique_ids.len() == preparation.annotation_ids.len(),
+            "GitHub operation annotation ids must be unique"
+        );
+
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let existing_operation_id = tx
+            .query_row(
+                "SELECT operation_id
+                 FROM github_operations
+                 WHERE operation_id = ?1 OR idempotency_key = ?2
+                 LIMIT 1",
+                params![preparation.operation_id, preparation.idempotency_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(existing_operation_id) = existing_operation_id {
+            tx.commit()?;
+            let existing = self
+                .github_operation(&existing_operation_id)?
+                .with_context(|| {
+                    format!(
+                        "GitHub operation {existing_operation_id} disappeared during preparation"
+                    )
+                })?;
+            anyhow::ensure!(
+                existing.operation_id == preparation.operation_id
+                    && existing.repo_id == preparation.repo_id
+                    && existing.version_id == preparation.version_id
+                    && existing.kind == preparation.kind
+                    && existing.request_json == preparation.request_json
+                    && existing.idempotency_key == preparation.idempotency_key
+                    && existing.annotation_ids == preparation.annotation_ids,
+                "GitHub operation id or idempotency key is already bound to a different request"
+            );
+            return Ok(existing);
+        }
+        let version_matches_repo = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM versions WHERE id = ?1 AND repo_id = ?2
+             )",
+            params![preparation.version_id, preparation.repo_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        anyhow::ensure!(
+            version_matches_repo,
+            "GitHub operation version {} does not belong to repository {}",
+            preparation.version_id,
+            preparation.repo_id
+        );
+
+        for annotation_id in &preparation.annotation_ids {
+            let already_reserved = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM github_operation_annotations items
+                    JOIN github_operations operations
+                      ON operations.operation_id = items.operation_id
+                    WHERE items.annotation_id = ?1
+                      AND operations.state IN ('prepared', 'unknown')
+                 )",
+                [annotation_id],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            anyhow::ensure!(
+                !already_reserved,
+                "annotation {annotation_id} is already reserved by an unresolved GitHub operation"
+            );
+
+            let reserved = tx.execute(
+                "UPDATE annotations
+                 SET delivery_state = 'pending'
+                 WHERE id = ?1
+                   AND repo_id = ?2
+                   AND kind = 'comment'
+                   AND submitted = 0
+                   AND status = 'active'
+                   AND delivery_state = 'draft'
+                   AND EXISTS(
+                       SELECT 1 FROM placements
+                       WHERE annotation_id = ?1 AND version_id = ?3
+                   )",
+                params![annotation_id, preparation.repo_id, preparation.version_id],
+            )?;
+            anyhow::ensure!(
+                reserved == 1,
+                "annotation {annotation_id} is not an active draft comment in the requested review version"
+            );
+        }
+
+        let timestamp = now();
+        tx.execute(
+            "INSERT INTO github_operations(
+                operation_id, repo_id, version_id, kind, request_json,
+                idempotency_key, state, last_error, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'prepared', NULL, ?7, ?7)",
+            params![
+                preparation.operation_id,
+                preparation.repo_id,
+                preparation.version_id,
+                preparation.kind.as_str(),
+                preparation.request_json,
+                preparation.idempotency_key,
+                timestamp,
+            ],
+        )?;
+        for (ordinal, annotation_id) in preparation.annotation_ids.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO github_operation_annotations(operation_id, annotation_id, ordinal)
+                 VALUES (?1, ?2, ?3)",
+                params![preparation.operation_id, annotation_id, ordinal],
+            )?;
+        }
+        tx.commit()?;
+        self.github_operation(&preparation.operation_id)?
+            .with_context(|| {
+                format!(
+                    "GitHub operation {} disappeared after preparation",
+                    preparation.operation_id
+                )
+            })
+    }
+
+    /// Marks a completed operation and only its recorded annotation set as
+    /// sent.  Both the journal and those annotation rows change in one
+    /// transaction.
+    pub fn mark_github_operation_sent(&self, operation_id: &str) -> Result<()> {
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
+            "UPDATE github_operations
+             SET state = 'sent', last_error = NULL, updated_at = ?2
+             WHERE operation_id = ?1 AND state IN ('prepared', 'unknown')",
+            params![operation_id, now()],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "GitHub operation {operation_id} is not awaiting reconciliation"
+        );
+        let expected: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM github_operation_annotations WHERE operation_id = ?1",
+            [operation_id],
+            |row| row.get(0),
+        )?;
+        let delivered = tx.execute(
+            "UPDATE annotations
+             SET delivery_state = 'sent', submitted = 1
+             WHERE delivery_state = 'pending'
+               AND id IN (
+                   SELECT annotation_id
+                   FROM github_operation_annotations
+                   WHERE operation_id = ?1
+               )",
+            [operation_id],
+        )?;
+        anyhow::ensure!(
+            delivered as i64 == expected,
+            "GitHub operation {operation_id} no longer owns every pending annotation"
+        );
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records that the process cannot prove whether the external request was
+    /// delivered.  The operation remains unresolved and its annotations stay
+    /// pending until a later GitHub refresh reconciles the idempotency marker.
+    pub fn mark_github_operation_unknown(&self, operation_id: &str, error: &str) -> Result<()> {
+        anyhow::ensure!(
+            !error.trim().is_empty(),
+            "unknown-operation error cannot be empty"
+        );
+        let updated = self.connection.execute(
+            "UPDATE github_operations
+             SET state = 'unknown', last_error = ?2, updated_at = ?3
+             WHERE operation_id = ?1 AND state = 'prepared'",
+            params![operation_id, error, now()],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "GitHub operation {operation_id} cannot transition to unknown"
+        );
+        Ok(())
+    }
+
+    /// Records a definitely-unsent operation as failed and releases only its
+    /// own annotations back to drafts.  Callers must use `unknown`, not this
+    /// method, for a timeout or any transport result that could hide success.
+    pub fn mark_github_operation_failed(&self, operation_id: &str, error: &str) -> Result<()> {
+        anyhow::ensure!(
+            !error.trim().is_empty(),
+            "failed-operation error cannot be empty"
+        );
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
+            "UPDATE github_operations
+             SET state = 'failed', last_error = ?2, updated_at = ?3
+             WHERE operation_id = ?1 AND state = 'prepared'",
+            params![operation_id, error, now()],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "GitHub operation {operation_id} cannot transition to failed"
+        );
+        let expected: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM github_operation_annotations WHERE operation_id = ?1",
+            [operation_id],
+            |row| row.get(0),
+        )?;
+        let released = tx.execute(
+            "UPDATE annotations
+             SET delivery_state = 'draft'
+             WHERE delivery_state = 'pending'
+               AND id IN (
+                   SELECT annotation_id
+                   FROM github_operation_annotations
+                   WHERE operation_id = ?1
+               )",
+            [operation_id],
+        )?;
+        anyhow::ensure!(
+            released as i64 == expected,
+            "GitHub operation {operation_id} no longer owns every pending annotation"
+        );
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn github_operation(&self, operation_id: &str) -> Result<Option<GitHubOperation>> {
+        let operation = self
+            .connection
+            .query_row(
+                "SELECT operation_id, repo_id, version_id, kind, request_json,
+                        idempotency_key, state, last_error, created_at, updated_at
+                 FROM github_operations WHERE operation_id = ?1",
+                [operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                },
+            )
+            .optional()?;
+        operation
+            .map(|values| self.github_operation_from_values(values))
+            .transpose()
+    }
+
+    /// Returns requests that need explicit reconciliation.  `Prepared` means
+    /// no outcome has been recorded yet; `Unknown` means a previous process
+    /// may have reached GitHub and must not blindly retry it.
+    pub fn unresolved_github_operations(&self) -> Result<Vec<GitHubOperation>> {
+        let values = {
+            let mut statement = self.connection.prepare(
+                "SELECT operation_id, repo_id, version_id, kind, request_json,
+                        idempotency_key, state, last_error, created_at, updated_at
+                 FROM github_operations
+                 WHERE state IN ('prepared', 'unknown')
+                 ORDER BY created_at, operation_id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        values
+            .into_iter()
+            .map(|value| self.github_operation_from_values(value))
+            .collect()
+    }
+
+    /// Converts durable prepared rows left by a process exit into `Unknown`.
+    /// This is safe to call on every startup before checking GitHub for the
+    /// operation's idempotency marker.
+    pub fn recover_unresolved_github_operations(&self) -> Result<Vec<GitHubOperation>> {
+        self.connection.execute(
+            "UPDATE github_operations
+             SET state = 'unknown',
+                 last_error = COALESCE(last_error, 'interrupted before GitHub outcome was recorded'),
+                 updated_at = ?1
+             WHERE state = 'prepared'",
+            [now()],
+        )?;
+        self.unresolved_github_operations()
+    }
+
+    fn github_operation_from_values(
+        &self,
+        (
+            operation_id,
+            repo_id,
+            version_id,
+            kind,
+            request_json,
+            idempotency_key,
+            state,
+            last_error,
+            created_at,
+            updated_at,
+        ): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+        ),
+    ) -> Result<GitHubOperation> {
+        let mut statement = self.connection.prepare(
+            "SELECT annotation_id
+             FROM github_operation_annotations
+             WHERE operation_id = ?1
+             ORDER BY ordinal",
+        )?;
+        let annotation_ids = statement
+            .query_map([&operation_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(GitHubOperation {
+            operation_id,
+            repo_id,
+            version_id,
+            kind: GitHubOperationKind::try_from(kind.as_str())?,
+            request_json,
+            idempotency_key,
+            state: GitHubOperationState::try_from(state.as_str())?,
+            last_error,
+            annotation_ids,
+            created_at,
+            updated_at,
+        })
+    }
+
     pub fn latest_placement_for_annotation(
         &self,
         annotation_id: &str,
@@ -2889,8 +3359,9 @@ mod tests {
     use std::thread;
 
     use super::{
-        RevQuestionSession, SideSessionRecord, Storage, MIGRATION_1, MIGRATION_2, MIGRATION_3,
-        MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8,
+        GitHubOperationKind, GitHubOperationPreparation, GitHubOperationState, RevQuestionSession,
+        SideSessionRecord, Storage, MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4,
+        MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8,
     };
     use rq_tui_domain::{
         AnchorSide, Annotation, AnnotationKind, AnnotationStatus, AskMessage, BaseBranchSource,
@@ -2965,6 +3436,51 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    fn add_draft_comment(storage: &Storage, id: &str, text: &str) {
+        storage
+            .add_annotation(
+                &Annotation {
+                    id: id.into(),
+                    repo_id: "status-repo".into(),
+                    kind: AnnotationKind::Comment,
+                    file_path: "src/lib.rs".into(),
+                    anchor_snippet: "selected".into(),
+                    anchor_hash: format!("hash-{id}"),
+                    anchor_start_offset: 0,
+                    anchor_line_count: 1,
+                    text: Some(text.into()),
+                    submitted: false,
+                    delivery_state: DeliveryState::Draft,
+                    status: AnnotationStatus::Active,
+                    status_reason: None,
+                    status_changed_at: None,
+                    created_at: "now".into(),
+                },
+                &Placement {
+                    annotation_id: id.into(),
+                    version_id: "status-version".into(),
+                    side: AnchorSide::New,
+                    line_start: 2,
+                    line_end: 2,
+                    outdated: false,
+                    ambiguous: false,
+                },
+            )
+            .unwrap();
+    }
+
+    fn github_operation(operation_id: &str, annotation_ids: &[&str]) -> GitHubOperationPreparation {
+        GitHubOperationPreparation {
+            operation_id: operation_id.into(),
+            repo_id: "status-repo".into(),
+            version_id: "status-version".into(),
+            kind: GitHubOperationKind::Review,
+            request_json: format!(r#"{{"marker":"{operation_id}"}}"#),
+            idempotency_key: format!("key-{operation_id}"),
+            annotation_ids: annotation_ids.iter().map(|id| (*id).into()).collect(),
+        }
     }
 
     fn snapshot(suffix: &str) -> PullRequestSnapshot {
@@ -3140,12 +3656,15 @@ mod tests {
                      'pull_request_snapshots_node',
                      'pull_request_review_threads_location',
                      'pull_request_review_comments_thread'
+                     ,'github_operations', 'github_operation_annotations',
+                     'github_operations_unresolved',
+                     'github_operation_annotations_annotation'
                    )",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 32);
+        assert_eq!(count, 36);
         let ephemeral_column: i64 = storage
             .connection
             .query_row(
@@ -3156,6 +3675,202 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ephemeral_column, 1);
+    }
+
+    #[test]
+    fn github_operation_preparation_is_atomic_and_reserves_only_its_annotations() {
+        let storage = Storage::in_memory().unwrap();
+        seed_status_annotation(&storage);
+        add_draft_comment(&storage, "second-comment", "second");
+
+        let invalid = github_operation("invalid", &["status-annotation", "missing"]);
+        assert!(storage.prepare_github_operation(&invalid).is_err());
+        assert_eq!(
+            storage
+                .annotation_by_id("status-annotation")
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            DeliveryState::Draft
+        );
+
+        let prepared = storage
+            .prepare_github_operation(&github_operation("one", &["status-annotation"]))
+            .unwrap();
+        assert_eq!(prepared.state, GitHubOperationState::Prepared);
+        assert_eq!(prepared.annotation_ids, vec!["status-annotation"]);
+        assert_eq!(
+            storage
+                .prepare_github_operation(&github_operation("one", &["status-annotation"]))
+                .unwrap(),
+            prepared
+        );
+        assert_eq!(
+            storage
+                .annotation_by_id("status-annotation")
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            DeliveryState::Pending
+        );
+        assert_eq!(
+            storage
+                .annotation_by_id("second-comment")
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            DeliveryState::Draft
+        );
+        assert!(storage
+            .prepare_github_operation(&github_operation("duplicate", &["status-annotation"]))
+            .is_err());
+    }
+
+    #[test]
+    fn github_operation_transitions_change_only_the_recorded_annotation_set() {
+        let storage = Storage::in_memory().unwrap();
+        seed_status_annotation(&storage);
+        add_draft_comment(&storage, "second-comment", "second");
+        add_draft_comment(&storage, "third-comment", "third");
+
+        storage
+            .prepare_github_operation(&github_operation("sent", &["status-annotation"]))
+            .unwrap();
+        storage.mark_github_operation_sent("sent").unwrap();
+        let sent = storage.github_operation("sent").unwrap().unwrap();
+        assert_eq!(sent.state, GitHubOperationState::Sent);
+        let annotation = storage
+            .annotation_by_id("status-annotation")
+            .unwrap()
+            .unwrap();
+        assert!(annotation.submitted);
+        assert_eq!(annotation.delivery_state, DeliveryState::Sent);
+        assert_eq!(
+            storage
+                .annotation_by_id("second-comment")
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            DeliveryState::Draft
+        );
+
+        storage
+            .prepare_github_operation(&github_operation("failed", &["second-comment"]))
+            .unwrap();
+        storage
+            .mark_github_operation_failed("failed", "connection refused before send")
+            .unwrap();
+        assert_eq!(
+            storage.github_operation("failed").unwrap().unwrap().state,
+            GitHubOperationState::Failed
+        );
+        assert_eq!(
+            storage
+                .annotation_by_id("second-comment")
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            DeliveryState::Draft
+        );
+
+        storage
+            .prepare_github_operation(&github_operation("unknown", &["third-comment"]))
+            .unwrap();
+        storage
+            .mark_github_operation_unknown("unknown", "response lost after upload")
+            .unwrap();
+        assert_eq!(
+            storage.github_operation("unknown").unwrap().unwrap().state,
+            GitHubOperationState::Unknown
+        );
+        assert_eq!(
+            storage
+                .annotation_by_id("third-comment")
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            DeliveryState::Pending
+        );
+    }
+
+    #[test]
+    fn github_operation_recovery_promotes_prepared_rows_to_unknown_without_cross_workspace_changes()
+    {
+        let storage = Storage::in_memory().unwrap();
+        seed_status_annotation(&storage);
+        add_draft_comment(&storage, "second-comment", "second");
+        storage
+            .prepare_github_operation(&github_operation("recover", &["status-annotation"]))
+            .unwrap();
+
+        let unresolved = storage.recover_unresolved_github_operations().unwrap();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].operation_id, "recover");
+        assert_eq!(unresolved[0].state, GitHubOperationState::Unknown);
+        assert_eq!(
+            unresolved[0].last_error.as_deref(),
+            Some("interrupted before GitHub outcome was recorded")
+        );
+        assert_eq!(
+            storage
+                .annotation_by_id("status-annotation")
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            DeliveryState::Pending
+        );
+        assert_eq!(
+            storage
+                .annotation_by_id("second-comment")
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            DeliveryState::Draft
+        );
+    }
+
+    #[test]
+    fn github_operations_without_local_annotations_are_durable_and_recoverable() {
+        let storage = Storage::in_memory().unwrap();
+        seed_status_annotation(&storage);
+
+        let approval = GitHubOperationPreparation {
+            operation_id: "approval-only".into(),
+            repo_id: "status-repo".into(),
+            version_id: "status-version".into(),
+            kind: GitHubOperationKind::Review,
+            request_json: r#"{"decision":"approve","body":""}"#.into(),
+            idempotency_key: "approval-only-marker".into(),
+            annotation_ids: vec![],
+        };
+        let prepared = storage.prepare_github_operation(&approval).unwrap();
+        assert!(prepared.annotation_ids.is_empty());
+        storage.mark_github_operation_sent("approval-only").unwrap();
+        assert_eq!(
+            storage
+                .github_operation("approval-only")
+                .unwrap()
+                .unwrap()
+                .state,
+            GitHubOperationState::Sent
+        );
+
+        let reply = GitHubOperationPreparation {
+            operation_id: "remote-reply".into(),
+            repo_id: "status-repo".into(),
+            version_id: "status-version".into(),
+            kind: GitHubOperationKind::Reply,
+            request_json: r#"{"thread":"remote","body":"reply"}"#.into(),
+            idempotency_key: "remote-reply-marker".into(),
+            annotation_ids: vec![],
+        };
+        storage.prepare_github_operation(&reply).unwrap();
+        let unresolved = storage.recover_unresolved_github_operations().unwrap();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].operation_id, "remote-reply");
+        assert!(unresolved[0].annotation_ids.is_empty());
+        assert_eq!(unresolved[0].kind, GitHubOperationKind::Reply);
+        assert_eq!(unresolved[0].state, GitHubOperationState::Unknown);
     }
 
     #[test]
@@ -3720,12 +4435,12 @@ mod tests {
         let count: i64 = storage
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 9",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 11",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 9);
+        assert_eq!(count, 11);
     }
 
     #[test]
@@ -3834,7 +4549,7 @@ mod tests {
         let migrations_applied: i64 = storage
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 5 AND 9",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 5 AND 11",
                 [],
                 |row| row.get(0),
             )
@@ -3849,7 +4564,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migrations_applied, 5);
+        assert_eq!(migrations_applied, 7);
         assert_eq!(tables, 2);
     }
 
