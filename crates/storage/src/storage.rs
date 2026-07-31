@@ -11,7 +11,9 @@ use rq_tui_domain::{
     DeliveryState, EphemeralSessionRecord, PendingChat, Placement, Repo, ReviewContext,
     SessionRecord, Version, VersionKind, WorkItem,
 };
-use rq_tui_github_review::{DiffSide, PullRequestSnapshot, ReviewComment, ReviewThread};
+use rq_tui_github_review::{
+    DiffSide, PullRequestReview, PullRequestSnapshot, ReviewComment, ReviewThread,
+};
 
 pub const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
 pub const MIGRATION_2: &str = include_str!("../migrations/0002_placement_side.sql");
@@ -25,6 +27,7 @@ pub const MIGRATION_9: &str = include_str!("../migrations/0009_annotation_status
 pub const MIGRATION_10: &str = include_str!("../migrations/0010_github_pull_request_snapshots.sql");
 pub const MIGRATION_11: &str = include_str!("../migrations/0011_github_operation_outbox.sql");
 pub const MIGRATION_12: &str = include_str!("../migrations/0012_github_multiline_threads.sql");
+pub const MIGRATION_13: &str = include_str!("../migrations/0013_github_pull_request_reviews.sql");
 
 pub struct Storage {
     connection: Connection,
@@ -273,6 +276,7 @@ impl Storage {
             (10, MIGRATION_10),
             (11, MIGRATION_11),
             (12, MIGRATION_12),
+            (13, MIGRATION_13),
         ] {
             let applied = tx
                 .query_row(
@@ -884,6 +888,31 @@ impl Storage {
             "DELETE FROM pull_request_review_threads WHERE version_id = ?1",
             [version_id],
         )?;
+        tx.execute(
+            "DELETE FROM pull_request_reviews WHERE version_id = ?1",
+            [version_id],
+        )?;
+
+        for (review_ordinal, review) in snapshot.reviews.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO pull_request_reviews(
+                    version_id, node_id, ordinal, database_id, author, body, state,
+                    commit_sha, submitted_at, url
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    version_id,
+                    review.node_id,
+                    sql_ordinal(review_ordinal)?,
+                    sql_optional_u64(review.database_id, "pull-request review database ID")?,
+                    review.author,
+                    review.body,
+                    review.state,
+                    review.commit_sha,
+                    review.submitted_at,
+                    review.url,
+                ],
+            )?;
+        }
 
         for (thread_ordinal, thread) in snapshot.threads.iter().enumerate() {
             tx.execute(
@@ -963,6 +992,48 @@ impl Storage {
         let Some((node_id, title, body, url, author, head_sha, base_sha, updated_at)) = snapshot
         else {
             return Ok(None);
+        };
+
+        let reviews = {
+            let mut statement = self.connection.prepare(
+                "SELECT node_id, database_id, author, body, state, commit_sha,
+                        submitted_at, url
+                 FROM pull_request_reviews
+                 WHERE version_id = ?1
+                 ORDER BY ordinal",
+            )?;
+            let reviews = statement
+                .query_map([version_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                })?
+                .map(|row| {
+                    let (node_id, database_id, author, body, state, commit_sha, submitted_at, url) =
+                        row?;
+                    Ok(PullRequestReview {
+                        node_id,
+                        database_id: sql_to_optional_u64(
+                            database_id,
+                            "pull-request review database ID",
+                        )?,
+                        author,
+                        body,
+                        state,
+                        commit_sha,
+                        submitted_at,
+                        url,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            reviews
         };
 
         let threads = {
@@ -1078,6 +1149,7 @@ impl Storage {
             head_sha,
             base_sha,
             updated_at,
+            reviews,
             threads: review_threads,
         }))
     }
@@ -3390,7 +3462,9 @@ mod tests {
         DeliveryState, EphemeralSessionRecord, PendingChat, Placement, Repo, SessionRecord,
         Version, VersionKind, WorkItem,
     };
-    use rq_tui_github_review::{DiffSide, PullRequestSnapshot, ReviewComment, ReviewThread};
+    use rq_tui_github_review::{
+        DiffSide, PullRequestReview, PullRequestSnapshot, ReviewComment, ReviewThread,
+    };
 
     fn seed_status_annotation(storage: &Storage) {
         storage
@@ -3515,6 +3589,16 @@ mod tests {
             head_sha: format!("head-{suffix}"),
             base_sha: format!("base-{suffix}"),
             updated_at: format!("2026-07-{suffix}T00:00:00Z"),
+            reviews: vec![PullRequestReview {
+                node_id: format!("review-{suffix}"),
+                database_id: Some(101),
+                author: "reviewer".into(),
+                body: "The complete review summary.".into(),
+                state: "APPROVED".into(),
+                commit_sha: Some(format!("head-{suffix}")),
+                submitted_at: Some("2026-07-31T02:00:00Z".into()),
+                url: "https://github.com/acme/rev/pull/1#pullrequestreview-101".into(),
+            }],
             threads: vec![ReviewThread {
                 node_id: format!("thread-{suffix}"),
                 path: "src/lib.rs".into(),
@@ -3680,7 +3764,9 @@ mod tests {
                      'pull_request_review_comments',
                      'pull_request_snapshots_node',
                      'pull_request_review_threads_location',
-                     'pull_request_review_comments_thread'
+                     'pull_request_review_comments_thread',
+                     'pull_request_reviews',
+                     'pull_request_reviews_version_state'
                      ,'github_operations', 'github_operation_annotations',
                      'github_operations_unresolved',
                      'github_operation_annotations_annotation'
@@ -3689,7 +3775,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 36);
+        assert_eq!(count, 38);
         let ephemeral_column: i64 = storage
             .connection
             .query_row(
@@ -3948,6 +4034,7 @@ mod tests {
 
         let mut replacement = snapshot("replacement");
         replacement.threads.clear();
+        replacement.reviews.clear();
         storage
             .upsert_pull_request_snapshot("status-version", &replacement)
             .unwrap();
@@ -4460,12 +4547,12 @@ mod tests {
         let count: i64 = storage
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 11",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 13",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 11);
+        assert_eq!(count, 13);
     }
 
     #[test]
@@ -4574,7 +4661,7 @@ mod tests {
         let migrations_applied: i64 = storage
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 5 AND 11",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 5 AND 13",
                 [],
                 |row| row.get(0),
             )
@@ -4589,7 +4676,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migrations_applied, 7);
+        assert_eq!(migrations_applied, 9);
         assert_eq!(tables, 2);
     }
 

@@ -30,7 +30,31 @@ pub struct PullRequestSnapshot {
     pub head_sha: String,
     pub base_sha: String,
     pub updated_at: String,
+    /// Overall PR reviews, independent of inline review threads. These are
+    /// retained so callers can show review decisions and reconcile a review
+    /// submission that completed remotely before the local process observed
+    /// its response.
+    #[serde(default)]
+    pub reviews: Vec<PullRequestReview>,
     pub threads: Vec<ReviewThread>,
+}
+
+/// A submitted (or pending) top-level GitHub pull-request review.
+///
+/// GitHub represents the decision as `state` (for example `APPROVED`,
+/// `CHANGES_REQUESTED`, or `COMMENTED`). Keeping GitHub's value verbatim
+/// preserves unfamiliar future states without making an older client fail to
+/// load an otherwise usable review snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestReview {
+    pub node_id: String,
+    pub database_id: Option<u64>,
+    pub author: String,
+    pub body: String,
+    pub state: String,
+    pub commit_sha: Option<String>,
+    pub submitted_at: Option<String>,
+    pub url: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +215,31 @@ query RevThreadComments($threadId: ID!, $commentsCursor: String) {
 }
 "#;
 
+const PULL_REQUEST_REVIEWS_QUERY: &str = r#"
+query RevPullRequestReviews($owner: String!, $repository: String!, $number: Int!, $reviewsCursor: String) {
+  repository(owner: $owner, name: $repository) {
+    pullRequest(number: $number) {
+      id
+      headRefOid
+      baseRefOid
+      reviews(first: 100, after: $reviewsCursor) {
+        nodes {
+          id
+          databaseId
+          author { login }
+          body
+          state
+          commit { oid }
+          submittedAt
+          url
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"#;
+
 pub struct GitHubReviewClient<T> {
     transport: T,
 }
@@ -322,7 +371,77 @@ impl<T: GitHubTransport> GitHubReviewClient<T> {
 
         let mut snapshot = snapshot.context("GitHub returned no pull-request snapshot")?;
         snapshot.threads = threads;
+        snapshot.reviews = self.load_reviews(reference, &snapshot)?;
         Ok(snapshot)
+    }
+
+    fn load_reviews(
+        &self,
+        reference: &PullRequestRef,
+        expected_snapshot: &PullRequestSnapshot,
+    ) -> Result<Vec<PullRequestReview>> {
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        let mut seen_reviews = HashSet::new();
+        let mut reviews = Vec::new();
+
+        loop {
+            let response = self.transport.execute(ApiRequest {
+                method: "POST",
+                path: "/graphql".into(),
+                body: json!({
+                    "query": PULL_REQUEST_REVIEWS_QUERY,
+                    "operationName": "RevPullRequestReviews",
+                    "variables": {
+                        "owner": reference.owner,
+                        "repository": reference.repository,
+                        "number": reference.number,
+                        "reviewsCursor": cursor,
+                    },
+                }),
+            })?;
+            let data = graphql_data(&response)?;
+            let pull_request = data
+                .get("repository")
+                .and_then(|repository| repository.get("pullRequest"))
+                .context("GitHub GraphQL response did not contain the pull request")?;
+            if pull_request.is_null() {
+                bail!(
+                    "GitHub GraphQL response did not contain pull request #{}",
+                    reference.number
+                );
+            }
+            ensure_same_revision(expected_snapshot, pull_request)?;
+
+            let review_connection = pull_request
+                .get("reviews")
+                .context("GitHub GraphQL response did not contain reviews")?;
+            let nodes = review_connection
+                .get("nodes")
+                .and_then(Value::as_array)
+                .context("GitHub GraphQL reviews.nodes was not an array")?;
+            for node in nodes {
+                let review = parse_review(node)?;
+                if !seen_reviews.insert(review.node_id.clone()) {
+                    bail!("GitHub returned the same pull-request review on more than one page");
+                }
+                reviews.push(review);
+            }
+
+            let page_info = parse_page_info(review_connection)?;
+            if !page_info.has_next_page {
+                break;
+            }
+            let next_cursor = page_info
+                .end_cursor
+                .context("GitHub returned hasNextPage without endCursor for reviews")?;
+            if !seen_cursors.insert(next_cursor.clone()) {
+                bail!("GitHub repeated a pull-request-review pagination cursor");
+            }
+            cursor = Some(next_cursor);
+        }
+
+        Ok(reviews)
     }
 
     pub fn submit_review(
@@ -456,7 +575,48 @@ fn parse_snapshot_metadata(value: &Value) -> Result<PullRequestSnapshot> {
         head_sha: required_string(value, "headRefOid")?,
         base_sha: required_string(value, "baseRefOid")?,
         updated_at: required_string(value, "updatedAt")?,
+        reviews: Vec::new(),
         threads: Vec::new(),
+    })
+}
+
+fn ensure_same_revision(expected: &PullRequestSnapshot, value: &Value) -> Result<()> {
+    let node_id = required_string(value, "id")?;
+    let head_sha = required_string(value, "headRefOid")?;
+    let base_sha = required_string(value, "baseRefOid")?;
+    if node_id != expected.node_id || head_sha != expected.head_sha || base_sha != expected.base_sha
+    {
+        bail!("pull-request revision changed while GitHub pages were loading; refresh again");
+    }
+    Ok(())
+}
+
+fn parse_review(value: &Value) -> Result<PullRequestReview> {
+    Ok(PullRequestReview {
+        node_id: required_string(value, "id")?,
+        database_id: optional_u64(value, "databaseId")?,
+        author: value
+            .get("author")
+            .and_then(|author| author.get("login"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        body: value
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        state: required_string(value, "state")?,
+        commit_sha: value
+            .get("commit")
+            .and_then(|commit| commit.get("oid"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        submitted_at: value
+            .get("submittedAt")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        url: required_string(value, "url")?,
     })
 }
 
@@ -705,6 +865,7 @@ mod tests {
         assert!(client.transport.requests.borrow().is_empty());
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn thread(
         id: &str,
         comment_nodes: Value,
@@ -794,6 +955,45 @@ mod tests {
         })
     }
 
+    fn review(
+        id: &str,
+        state: &str,
+        commit_sha: Option<&str>,
+        submitted_at: Option<&str>,
+    ) -> Value {
+        json!({
+            "id": id,
+            "databaseId": 800,
+            "author": { "login": "reviewer" },
+            "body": format!("Review body for {id}"),
+            "state": state,
+            "commit": commit_sha.map(|oid| json!({ "oid": oid })),
+            "submittedAt": submitted_at,
+            "url": format!("https://github.com/acme/api/pull/17#pullrequestreview-{id}"),
+        })
+    }
+
+    fn reviews_page(reviews: Value, has_next: bool, end_cursor: Option<&str>) -> Value {
+        json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "id": "PR_node_17",
+                        "headRefOid": "head-sha-2",
+                        "baseRefOid": "base-sha-1",
+                        "reviews": {
+                            "nodes": reviews,
+                            "pageInfo": {
+                                "hasNextPage": has_next,
+                                "endCursor": end_cursor,
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     #[test]
     fn loads_two_thread_pages_and_paginates_thread_comments() {
         let transport = FakeTransport {
@@ -848,6 +1048,7 @@ mod tests {
                     false,
                     None,
                 ),
+                reviews_page(json!([]), false, None),
             ])),
         };
         let client = GitHubReviewClient::new(transport);
@@ -858,6 +1059,7 @@ mod tests {
         assert_eq!(snapshot.body, "## Description\nA paginated review.");
         assert_eq!(snapshot.head_sha, "head-sha-2");
         assert_eq!(snapshot.base_sha, "base-sha-1");
+        assert!(snapshot.reviews.is_empty());
         assert_eq!(snapshot.threads.len(), 2);
         assert!(snapshot.threads[0].is_outdated);
         assert!(!snapshot.threads[0].is_resolved);
@@ -873,7 +1075,7 @@ mod tests {
         assert_eq!(snapshot.threads[1].side, DiffSide::Left);
 
         let requests = client.transport.requests.borrow();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         assert_eq!(requests[0].path, "/graphql");
         assert_eq!(requests[0].body["operationName"], "RevPullRequest");
         let query = requests[0].body["query"].as_str().unwrap();
@@ -900,6 +1102,75 @@ mod tests {
         assert_eq!(
             requests[2].body["variables"]["threadsCursor"],
             "threads-cursor-1"
+        );
+        assert_eq!(requests[3].body["operationName"], "RevPullRequestReviews");
+        let review_query = requests[3].body["query"].as_str().unwrap();
+        for field in [
+            "reviews",
+            "databaseId",
+            "state",
+            "commit { oid }",
+            "submittedAt",
+        ] {
+            assert!(review_query.contains(field), "query is missing {field}");
+        }
+    }
+
+    #[test]
+    fn loads_all_overall_review_pages_with_metadata_for_reconciliation() {
+        let transport = FakeTransport {
+            requests: RefCell::new(Vec::new()),
+            responses: RefCell::new(VecDeque::from([
+                pull_request_page(json!([]), false, None),
+                reviews_page(
+                    json!([
+                        review(
+                            "review-1",
+                            "APPROVED",
+                            Some("head-sha-2"),
+                            Some("2026-07-31T03:00:00Z")
+                        ),
+                        review("review-2", "PENDING", None, None),
+                    ]),
+                    true,
+                    Some("reviews-page-2"),
+                ),
+                reviews_page(
+                    json!([review(
+                        "review-3",
+                        "CHANGES_REQUESTED",
+                        Some("head-sha-2"),
+                        Some("2026-07-31T04:00:00Z")
+                    )]),
+                    false,
+                    None,
+                ),
+            ])),
+        };
+        let client = GitHubReviewClient::new(transport);
+        let snapshot = client.load_snapshot(&reference()).unwrap();
+
+        assert_eq!(snapshot.reviews.len(), 3);
+        assert_eq!(snapshot.reviews[0].database_id, Some(800));
+        assert_eq!(snapshot.reviews[0].author, "reviewer");
+        assert_eq!(snapshot.reviews[0].state, "APPROVED");
+        assert_eq!(
+            snapshot.reviews[0].commit_sha.as_deref(),
+            Some("head-sha-2")
+        );
+        assert_eq!(
+            snapshot.reviews[0].submitted_at.as_deref(),
+            Some("2026-07-31T03:00:00Z")
+        );
+        assert!(snapshot.reviews[1].commit_sha.is_none());
+        assert!(snapshot.reviews[1].submitted_at.is_none());
+
+        let requests = client.transport.requests.borrow();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1].body["variables"]["reviewsCursor"], Value::Null);
+        assert_eq!(
+            requests[2].body["variables"]["reviewsCursor"],
+            "reviews-page-2"
         );
     }
 
@@ -950,6 +1221,41 @@ mod tests {
         let transport = FakeTransport {
             requests: RefCell::new(Vec::new()),
             responses: RefCell::new(VecDeque::from([first, second])),
+        };
+        let error = GitHubReviewClient::new(transport)
+            .load_snapshot(&reference())
+            .unwrap_err();
+        assert!(error.to_string().contains("revision changed"));
+    }
+
+    #[test]
+    fn repeated_review_pagination_cursors_are_rejected_instead_of_looping() {
+        let transport = FakeTransport {
+            requests: RefCell::new(Vec::new()),
+            responses: RefCell::new(VecDeque::from([
+                pull_request_page(json!([]), false, None),
+                reviews_page(json!([]), true, Some("same-review-cursor")),
+                reviews_page(json!([]), true, Some("same-review-cursor")),
+            ])),
+        };
+        let error = GitHubReviewClient::new(transport)
+            .load_snapshot(&reference())
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("repeated a pull-request-review pagination cursor"));
+    }
+
+    #[test]
+    fn revision_changes_while_loading_reviews_are_rejected() {
+        let mut changed = reviews_page(json!([]), false, None);
+        changed["data"]["repository"]["pullRequest"]["baseRefOid"] = json!("newer-base");
+        let transport = FakeTransport {
+            requests: RefCell::new(Vec::new()),
+            responses: RefCell::new(VecDeque::from([
+                pull_request_page(json!([]), false, None),
+                changed,
+            ])),
         };
         let error = GitHubReviewClient::new(transport)
             .load_snapshot(&reference())

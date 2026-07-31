@@ -1,4 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_clippy_test", "rust_library", "rust_test", "rustfmt_test")
 load("@crates//:defs.bzl", "crate_deps")
 
 DEPS = crate_deps(
@@ -26,4 +26,22 @@ rust_test(
     edition = "2021",
     deps = DEPS,
     visibility = ["//visibility:private"],
+)
+
+rust_clippy_test(
+    name = "clippy_test",
+    targets = [":github_review_lib", ":github_review_tests"],
+    visibility = ["//visibility:private"],
+)
+
+rustfmt_test(
+    name = "rustfmt_test",
+    targets = [":github_review_lib", ":github_review_tests"],
+    visibility = ["//visibility:private"],
+)
+
+test_suite(
+    name = "github_review_test_suite",
+    tests = [":github_review_tests", ":clippy_test", ":rustfmt_test"],
+    visibility = ["//:__pkg__"],
 )
